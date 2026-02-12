@@ -1,5 +1,6 @@
 import { delay, http, HttpResponse } from 'msw'
 import {
+  analyzeStockWithAI,
   createOrder,
   createScreenerRun,
   getAIRecords,
@@ -54,6 +55,11 @@ export const handlers = [
   http.get('/api/stocks/:symbol/analysis', async ({ params }) => {
     await delay(160)
     return HttpResponse.json(getAnalysis(String(params.symbol)))
+  }),
+
+  http.post('/api/stocks/:symbol/ai-analyze', async ({ params }) => {
+    await delay(420)
+    return HttpResponse.json(analyzeStockWithAI(String(params.symbol)))
   }),
 
   http.put('/api/stocks/:symbol/annotations', async ({ request, params }) => {

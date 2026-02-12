@@ -21,6 +21,7 @@ import { ArrowLeftOutlined } from '@ant-design/icons'
 import { Controller, useForm } from 'react-hook-form'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
+  analyzeStockWithAI,
   getSignals,
   getStockAnalysis,
   getStockCandles,
@@ -31,7 +32,7 @@ import { IntradayChart } from '@/shared/charts/IntradayChart'
 import { KLineChart } from '@/shared/charts/KLineChart'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { useUIStore } from '@/state/uiStore'
-import type { StockAnnotation } from '@/types/contracts'
+import type { AIAnalysisRecord, StockAnnotation } from '@/types/contracts'
 
 function defaultAnnotation(symbol: string): StockAnnotation {
   return {
@@ -52,6 +53,7 @@ export function ChartPage() {
   const symbol = useParams().symbol ?? ''
   const stockName = useUIStore((state) => state.stockNameMap[symbol])
   const [intradayDate, setIntradayDate] = useState<string | null>(null)
+  const [lastAIRecord, setLastAIRecord] = useState<AIAnalysisRecord | null>(null)
   const cachedDraft = useUIStore((state) => state.annotationDrafts[symbol])
   const upsertDraft = useUIStore((state) => state.upsertDraft)
   const symbolText = symbol.toUpperCase()
@@ -106,6 +108,19 @@ export function ChartPage() {
       upsertDraft(payload)
       void queryClient.invalidateQueries({ queryKey: ['analysis', symbol] })
       message.success('已保存图上标注（手工优先）')
+    },
+  })
+
+  const analyzeMutation = useMutation({
+    mutationFn: () => analyzeStockWithAI(symbol),
+    onSuccess: (record) => {
+      setLastAIRecord(record)
+      void queryClient.invalidateQueries({ queryKey: ['analysis', symbol] })
+      void queryClient.invalidateQueries({ queryKey: ['ai-records'] })
+      message.success('AI分析完成')
+    },
+    onError: () => {
+      message.error('AI分析失败，请稍后重试')
     },
   })
 
@@ -271,6 +286,14 @@ export function ChartPage() {
 
           <Space>
             <Button
+              loading={analyzeMutation.isPending}
+              onClick={() => {
+                void analyzeMutation.mutateAsync()
+              }}
+            >
+              AI分析本股
+            </Button>
+            <Button
               type="primary"
               loading={saveMutation.isPending}
               onClick={handleSubmit((values) =>
@@ -286,6 +309,26 @@ export function ChartPage() {
             <Tag color="green">manual &gt; auto</Tag>
             <Tag color="blue">confidence {analysisQuery.data?.analysis.confidence ?? '-'}</Tag>
           </Space>
+          {lastAIRecord ? (
+            <Alert
+              type={lastAIRecord.error_code ? 'warning' : 'success'}
+              showIcon
+              message={`AI结论: ${lastAIRecord.conclusion} | 置信度 ${lastAIRecord.confidence}`}
+              description={
+                <Space direction="vertical" size={4}>
+                  <Typography.Text>{lastAIRecord.summary}</Typography.Text>
+                  <Typography.Text type="secondary">
+                    来源: {lastAIRecord.source_urls.join(' | ') || '无'}
+                  </Typography.Text>
+                  {lastAIRecord.error_code ? (
+                    <Typography.Text type="warning">
+                      回退原因: {lastAIRecord.error_code}
+                    </Typography.Text>
+                  ) : null}
+                </Space>
+              }
+            />
+          ) : null}
         </Space>
       </Card>
 

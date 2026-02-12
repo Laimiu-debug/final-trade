@@ -66,3 +66,11 @@ def test_intraday_endpoint_returns_points() -> None:
     body = resp.json()
     assert len(body["points"]) > 0
     assert "date" in body
+
+
+def test_ai_analyze_stock_endpoint() -> None:
+    resp = client.post("/api/stocks/sz300750/ai-analyze")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["symbol"] == "sz300750"
+    assert "summary" in body and body["summary"]

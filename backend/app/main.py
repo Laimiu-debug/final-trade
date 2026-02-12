@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .models import (
+    AIAnalysisRecord,
     AIRecordsResponse,
     AnnotationUpdateResponse,
     ApiErrorPayload,
@@ -130,6 +131,11 @@ def get_review_stats() -> ReviewResponse:
 @app.get("/api/ai/records", response_model=AIRecordsResponse)
 def get_ai_records() -> AIRecordsResponse:
     return AIRecordsResponse(items=store.get_ai_records())
+
+
+@app.post("/api/stocks/{symbol}/ai-analyze", response_model=AIAnalysisRecord)
+def post_stock_ai_analyze(symbol: str) -> AIAnalysisRecord:
+    return store.analyze_stock_with_ai(symbol)
 
 
 @app.get("/api/config", response_model=AppConfig)

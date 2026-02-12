@@ -33,6 +33,26 @@ const stockPool: Array<{ symbol: string; name: string; trend: TrendClass; stage:
 const candlesMap = new Map<string, CandlePoint[]>()
 const runStore = new Map<string, ScreenerRunDetail>()
 const annotationStore = new Map<string, StockAnnotation>()
+let aiRecordsStore: AIAnalysisRecord[] = [
+  {
+    provider: 'openai',
+    symbol: 'sz300750',
+    fetched_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    source_urls: ['https://example.com/news/ev-1', 'https://example.com/forum/battery'],
+    summary: '板块热度延续，龙头与补涨梯队结构完整。',
+    conclusion: '发酵中',
+    confidence: 0.78,
+  },
+  {
+    provider: 'openai',
+    symbol: 'sh600519',
+    fetched_at: dayjs().subtract(1, 'day').format('YYYY-MM-DD HH:mm:ss'),
+    source_urls: ['https://example.com/news/consumption'],
+    summary: '消费主线延续，成交结构稳定。',
+    conclusion: '高潮',
+    confidence: 0.66,
+  },
+]
 
 let configStore: AppConfig = {
   tdx_data_path: 'D:\\new_tdx\\vipdoc',
@@ -87,7 +107,7 @@ let configStore: AppConfig = {
     },
     {
       id: 'custom-1',
-      label: '自定义Provider',
+      label: '自定义 Provider',
       base_url: 'https://your-provider.example.com/v1',
       model: 'custom-model',
       api_key: '',
@@ -240,7 +260,7 @@ function createMockSymbol(index: number) {
 
 function createMockName(index: number) {
   const sectors = ['科技', '医药', '消费', '金融', '能源', '制造', '材料', '军工']
-  return `${sectors[index % sectors.length]}样本${index + 1}`
+  return `${sectors[index % sectors.length]}鏍锋湰${index + 1}`
 }
 
 function createPoolRecord(index: number, mode: ScreenerMode, stage: 'input' | 'step1' | 'step2' | 'step3' | 'step4'): ScreenerResult {
@@ -310,7 +330,7 @@ export function createScreenerRun(params: ScreenerParams) {
   const step3Pool = step2Pool.slice(0, step3Count).map((row, index) => ({
     ...row,
     score: 86 - (index % 20),
-    labels: ['量能健康'],
+    labels: ['閲忚兘鍋ュ悍'],
   }))
 
   const finalBase = mode === 'strict' ? stockPool.slice(0, 5) : stockPool
@@ -409,7 +429,7 @@ export function saveAnnotation(annotation: StockAnnotation) {
 
 export function getSignals(): SignalResult[] {
   const raw: Array<{ symbol: string; name: string; trigger_reason: string; signals: Array<'A' | 'B' | 'C'> }> = [
-    { symbol: 'sz300750', name: '宁德时代', trigger_reason: '突破新高后缩量回踩', signals: ['A', 'B'] },
+    { symbol: 'sz300750', name: '宁德时代', trigger_reason: '突破前高后缩量回踩确认', signals: ['A', 'B'] },
     { symbol: 'sh601899', name: '紫金矿业', trigger_reason: '板块分歧后转一致', signals: ['A', 'C'] },
     { symbol: 'sh600519', name: '贵州茅台', trigger_reason: 'MA10回踩确认', signals: ['A'] },
   ]
@@ -521,28 +541,25 @@ export function getReview(): { stats: ReviewStats; trades: TradeRecord[] } {
 }
 
 export function getAIRecords(): AIAnalysisRecord[] {
-  return [
-    {
-      provider: 'openai',
-      symbol: 'sz300750',
-      fetched_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
-      source_urls: ['https://example.com/news/ev-1', 'https://example.com/forum/battery'],
-      summary: '板块热度持续，头部与补涨梯队完整。',
-      conclusion: '发酵中',
-      confidence: 0.78,
-    },
-    {
-      provider: 'openai',
-      symbol: 'sh600519',
-      fetched_at: dayjs().subtract(1, 'day').format('YYYY-MM-DD HH:mm:ss'),
-      source_urls: ['https://example.com/news/consumption'],
-      summary: '消费主线维持，成交稳定。',
-      conclusion: '高潮',
-      confidence: 0.66,
-    },
-  ]
+  return aiRecordsStore
 }
 
+export function analyzeStockWithAI(symbol: string): AIAnalysisRecord {
+  const base = stockPool.find((item) => item.symbol === symbol)
+  const conclusion = base?.trend === 'B' ? '高潮' : '发酵中'
+  const confidence = base?.trend === 'B' ? 0.72 : 0.68
+  const record: AIAnalysisRecord = {
+    provider: configStore.ai_provider,
+    symbol,
+    fetched_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    source_urls: configStore.ai_sources.filter((item) => item.enabled).slice(0, 3).map((item) => item.url),
+    summary: `已完成 ${symbol} 的题材与量价联合分析，建议结合当前分时承接与回撤结构确认买点。`,
+    conclusion,
+    confidence,
+  }
+  aiRecordsStore = [record, ...aiRecordsStore].slice(0, 200)
+  return record
+}
 export function getConfigStore() {
   return configStore
 }
@@ -551,3 +568,4 @@ export function setConfigStore(payload: AppConfig) {
   configStore = payload
   return configStore
 }
+

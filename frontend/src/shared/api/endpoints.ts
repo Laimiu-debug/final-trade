@@ -78,6 +78,12 @@ export function getAIRecords() {
   return apiRequest<{ items: AIAnalysisRecord[] }>('/api/ai/records')
 }
 
+export function analyzeStockWithAI(symbol: string) {
+  return apiRequest<AIAnalysisRecord>(`/api/stocks/${symbol}/ai-analyze`, {
+    method: 'POST',
+  })
+}
+
 export function getConfig() {
   return apiRequest<AppConfig>('/api/config')
 }

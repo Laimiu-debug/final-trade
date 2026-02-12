@@ -1,10 +1,14 @@
 ﻿from __future__ import annotations
 
 import math
+import os
 import random
+import re
 from datetime import datetime, timedelta
 from typing import Literal
 from uuid import uuid4
+
+import httpx
 
 from .models import (
     AIAnalysisRecord,
@@ -64,6 +68,7 @@ class InMemoryStore:
         self._annotation_store: dict[str, StockAnnotation] = {}
         self._config: AppConfig = self._default_config()
         self._latest_rows: dict[str, ScreenerResult] = {}
+        self._ai_record_store: list[AIAnalysisRecord] = self._default_ai_records()
 
     @staticmethod
     def _default_config() -> AppConfig:
@@ -161,6 +166,224 @@ class InMemoryStore:
     @staticmethod
     def _hash_seed(text: str) -> int:
         return sum(ord(c) for c in text)
+
+    def _default_ai_records(self) -> list[AIAnalysisRecord]:
+        return [
+            AIAnalysisRecord(
+                provider="openai",
+                symbol="sz300750",
+                fetched_at=self._now_datetime(),
+                source_urls=["https://example.com/news/ev-1", "https://example.com/forum/battery"],
+                summary="板块热度持续，头部与补涨梯队完整。",
+                conclusion="发酵中",
+                confidence=0.78,
+            ),
+            AIAnalysisRecord(
+                provider="openai",
+                symbol="sh600519",
+                fetched_at=(datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+                source_urls=["https://example.com/news/consumption"],
+                summary="消费主线维持，成交稳定。",
+                conclusion="高潮",
+                confidence=0.66,
+            ),
+        ]
+
+    def _enabled_ai_source_urls(self, limit: int = 5) -> list[str]:
+        urls = [item.url for item in self._config.ai_sources if item.enabled and item.url.strip()]
+        return urls[:limit]
+
+    def _active_ai_provider(self) -> AIProviderConfig | None:
+        for provider in self._config.ai_providers:
+            if provider.id == self._config.ai_provider and provider.enabled:
+                return provider
+        return None
+
+    @staticmethod
+    def _read_api_key_file(path_text: str) -> str:
+        if not path_text.strip():
+            return ""
+        full = os.path.expandvars(path_text.strip())
+        full = os.path.expanduser(full)
+        try:
+            with open(full, "r", encoding="utf-8") as fp:
+                return fp.read().strip()
+        except OSError:
+            return ""
+
+    def _resolve_provider_api_key(self, provider: AIProviderConfig | None) -> str:
+        if provider and provider.api_key.strip():
+            return provider.api_key.strip()
+        if self._config.api_key.strip():
+            return self._config.api_key.strip()
+        if provider and provider.api_key_path.strip():
+            key = self._read_api_key_file(provider.api_key_path)
+            if key:
+                return key
+        if self._config.api_key_path.strip():
+            key = self._read_api_key_file(self._config.api_key_path)
+            if key:
+                return key
+        return ""
+
+    def _heuristic_ai_analysis(
+        self,
+        symbol: str,
+        row: ScreenerResult | None,
+        source_urls: list[str],
+    ) -> AIAnalysisRecord:
+        provider = self._config.ai_provider
+        if row is None:
+            return AIAnalysisRecord(
+                provider=provider,
+                symbol=symbol,
+                fetched_at=self._now_datetime(),
+                source_urls=source_urls,
+                summary="缺少筛选上下文，按默认规则给出保守建议：先观察量价是否共振，再决定是否纳入跟踪。",
+                conclusion="Unknown",
+                confidence=0.52,
+                error_code="AI_CONTEXT_MISSING",
+            )
+
+        ret_text = f"{row.ret40 * 100:.2f}%"
+        retrace_text = f"{row.retrace20 * 100:.2f}%"
+        turnover_text = f"{row.turnover20 * 100:.2f}%"
+        if row.trend_class == "B" and row.retrace20 > 0.12:
+            conclusion = "退潮"
+        elif row.ai_confidence >= 0.72 and row.up_down_volume_ratio >= 1.2:
+            conclusion = "发酵中"
+        else:
+            conclusion = "高潮" if row.theme_stage == "高潮" else "发酵中"
+
+        summary = (
+            f"趋势类型 {row.trend_class}，阶段 {row.stage}，窗口涨幅 {ret_text}，"
+            f"回撤 {retrace_text}，20日平均换手 {turnover_text}。"
+            "建议结合分时承接与板块联动确认节奏。"
+        )
+        confidence = max(0.45, min(0.95, row.ai_confidence))
+        return AIAnalysisRecord(
+            provider=provider,
+            symbol=symbol,
+            fetched_at=self._now_datetime(),
+            source_urls=source_urls,
+            summary=summary,
+            conclusion=conclusion,
+            confidence=round(confidence, 2),
+            error_code=None,
+        )
+
+    def _extract_conclusion_from_text(self, text: str) -> str:
+        if "退潮" in text:
+            return "退潮"
+        if "高潮" in text:
+            return "高潮"
+        if "发酵" in text:
+            return "发酵中"
+        return "Unknown"
+
+    def _extract_confidence_from_text(self, text: str, fallback: float) -> float:
+        match = re.search(r"(\d{1,3}(?:\.\d+)?%)|(0?\.\d+)", text)
+        if not match:
+            return fallback
+        token = match.group(0)
+        if token.endswith("%"):
+            value = float(token[:-1]) / 100.0
+        else:
+            value = float(token)
+        return max(0.0, min(1.0, value))
+
+    def _call_provider_for_stock(
+        self,
+        symbol: str,
+        row: ScreenerResult | None,
+        source_urls: list[str],
+    ) -> AIAnalysisRecord | None:
+        provider = self._active_ai_provider()
+        api_key = self._resolve_provider_api_key(provider)
+        if provider is None or not provider.base_url.strip() or not provider.model.strip():
+            return None
+        if not api_key:
+            return None
+
+        row_text = "无近期筛选上下文"
+        if row:
+            row_text = (
+                f"trend={row.trend_class}, stage={row.stage}, ret={row.ret40:.4f}, "
+                f"turnover20={row.turnover20:.4f}, retrace20={row.retrace20:.4f}, "
+                f"vol_ratio={row.up_down_volume_ratio:.4f}, theme={row.theme_stage}"
+            )
+        prompt = (
+            "请基于股票技术面与题材热度给出简短结论。"
+            "输出格式: 结论(发酵中/高潮/退潮/Unknown) + 置信度(0-1) + 2句摘要。\n"
+            f"symbol={symbol}\n"
+            f"features={row_text}\n"
+            f"sources={source_urls}"
+        )
+        body = {
+            "model": provider.model,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": "你是A股短线趋势分析助手。"},
+                {"role": "user", "content": prompt},
+            ],
+        }
+
+        try:
+            with httpx.Client(timeout=float(self._config.ai_timeout_sec)) as client:
+                response = client.post(
+                    f"{provider.base_url.rstrip('/')}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json=body,
+                )
+            response.raise_for_status()
+            payload = response.json()
+            content = (
+                payload.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            if not content:
+                raise ValueError("AI_EMPTY_CONTENT")
+
+            fallback_confidence = row.ai_confidence if row else 0.6
+            conclusion = self._extract_conclusion_from_text(content)
+            confidence = self._extract_confidence_from_text(content, fallback_confidence)
+            summary = content.replace("\n", " ").strip()
+            if len(summary) > 220:
+                summary = f"{summary[:220]}..."
+            return AIAnalysisRecord(
+                provider=provider.id,
+                symbol=symbol,
+                fetched_at=self._now_datetime(),
+                source_urls=source_urls,
+                summary=summary,
+                conclusion=conclusion,
+                confidence=round(confidence, 2),
+                error_code=None,
+            )
+        except httpx.TimeoutException:
+            return AIAnalysisRecord(
+                provider=provider.id,
+                symbol=symbol,
+                fetched_at=self._now_datetime(),
+                source_urls=source_urls,
+                summary="AI请求超时，已回退本地规则分析。",
+                conclusion="Unknown",
+                confidence=0.45,
+                error_code="AI_TIMEOUT",
+            )
+        except Exception:
+            return AIAnalysisRecord(
+                provider=provider.id,
+                symbol=symbol,
+                fetched_at=self._now_datetime(),
+                source_urls=source_urls,
+                summary="AI请求失败，已回退本地规则分析。",
+                conclusion="Unknown",
+                confidence=0.45,
+                error_code="AI_PROVIDER_ERROR",
+            )
 
     def _gen_candles(self, seed: int, start_price: float = 40.0) -> list[CandlePoint]:
         points: list[CandlePoint] = []
@@ -665,27 +888,22 @@ class InMemoryStore:
             ],
         )
 
+    def analyze_stock_with_ai(self, symbol: str) -> AIAnalysisRecord:
+        row = self._latest_rows.get(symbol)
+        source_urls = self._enabled_ai_source_urls()
+        fallback = self._heuristic_ai_analysis(symbol, row, source_urls)
+        provider_result = self._call_provider_for_stock(symbol, row, source_urls)
+        record = provider_result or fallback
+        if provider_result and provider_result.error_code:
+            record = fallback.model_copy(update={"error_code": provider_result.error_code})
+
+        self._ai_record_store.insert(0, record)
+        if len(self._ai_record_store) > 200:
+            self._ai_record_store = self._ai_record_store[:200]
+        return record
+
     def get_ai_records(self) -> list[AIAnalysisRecord]:
-        return [
-            AIAnalysisRecord(
-                provider="openai",
-                symbol="sz300750",
-                fetched_at=self._now_datetime(),
-                source_urls=["https://example.com/news/ev-1", "https://example.com/forum/battery"],
-                summary="板块热度持续，头部与补涨梯队完整。",
-                conclusion="发酵中",
-                confidence=0.78,
-            ),
-            AIAnalysisRecord(
-                provider="openai",
-                symbol="sh600519",
-                fetched_at=(datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
-                source_urls=["https://example.com/news/consumption"],
-                summary="消费主线维持，成交稳定。",
-                conclusion="高潮",
-                confidence=0.66,
-            ),
-        ]
+        return self._ai_record_store
 
     def get_config(self) -> AppConfig:
         return self._config
