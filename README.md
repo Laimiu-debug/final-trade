@@ -1,0 +1,3 @@
+# final trade
+
+Project initialized.
