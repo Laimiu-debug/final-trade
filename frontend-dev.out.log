@@ -1,0 +1,24 @@
+
+> frontend@0.0.0 dev:host E:\Laimiu\final trade\frontend
+> vite --host 127.0.0.1 --port 4173
+
+
+  [32m[1mVITE[22m v7.3.1[39m  [2mready in [0m[1m328[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m4173[22m/[39m
+[2m00:32:09[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
+[2m00:45:51[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
+[2m00:49:27[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
+[2m00:49:40[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/settings/SettingsPage.tsx[22m
+[2m00:55:45[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/chart/ChartPage.tsx, /src/pages/screener/ScreenerPage.tsx[22m
+[2m00:55:55[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
+[2m00:56:11[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
+[2m00:56:44[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/chart/ChartPage.tsx[22m
+[2m00:57:06[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
+[2m00:59:59[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
+[2m01:00:19[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
+[2m01:00:43[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
+[2m01:01:07[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
+[2m01:01:19[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
+[2m01:02:33[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
+ ELIFECYCLE  Command failed with exit code 4294967295.

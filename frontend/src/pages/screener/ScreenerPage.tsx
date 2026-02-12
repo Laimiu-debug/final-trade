@@ -1,0 +1,2453 @@
+﻿import { type CSSProperties, useCallback, useEffect, useMemo, useState } from 'react'
+import { useMutation } from '@tanstack/react-query'
+import {
+  App as AntdApp,
+  Alert,
+  Button,
+  Card,
+  Checkbox,
+  Col,
+  Dropdown,
+  Input,
+  InputNumber,
+  Popover,
+  Radio,
+  Row,
+  Space,
+  Statistic,
+  Table,
+  Tag,
+  Typography,
+} from 'antd'
+import type { ColumnsType } from 'antd/es/table'
+import type { MenuProps } from 'antd'
+import { Controller, useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
+import { DownOutlined, SettingOutlined, UpOutlined } from '@ant-design/icons'
+import { useNavigate } from 'react-router-dom'
+import { jsPDF } from 'jspdf'
+import autoTable from 'jspdf-autotable'
+import * as XLSX from 'xlsx'
+import { PageHeader } from '@/shared/components/PageHeader'
+import { getScreenerRun, runScreener } from '@/shared/api/endpoints'
+import { useUIStore } from '@/state/uiStore'
+import type {
+  ScreenerParams,
+  ScreenerPoolKey,
+  ScreenerResult,
+  ScreenerStepPools,
+  ThemeStage,
+  TrendClass,
+} from '@/types/contracts'
+import { formatLargeMoney, formatPct } from '@/shared/utils/format'
+
+const formSchema = z.object({
+  board_filters: z.array(z.enum(['main', 'gem', 'star', 'beijing', 'st'])).min(1, '至少选择一个板块'),
+  mode: z.enum(['strict', 'loose']),
+  return_window_days: z.number().min(5).max(120),
+  top_n: z.number().min(100).max(2000),
+  turnover_threshold: z.number().min(0.01).max(0.2),
+  amount_threshold: z.number().min(5e7).max(5e9),
+  amplitude_threshold: z.number().min(0.01).max(0.15),
+})
+
+type FormValues = z.infer<typeof formSchema>
+type ScreenerRunMeta = { runId: string; degraded: boolean; degradedReason?: string }
+
+interface StepConfigs {
+  step1: {
+    top_n: number
+    turnover_threshold: number
+    amount_threshold: number
+    amplitude_threshold: number
+  }
+  step2: {
+    retrace_min: number
+    retrace_max: number
+    max_pullback_days: number
+    min_ma10_above_ma20_days: number
+    min_ma5_above_ma10_days: number
+    max_price_vs_ma20: number
+    require_above_ma20: boolean
+    allow_b_trend: boolean
+  }
+  step3: {
+    min_vol_slope20: number
+    min_up_down_volume_ratio: number
+    max_pullback_volume_ratio: number
+    allow_blowoff_top: boolean
+    allow_divergence_5d: boolean
+    allow_upper_shadow_risk: boolean
+    allow_degraded: boolean
+  }
+  step4: {
+    final_top_n: number
+    min_ai_confidence: number
+    allowed_theme_stages: ThemeStage[]
+    allow_degraded: boolean
+  }
+}
+
+const defaultStepConfigs: StepConfigs = {
+  step1: {
+    top_n: 500,
+    turnover_threshold: 0.05,
+    amount_threshold: 5e8,
+    amplitude_threshold: 0.03,
+  },
+  step2: {
+    retrace_min: 0.05,
+    retrace_max: 0.25,
+    max_pullback_days: 3,
+    min_ma10_above_ma20_days: 5,
+    min_ma5_above_ma10_days: 3,
+    max_price_vs_ma20: 0.08,
+    require_above_ma20: true,
+    allow_b_trend: false,
+  },
+  step3: {
+    min_vol_slope20: 0.05,
+    min_up_down_volume_ratio: 1.3,
+    max_pullback_volume_ratio: 0.75,
+    allow_blowoff_top: false,
+    allow_divergence_5d: false,
+    allow_upper_shadow_risk: false,
+    allow_degraded: false,
+  },
+  step4: {
+    final_top_n: 8,
+    min_ai_confidence: 0.55,
+    allowed_theme_stages: ['发酵中', '高潮'],
+    allow_degraded: true,
+  },
+}
+
+const defaultFormValues: FormValues = {
+  board_filters: ['main', 'gem', 'star'],
+  mode: 'strict',
+  return_window_days: 40,
+  top_n: 500,
+  turnover_threshold: 0.05,
+  amount_threshold: 5e8,
+  amplitude_threshold: 0.03,
+}
+
+const poolOrder: ScreenerPoolKey[] = ['input', 'step1', 'step2', 'step3', 'step4', 'final']
+
+const poolStepIndex: Record<ScreenerPoolKey, number> = {
+  input: 0,
+  step1: 1,
+  step2: 2,
+  step3: 3,
+  step4: 4,
+  final: 0,
+}
+
+const poolLabelMap: Record<ScreenerPoolKey, string> = {
+  input: '输入池',
+  step1: '第1步池',
+  step2: '第2步池',
+  step3: '第3步池',
+  step4: '第4步池',
+  final: '终选池',
+}
+
+const emptyStepPools: ScreenerStepPools = {
+  input: [],
+  step1: [],
+  step2: [],
+  step3: [],
+  step4: [],
+  final: [],
+}
+
+const previousPoolByStep: Record<1 | 2 | 3 | 4, ScreenerPoolKey> = {
+  1: 'input',
+  2: 'step1',
+  3: 'step2',
+  4: 'step3',
+}
+
+type ScreenerColumnKey =
+  | 'symbol'
+  | 'name'
+  | 'latest_price'
+  | 'day_change'
+  | 'day_change_pct'
+  | 'ret40'
+  | 'turnover20'
+  | 'amount20'
+  | 'amplitude20'
+  | 'retrace20'
+  | 'pullback_days'
+  | 'trend_class'
+  | 'stage'
+  | 'score'
+  | 'ai_confidence'
+  | 'theme_stage'
+
+const defaultColumnOrder: ScreenerColumnKey[] = [
+  'symbol',
+  'name',
+  'latest_price',
+  'day_change',
+  'day_change_pct',
+  'ret40',
+  'turnover20',
+  'amount20',
+  'amplitude20',
+  'retrace20',
+  'pullback_days',
+  'trend_class',
+  'stage',
+  'score',
+  'ai_confidence',
+  'theme_stage',
+]
+
+const tableColumnMap: Record<ScreenerColumnKey, ColumnsType<ScreenerResult>[number]> = {
+  symbol: { key: 'symbol', title: '代码', dataIndex: 'symbol', width: 110, fixed: 'left' },
+  name: { key: 'name', title: '名称', dataIndex: 'name', width: 120 },
+  latest_price: {
+    key: 'latest_price',
+    title: '当日价格',
+    dataIndex: 'latest_price',
+    width: 100,
+    render: (value: number) => (typeof value === 'number' ? value.toFixed(2) : '--'),
+  },
+  day_change: {
+    key: 'day_change',
+    title: '当日涨跌',
+    dataIndex: 'day_change',
+    width: 100,
+    render: (value: number) => (
+      typeof value === 'number' ? (
+      <Typography.Text type={value >= 0 ? 'danger' : 'success'}>
+        {value >= 0 ? `+${value.toFixed(2)}` : value.toFixed(2)}
+      </Typography.Text>
+      ) : '--'
+    ),
+  },
+  day_change_pct: {
+    key: 'day_change_pct',
+    title: '当日涨跌幅',
+    dataIndex: 'day_change_pct',
+    width: 110,
+    render: (value: number) => (
+      typeof value === 'number' ? (
+      <Typography.Text type={value >= 0 ? 'danger' : 'success'}>
+        {value >= 0 ? `+${formatPct(value)}` : formatPct(value)}
+      </Typography.Text>
+      ) : '--'
+    ),
+  },
+  ret40: {
+    key: 'ret40',
+    title: '涨幅',
+    dataIndex: 'ret40',
+    width: 110,
+    render: (value: number) => formatPct(value),
+  },
+  turnover20: {
+    key: 'turnover20',
+    title: '换手',
+    dataIndex: 'turnover20',
+    width: 110,
+    render: (value: number) => formatPct(value),
+  },
+  amount20: {
+    key: 'amount20',
+    title: '成交额',
+    dataIndex: 'amount20',
+    width: 130,
+    render: (value: number) => formatLargeMoney(value),
+  },
+  amplitude20: {
+    key: 'amplitude20',
+    title: '振幅',
+    dataIndex: 'amplitude20',
+    width: 110,
+    render: (value: number) => formatPct(value),
+  },
+  retrace20: {
+    key: 'retrace20',
+    title: '20日回撤',
+    dataIndex: 'retrace20',
+    width: 110,
+    render: (value: number) => formatPct(value),
+  },
+  pullback_days: {
+    key: 'pullback_days',
+    title: '回调天数',
+    dataIndex: 'pullback_days',
+    width: 100,
+  },
+  trend_class: {
+    key: 'trend_class',
+    title: '趋势',
+    dataIndex: 'trend_class',
+    width: 90,
+    render: (value: string) => <Tag color={value === 'B' ? 'red' : 'green'}>{value}</Tag>,
+  },
+  stage: { key: 'stage', title: '阶段', dataIndex: 'stage', width: 90 },
+  score: { key: 'score', title: '综合分', dataIndex: 'score', width: 90 },
+  ai_confidence: {
+    key: 'ai_confidence',
+    title: 'AI置信度',
+    dataIndex: 'ai_confidence',
+    width: 110,
+    render: (value: number) => formatPct(value),
+  },
+  theme_stage: { key: 'theme_stage', title: '题材阶段', dataIndex: 'theme_stage', width: 110 },
+}
+
+function buildColumnTitleMap(returnWindowDays: number): Record<ScreenerColumnKey, string> {
+  return {
+    symbol: '代码',
+    name: '名称',
+    latest_price: '当日价格',
+    day_change: '当日涨跌',
+    day_change_pct: '当日涨跌幅',
+    ret40: `${returnWindowDays}日涨幅`,
+    turnover20: '20日平均换手',
+    amount20: '20日平均成交额',
+    amplitude20: '20日平均振幅',
+    retrace20: '20日回撤',
+    pullback_days: '回调天数',
+    trend_class: '趋势',
+    stage: '阶段',
+    score: '综合分',
+    ai_confidence: 'AI置信度',
+    theme_stage: '题材阶段',
+  }
+}
+type ExportFormat = 'csv' | 'xlsx' | 'pdf'
+
+const exportFormatLabelMap: Record<ExportFormat, string> = {
+  csv: 'CSV',
+  xlsx: 'Excel',
+  pdf: 'PDF',
+}
+
+const MANUAL_LABEL = '手工添加'
+const SCREENER_CACHE_KEY = 'tdx-trend-screener-cache-v4'
+type StageType = 'Early' | 'Mid' | 'Late'
+type BoardFilterKey = 'main' | 'gem' | 'star' | 'beijing' | 'st'
+type TableSortField =
+  | 'manual'
+  | 'score'
+  | 'ret40'
+  | 'turnover20'
+  | 'amount20'
+  | 'amplitude20'
+  | 'retrace20'
+  | 'latest_price'
+  | 'day_change_pct'
+type TableSortDirection = 'asc' | 'desc'
+
+const trendClassLabelMap: Record<TrendClass, string> = {
+  A: 'A 阶梯慢牛',
+  A_B: 'A_B 慢牛加速',
+  B: 'B 脉冲涨停',
+  Unknown: 'Unknown',
+}
+
+const stageLabelMap: Record<StageType, string> = {
+  Early: '早期',
+  Mid: '中期',
+  Late: '后期',
+}
+
+const boardFilterLabelMap: Record<BoardFilterKey, string> = {
+  main: '主板',
+  gem: '创业板',
+  star: '科创板',
+  beijing: '北交所',
+  st: 'ST',
+}
+
+const numericSortFields: TableSortField[] = [
+  'score',
+  'ret40',
+  'turnover20',
+  'amount20',
+  'amplitude20',
+  'retrace20',
+  'latest_price',
+  'day_change_pct',
+]
+
+function isTableSortField(value: string): value is TableSortField {
+  return (
+    value === 'manual'
+    || value === 'score'
+    || value === 'ret40'
+    || value === 'turnover20'
+    || value === 'amount20'
+    || value === 'amplitude20'
+    || value === 'retrace20'
+    || value === 'latest_price'
+    || value === 'day_change_pct'
+  )
+}
+
+function isTrendClass(value: string): value is TrendClass {
+  return value === 'A' || value === 'A_B' || value === 'B' || value === 'Unknown'
+}
+
+function isStageType(value: string): value is StageType {
+  return value === 'Early' || value === 'Mid' || value === 'Late'
+}
+
+function isScreenerColumnKey(value: string): value is ScreenerColumnKey {
+  return (
+    value === 'symbol'
+    || value === 'name'
+    || value === 'latest_price'
+    || value === 'day_change'
+    || value === 'day_change_pct'
+    || value === 'ret40'
+    || value === 'turnover20'
+    || value === 'amount20'
+    || value === 'amplitude20'
+    || value === 'retrace20'
+    || value === 'pullback_days'
+    || value === 'trend_class'
+    || value === 'stage'
+    || value === 'score'
+    || value === 'ai_confidence'
+    || value === 'theme_stage'
+  )
+}
+
+function normalizeStockName(name: string) {
+  return name.toUpperCase().replace(/\s+/g, '')
+}
+
+function isStStock(row: ScreenerResult) {
+  const name = normalizeStockName(row.name)
+  return name.includes('ST')
+}
+
+function detectPrimaryBoard(row: ScreenerResult): Exclude<BoardFilterKey, 'st'> | null {
+  const symbol = row.symbol.toLowerCase()
+  if (symbol.length < 8) return null
+  const market = symbol.slice(0, 2)
+  const code = symbol.slice(2)
+  if (market === 'bj') return 'beijing'
+  if (market === 'sh') {
+    if (code.startsWith('688') || code.startsWith('689')) return 'star'
+    return 'main'
+  }
+  if (market === 'sz') {
+    if (code.startsWith('300') || code.startsWith('301')) return 'gem'
+    return 'main'
+  }
+  return null
+}
+
+function rowMatchesBoardFilters(row: ScreenerResult, filters: BoardFilterKey[]) {
+  if (filters.length === 0) return false
+  const selected = new Set(filters)
+  const isSt = isStStock(row)
+  if (isSt && !selected.has('st')) return false
+  if (!isSt && selected.size === 1 && selected.has('st')) return false
+  const board = detectPrimaryBoard(row)
+  const selectedBoards = filters.filter((item) => item !== 'st')
+  if (selectedBoards.length === 0) {
+    return isSt
+  }
+  if (!board) return false
+  return selectedBoards.includes(board)
+}
+
+function filterRowsByBoards(rows: ScreenerResult[], filters: BoardFilterKey[]) {
+  if (!rows.length) return rows
+  if (!filters.length) return []
+  return rows.filter((row) => rowMatchesBoardFilters(row, filters))
+}
+
+interface ScreenerCachePayload {
+  version: 1
+  updated_at: string
+  form_values: FormValues
+  active_pool: ScreenerPoolKey
+  executed_step: number
+  pools: ScreenerStepPools
+  run_meta?: ScreenerRunMeta
+  step_configs: StepConfigs
+  column_order: ScreenerColumnKey[]
+  column_visible: Record<ScreenerColumnKey, boolean>
+  input_pool_key?: string
+  raw_input_pool?: ScreenerResult[]
+}
+
+let memoryScreenerCache: ScreenerCachePayload | null = null
+
+function defaultColumnVisibleState() {
+  return defaultColumnOrder.reduce(
+    (acc, key) => ({ ...acc, [key]: true }),
+    {} as Record<ScreenerColumnKey, boolean>,
+  )
+}
+
+function createDefaultScreenerCache(): ScreenerCachePayload {
+  return {
+    version: 1,
+    updated_at: new Date().toISOString(),
+    form_values: defaultFormValues,
+    active_pool: 'input',
+    executed_step: 0,
+    pools: emptyStepPools,
+    run_meta: undefined,
+    step_configs: defaultStepConfigs,
+    column_order: defaultColumnOrder,
+    column_visible: defaultColumnVisibleState(),
+    input_pool_key: '',
+    raw_input_pool: [],
+  }
+}
+
+function buildInputPoolKey(params: Pick<FormValues, 'return_window_days'>) {
+  return `${params.return_window_days}`
+}
+
+function sanitizeColumnOrder(raw: unknown): ScreenerColumnKey[] {
+  if (!Array.isArray(raw)) return defaultColumnOrder
+  const valid = new Set(defaultColumnOrder)
+  const picked = raw.filter((item): item is ScreenerColumnKey => valid.has(item as ScreenerColumnKey))
+  const dedup: ScreenerColumnKey[] = []
+  for (const key of picked) {
+    if (!dedup.includes(key)) dedup.push(key)
+  }
+  for (const key of defaultColumnOrder) {
+    if (!dedup.includes(key)) dedup.push(key)
+  }
+  return dedup
+}
+
+function sanitizeColumnVisible(raw: unknown): Record<ScreenerColumnKey, boolean> {
+  const defaultVisible = defaultColumnVisibleState()
+  if (!raw || typeof raw !== 'object') return defaultVisible
+  return defaultColumnOrder.reduce(
+    (acc, key) => ({
+      ...acc,
+      [key]: typeof (raw as Record<string, unknown>)[key] === 'boolean'
+        ? ((raw as Record<string, unknown>)[key] as boolean)
+        : defaultVisible[key],
+    }),
+    {} as Record<ScreenerColumnKey, boolean>,
+  )
+}
+
+function sanitizeResultRows(raw: unknown): ScreenerResult[] {
+  if (!Array.isArray(raw)) return []
+  return raw.map((item) => {
+    if (!item || typeof item !== 'object') return item as ScreenerResult
+    const row = item as Partial<ScreenerResult>
+    return {
+      ...row,
+      latest_price: typeof row.latest_price === 'number' ? row.latest_price : 0,
+      day_change: typeof row.day_change === 'number' ? row.day_change : 0,
+      day_change_pct: typeof row.day_change_pct === 'number' ? row.day_change_pct : 0,
+    } as ScreenerResult
+  })
+}
+
+function sanitizePools(raw: unknown): ScreenerStepPools {
+  if (!raw || typeof raw !== 'object') return emptyStepPools
+  const pools = raw as Partial<ScreenerStepPools>
+  return {
+    input: sanitizeResultRows(pools.input),
+    step1: sanitizeResultRows(pools.step1),
+    step2: sanitizeResultRows(pools.step2),
+    step3: sanitizeResultRows(pools.step3),
+    step4: sanitizeResultRows(pools.step4),
+    final: sanitizeResultRows(pools.final),
+  }
+}
+
+function loadScreenerCache(): ScreenerCachePayload {
+  if (memoryScreenerCache) {
+    return memoryScreenerCache
+  }
+  const fallback = createDefaultScreenerCache()
+  try {
+    const raw = window.localStorage.getItem(SCREENER_CACHE_KEY)
+    if (!raw) return fallback
+    const parsed = JSON.parse(raw) as Partial<ScreenerCachePayload>
+
+    const stepConfigs = {
+      step1: { ...defaultStepConfigs.step1, ...(parsed.step_configs?.step1 ?? {}) },
+      step2: { ...defaultStepConfigs.step2, ...(parsed.step_configs?.step2 ?? {}) },
+      step3: { ...defaultStepConfigs.step3, ...(parsed.step_configs?.step3 ?? {}) },
+      step4: { ...defaultStepConfigs.step4, ...(parsed.step_configs?.step4 ?? {}) },
+    }
+
+    const formValues = {
+      ...defaultFormValues,
+      ...(parsed.form_values ?? {}),
+      top_n: stepConfigs.step1.top_n,
+    }
+
+    const activePool = poolOrder.includes(parsed.active_pool as ScreenerPoolKey)
+      ? (parsed.active_pool as ScreenerPoolKey)
+      : 'input'
+
+    const executedStep = Math.max(0, Math.min(4, Number(parsed.executed_step ?? 0)))
+    const runMeta = parsed.run_meta && typeof parsed.run_meta.runId === 'string'
+      ? parsed.run_meta
+      : undefined
+
+    const normalized: ScreenerCachePayload = {
+      version: 1,
+      updated_at: typeof parsed.updated_at === 'string' ? parsed.updated_at : fallback.updated_at,
+      form_values: formValues,
+      active_pool: activePool,
+      executed_step: executedStep,
+      pools: sanitizePools(parsed.pools),
+      run_meta: runMeta,
+      step_configs: stepConfigs,
+      column_order: sanitizeColumnOrder(parsed.column_order),
+      column_visible: sanitizeColumnVisible(parsed.column_visible),
+      input_pool_key: typeof parsed.input_pool_key === 'string' ? parsed.input_pool_key : '',
+      raw_input_pool: sanitizeResultRows(parsed.raw_input_pool),
+    }
+    memoryScreenerCache = normalized
+    return normalized
+  } catch {
+    return fallback
+  }
+}
+
+function saveScreenerCache(payload: ScreenerCachePayload) {
+  memoryScreenerCache = payload
+  try {
+    const persistedPayload: ScreenerCachePayload = {
+      ...payload,
+      raw_input_pool: [],
+    }
+    window.localStorage.setItem(SCREENER_CACHE_KEY, JSON.stringify(persistedPayload))
+  } catch {
+    // ignore quota and serialization errors; runtime state remains available
+  }
+}
+
+function csvEscape(raw: string) {
+  if (raw.includes(',') || raw.includes('"') || raw.includes('\n')) {
+    return `"${raw.replaceAll('"', '""')}"`
+  }
+  return raw
+}
+
+function formatTimestampForFile() {
+  const now = new Date()
+  const y = now.getFullYear()
+  const m = String(now.getMonth() + 1).padStart(2, '0')
+  const d = String(now.getDate()).padStart(2, '0')
+  const hh = String(now.getHours()).padStart(2, '0')
+  const mm = String(now.getMinutes()).padStart(2, '0')
+  const ss = String(now.getSeconds()).padStart(2, '0')
+  return `${y}${m}${d}-${hh}${mm}${ss}`
+}
+
+function runStep1(inputPool: ScreenerResult[], config: StepConfigs['step1']) {
+  const filtered = inputPool
+    .filter(
+      (row) =>
+        row.turnover20 >= config.turnover_threshold &&
+        row.amount20 >= config.amount_threshold &&
+        row.amplitude20 >= config.amplitude_threshold,
+    )
+    .sort((a, b) => b.ret40 - a.ret40)
+    .slice(0, config.top_n)
+
+  if (filtered.length > 400) return filtered.slice(0, 400)
+  return filtered
+}
+
+function runStep2(
+  step1Pool: ScreenerResult[],
+  config: StepConfigs['step2'],
+  mode: FormValues['mode'],
+) {
+  const loosePadding = mode === 'loose' ? 0.02 : 0
+  const looseDays = mode === 'loose' ? 1 : 0
+  const rawRetraceMin = Math.min(config.retrace_min, config.retrace_max)
+  const rawRetraceMax = Math.max(config.retrace_min, config.retrace_max)
+  const retraceMin = Math.max(0, rawRetraceMin - loosePadding)
+  const retraceMax = Math.min(0.8, rawRetraceMax + loosePadding)
+  const maxPullbackDays = config.max_pullback_days + looseDays
+  const minMa10AboveMa20Days = Math.max(0, config.min_ma10_above_ma20_days - looseDays)
+  const minMa5AboveMa10Days = Math.max(0, config.min_ma5_above_ma10_days - looseDays)
+  return step1Pool.filter(
+    (row) =>
+      row.retrace20 >= retraceMin &&
+      row.retrace20 <= retraceMax &&
+      row.pullback_days <= maxPullbackDays &&
+      row.ma10_above_ma20_days >= minMa10AboveMa20Days &&
+      row.ma5_above_ma10_days >= minMa5AboveMa10Days &&
+      Math.abs(row.price_vs_ma20) <= config.max_price_vs_ma20 &&
+      (!config.require_above_ma20 || row.price_vs_ma20 >= 0) &&
+      (config.allow_b_trend || row.trend_class !== 'B'),
+  )
+}
+
+function runStep3(step2Pool: ScreenerResult[], config: StepConfigs['step3']) {
+  return step2Pool.filter(
+    (row) =>
+      row.vol_slope20 >= config.min_vol_slope20 &&
+      row.up_down_volume_ratio >= config.min_up_down_volume_ratio &&
+      row.pullback_volume_ratio <= config.max_pullback_volume_ratio &&
+      (config.allow_blowoff_top || !row.has_blowoff_top) &&
+      (config.allow_divergence_5d || !row.has_divergence_5d) &&
+      (config.allow_upper_shadow_risk || !row.has_upper_shadow_risk) &&
+      (config.allow_degraded || !row.degraded),
+  )
+}
+
+function runStep4(step3Pool: ScreenerResult[], config: StepConfigs['step4']) {
+  const source = config.allow_degraded
+    ? step3Pool
+    : step3Pool.filter((row) => !row.degraded)
+  return source
+    .filter(
+      (row) =>
+        row.ai_confidence >= config.min_ai_confidence &&
+        config.allowed_theme_stages.includes(row.theme_stage),
+    )
+    .sort((a, b) => b.score + b.ai_confidence * 20 - (a.score + a.ai_confidence * 20))
+    .slice(0, config.final_top_n)
+}
+
+function mergeManualRows(calculatedRows: ScreenerResult[], currentRows: ScreenerResult[]) {
+  const manualRows = currentRows.filter((row) => row.labels.includes(MANUAL_LABEL))
+  if (manualRows.length === 0) return calculatedRows
+  const existingSymbols = new Set(calculatedRows.map((row) => row.symbol))
+  const appendedManual = manualRows.filter((row) => !existingSymbols.has(row.symbol))
+  return [...appendedManual, ...calculatedRows]
+}
+
+interface LabeledNumberInputProps {
+  label: string
+  min?: number
+  max?: number
+  step?: number
+  value?: number | null
+  onChange?: (value: number | null) => void
+  style?: CSSProperties
+}
+
+function LabeledNumberInput({ label, style, ...props }: LabeledNumberInputProps) {
+  return (
+    <Space.Compact style={{ width: '100%', ...style }}>
+      <div
+        style={{
+          minWidth: 128,
+          paddingInline: 12,
+          display: 'inline-flex',
+          alignItems: 'center',
+          border: '1px solid rgba(5, 5, 5, 0.12)',
+          borderRight: 0,
+          borderRadius: '8px 0 0 8px',
+          background: 'rgba(5, 5, 5, 0.04)',
+          color: 'rgba(0, 0, 0, 0.72)',
+          fontSize: 13,
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {label}
+      </div>
+      <InputNumber {...props} style={{ width: '100%' }} />
+    </Space.Compact>
+  )
+}
+
+export function ScreenerPage() {
+  const { message } = AntdApp.useApp()
+  const navigate = useNavigate()
+  const setSelectedSymbol = useUIStore((state) => state.setSelectedSymbol)
+  const initialCache = useMemo(() => loadScreenerCache(), [])
+
+  const [activePool, setActivePool] = useState<ScreenerPoolKey>(initialCache.active_pool)
+  const [executedStep, setExecutedStep] = useState(initialCache.executed_step)
+  const [pools, setPools] = useState<ScreenerStepPools>(initialCache.pools)
+  const [runMeta, setRunMeta] = useState<ScreenerRunMeta | undefined>(initialCache.run_meta)
+  const [stepConfigs, setStepConfigs] = useState<StepConfigs>(initialCache.step_configs)
+  const [runningStep, setRunningStep] = useState<number | null>(null)
+  const [columnOrder, setColumnOrder] = useState<ScreenerColumnKey[]>(initialCache.column_order)
+  const [columnVisible, setColumnVisible] = useState<Record<ScreenerColumnKey, boolean>>(
+    initialCache.column_visible,
+  )
+  const [draggingSymbol, setDraggingSymbol] = useState<string | null>(null)
+  const [dragOverPool, setDragOverPool] = useState<ScreenerPoolKey | null>(null)
+  const [dragOverSymbol, setDragOverSymbol] = useState<string | null>(null)
+  const [draggingColumnKey, setDraggingColumnKey] = useState<ScreenerColumnKey | null>(null)
+  const [dragOverColumnKey, setDragOverColumnKey] = useState<ScreenerColumnKey | null>(null)
+  const [keywordFilter, setKeywordFilter] = useState('')
+  const [trendFilters, setTrendFilters] = useState<TrendClass[]>([])
+  const [stageFilters, setStageFilters] = useState<StageType[]>([])
+  const [sortField, setSortField] = useState<TableSortField>('manual')
+  const [sortDirection, setSortDirection] = useState<TableSortDirection>('desc')
+  const [tablePage, setTablePage] = useState(1)
+  const [tablePageSize, setTablePageSize] = useState(8)
+  const [inputPoolKey, setInputPoolKey] = useState(initialCache.input_pool_key ?? '')
+  const [rawInputPool, setRawInputPool] = useState<ScreenerResult[]>(initialCache.raw_input_pool ?? [])
+  const [quickSearchKeyword, setQuickSearchKeyword] = useState('')
+
+  const { control, handleSubmit, getValues, setValue, trigger } = useForm<FormValues>({
+    resolver: zodResolver(formSchema),
+    defaultValues: initialCache.form_values,
+  })
+
+  const mode = useWatch({
+    control,
+    name: 'mode',
+    defaultValue: 'strict',
+  })
+  const returnWindowDays = useWatch({
+    control,
+    name: 'return_window_days',
+    defaultValue: 40,
+  })
+  const watchedFormValues = useWatch({
+    control,
+    defaultValue: initialCache.form_values,
+  }) as FormValues
+  const currentInputPoolKey = useMemo(
+    () =>
+      buildInputPoolKey({
+        return_window_days:
+          watchedFormValues?.return_window_days ?? defaultFormValues.return_window_days,
+      }),
+    [watchedFormValues],
+  )
+  const columnTitleMap = useMemo(
+    () => buildColumnTitleMap(returnWindowDays),
+    [returnWindowDays],
+  )
+
+  useEffect(() => {
+    saveScreenerCache({
+      version: 1,
+      updated_at: new Date().toISOString(),
+      form_values: watchedFormValues ?? defaultFormValues,
+      active_pool: activePool,
+      executed_step: executedStep,
+      pools,
+      run_meta: runMeta,
+      step_configs: stepConfigs,
+      column_order: columnOrder,
+      column_visible: columnVisible,
+      input_pool_key: inputPoolKey,
+      raw_input_pool: rawInputPool,
+    })
+  }, [
+    activePool,
+    executedStep,
+    pools,
+    runMeta,
+    stepConfigs,
+    columnOrder,
+    columnVisible,
+    inputPoolKey,
+    rawInputPool,
+    watchedFormValues,
+  ])
+
+  function buildScreenerParams(values: FormValues): ScreenerParams {
+    const markets = ['sh', 'sz', 'bj'] as const
+    return {
+      markets: [...markets],
+      mode: values.mode,
+      return_window_days: values.return_window_days,
+      top_n: values.top_n,
+      turnover_threshold: values.turnover_threshold,
+      amount_threshold: values.amount_threshold,
+      amplitude_threshold: values.amplitude_threshold,
+    }
+  }
+
+  const loadInputMutation = useMutation({
+    mutationFn: async (values: FormValues) => {
+      const params = buildScreenerParams(values)
+      const run = await runScreener(params)
+      const detail = await getScreenerRun(run.run_id)
+      return detail
+    },
+    onSuccess: (detail, values) => {
+      const sourceInputPool = detail.step_pools?.input ?? detail.results
+      const inputPool = filterRowsByBoards(sourceInputPool, values.board_filters)
+      setRawInputPool(sourceInputPool)
+      setPools((prev) => ({
+        input: inputPool,
+        step1: [],
+        step2: [],
+        step3: [],
+        step4: [],
+        final: prev.final,
+      }))
+      setExecutedStep(0)
+      setActivePool('input')
+      setRunMeta({
+        runId: detail.run_id,
+        degraded: detail.degraded,
+        degradedReason: detail.degraded_reason,
+      })
+      setInputPoolKey(
+        buildInputPoolKey({
+          return_window_days: values.return_window_days,
+        }),
+      )
+      message.success(`已加载输入池（当前板块 ${inputPool.length} / 全量 ${sourceInputPool.length}）`)
+    },
+  })
+
+  const rows = useMemo(() => pools[activePool] ?? [], [activePool, pools])
+  const allRowsBySymbol = useMemo(() => {
+    const map = new Map<string, ScreenerResult>()
+    for (const key of poolOrder) {
+      for (const row of pools[key]) {
+        if (!map.has(row.symbol)) {
+          map.set(row.symbol, row)
+        }
+      }
+    }
+    return map
+  }, [pools])
+  const quickSearchRows = useMemo(() => {
+    const keyword = quickSearchKeyword.trim().toLowerCase()
+    if (!keyword) return [] as ScreenerResult[]
+    return Array.from(allRowsBySymbol.values())
+      .filter((row) =>
+        row.symbol.toLowerCase().includes(keyword) || row.name.toLowerCase().includes(keyword),
+      )
+      .slice(0, 12)
+  }, [allRowsBySymbol, quickSearchKeyword])
+
+  const filteredRows = useMemo(() => {
+    const keyword = keywordFilter.trim().toLowerCase()
+    const list = rows.filter((row) => {
+      if (
+        keyword.length > 0 &&
+        !row.symbol.toLowerCase().includes(keyword) &&
+        !row.name.toLowerCase().includes(keyword)
+      ) {
+        return false
+      }
+      if (trendFilters.length > 0 && !trendFilters.includes(row.trend_class)) {
+        return false
+      }
+      if (stageFilters.length > 0 && !stageFilters.includes(row.stage as StageType)) {
+        return false
+      }
+      return true
+    })
+
+    if (sortField === 'manual') {
+      return list
+    }
+
+    const sorted = [...list].sort((a, b) => {
+      const va = a[sortField]
+      const vb = b[sortField]
+      if (typeof va === 'number' && typeof vb === 'number') {
+        return va - vb
+      }
+      return String(va ?? '').localeCompare(String(vb ?? ''), 'zh-CN')
+    })
+    return sortDirection === 'asc' ? sorted : sorted.reverse()
+  }, [keywordFilter, rows, sortDirection, sortField, stageFilters, trendFilters])
+
+  useEffect(() => {
+    setTablePage(1)
+  }, [activePool, keywordFilter, trendFilters, stageFilters, sortField, sortDirection])
+
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(filteredRows.length / tablePageSize))
+    if (tablePage > maxPage) {
+      setTablePage(maxPage)
+    }
+  }, [filteredRows.length, tablePage, tablePageSize])
+
+  const summary = useMemo(
+    () => ({
+      input_count: pools.input.length,
+      step1_count: pools.step1.length,
+      step2_count: pools.step2.length,
+      step3_count: pools.step3.length,
+      step4_count: pools.step4.length,
+      final_count: pools.final.length,
+    }),
+    [pools],
+  )
+
+  const nextPoolKey = useMemo<ScreenerPoolKey | null>(() => {
+    const currentIndex = poolOrder.indexOf(activePool)
+    if (currentIndex < 0 || currentIndex >= poolOrder.length - 1) return null
+    return poolOrder[currentIndex + 1]
+  }, [activePool])
+  const inputPoolOutdated = pools.input.length > 0 && inputPoolKey !== '' && inputPoolKey !== currentInputPoolKey
+  const hasTableFilters = keywordFilter.trim().length > 0 || trendFilters.length > 0 || stageFilters.length > 0
+  const canReorderInTable = sortField === 'manual' && !hasTableFilters && rows.length > 1
+  const canDragRows = Boolean(nextPoolKey) || canReorderInTable
+
+  function toggleColumnVisibility(key: ScreenerColumnKey, visible: boolean) {
+    setColumnVisible((prev) => {
+      const visibleCount = Object.values(prev).filter(Boolean).length
+      if (!visible && prev[key] && visibleCount <= 1) {
+        message.info('至少保留一列显示')
+        return prev
+      }
+      return { ...prev, [key]: visible }
+    })
+  }
+
+  function moveColumn(key: ScreenerColumnKey, direction: 'up' | 'down') {
+    setColumnOrder((prev) => {
+      const index = prev.indexOf(key)
+      if (index < 0) return prev
+      const targetIndex = direction === 'up' ? index - 1 : index + 1
+      if (targetIndex < 0 || targetIndex >= prev.length) return prev
+      const next = [...prev]
+      const temp = next[targetIndex]
+      next[targetIndex] = next[index]
+      next[index] = temp
+      return next
+    })
+  }
+
+  function reorderColumnByDrag(sourceKey: ScreenerColumnKey, targetKey: ScreenerColumnKey) {
+    if (sourceKey === targetKey) return
+    setColumnOrder((prev) => {
+      const fromIndex = prev.indexOf(sourceKey)
+      const toIndex = prev.indexOf(targetKey)
+      if (fromIndex < 0 || toIndex < 0) return prev
+      const next = [...prev]
+      const [moved] = next.splice(fromIndex, 1)
+      next.splice(toIndex, 0, moved)
+      return next
+    })
+  }
+
+  function resetColumns() {
+    setColumnOrder(defaultColumnOrder)
+    setColumnVisible(
+      defaultColumnOrder.reduce(
+        (acc, key) => ({ ...acc, [key]: true }),
+        {} as Record<ScreenerColumnKey, boolean>,
+      ),
+    )
+  }
+
+  const addRowToPoolManually = useCallback((targetPool: ScreenerPoolKey, row: ScreenerResult) => {
+    let inserted = false
+    setPools((prev) => {
+      const exists = prev[targetPool].some((item) => item.symbol === row.symbol)
+      if (exists) return prev
+
+      inserted = true
+      const manualRow: ScreenerResult = {
+        ...row,
+        labels: Array.from(new Set([...(row.labels ?? []), MANUAL_LABEL])),
+      }
+
+      if (targetPool === 'step1') {
+        return {
+          ...prev,
+          step1: [manualRow, ...prev.step1],
+          step2: [],
+          step3: [],
+          step4: [],
+          final: prev.final,
+        }
+      }
+      if (targetPool === 'step2') {
+        return {
+          ...prev,
+          step2: [manualRow, ...prev.step2],
+          step3: [],
+          step4: [],
+          final: prev.final,
+        }
+      }
+      if (targetPool === 'step3') {
+        return {
+          ...prev,
+          step3: [manualRow, ...prev.step3],
+          step4: [],
+          final: prev.final,
+        }
+      }
+      if (targetPool === 'final') {
+        return { ...prev, final: [manualRow, ...prev.final] }
+      }
+      return { ...prev, step4: [manualRow, ...prev.step4] }
+    })
+
+    if (!inserted) {
+      message.info(`${row.symbol} 已在${poolLabelMap[targetPool]}中`)
+      return
+    }
+
+    setExecutedStep((prev) =>
+      targetPool === 'final' ? prev : Math.max(prev, poolStepIndex[targetPool]),
+    )
+    setActivePool(targetPool)
+    message.success(`${row.symbol} 已手工加入${poolLabelMap[targetPool]}`)
+  }, [message])
+
+  function reorderRowsInActivePool(sourceSymbol: string, targetSymbol: string) {
+    if (sourceSymbol === targetSymbol) {
+      return
+    }
+    setPools((prev) => {
+      const sourceRows = prev[activePool]
+      const fromIndex = sourceRows.findIndex((item) => item.symbol === sourceSymbol)
+      const toIndex = sourceRows.findIndex((item) => item.symbol === targetSymbol)
+      if (fromIndex < 0 || toIndex < 0) {
+        return prev
+      }
+      const nextRows = [...sourceRows]
+      const [moved] = nextRows.splice(fromIndex, 1)
+      nextRows.splice(toIndex, 0, moved)
+      return {
+        ...prev,
+        [activePool]: nextRows,
+      } as ScreenerStepPools
+    })
+  }
+
+  function handleDropToPool(targetPool: ScreenerPoolKey, symbolFromDrop?: string) {
+    const canDropToNext = nextPoolKey !== null && targetPool === nextPoolKey
+    const canDropToFinal = targetPool === 'final' && activePool !== 'final'
+    const canDropToManualPool = targetPool !== 'input' && targetPool !== activePool
+    if (!canDropToNext && !canDropToFinal && !canDropToManualPool) {
+      message.info('仅支持拖动到其他池（下一池、终选池或手工目标池）')
+      return
+    }
+
+    const symbol = symbolFromDrop ?? draggingSymbol
+    if (!symbol) return
+    const row = allRowsBySymbol.get(symbol) ?? pools[activePool].find((item) => item.symbol === symbol)
+    if (!row) {
+      message.warning('当前股票池未找到该股票')
+      return
+    }
+    addRowToPoolManually(targetPool, row)
+  }
+
+  const visibleDataColumns = useMemo<ColumnsType<ScreenerResult>>(() => {
+    return columnOrder
+      .filter((key) => columnVisible[key])
+      .map((key) => {
+        const column: ColumnsType<ScreenerResult>[number] = {
+          ...tableColumnMap[key],
+          title: columnTitleMap[key],
+        }
+
+        if (numericSortFields.includes(key as TableSortField)) {
+          column.sorter = true
+          column.sortOrder = sortField === key
+            ? (sortDirection === 'asc' ? 'ascend' : 'descend')
+            : null
+          column.sortDirections = ['descend', 'ascend']
+          column.showSorterTooltip = { title: '点击切换升降序' }
+        }
+
+        if (key === 'trend_class') {
+          column.filters = (Object.keys(trendClassLabelMap) as TrendClass[]).map((value) => ({
+            text: trendClassLabelMap[value],
+            value,
+          }))
+          column.filteredValue = trendFilters.length > 0 ? trendFilters : null
+        }
+
+        if (key === 'stage') {
+          column.filters = (Object.keys(stageLabelMap) as StageType[]).map((value) => ({
+            text: stageLabelMap[value],
+            value,
+          }))
+          column.filteredValue = stageFilters.length > 0 ? stageFilters : null
+        }
+
+        if (key === 'symbol') {
+          column.filterDropdown = ({ confirm, clearFilters }) => (
+            <Space direction="vertical" size={8} style={{ width: 220, padding: 8 }}>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                输入代码或名称关键词
+              </Typography.Text>
+              <Input
+                autoFocus
+                allowClear
+                value={keywordFilter}
+                onChange={(event) => setKeywordFilter(event.target.value)}
+                onPressEnter={() => confirm()}
+                placeholder="例如: 600519 / 茅台"
+              />
+              <Space>
+                <Button size="small" type="primary" onClick={() => confirm()}>
+                  应用
+                </Button>
+                <Button
+                  size="small"
+                  onClick={() => {
+                    setKeywordFilter('')
+                    clearFilters?.()
+                    confirm()
+                  }}
+                >
+                  重置
+                </Button>
+              </Space>
+            </Space>
+          )
+          column.filteredValue = keywordFilter.trim().length > 0 ? [keywordFilter] : null
+        }
+
+        return column
+      })
+  }, [
+    columnOrder,
+    columnTitleMap,
+    columnVisible,
+    keywordFilter,
+    sortDirection,
+    sortField,
+    stageFilters,
+    trendFilters,
+  ])
+
+  function formatExportValue(row: ScreenerResult, key: ScreenerColumnKey) {
+    switch (key) {
+      case 'latest_price':
+      case 'day_change':
+        return typeof row[key] === 'number' ? (row[key] as number).toFixed(2) : '--'
+      case 'ret40':
+      case 'turnover20':
+      case 'amplitude20':
+      case 'retrace20':
+      case 'ai_confidence':
+      case 'day_change_pct':
+        return typeof row[key] === 'number' ? formatPct(row[key] as number) : '--'
+      case 'amount20':
+        return formatLargeMoney(row.amount20)
+      default:
+        return String(row[key] ?? '')
+    }
+  }
+
+  function buildExportDataset(poolKey: ScreenerPoolKey) {
+    const rowsForExport = pools[poolKey]
+    if (rowsForExport.length === 0) {
+      return null
+    }
+    const baseKeys: ScreenerColumnKey[] = ['symbol', 'name']
+    const visibleKeys = columnOrder.filter((key) => columnVisible[key])
+    const exportKeys = [
+      ...baseKeys,
+      ...visibleKeys.filter((key) => !baseKeys.includes(key)),
+    ]
+    const header = exportKeys.map((key) => columnTitleMap[key])
+    const lines = rowsForExport.map((row) =>
+      exportKeys.map((key) => formatExportValue(row, key)),
+    )
+    return {
+      header,
+      lines,
+      count: rowsForExport.length,
+    }
+  }
+
+  function downloadByBlob(content: BlobPart, type: string, fileName: string) {
+    const blob = new Blob([content], { type })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = fileName
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+  }
+
+  function exportPool(poolKey: ScreenerPoolKey, format: ExportFormat) {
+    const dataset = buildExportDataset(poolKey)
+    if (!dataset) {
+      message.info(`${poolLabelMap[poolKey]}暂无可导出数据`)
+      return
+    }
+
+    const { header, lines, count } = dataset
+    const timestamp = formatTimestampForFile()
+    const baseFileName = `stock-pool-${poolKey}-${timestamp}`
+
+    if (format === 'csv') {
+      const csv = `\uFEFF${[header, ...lines]
+        .map((line) => line.map((cell) => csvEscape(cell)).join(','))
+        .join('\n')}`
+      downloadByBlob(csv, 'text/csv;charset=utf-8;', `${baseFileName}.csv`)
+    } else if (format === 'xlsx') {
+      const worksheet = XLSX.utils.aoa_to_sheet([header, ...lines])
+      const workbook = XLSX.utils.book_new()
+      XLSX.utils.book_append_sheet(workbook, worksheet, poolLabelMap[poolKey])
+      XLSX.writeFile(workbook, `${baseFileName}.xlsx`)
+    } else {
+      const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' })
+      doc.setFontSize(12)
+      doc.text(`${poolLabelMap[poolKey]} 导出`, 40, 30)
+      autoTable(doc, {
+        startY: 40,
+        head: [header],
+        body: lines,
+        styles: { fontSize: 8, cellPadding: 3 },
+        headStyles: { fillColor: [15, 139, 111] },
+        margin: { left: 20, right: 20 },
+      })
+      doc.save(`${baseFileName}.pdf`)
+    }
+
+    message.success(`已导出${poolLabelMap[poolKey]}（${count}）- ${exportFormatLabelMap[format]}`)
+  }
+
+  function buildExportMenu(poolKey: ScreenerPoolKey): MenuProps {
+    return {
+      items: [
+        { key: 'csv', label: '导出 CSV' },
+        { key: 'xlsx', label: '导出 Excel' },
+        { key: 'pdf', label: '导出 PDF' },
+      ],
+      onClick: (info) => {
+        info.domEvent.stopPropagation()
+        const key = String(info.key)
+        if (key === 'csv' || key === 'xlsx' || key === 'pdf') {
+          exportPool(poolKey, key as ExportFormat)
+        }
+      },
+    }
+  }
+
+  async function ensureFormValid() {
+    const valid = await trigger()
+    if (!valid) {
+      message.error('请先修正筛选参数')
+      return false
+    }
+    return true
+  }
+
+  async function ensureInputPoolLoaded() {
+    if (rawInputPool.length > 0 && inputPoolKey === currentInputPoolKey) {
+      const boardFilters = getValues('board_filters')
+      const inputPool = filterRowsByBoards(rawInputPool, boardFilters)
+      setPools((prev) => ({ ...prev, input: inputPool }))
+      return inputPool
+    }
+    const ok = await ensureFormValid()
+    if (!ok) return null
+    const detail = await loadInputMutation.mutateAsync(getValues())
+    const sourceInputPool = detail.step_pools?.input ?? detail.results
+    return filterRowsByBoards(sourceInputPool, getValues('board_filters'))
+  }
+
+  function invalidateFrom(step: 1 | 2 | 3 | 4) {
+    setPools((prev) => {
+      if (step === 1) return { ...prev, step1: [], step2: [], step3: [], step4: [] }
+      if (step === 2) return { ...prev, step2: [], step3: [], step4: [] }
+      if (step === 3) return { ...prev, step3: [], step4: [] }
+      return { ...prev, step4: [] }
+    })
+    setExecutedStep((prev) => Math.min(prev, step - 1))
+    setActivePool((prev) => (poolStepIndex[prev] >= step ? previousPoolByStep[step] : prev))
+  }
+
+  async function executeStep(step: 1 | 2 | 3 | 4) {
+    if (step > executedStep + 1) {
+      message.info(`请先运行第${executedStep + 1}步`)
+      return
+    }
+    setRunningStep(step)
+    try {
+      const inputPool = await ensureInputPoolLoaded()
+      if (!inputPool) return
+      let nextCount = 0
+      setPools((prev) => {
+        if (step === 1) {
+          const step1 = mergeManualRows(runStep1(inputPool, stepConfigs.step1), prev.step1)
+          nextCount = step1.length
+          return { ...prev, input: inputPool, step1, step2: [], step3: [], step4: [] }
+        }
+        if (step === 2) {
+          const step2 = mergeManualRows(runStep2(prev.step1, stepConfigs.step2, mode), prev.step2)
+          nextCount = step2.length
+          return { ...prev, step2, step3: [], step4: [] }
+        }
+        if (step === 3) {
+          const step3 = mergeManualRows(runStep3(prev.step2, stepConfigs.step3), prev.step3)
+          nextCount = step3.length
+          return { ...prev, step3, step4: [] }
+        }
+        const step4 = mergeManualRows(runStep4(prev.step3, stepConfigs.step4), prev.step4)
+        nextCount = step4.length
+        return { ...prev, step4 }
+      })
+      setExecutedStep(step)
+      setActivePool(`step${step}` as ScreenerPoolKey)
+      message.success(`第${step}步运行完成，股票数 ${nextCount}`)
+    } finally {
+      setRunningStep(null)
+    }
+  }
+
+  async function executeAll() {
+    setRunningStep(4)
+    try {
+      const inputPool = await ensureInputPoolLoaded()
+      if (!inputPool) return
+      const step1 = mergeManualRows(runStep1(inputPool, stepConfigs.step1), pools.step1)
+      const step2 = mergeManualRows(runStep2(step1, stepConfigs.step2, mode), pools.step2)
+      const step3 = mergeManualRows(runStep3(step2, stepConfigs.step3), pools.step3)
+      const step4 = mergeManualRows(runStep4(step3, stepConfigs.step4), pools.step4)
+      setPools((prev) => ({
+        input: inputPool,
+        step1,
+        step2,
+        step3,
+        step4,
+        final: prev.final,
+      }))
+      setExecutedStep(4)
+      setActivePool('step4')
+      message.success('四步筛选已完成')
+    } finally {
+      setRunningStep(null)
+    }
+  }
+
+  function onClickPool(poolKey: ScreenerPoolKey) {
+    const requiredStep = poolStepIndex[poolKey]
+    if (requiredStep > executedStep) {
+      message.info(`请先运行到第${requiredStep}步`)
+      return
+    }
+    setActivePool(poolKey)
+  }
+
+  const step1ConfigContent = (
+    <Space orientation="vertical" size={8} style={{ width: 320 }}>
+      <Typography.Text strong>第1步配置</Typography.Text>
+      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+        规则：先按 {returnWindowDays} 日涨幅排序取 TopN，再按活跃度过滤。
+      </Typography.Text>
+      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+        固定边界：结果&gt;400 截断为 400；结果&lt;100 保留全部并告警。
+      </Typography.Text>
+      <LabeledNumberInput
+        label="涨幅窗口(天)"
+        min={5}
+        max={120}
+        value={returnWindowDays}
+        onChange={(value) => {
+          const nextValue = Math.max(5, Math.min(120, Math.round(value ?? returnWindowDays)))
+          setValue('return_window_days', nextValue, {
+            shouldValidate: true,
+            shouldDirty: true,
+          })
+          invalidateFrom(1)
+        }}
+        style={{ width: '100%' }}
+      />
+      <LabeledNumberInput
+        label="涨幅TopN"
+        min={100}
+        max={2000}
+        step={50}
+        value={stepConfigs.step1.top_n}
+        onChange={(value) => {
+          const nextTopN = value ?? stepConfigs.step1.top_n
+          setStepConfigs((prev) => ({
+            ...prev,
+            step1: { ...prev.step1, top_n: nextTopN },
+          }))
+          setValue('top_n', nextTopN, {
+            shouldValidate: true,
+            shouldDirty: true,
+          })
+          invalidateFrom(1)
+        }}
+        style={{ width: '100%' }}
+      />
+      <LabeledNumberInput
+        label="20日换手下限(%)"
+        min={1}
+        max={20}
+        step={0.5}
+        value={Number((stepConfigs.step1.turnover_threshold * 100).toFixed(2))}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step1: {
+              ...prev.step1,
+              turnover_threshold:
+                ((value ?? prev.step1.turnover_threshold * 100) as number) / 100,
+            },
+          }))
+          invalidateFrom(1)
+        }}
+        style={{ width: '100%' }}
+      />
+      <LabeledNumberInput
+        label="20日成交额下限(亿)"
+        min={0.5}
+        max={50}
+        step={0.1}
+        value={Number((stepConfigs.step1.amount_threshold / 1e8).toFixed(2))}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step1: {
+              ...prev.step1,
+              amount_threshold:
+                ((value ?? prev.step1.amount_threshold / 1e8) as number) * 1e8,
+            },
+          }))
+          invalidateFrom(1)
+        }}
+        style={{ width: '100%' }}
+      />
+      <LabeledNumberInput
+        label="20日振幅下限(%)"
+        min={1}
+        max={15}
+        step={0.5}
+        value={Number((stepConfigs.step1.amplitude_threshold * 100).toFixed(2))}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step1: {
+              ...prev.step1,
+              amplitude_threshold:
+                ((value ?? prev.step1.amplitude_threshold * 100) as number) / 100,
+            },
+          }))
+          invalidateFrom(1)
+        }}
+        style={{ width: '100%' }}
+      />
+    </Space>
+  )
+
+  const step2ConfigContent = (
+    <Space orientation="vertical" size={8} style={{ width: 290 }}>
+      <Typography.Text strong>第2步配置</Typography.Text>
+      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+        当前模式：{mode === 'strict' ? '严格（容差更小）' : '宽松（容差更大）'}
+      </Typography.Text>
+      <LabeledNumberInput
+        label="回撤下限"
+        min={0}
+        max={0.4}
+        step={0.01}
+        value={stepConfigs.step2.retrace_min}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step2: {
+              ...prev.step2,
+              retrace_min: value ?? prev.step2.retrace_min,
+            },
+          }))
+          invalidateFrom(2)
+        }}
+      />
+      <LabeledNumberInput
+        label="回撤上限"
+        min={0.05}
+        max={0.5}
+        step={0.01}
+        value={stepConfigs.step2.retrace_max}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step2: {
+              ...prev.step2,
+              retrace_max: value ?? prev.step2.retrace_max,
+            },
+          }))
+          invalidateFrom(2)
+        }}
+      />
+      <LabeledNumberInput
+        label="回调天数"
+        min={1}
+        max={10}
+        value={stepConfigs.step2.max_pullback_days}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step2: {
+              ...prev.step2,
+              max_pullback_days: value ?? prev.step2.max_pullback_days,
+            },
+          }))
+          invalidateFrom(2)
+        }}
+      />
+      <LabeledNumberInput
+        label="MA10>MA20天数"
+        min={0}
+        max={20}
+        value={stepConfigs.step2.min_ma10_above_ma20_days}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step2: {
+              ...prev.step2,
+              min_ma10_above_ma20_days: value ?? prev.step2.min_ma10_above_ma20_days,
+            },
+          }))
+          invalidateFrom(2)
+        }}
+      />
+      <LabeledNumberInput
+        label="MA5>MA10天数"
+        min={0}
+        max={20}
+        value={stepConfigs.step2.min_ma5_above_ma10_days}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step2: {
+              ...prev.step2,
+              min_ma5_above_ma10_days: value ?? prev.step2.min_ma5_above_ma10_days,
+            },
+          }))
+          invalidateFrom(2)
+        }}
+      />
+      <LabeledNumberInput
+        label="距MA20容差"
+        min={0.01}
+        max={0.2}
+        step={0.01}
+        value={stepConfigs.step2.max_price_vs_ma20}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step2: {
+              ...prev.step2,
+              max_price_vs_ma20: value ?? prev.step2.max_price_vs_ma20,
+            },
+          }))
+          invalidateFrom(2)
+        }}
+      />
+      <Checkbox
+        checked={stepConfigs.step2.require_above_ma20}
+        onChange={(event) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step2: { ...prev.step2, require_above_ma20: event.target.checked },
+          }))
+          invalidateFrom(2)
+        }}
+      >
+        必须站上 MA20
+      </Checkbox>
+      <Checkbox
+        checked={stepConfigs.step2.allow_b_trend}
+        onChange={(event) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step2: { ...prev.step2, allow_b_trend: event.target.checked },
+          }))
+          invalidateFrom(2)
+        }}
+      >
+        允许 B 类趋势
+      </Checkbox>
+    </Space>
+  )
+
+  const step3ConfigContent = (
+    <Space orientation="vertical" size={8} style={{ width: 290 }}>
+      <Typography.Text strong>第3步配置</Typography.Text>
+      <LabeledNumberInput
+        label="量能斜率下限"
+        min={-1}
+        max={2}
+        step={0.05}
+        value={stepConfigs.step3.min_vol_slope20}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step3: { ...prev.step3, min_vol_slope20: value ?? prev.step3.min_vol_slope20 },
+          }))
+          invalidateFrom(3)
+        }}
+      />
+      <LabeledNumberInput
+        label="涨跌量比下限"
+        min={0.8}
+        max={3}
+        step={0.05}
+        value={stepConfigs.step3.min_up_down_volume_ratio}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step3: {
+              ...prev.step3,
+              min_up_down_volume_ratio:
+                value ?? prev.step3.min_up_down_volume_ratio,
+            },
+          }))
+          invalidateFrom(3)
+        }}
+      />
+      <LabeledNumberInput
+        label="回调量比上限"
+        min={0.4}
+        max={1.2}
+        step={0.05}
+        value={stepConfigs.step3.max_pullback_volume_ratio}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step3: {
+              ...prev.step3,
+              max_pullback_volume_ratio:
+                value ?? prev.step3.max_pullback_volume_ratio,
+            },
+          }))
+          invalidateFrom(3)
+        }}
+      />
+      <Checkbox
+        checked={stepConfigs.step3.allow_blowoff_top}
+        onChange={(event) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step3: { ...prev.step3, allow_blowoff_top: event.target.checked },
+          }))
+          invalidateFrom(3)
+        }}
+      >
+        允许天量天价风险
+      </Checkbox>
+      <Checkbox
+        checked={stepConfigs.step3.allow_divergence_5d}
+        onChange={(event) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step3: { ...prev.step3, allow_divergence_5d: event.target.checked },
+          }))
+          invalidateFrom(3)
+        }}
+      >
+        允许5日量价背离
+      </Checkbox>
+      <Checkbox
+        checked={stepConfigs.step3.allow_upper_shadow_risk}
+        onChange={(event) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step3: { ...prev.step3, allow_upper_shadow_risk: event.target.checked },
+          }))
+          invalidateFrom(3)
+        }}
+      >
+        允许长上影风险
+      </Checkbox>
+      <Checkbox
+        checked={stepConfigs.step3.allow_degraded}
+        onChange={(event) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step3: { ...prev.step3, allow_degraded: event.target.checked },
+          }))
+          invalidateFrom(3)
+        }}
+      >
+        包含降级数据
+      </Checkbox>
+    </Space>
+  )
+
+  const step4ConfigContent = (
+    <Space orientation="vertical" size={8} style={{ width: 290 }}>
+      <Typography.Text strong>第4步配置</Typography.Text>
+      <LabeledNumberInput
+        label="最终数量"
+        min={1}
+        max={50}
+        value={stepConfigs.step4.final_top_n}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step4: { ...prev.step4, final_top_n: value ?? prev.step4.final_top_n },
+          }))
+          invalidateFrom(4)
+        }}
+      />
+      <LabeledNumberInput
+        label="AI置信度"
+        min={0}
+        max={1}
+        step={0.01}
+        value={stepConfigs.step4.min_ai_confidence}
+        onChange={(value) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step4: {
+              ...prev.step4,
+              min_ai_confidence: value ?? prev.step4.min_ai_confidence,
+            },
+          }))
+          invalidateFrom(4)
+        }}
+      />
+      <Checkbox.Group
+        value={stepConfigs.step4.allowed_theme_stages}
+        onChange={(values) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step4: {
+              ...prev.step4,
+              allowed_theme_stages: values as ThemeStage[],
+            },
+          }))
+          invalidateFrom(4)
+        }}
+        options={[
+          { label: '发酵中', value: '发酵中' },
+          { label: '高潮', value: '高潮' },
+          { label: '退潮', value: '退潮' },
+          { label: 'Unknown', value: 'Unknown' },
+        ]}
+      />
+      <Checkbox
+        checked={stepConfigs.step4.allow_degraded}
+        onChange={(event) => {
+          setStepConfigs((prev) => ({
+            ...prev,
+            step4: { ...prev.step4, allow_degraded: event.target.checked },
+          }))
+          invalidateFrom(4)
+        }}
+      >
+        包含降级数据
+      </Checkbox>
+    </Space>
+  )
+
+  const cardValues: Record<ScreenerPoolKey, number | string> = {
+    input: summary.input_count,
+    step1: executedStep >= 1 ? summary.step1_count : '-',
+    step2: executedStep >= 2 ? summary.step2_count : '-',
+    step3: executedStep >= 3 ? summary.step3_count : '-',
+    step4: executedStep >= 4 ? summary.step4_count : '-',
+    final: summary.final_count,
+  }
+
+  const stepConfigHint: Record<Exclude<ScreenerPoolKey, 'input' | 'final'>, string> = {
+    step1: `${returnWindowDays}日 | Top${stepConfigs.step1.top_n} | 换手>=${formatPct(stepConfigs.step1.turnover_threshold)}`,
+    step2: `回撤${formatPct(stepConfigs.step2.retrace_min)}~${formatPct(stepConfigs.step2.retrace_max)} | 回调<=${stepConfigs.step2.max_pullback_days}天`,
+    step3: `斜率>=${stepConfigs.step3.min_vol_slope20.toFixed(2)} | 量比>=${stepConfigs.step3.min_up_down_volume_ratio.toFixed(2)}`,
+    step4: `Top=${stepConfigs.step4.final_top_n} | AI>=${stepConfigs.step4.min_ai_confidence.toFixed(2)}`,
+  }
+
+  const tableSettingsContent = (
+    <Space orientation="vertical" size={8} style={{ width: 320 }}>
+      <Typography.Text strong>表头设置</Typography.Text>
+      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+        勾选控制显示列，可拖动行或使用上下按钮调整列顺序。
+      </Typography.Text>
+      {columnOrder.map((key, index) => (
+        <Row
+          key={key}
+          align="middle"
+          gutter={8}
+          draggable
+          onDragStart={(event) => {
+            event.dataTransfer.effectAllowed = 'move'
+            event.dataTransfer.setData('text/plain', key)
+            setDraggingColumnKey(key)
+          }}
+          onDragOver={(event) => {
+            event.preventDefault()
+            event.dataTransfer.dropEffect = 'move'
+            if (dragOverColumnKey !== key) setDragOverColumnKey(key)
+          }}
+          onDragLeave={() => {
+            if (dragOverColumnKey === key) setDragOverColumnKey(null)
+          }}
+          onDrop={(event) => {
+            event.preventDefault()
+            const raw = event.dataTransfer.getData('text/plain') || draggingColumnKey || ''
+            if (isScreenerColumnKey(raw)) {
+              reorderColumnByDrag(raw, key)
+            }
+            setDraggingColumnKey(null)
+            setDragOverColumnKey(null)
+          }}
+          onDragEnd={() => {
+            setDraggingColumnKey(null)
+            setDragOverColumnKey(null)
+          }}
+          style={{
+            padding: 4,
+            borderRadius: 8,
+            cursor: 'grab',
+            background: dragOverColumnKey === key ? 'rgba(15, 139, 111, 0.08)' : undefined,
+          }}
+        >
+          <Col flex="auto">
+            <Checkbox
+              checked={columnVisible[key]}
+              onChange={(event) => toggleColumnVisibility(key, event.target.checked)}
+            >
+              {columnTitleMap[key]}
+            </Checkbox>
+          </Col>
+          <Col>
+            <Space size={4}>
+              <Button
+                size="small"
+                icon={<UpOutlined />}
+                disabled={index === 0}
+                onClick={() => moveColumn(key, 'up')}
+              />
+              <Button
+                size="small"
+                icon={<DownOutlined />}
+                disabled={index === columnOrder.length - 1}
+                onClick={() => moveColumn(key, 'down')}
+              />
+            </Space>
+          </Col>
+        </Row>
+      ))}
+      <Button size="small" onClick={resetColumns}>
+        重置默认列
+      </Button>
+    </Space>
+  )
+
+  const tableRenderColumns = useMemo<ColumnsType<ScreenerResult>>(() => {
+    const actionColumn: ColumnsType<ScreenerResult>[number] = {
+      title: '操作',
+      key: 'actions',
+      width: 190,
+      fixed: 'right',
+      render: (_, row) => (
+        <Space size={4}>
+          <Button
+            type="link"
+            onClick={() => {
+              setSelectedSymbol(row.symbol, row.name)
+              navigate(`/stocks/${row.symbol}/chart`)
+            }}
+          >
+            看图标注
+          </Button>
+          {nextPoolKey ? (
+            <Button
+              type="link"
+              onClick={() => addRowToPoolManually(nextPoolKey, row)}
+            >
+              加入下一池
+            </Button>
+          ) : null}
+        </Space>
+      ),
+    }
+    return [...visibleDataColumns, actionColumn]
+  }, [addRowToPoolManually, navigate, nextPoolKey, setSelectedSymbol, visibleDataColumns])
+
+  return (
+    <Space orientation="vertical" size={16} style={{ width: '100%' }}>
+      <PageHeader
+        title="选股漏斗控制台"
+        subtitle="支持按第1~第4步逐步运行。每一步可独立配置，运行后再查看对应股票池。"
+        badge="分步运行"
+      />
+
+      <Card className="glass-card" variant="borderless">
+        <Space orientation="vertical" size={14} style={{ width: '100%' }}>
+          <Typography.Text strong>筛选参数</Typography.Text>
+          <Row gutter={[16, 12]}>
+            <Col xs={24} md={16}>
+              <Controller
+                control={control}
+                name="board_filters"
+                render={({ field }) => (
+                  <Checkbox.Group
+                    value={field.value}
+                    onChange={(value) => {
+                      const next = value as FormValues['board_filters']
+                      field.onChange(next)
+                      if (rawInputPool.length > 0 && inputPoolKey === currentInputPoolKey) {
+                        setPools((prev) => ({
+                          ...prev,
+                          input: filterRowsByBoards(rawInputPool, next),
+                        }))
+                      }
+                      invalidateFrom(1)
+                    }}
+                    options={[
+                      { label: boardFilterLabelMap.main, value: 'main' },
+                      { label: boardFilterLabelMap.gem, value: 'gem' },
+                      { label: boardFilterLabelMap.star, value: 'star' },
+                      { label: boardFilterLabelMap.beijing, value: 'beijing' },
+                      { label: boardFilterLabelMap.st, value: 'st' },
+                    ]}
+                  />
+                )}
+              />
+            </Col>
+            <Col xs={24} md={8}>
+              <Controller
+                control={control}
+                name="mode"
+                render={({ field }) => (
+                  <Radio.Group
+                    value={field.value}
+                    onChange={(evt) => {
+                      field.onChange(evt.target.value)
+                      invalidateFrom(2)
+                    }}
+                    optionType="button"
+                    options={[
+                      { label: '严格', value: 'strict' },
+                      { label: '宽松', value: 'loose' },
+                    ]}
+                  />
+                )}
+              />
+            </Col>
+          </Row>
+
+          <Space>
+            <Button
+              loading={loadInputMutation.isPending && runningStep === null}
+              onClick={handleSubmit(async (values) => {
+                await loadInputMutation.mutateAsync(values)
+              })}
+            >
+              加载输入池
+            </Button>
+            <Button
+              loading={runningStep === 4}
+              onClick={() => {
+                void executeAll()
+              }}
+            >
+              快速一键运行（可选）
+            </Button>
+          </Space>
+        </Space>
+      </Card>
+
+      <Card className="glass-card" variant="borderless">
+        <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+          <Typography.Text strong>快捷搜索与拖动加票</Typography.Text>
+          <Input
+            allowClear
+            value={quickSearchKeyword}
+            onChange={(event) => setQuickSearchKeyword(event.target.value)}
+            placeholder="输入股票代码或名称，拖动结果卡片到任意池（推荐拖到终选池）"
+          />
+          <Space wrap size={[8, 8]}>
+            {quickSearchRows.length > 0 ? (
+              quickSearchRows.map((row) => (
+                <Tag
+                  key={`quick-${row.symbol}`}
+                  color="processing"
+                  style={{ cursor: 'grab', userSelect: 'none' }}
+                  draggable
+                  onDragStart={(event) => {
+                    event.dataTransfer.effectAllowed = 'move'
+                    event.dataTransfer.setData('text/plain', row.symbol)
+                    setDraggingSymbol(row.symbol)
+                  }}
+                  onDragEnd={() => {
+                    setDraggingSymbol(null)
+                    setDragOverPool(null)
+                  }}
+                >
+                  {row.symbol.toUpperCase()} {row.name}
+                </Tag>
+              ))
+            ) : (
+              <Typography.Text type="secondary">暂无匹配结果</Typography.Text>
+            )}
+          </Space>
+        </Space>
+      </Card>
+
+      <Row gutter={[12, 12]}>
+        {poolOrder.map((poolKey) => {
+          const requiredStep = poolStepIndex[poolKey]
+          const isAvailable = requiredStep === 0 || requiredStep <= executedStep
+          const isActive = activePool === poolKey
+          const isDropTarget = isAvailable && poolKey !== 'input' && poolKey !== activePool
+          const isDragOver = draggingSymbol !== null && dragOverPool === poolKey && isDropTarget
+          const canExport = isAvailable && pools[poolKey].length > 0
+
+          return (
+            <Col xs={12} md={4} key={poolKey}>
+              <Card
+                className="glass-card"
+                variant="borderless"
+                hoverable
+                onClick={() => onClickPool(poolKey)}
+                onDragOver={(event) => {
+                  if (!isDropTarget) return
+                  event.preventDefault()
+                  event.dataTransfer.dropEffect = 'move'
+                  if (dragOverPool !== poolKey) setDragOverPool(poolKey)
+                }}
+                onDragLeave={() => {
+                  if (dragOverPool === poolKey) setDragOverPool(null)
+                }}
+                onDrop={(event) => {
+                  if (!isDropTarget) return
+                  event.preventDefault()
+                  event.stopPropagation()
+                  const symbol = event.dataTransfer.getData('text/plain')
+                  handleDropToPool(poolKey, symbol)
+                  setDragOverPool(null)
+                  setDraggingSymbol(null)
+                }}
+                style={{
+                  cursor: 'pointer',
+                  border: isDragOver
+                    ? '1px dashed rgba(15,139,111,0.85)'
+                    : isActive
+                      ? '1px solid rgba(15,139,111,0.55)'
+                      : undefined,
+                  boxShadow: isDragOver
+                    ? '0 0 0 3px rgba(15,139,111,0.22) inset'
+                    : isActive
+                      ? '0 0 0 2px rgba(15,139,111,0.18) inset'
+                      : undefined,
+                }}
+              >
+                <Space orientation="vertical" size={6} style={{ width: '100%' }}>
+                  <Statistic
+                    title={
+                      poolKey === 'input'
+                        ? '输入池'
+                        : poolKey === 'final'
+                          ? '终选池'
+                          : `第${poolStepIndex[poolKey]}步通过`
+                    }
+                    value={cardValues[poolKey]}
+                  />
+                  {poolKey === 'input' ? (
+                    <Space size={6}>
+                      <Button
+                        size="small"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          void handleSubmit(async (values) => {
+                            await loadInputMutation.mutateAsync(values)
+                          })()
+                        }}
+                      >
+                        重新加载输入池
+                      </Button>
+                      <Dropdown
+                        trigger={['click']}
+                        menu={buildExportMenu(poolKey)}
+                        disabled={!canExport}
+                      >
+                        <Button
+                          size="small"
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          导出
+                        </Button>
+                      </Dropdown>
+                    </Space>
+                  ) : poolKey === 'final' ? (
+                    <Space size={6}>
+                      <Dropdown
+                        trigger={['click']}
+                        menu={buildExportMenu(poolKey)}
+                        disabled={!canExport}
+                      >
+                        <Button
+                          size="small"
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          导出
+                        </Button>
+                      </Dropdown>
+                      <Button
+                        size="small"
+                        danger
+                        disabled={pools.final.length === 0}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setPools((prev) => ({ ...prev, final: [] }))
+                          if (activePool === 'final') {
+                            const fallbackPool =
+                              executedStep >= 4 ? 'step4' : executedStep >= 3 ? 'step3' : executedStep >= 2 ? 'step2' : executedStep >= 1 ? 'step1' : 'input'
+                            setActivePool(fallbackPool)
+                          }
+                          message.success('终选池已清空')
+                        }}
+                      >
+                        清空终选池
+                      </Button>
+                    </Space>
+                  ) : (
+                    <Space size={6}>
+                      <Button
+                        size="small"
+                        type={requiredStep === executedStep + 1 ? 'primary' : 'default'}
+                        loading={runningStep === requiredStep}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          void executeStep(requiredStep as 1 | 2 | 3 | 4)
+                        }}
+                      >
+                        运行第{requiredStep}步
+                      </Button>
+                      <Popover
+                        trigger="click"
+                        placement="bottom"
+                        content={
+                          requiredStep === 1
+                            ? step1ConfigContent
+                            : requiredStep === 2
+                              ? step2ConfigContent
+                              : requiredStep === 3
+                                ? step3ConfigContent
+                                : step4ConfigContent
+                        }
+                      >
+                        <Button
+                          size="small"
+                          icon={<SettingOutlined />}
+                          onClick={(event) => event.stopPropagation()}
+                        />
+                      </Popover>
+                      <Dropdown
+                        trigger={['click']}
+                        menu={buildExportMenu(poolKey)}
+                        disabled={!canExport}
+                      >
+                        <Button
+                          size="small"
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          导出
+                        </Button>
+                      </Dropdown>
+                    </Space>
+                  )}
+                  {poolKey !== 'input' && poolKey !== 'final' ? (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      {stepConfigHint[poolKey]}
+                    </Typography.Text>
+                  ) : null}
+                  <Typography.Text type="secondary">
+                    {isAvailable
+                      ? poolKey === 'final'
+                        ? '任意池可手工拖入终选池'
+                        : '点击查看该股票池'
+                      : `请先运行到第${requiredStep}步`}
+                  </Typography.Text>
+                  {isDropTarget ? (
+                    <Typography.Text type="secondary">
+                      可拖动股票到此池手工添加
+                    </Typography.Text>
+                  ) : null}
+                </Space>
+              </Card>
+            </Col>
+          )
+        })}
+      </Row>
+
+      {runMeta?.degraded ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="本次筛选包含降级数据"
+          description={runMeta.degradedReason}
+        />
+      ) : null}
+      {inputPoolOutdated ? (
+        <Alert
+          type="info"
+          showIcon
+          message="输入池参数已变更，当前展示的是旧输入池"
+          description="点击“运行第1步”或“加载输入池”后将自动按新参数重算。"
+        />
+      ) : null}
+
+      <Card className="glass-card" variant="borderless">
+        <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+          <Row justify="space-between" align="middle">
+            <Col>
+              <Typography.Text strong>
+                当前股票池: {poolLabelMap[activePool]}（筛选后 {filteredRows.length} / 总 {rows.length}）
+              </Typography.Text>
+            </Col>
+            <Col>
+              <Space>
+                {nextPoolKey ? (
+                  <Typography.Text type="secondary">
+                    拖动行到任意目标池卡片可手工加票（常用: {poolLabelMap[nextPoolKey]} / 终选池）
+                  </Typography.Text>
+                ) : null}
+                <Typography.Text type="secondary">
+                  {canReorderInTable ? '支持在表格内拖动重排' : '切换“自定义顺序”后可拖动重排'}
+                </Typography.Text>
+                <Popover trigger="click" placement="bottomRight" content={tableSettingsContent}>
+                  <Button size="small" icon={<SettingOutlined />}>
+                    表头设置
+                  </Button>
+                </Popover>
+                <Dropdown
+                  trigger={['click']}
+                  menu={buildExportMenu(activePool)}
+                  disabled={rows.length === 0}
+                >
+                  <Button size="small">导出当前池</Button>
+                </Dropdown>
+              </Space>
+            </Col>
+          </Row>
+          <Row justify="space-between" align="middle">
+            <Col>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                说明: 在表头点击列名可排序，点击漏斗图标可筛选。拖动到下一池是“手工加票”。
+              </Typography.Text>
+            </Col>
+            <Col>
+              <Button
+                size="small"
+                onClick={() => {
+                  setKeywordFilter('')
+                  setTrendFilters([])
+                  setStageFilters([])
+                  setSortField('manual')
+                  setSortDirection('desc')
+                }}
+              >
+                重置表头筛选/排序
+              </Button>
+            </Col>
+          </Row>
+          <Table<ScreenerResult>
+            rowKey="symbol"
+            dataSource={filteredRows}
+            columns={tableRenderColumns}
+            onChange={(_, filters, sorter) => {
+              const trendValues = Array.isArray(filters.trend_class)
+                ? filters.trend_class
+                    .map((value) => String(value))
+                    .filter((value): value is TrendClass => isTrendClass(value))
+                : []
+              const stageValues = Array.isArray(filters.stage)
+                ? filters.stage
+                    .map((value) => String(value))
+                    .filter((value): value is StageType => isStageType(value))
+                : []
+              const keywordValue = Array.isArray(filters.symbol) && filters.symbol.length > 0
+                ? String(filters.symbol[0] ?? '')
+                : ''
+
+              setTrendFilters(trendValues)
+              setStageFilters(stageValues)
+              setKeywordFilter(keywordValue)
+
+              const sorterObj = Array.isArray(sorter) ? sorter[0] : sorter
+              const order = sorterObj?.order
+              const field = String(sorterObj?.field ?? sorterObj?.columnKey ?? '')
+              if (order && isTableSortField(field)) {
+                setSortField(field)
+                setSortDirection(order === 'ascend' ? 'asc' : 'desc')
+              } else {
+                setSortField('manual')
+                setSortDirection('desc')
+              }
+            }}
+            onRow={(record) => ({
+              draggable: canDragRows,
+              onDragStart: (event) => {
+                if (!canDragRows) return
+                event.dataTransfer.effectAllowed = 'move'
+                event.dataTransfer.setData('text/plain', record.symbol)
+                setDraggingSymbol(record.symbol)
+              },
+              onDragOver: (event) => {
+                if (!canReorderInTable) return
+                event.preventDefault()
+                event.dataTransfer.dropEffect = 'move'
+                if (dragOverSymbol !== record.symbol) {
+                  setDragOverSymbol(record.symbol)
+                }
+              },
+              onDragLeave: () => {
+                if (dragOverSymbol === record.symbol) {
+                  setDragOverSymbol(null)
+                }
+              },
+              onDrop: (event) => {
+                if (!canReorderInTable) return
+                event.preventDefault()
+                event.stopPropagation()
+                const sourceSymbol = event.dataTransfer.getData('text/plain') || draggingSymbol
+                if (!sourceSymbol || sourceSymbol === record.symbol) return
+                reorderRowsInActivePool(sourceSymbol, record.symbol)
+                setDraggingSymbol(null)
+                setDragOverSymbol(null)
+              },
+              onDragEnd: () => {
+                setDraggingSymbol(null)
+                setDragOverPool(null)
+                setDragOverSymbol(null)
+              },
+              style: canDragRows
+                ? {
+                    cursor: canReorderInTable ? 'grab' : 'move',
+                    background: canReorderInTable && dragOverSymbol === record.symbol
+                      ? 'rgba(15, 139, 111, 0.08)'
+                      : undefined,
+                  }
+                : undefined,
+            })}
+            scroll={{ x: 1550 }}
+            loading={loadInputMutation.isPending}
+            pagination={{
+              current: tablePage,
+              pageSize: tablePageSize,
+              total: filteredRows.length,
+              position: ['bottomRight'],
+              showSizeChanger: true,
+              pageSizeOptions: [8, 16, 24, 50],
+              showQuickJumper: true,
+              showTotal: (total, range) => `第 ${range[0]}-${range[1]} 条 / 共 ${total} 条`,
+              onChange: (page, pageSize) => {
+                if (pageSize !== tablePageSize) {
+                  setTablePageSize(pageSize)
+                  setTablePage(1)
+                  return
+                }
+                setTablePage(page)
+              },
+            }}
+          />
+        </Space>
+      </Card>
+    </Space>
+  )
+}
+
+

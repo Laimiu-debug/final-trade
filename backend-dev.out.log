@@ -1,0 +1,10 @@
+INFO:     127.0.0.1:8607 - "GET /api/ai/records HTTP/1.1" 200 OK
+INFO:     127.0.0.1:8209 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:8211 - "POST /api/screener/run HTTP/1.1" 200 OK
+INFO:     127.0.0.1:14951 - "GET /api/screener/runs/1770913904126-2329a2 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:1178 - "POST /api/screener/run HTTP/1.1" 200 OK
+INFO:     127.0.0.1:14639 - "GET /api/screener/runs/1770913910800-47148a HTTP/1.1" 200 OK
+INFO:     127.0.0.1:9023 - "POST /api/screener/run HTTP/1.1" 200 OK
+INFO:     127.0.0.1:9027 - "GET /api/screener/runs/1770913920084-b939a9 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:11677 - "POST /api/screener/run HTTP/1.1" 200 OK
+INFO:     127.0.0.1:11678 - "GET /api/screener/runs/1770914487398-1b69f4 HTTP/1.1" 200 OK
