@@ -25,6 +25,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import { ApiError } from '@/shared/api/client'
 import { getSignals, postSimOrder } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
+import { useUIStore } from '@/state/uiStore'
 import type { SignalResult, SignalScanMode, SignalType } from '@/types/contracts'
 
 type StatusFilter = 'active' | 'expiring' | 'expired' | 'all'
@@ -123,6 +124,7 @@ function renderTimelinessTag(row: SignalTableRow) {
 export function SignalsPage() {
   const { message } = AntdApp.useApp()
   const navigate = useNavigate()
+  const setSelectedSymbol = useUIStore((state) => state.setSelectedSymbol)
   const [searchParams] = useSearchParams()
   const runId = searchParams.get('run_id') ?? undefined
 
@@ -342,7 +344,23 @@ export function SignalsPage() {
               type="link"
               size="small"
               icon={<LineChartOutlined />}
-              onClick={() => navigate(`/stocks/${row.symbol}/chart`)}
+              onClick={() => {
+                const params = new URLSearchParams({
+                  signal_mode: mode,
+                  signal_window_days: String(windowDays),
+                  signal_min_score: String(minScore),
+                  signal_min_event_count: String(minEventCount),
+                  signal_require_sequence: String(requireSequence),
+                })
+                if (runId) {
+                  params.set('signal_run_id', runId)
+                }
+                if (row.name) {
+                  params.set('signal_stock_name', row.name)
+                }
+                setSelectedSymbol(row.symbol, row.name)
+                navigate(`/stocks/${row.symbol}/chart?${params.toString()}`)
+              }}
             >
               查看K线
             </Button>
@@ -371,7 +389,20 @@ export function SignalsPage() {
         ),
       },
     ],
-    [eventFilters, navigate, phaseFilters, primarySignalFilters, quickBuyMutation, quickQuantity],
+    [
+      eventFilters,
+      minEventCount,
+      minScore,
+      mode,
+      navigate,
+      phaseFilters,
+      primarySignalFilters,
+      quickBuyMutation,
+      quickQuantity,
+      requireSequence,
+      runId,
+      windowDays,
+    ],
   )
 
   const expandedRowRender = (row: SignalTableRow) => (

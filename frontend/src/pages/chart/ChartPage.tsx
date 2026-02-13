@@ -19,7 +19,7 @@ import {
 } from 'antd'
 import { ArrowLeftOutlined } from '@ant-design/icons'
 import { Controller, useForm } from 'react-hook-form'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   analyzeStockWithAI,
   getAIRecords,
@@ -33,7 +33,7 @@ import { IntradayChart } from '@/shared/charts/IntradayChart'
 import { KLineChart } from '@/shared/charts/KLineChart'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { useUIStore } from '@/state/uiStore'
-import type { AIAnalysisRecord, StockAnnotation } from '@/types/contracts'
+import type { AIAnalysisRecord, SignalScanMode, StockAnnotation } from '@/types/contracts'
 
 function defaultAnnotation(symbol: string): StockAnnotation {
   return {
@@ -52,6 +52,8 @@ export function ChartPage() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const symbol = useParams().symbol ?? ''
+  const [searchParams] = useSearchParams()
+  const routeStockName = searchParams.get('signal_stock_name') ?? undefined
   const stockName = useUIStore((state) => state.stockNameMap[symbol])
   const cachedAIRecord = useUIStore((state) => state.latestAIBySymbol[symbol])
   const [intradayDate, setIntradayDate] = useState<string | null>(null)
@@ -60,9 +62,20 @@ export function ChartPage() {
   const cachedDraft = useUIStore((state) => state.annotationDrafts[symbol])
   const upsertDraft = useUIStore((state) => state.upsertDraft)
   const upsertLatestAIRecord = useUIStore((state) => state.upsertLatestAIRecord)
+  const setSelectedSymbol = useUIStore((state) => state.setSelectedSymbol)
   const symbolText = symbol.toUpperCase()
-  const resolvedName = stockName || lastAIRecord?.name || cachedAIRecord?.name
+  const resolvedName = stockName || routeStockName || lastAIRecord?.name || cachedAIRecord?.name
   const stockTitle = resolvedName ? `${resolvedName} (${symbolText})` : symbolText
+  const signalModeParam = searchParams.get('signal_mode')
+  const signalMode: SignalScanMode = signalModeParam === 'full_market' ? 'full_market' : 'trend_pool'
+  const signalRunId = searchParams.get('signal_run_id') ?? undefined
+  const parsedWindowDays = Number(searchParams.get('signal_window_days') ?? 60)
+  const signalWindowDays = Number.isFinite(parsedWindowDays) ? Math.max(20, Math.round(parsedWindowDays)) : 60
+  const parsedMinScore = Number(searchParams.get('signal_min_score') ?? 60)
+  const signalMinScore = Number.isFinite(parsedMinScore) ? Math.max(0, Math.min(100, parsedMinScore)) : 60
+  const parsedMinEventCount = Number(searchParams.get('signal_min_event_count') ?? 1)
+  const signalMinEventCount = Number.isFinite(parsedMinEventCount) ? Math.max(1, Math.round(parsedMinEventCount)) : 1
+  const signalRequireSequence = searchParams.get('signal_require_sequence') === 'true'
 
   const candlesQuery = useQuery({
     queryKey: ['candles', symbol],
@@ -77,8 +90,24 @@ export function ChartPage() {
   })
 
   const signalsQuery = useQuery({
-    queryKey: ['signals'],
-    queryFn: () => getSignals(),
+    queryKey: [
+      'signals',
+      signalMode,
+      signalRunId ?? '',
+      signalWindowDays,
+      signalMinScore,
+      signalMinEventCount,
+      signalRequireSequence,
+    ],
+    queryFn: () =>
+      getSignals({
+        mode: signalMode,
+        run_id: signalRunId,
+        window_days: signalWindowDays,
+        min_score: signalMinScore,
+        min_event_count: signalMinEventCount,
+        require_sequence: signalRequireSequence,
+      }),
   })
 
   const aiRecordsQuery = useQuery({
@@ -96,6 +125,12 @@ export function ChartPage() {
     defaultValues: defaultAnnotation(symbol),
   })
   const manualStartDate = watch('start_date')
+
+  useEffect(() => {
+    if (routeStockName) {
+      setSelectedSymbol(symbol, routeStockName)
+    }
+  }, [routeStockName, setSelectedSymbol, symbol])
 
   useEffect(() => {
     if (!analysisQuery.data) return
@@ -148,7 +183,9 @@ export function ChartPage() {
     },
   })
 
-  const symbolSignals = (signalsQuery.data?.items ?? []).filter((item) => item.symbol === symbol)
+  const symbolSignals = (signalsQuery.data?.items ?? []).filter(
+    (item) => item.symbol.toLowerCase() === symbol.toLowerCase(),
+  )
 
   function backToPrev() {
     if (window.history.length > 1) {
