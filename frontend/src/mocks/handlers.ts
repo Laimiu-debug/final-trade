@@ -1,19 +1,26 @@
 import { delay, http, HttpResponse } from 'msw'
 import {
   analyzeStockWithAI,
+  cancelOrder,
   createOrder,
   createScreenerRun,
   deleteAIRecord,
+  getFills,
   getAIRecords,
   getAnalysis,
   getCandlePayload,
   getIntradayPayload,
   getConfigStore,
+  getOrders,
   getPortfolio,
   getReview,
+  getSimConfigStore,
   getScreenerRun,
   getSignals,
+  resetAccount,
   saveAnnotation,
+  setSimConfigStore,
+  settleOrders,
   setConfigStore,
   testAIProvider,
 } from '@/mocks/data'
@@ -120,14 +127,97 @@ export const handlers = [
     return HttpResponse.json(createOrder(payload))
   }),
 
+  http.get('/api/sim/orders', async ({ request }) => {
+    await delay(120)
+    const url = new URL(request.url)
+    const page = Number(url.searchParams.get('page') ?? 1)
+    const pageSize = Number(url.searchParams.get('page_size') ?? 50)
+    return HttpResponse.json(
+      getOrders({
+        status: (url.searchParams.get('status') ?? undefined) as
+          | 'pending'
+          | 'filled'
+          | 'cancelled'
+          | 'rejected'
+          | undefined,
+        symbol: url.searchParams.get('symbol') ?? undefined,
+        side: (url.searchParams.get('side') ?? undefined) as 'buy' | 'sell' | undefined,
+        date_from: url.searchParams.get('date_from') ?? undefined,
+        date_to: url.searchParams.get('date_to') ?? undefined,
+        page: Number.isFinite(page) ? page : 1,
+        page_size: Number.isFinite(pageSize) ? pageSize : 50,
+      }),
+    )
+  }),
+
+  http.get('/api/sim/fills', async ({ request }) => {
+    await delay(120)
+    const url = new URL(request.url)
+    const page = Number(url.searchParams.get('page') ?? 1)
+    const pageSize = Number(url.searchParams.get('page_size') ?? 50)
+    return HttpResponse.json(
+      getFills({
+        symbol: url.searchParams.get('symbol') ?? undefined,
+        side: (url.searchParams.get('side') ?? undefined) as 'buy' | 'sell' | undefined,
+        date_from: url.searchParams.get('date_from') ?? undefined,
+        date_to: url.searchParams.get('date_to') ?? undefined,
+        page: Number.isFinite(page) ? page : 1,
+        page_size: Number.isFinite(pageSize) ? pageSize : 50,
+      }),
+    )
+  }),
+
+  http.post('/api/sim/orders/:orderId/cancel', async ({ params }) => {
+    await delay(120)
+    const result = cancelOrder(String(params.orderId))
+    if (!result) {
+      return HttpResponse.json(
+        {
+          code: 'SIM_ORDER_NOT_FOUND',
+          message: '订单不存在',
+          trace_id: `${Date.now()}`,
+        },
+        { status: 404 },
+      )
+    }
+    return HttpResponse.json(result)
+  }),
+
+  http.post('/api/sim/settle', async () => {
+    await delay(120)
+    return HttpResponse.json(settleOrders())
+  }),
+
+  http.post('/api/sim/reset', async () => {
+    await delay(120)
+    return HttpResponse.json(resetAccount())
+  }),
+
+  http.get('/api/sim/config', async () => {
+    await delay(90)
+    return HttpResponse.json(getSimConfigStore())
+  }),
+
+  http.put('/api/sim/config', async ({ request }) => {
+    await delay(120)
+    const payload = (await request.json()) as Parameters<typeof setSimConfigStore>[0]
+    return HttpResponse.json(setSimConfigStore(payload))
+  }),
+
   http.get('/api/sim/portfolio', async () => {
     await delay(100)
     return HttpResponse.json(getPortfolio())
   }),
 
-  http.get('/api/review/stats', async () => {
+  http.get('/api/review/stats', async ({ request }) => {
     await delay(100)
-    return HttpResponse.json(getReview())
+    const url = new URL(request.url)
+    return HttpResponse.json(
+      getReview({
+        date_from: url.searchParams.get('date_from') ?? undefined,
+        date_to: url.searchParams.get('date_to') ?? undefined,
+      }),
+    )
   }),
 
   http.get('/api/ai/records', async () => {

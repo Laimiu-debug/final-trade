@@ -6,12 +6,20 @@ import type {
   AppConfig,
   CandlePoint,
   IntradayPoint,
+  PortfolioPosition,
   PortfolioSnapshot,
-  ReviewStats,
+  ReviewResponse,
   ScreenerMode,
   ScreenerParams,
   ScreenerResult,
   ScreenerRunDetail,
+  SimFillsResponse,
+  SimOrdersResponse,
+  SimResetResponse,
+  SimSettleResponse,
+  SimTradeFill,
+  SimTradeOrder,
+  SimTradingConfig,
   SignalScanMode,
   SignalResult,
   SignalsResponse,
@@ -139,6 +147,28 @@ let configStore: AppConfig = {
     { id: 'xueqiu', name: '雪球', url: 'https://xueqiu.com/', enabled: false },
   ],
 }
+
+let simConfigStore: SimTradingConfig = {
+  initial_capital: 1_000_000,
+  commission_rate: 0.0003,
+  min_commission: 5,
+  stamp_tax_rate: 0.001,
+  transfer_fee_rate: 0.00001,
+  slippage_rate: 0,
+}
+
+let simCash = simConfigStore.initial_capital
+let simOrdersStore: SimTradeOrder[] = []
+let simFillsStore: SimTradeFill[] = []
+let simLotsStore: Array<{
+  symbol: string
+  buy_date: string
+  buy_price: number
+  unit_cost: number
+  quantity: number
+  remaining: number
+}> = []
+let simClosedTradesStore: TradeRecord[] = []
 
 function hashSeed(text: string) {
   return text.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)
@@ -465,6 +495,97 @@ export function getSignals(params?: {
   }
 }
 
+function applyOrderFill(order: SimTradeOrder): SimTradeFill | null {
+  const symbol = order.symbol
+  const submitDate = order.submit_date
+  const fillPrice = Number(order.estimated_price ?? 20)
+  const grossAmount = fillPrice * order.quantity
+  const commission = Math.max(grossAmount * simConfigStore.commission_rate, simConfigStore.min_commission)
+  const stampTax = order.side === 'sell' ? grossAmount * simConfigStore.stamp_tax_rate : 0
+  const transferFee = grossAmount * simConfigStore.transfer_fee_rate
+  const totalFee = commission + stampTax + transferFee
+
+  if (order.side === 'buy' && simCash < grossAmount + totalFee) {
+    order.status = 'rejected'
+    order.reject_reason = 'SIM_INSUFFICIENT_CASH'
+    order.status_reason = 'SIM_INSUFFICIENT_CASH'
+    order.cash_impact = 0
+    order.filled_date = undefined
+    return null
+  }
+
+  const available = simLotsStore.filter((lot) => lot.symbol === symbol).reduce((sum, lot) => sum + lot.remaining, 0)
+  if (order.side === 'sell' && available < order.quantity) {
+    order.status = 'rejected'
+    order.reject_reason = 'SIM_INSUFFICIENT_POSITION'
+    order.status_reason = 'SIM_INSUFFICIENT_POSITION'
+    order.cash_impact = 0
+    order.filled_date = undefined
+    return null
+  }
+
+  const fill: SimTradeFill = {
+    order_id: order.order_id,
+    symbol,
+    side: order.side,
+    quantity: order.quantity,
+    fill_date: submitDate,
+    fill_price: fillPrice,
+    price_source: 'vwap',
+    gross_amount: Number(grossAmount.toFixed(4)),
+    net_amount: Number((order.side === 'buy' ? -(grossAmount + totalFee) : grossAmount - totalFee).toFixed(4)),
+    fee_commission: Number(commission.toFixed(4)),
+    fee_stamp_tax: Number(stampTax.toFixed(4)),
+    fee_transfer: Number(transferFee.toFixed(4)),
+  }
+
+  if (order.side === 'buy') {
+    simCash -= grossAmount + totalFee
+    simLotsStore.push({
+      symbol,
+      buy_date: submitDate,
+      buy_price: fillPrice,
+      unit_cost: (grossAmount + totalFee) / order.quantity,
+      quantity: order.quantity,
+      remaining: order.quantity,
+    })
+  } else {
+    simCash += grossAmount - totalFee
+    let remaining = order.quantity
+    for (const lot of simLotsStore) {
+      if (lot.symbol !== symbol || lot.remaining <= 0 || remaining <= 0) continue
+      const take = Math.min(lot.remaining, remaining)
+      const buyCost = lot.unit_cost * take
+      const sellFeePart = totalFee * (take / order.quantity)
+      const sellNet = fillPrice * take - sellFeePart
+      const pnlAmount = sellNet - buyCost
+      simClosedTradesStore.push({
+        symbol,
+        buy_date: lot.buy_date,
+        buy_price: lot.buy_price,
+        sell_date: submitDate,
+        sell_price: fillPrice,
+        quantity: take,
+        holding_days: Math.max(0, dayjs(submitDate).diff(dayjs(lot.buy_date), 'day')),
+        pnl_amount: Number(pnlAmount.toFixed(4)),
+        pnl_ratio: buyCost > 0 ? Number((pnlAmount / buyCost).toFixed(6)) : 0,
+      })
+      lot.remaining -= take
+      remaining -= take
+    }
+    simLotsStore = simLotsStore.filter((lot) => lot.remaining > 0)
+  }
+
+  simCash = Number(simCash.toFixed(4))
+  order.status = 'filled'
+  order.filled_date = submitDate
+  order.reject_reason = undefined
+  order.status_reason = undefined
+  order.cash_impact = fill.net_amount
+  simFillsStore = [fill, ...simFillsStore]
+  return fill
+}
+
 export function createOrder(payload: {
   symbol: string
   side: 'buy' | 'sell'
@@ -472,89 +593,325 @@ export function createOrder(payload: {
   signal_date: string
   submit_date: string
 }) {
-  const orderId = `ord-${Date.now()}`
-  return {
-    order: {
-      order_id: orderId,
-      symbol: payload.symbol,
-      side: payload.side,
-      quantity: payload.quantity,
-      signal_date: payload.signal_date,
-      submit_date: payload.submit_date,
-      status: 'filled' as const,
-    },
-    fill: {
-      order_id: orderId,
-      symbol: payload.symbol,
-      fill_date: payload.submit_date,
-      fill_price: 86.35,
-      price_source: 'vwap' as const,
-      fee_commission: 5,
-      fee_stamp_tax: payload.side === 'sell' ? 16.2 : 0,
-      fee_transfer: 0.5,
-    },
+  const symbol = payload.symbol.trim().toLowerCase()
+  const orderId = `ord-${Date.now()}-${Math.floor(Math.random() * 1000)}`
+  const submitDate = payload.submit_date || dayjs().format('YYYY-MM-DD')
+  const candles = ensureCandles(symbol)
+  const latest = candles[candles.length - 1]
+  const basePrice = latest?.open ?? latest?.close ?? 20
+  const slippage = simConfigStore.slippage_rate
+  const estimatedPrice = Number(
+    (
+      payload.side === 'buy'
+        ? basePrice * (1 + slippage)
+        : basePrice * (1 - slippage)
+    ).toFixed(4),
+  )
+  const estimatedAmount = estimatedPrice * payload.quantity
+  const estimatedCommission = Math.max(estimatedAmount * simConfigStore.commission_rate, simConfigStore.min_commission)
+  const estimatedStamp = payload.side === 'sell' ? estimatedAmount * simConfigStore.stamp_tax_rate : 0
+  const estimatedTransfer = estimatedAmount * simConfigStore.transfer_fee_rate
+  const estimatedFee = estimatedCommission + estimatedStamp + estimatedTransfer
+
+  const baseOrder: SimTradeOrder = {
+    order_id: orderId,
+    symbol,
+    side: payload.side,
+    quantity: payload.quantity,
+    signal_date: payload.signal_date,
+    submit_date: submitDate,
+    expected_fill_date: submitDate,
+    filled_date: undefined,
+    estimated_price: estimatedPrice,
+    cash_impact: payload.side === 'buy' ? -(estimatedAmount + estimatedFee) : estimatedAmount - estimatedFee,
+    status: 'pending',
   }
+
+  if (payload.quantity % 100 !== 0 || payload.quantity <= 0) {
+    baseOrder.status = 'rejected'
+    baseOrder.reject_reason = 'SIM_INVALID_LOT_SIZE'
+    baseOrder.status_reason = 'SIM_INVALID_LOT_SIZE'
+    baseOrder.cash_impact = 0
+  } else if (payload.side === 'sell') {
+    const available = simLotsStore.filter((lot) => lot.symbol === symbol).reduce((sum, lot) => sum + lot.remaining, 0)
+    if (available < payload.quantity) {
+      baseOrder.status = 'rejected'
+      baseOrder.reject_reason = 'SIM_INSUFFICIENT_POSITION'
+      baseOrder.status_reason = 'SIM_INSUFFICIENT_POSITION'
+      baseOrder.cash_impact = 0
+    }
+  } else if (payload.side === 'buy' && simCash < estimatedAmount + estimatedFee) {
+    baseOrder.status = 'rejected'
+    baseOrder.reject_reason = 'SIM_INSUFFICIENT_CASH'
+    baseOrder.status_reason = 'SIM_INSUFFICIENT_CASH'
+    baseOrder.cash_impact = 0
+  }
+
+  simOrdersStore = [baseOrder, ...simOrdersStore]
+  return { order: baseOrder }
 }
 
 export function getPortfolio(): PortfolioSnapshot {
+  settleOrders()
+  const grouped = new Map<string, { quantity: number; cost: number; earliestBuy: string }>()
+  simLotsStore.forEach((lot) => {
+    const prev = grouped.get(lot.symbol)
+    const remainingCost = lot.unit_cost * lot.remaining
+    if (!prev) {
+      grouped.set(lot.symbol, {
+        quantity: lot.remaining,
+        cost: remainingCost,
+        earliestBuy: lot.buy_date,
+      })
+      return
+    }
+    grouped.set(lot.symbol, {
+      quantity: prev.quantity + lot.remaining,
+      cost: prev.cost + remainingCost,
+      earliestBuy: prev.earliestBuy < lot.buy_date ? prev.earliestBuy : lot.buy_date,
+    })
+  })
+
+  const positions: PortfolioPosition[] = Array.from(grouped.entries()).map(([symbol, item]) => {
+    const candles = ensureCandles(symbol)
+    const latest = candles[candles.length - 1]
+    const currentPrice = latest?.close ?? 0
+    const marketValue = currentPrice * item.quantity
+    const pnlAmount = marketValue - item.cost
+    return {
+      symbol,
+      name: stockPool.find((row) => row.symbol === symbol)?.name ?? symbol.toUpperCase(),
+      quantity: item.quantity,
+      available_quantity: item.quantity,
+      avg_cost: item.quantity > 0 ? Number((item.cost / item.quantity).toFixed(4)) : 0,
+      current_price: Number(currentPrice.toFixed(4)),
+      market_value: Number(marketValue.toFixed(4)),
+      pnl_amount: Number(pnlAmount.toFixed(4)),
+      pnl_ratio: item.cost > 0 ? Number((pnlAmount / item.cost).toFixed(6)) : 0,
+      holding_days: Math.max(0, dayjs().diff(dayjs(item.earliestBuy), 'day')),
+    }
+  })
+
+  const positionValue = positions.reduce((sum, item) => sum + item.market_value, 0)
+  const realizedPnl = simClosedTradesStore.reduce((sum, item) => sum + item.pnl_amount, 0)
+  const unrealizedPnl = positions.reduce((sum, item) => sum + item.pnl_amount, 0)
   return {
-    total_asset: 1_082_000,
-    cash: 308_000,
-    position_value: 774_000,
-    positions: [
-      {
-        symbol: 'sz300750',
-        name: '宁德时代',
-        quantity: 1500,
-        avg_cost: 165.3,
-        current_price: 174.2,
-        pnl_ratio: 0.0538,
-        holding_days: 9,
-      },
-      {
-        symbol: 'sh601899',
-        name: '紫金矿业',
-        quantity: 12000,
-        avg_cost: 16.8,
-        current_price: 17.6,
-        pnl_ratio: 0.0476,
-        holding_days: 14,
-      },
-    ],
+    as_of_date: dayjs().format('YYYY-MM-DD'),
+    total_asset: Number((simCash + positionValue).toFixed(4)),
+    cash: simCash,
+    position_value: Number(positionValue.toFixed(4)),
+    realized_pnl: Number(realizedPnl.toFixed(4)),
+    unrealized_pnl: Number(unrealizedPnl.toFixed(4)),
+    pending_order_count: simOrdersStore.filter((item) => item.status === 'pending').length,
+    positions,
   }
 }
 
-export function getReview(): { stats: ReviewStats; trades: TradeRecord[] } {
+export function getReview(params?: {
+  date_from?: string
+  date_to?: string
+}): ReviewResponse {
+  settleOrders()
+  const now = dayjs()
+  const dateFrom = params?.date_from ?? now.subtract(90, 'day').format('YYYY-MM-DD')
+  const dateTo = params?.date_to ?? now.format('YYYY-MM-DD')
+  const trades = simClosedTradesStore.filter((item) => item.sell_date >= dateFrom && item.sell_date <= dateTo)
+  const tradeCount = trades.length
+  const winCount = trades.filter((row) => row.pnl_amount > 0).length
+  const lossCount = trades.filter((row) => row.pnl_amount < 0).length
+  const grossProfit = trades.filter((row) => row.pnl_amount > 0).reduce((sum, row) => sum + row.pnl_amount, 0)
+  const grossLoss = trades.filter((row) => row.pnl_amount < 0).reduce((sum, row) => sum + row.pnl_amount, 0)
+  const totalPnl = trades.reduce((sum, row) => sum + row.pnl_amount, 0)
+  const avgPnlRatio = tradeCount > 0 ? trades.reduce((sum, row) => sum + row.pnl_ratio, 0) / tradeCount : 0
+
+  const equityCurve = [{ date: dateFrom, equity: simConfigStore.initial_capital, realized_pnl: 0 }]
+  let runningPnl = 0
+  trades
+    .slice()
+    .sort((a, b) => a.sell_date.localeCompare(b.sell_date))
+    .forEach((row) => {
+      runningPnl += row.pnl_amount
+      equityCurve.push({
+        date: row.sell_date,
+        equity: Number((simConfigStore.initial_capital + runningPnl).toFixed(4)),
+        realized_pnl: Number(runningPnl.toFixed(4)),
+      })
+    })
+
+  if (equityCurve[equityCurve.length - 1]?.date !== dateTo) {
+    equityCurve.push({
+      date: dateTo,
+      equity: equityCurve[equityCurve.length - 1]?.equity ?? simConfigStore.initial_capital,
+      realized_pnl: equityCurve[equityCurve.length - 1]?.realized_pnl ?? 0,
+    })
+  }
+
+  let peak = equityCurve[0]?.equity ?? simConfigStore.initial_capital
+  const drawdownCurve = equityCurve.map((point) => {
+    peak = Math.max(peak, point.equity)
+    return {
+      date: point.date,
+      drawdown: peak > 0 ? Number(((point.equity - peak) / peak).toFixed(6)) : 0,
+    }
+  })
+
+  const monthlyMap = new Map<string, { pnl: number; count: number }>()
+  trades.forEach((trade) => {
+    const key = trade.sell_date.slice(0, 7)
+    const prev = monthlyMap.get(key) ?? { pnl: 0, count: 0 }
+    monthlyMap.set(key, { pnl: prev.pnl + trade.pnl_amount, count: prev.count + 1 })
+  })
+
+  const monthlyReturns = Array.from(monthlyMap.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([month, value]) => ({
+      month,
+      return_ratio: Number((value.pnl / simConfigStore.initial_capital).toFixed(6)),
+      pnl_amount: Number(value.pnl.toFixed(4)),
+      trade_count: value.count,
+    }))
+
+  const sortedByPnl = trades.slice().sort((a, b) => b.pnl_amount - a.pnl_amount)
+  const topTrades = sortedByPnl.slice(0, 10)
+  const bottomTrades = sortedByPnl.slice(-10).reverse()
+
+  const maxDrawdown = Math.max(0, ...drawdownCurve.map((item) => Math.abs(item.drawdown)))
   return {
     stats: {
-      win_rate: 0.62,
-      total_return: 0.128,
-      max_drawdown: 0.071,
-      avg_pnl_ratio: 0.034,
+      win_rate: tradeCount > 0 ? winCount / tradeCount : 0,
+      total_return: totalPnl / simConfigStore.initial_capital,
+      max_drawdown: maxDrawdown,
+      avg_pnl_ratio: avgPnlRatio,
+      trade_count: tradeCount,
+      win_count: winCount,
+      loss_count: lossCount,
+      profit_factor: grossLoss < 0 ? grossProfit / Math.abs(grossLoss) : grossProfit > 0 ? 999 : 0,
     },
-    trades: [
-      {
-        symbol: 'sz300750',
-        buy_date: '2026-01-16',
-        buy_price: 160.5,
-        sell_date: '2026-01-23',
-        sell_price: 172.4,
-        holding_days: 7,
-        pnl_amount: 17850,
-        pnl_ratio: 0.074,
-      },
-      {
-        symbol: 'sh601899',
-        buy_date: '2026-01-08',
-        buy_price: 15.6,
-        sell_date: '2026-01-20',
-        sell_price: 17.2,
-        holding_days: 12,
-        pnl_amount: 9600,
-        pnl_ratio: 0.102,
-      },
-    ],
+    trades,
+    equity_curve: equityCurve,
+    drawdown_curve: drawdownCurve,
+    monthly_returns: monthlyReturns,
+    top_trades: topTrades,
+    bottom_trades: bottomTrades,
+    cost_snapshot: simConfigStore,
+    range: {
+      date_from: dateFrom,
+      date_to: dateTo,
+      date_axis: 'sell',
+    },
   }
+}
+
+export function getOrders(params?: {
+  status?: 'pending' | 'filled' | 'cancelled' | 'rejected'
+  symbol?: string
+  side?: 'buy' | 'sell'
+  date_from?: string
+  date_to?: string
+  page?: number
+  page_size?: number
+}): SimOrdersResponse {
+  const page = params?.page ?? 1
+  const pageSize = params?.page_size ?? 50
+  let rows = simOrdersStore.slice()
+  if (params?.status) rows = rows.filter((row) => row.status === params.status)
+  if (params?.symbol) rows = rows.filter((row) => row.symbol === params.symbol?.trim().toLowerCase())
+  if (params?.side) rows = rows.filter((row) => row.side === params.side)
+  if (params?.date_from) rows = rows.filter((row) => row.submit_date >= params.date_from!)
+  if (params?.date_to) rows = rows.filter((row) => row.submit_date <= params.date_to!)
+  const total = rows.length
+  const start = Math.max(0, (page - 1) * pageSize)
+  return {
+    items: rows.slice(start, start + pageSize),
+    total,
+    page,
+    page_size: pageSize,
+  }
+}
+
+export function getFills(params?: {
+  symbol?: string
+  side?: 'buy' | 'sell'
+  date_from?: string
+  date_to?: string
+  page?: number
+  page_size?: number
+}): SimFillsResponse {
+  const page = params?.page ?? 1
+  const pageSize = params?.page_size ?? 50
+  let rows = simFillsStore.slice()
+  if (params?.symbol) rows = rows.filter((row) => row.symbol === params.symbol?.trim().toLowerCase())
+  if (params?.side) rows = rows.filter((row) => row.side === params.side)
+  if (params?.date_from) rows = rows.filter((row) => row.fill_date >= params.date_from!)
+  if (params?.date_to) rows = rows.filter((row) => row.fill_date <= params.date_to!)
+  const total = rows.length
+  const start = Math.max(0, (page - 1) * pageSize)
+  return {
+    items: rows.slice(start, start + pageSize),
+    total,
+    page,
+    page_size: pageSize,
+  }
+}
+
+export function cancelOrder(orderId: string) {
+  const index = simOrdersStore.findIndex((item) => item.order_id === orderId)
+  if (index < 0) {
+    return null
+  }
+  const target = simOrdersStore[index]
+  if (target.status !== 'pending') {
+    return { order: target, fill: undefined }
+  }
+  simOrdersStore[index] = {
+    ...target,
+    status: 'cancelled',
+    status_reason: 'USER_CANCELLED',
+  }
+  return { order: simOrdersStore[index], fill: undefined }
+}
+
+export function settleOrders(): SimSettleResponse {
+  let settledCount = 0
+  let filledCount = 0
+  simOrdersStore.forEach((order) => {
+    if (order.status !== 'pending') return
+    settledCount += 1
+    const fill = applyOrderFill(order)
+    if (fill) filledCount += 1
+  })
+  return {
+    settled_count: settledCount,
+    filled_count: filledCount,
+    pending_count: simOrdersStore.filter((item) => item.status === 'pending').length,
+    as_of_date: dayjs().format('YYYY-MM-DD'),
+    last_settle_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+  }
+}
+
+export function resetAccount(): SimResetResponse {
+  simOrdersStore = []
+  simFillsStore = []
+  simLotsStore = []
+  simClosedTradesStore = []
+  simCash = simConfigStore.initial_capital
+  return {
+    success: true,
+    as_of_date: dayjs().format('YYYY-MM-DD'),
+    cash: simCash,
+  }
+}
+
+export function getSimConfigStore() {
+  return simConfigStore
+}
+
+export function setSimConfigStore(payload: SimTradingConfig) {
+  simConfigStore = payload
+  if (simOrdersStore.length === 0 && simFillsStore.length === 0 && simLotsStore.length === 0) {
+    simCash = payload.initial_capital
+  }
+  return simConfigStore
 }
 
 export function getAIRecords(): AIAnalysisRecord[] {

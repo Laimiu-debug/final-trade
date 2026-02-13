@@ -8,17 +8,21 @@ import type {
   DeleteAIRecordResponse,
   IntradayPayload,
   PortfolioSnapshot,
-  ReviewStats,
+  ReviewResponse,
   ScreenerParams,
   ScreenerRunDetail,
   ScreenerRunResponse,
-  SignalsResponse,
   SignalScanMode,
+  SignalsResponse,
+  SimFillsResponse,
+  SimOrdersResponse,
+  SimResetResponse,
+  SimSettleResponse,
   SimTradeFill,
   SimTradeOrder,
+  SimTradingConfig,
   StockAnalysis,
   StockAnnotation,
-  TradeRecord,
 } from '@/types/contracts'
 
 export function runScreener(params: ScreenerParams) {
@@ -88,20 +92,117 @@ export function getSignals(params?: {
   })
 }
 
-export function postSimOrder(payload: Omit<SimTradeOrder, 'order_id' | 'status'>) {
+export function postSimOrder(payload: {
+  symbol: string
+  side: 'buy' | 'sell'
+  quantity: number
+  signal_date: string
+  submit_date: string
+}) {
   return apiRequest<{ order: SimTradeOrder; fill?: SimTradeFill }>('/api/sim/orders', {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 45_000,
+  })
+}
+
+export function getPortfolio() {
+  return apiRequest<PortfolioSnapshot>('/api/sim/portfolio', {
+    timeoutMs: 45_000,
+  })
+}
+
+export function getSimOrders(params?: {
+  status?: 'pending' | 'filled' | 'cancelled' | 'rejected'
+  symbol?: string
+  side?: 'buy' | 'sell'
+  date_from?: string
+  date_to?: string
+  page?: number
+  page_size?: number
+}) {
+  const query = new URLSearchParams()
+  if (params?.status) query.set('status', params.status)
+  if (params?.symbol) query.set('symbol', params.symbol)
+  if (params?.side) query.set('side', params.side)
+  if (params?.date_from) query.set('date_from', params.date_from)
+  if (params?.date_to) query.set('date_to', params.date_to)
+  if (typeof params?.page === 'number') query.set('page', String(params.page))
+  if (typeof params?.page_size === 'number') query.set('page_size', String(params.page_size))
+  const suffix = query.toString()
+  return apiRequest<SimOrdersResponse>(`/api/sim/orders${suffix ? `?${suffix}` : ''}`, {
+    timeoutMs: 45_000,
+  })
+}
+
+export function getSimFills(params?: {
+  symbol?: string
+  side?: 'buy' | 'sell'
+  date_from?: string
+  date_to?: string
+  page?: number
+  page_size?: number
+}) {
+  const query = new URLSearchParams()
+  if (params?.symbol) query.set('symbol', params.symbol)
+  if (params?.side) query.set('side', params.side)
+  if (params?.date_from) query.set('date_from', params.date_from)
+  if (params?.date_to) query.set('date_to', params.date_to)
+  if (typeof params?.page === 'number') query.set('page', String(params.page))
+  if (typeof params?.page_size === 'number') query.set('page_size', String(params.page_size))
+  const suffix = query.toString()
+  return apiRequest<SimFillsResponse>(`/api/sim/fills${suffix ? `?${suffix}` : ''}`, {
+    timeoutMs: 45_000,
+  })
+}
+
+export function cancelSimOrder(orderId: string) {
+  return apiRequest<{ order: SimTradeOrder; fill?: SimTradeFill }>(`/api/sim/orders/${orderId}/cancel`, {
+    method: 'POST',
+    timeoutMs: 45_000,
+  })
+}
+
+export function settleSim() {
+  return apiRequest<SimSettleResponse>('/api/sim/settle', {
+    method: 'POST',
+    timeoutMs: 60_000,
+  })
+}
+
+export function resetSim() {
+  return apiRequest<SimResetResponse>('/api/sim/reset', {
+    method: 'POST',
+    timeoutMs: 45_000,
+  })
+}
+
+export function getSimConfig() {
+  return apiRequest<SimTradingConfig>('/api/sim/config')
+}
+
+export function updateSimConfig(payload: SimTradingConfig) {
+  return apiRequest<SimTradingConfig>('/api/sim/config', {
+    method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   })
 }
 
-export function getPortfolio() {
-  return apiRequest<PortfolioSnapshot>('/api/sim/portfolio')
-}
-
-export function getReviewStats() {
-  return apiRequest<{ stats: ReviewStats; trades: TradeRecord[] }>('/api/review/stats')
+export function getReviewStats(params?: {
+  date_from?: string
+  date_to?: string
+  date_axis?: 'sell'
+}) {
+  const query = new URLSearchParams()
+  if (params?.date_from) query.set('date_from', params.date_from)
+  if (params?.date_to) query.set('date_to', params.date_to)
+  if (params?.date_axis) query.set('date_axis', params.date_axis)
+  const suffix = query.toString()
+  return apiRequest<ReviewResponse>(`/api/review/stats${suffix ? `?${suffix}` : ''}`, {
+    timeoutMs: 45_000,
+  })
 }
 
 export function getAIRecords() {

@@ -1,9 +1,59 @@
-﻿from fastapi.testclient import TestClient
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from app.main import app
 
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def reset_sim_account() -> None:
+    resp = client.post("/api/sim/reset")
+    assert resp.status_code == 200
+
+
+def _load_symbol_dates(symbol: str) -> list[str]:
+    resp = client.get(f"/api/stocks/{symbol}/candles")
+    assert resp.status_code == 200
+    candles = resp.json()["candles"]
+    assert len(candles) >= 10
+    return [item["time"] for item in candles]
+
+
+def _post_buy(symbol: str, submit_date: str, quantity: int = 100) -> dict[str, object]:
+    payload = {
+        "symbol": symbol,
+        "side": "buy",
+        "quantity": quantity,
+        "signal_date": submit_date,
+        "submit_date": submit_date,
+    }
+    resp = client.post("/api/sim/orders", json=payload)
+    assert resp.status_code == 200
+    return resp.json()["order"]
+
+
+def _post_sell(symbol: str, submit_date: str, quantity: int = 100) -> dict[str, object]:
+    payload = {
+        "symbol": symbol,
+        "side": "sell",
+        "quantity": quantity,
+        "signal_date": submit_date,
+        "submit_date": submit_date,
+    }
+    resp = client.post("/api/sim/orders", json=payload)
+    assert resp.status_code == 200
+    return resp.json()["order"]
 
 
 def test_run_and_get_screener() -> None:
@@ -181,3 +231,198 @@ def test_signals_endpoint_trend_pool_mode() -> None:
     assert body["mode"] == "trend_pool"
     assert body["source_count"] >= 0
     assert isinstance(body["items"], list)
+
+
+def test_sim_order_buy_pending_then_settle_filled() -> None:
+    dates = _load_symbol_dates("sz300750")
+    submit_date = dates[-6]
+
+    order_resp = client.post(
+        "/api/sim/orders",
+        json={
+            "symbol": "sz300750",
+            "side": "buy",
+            "quantity": 100,
+            "signal_date": submit_date,
+            "submit_date": submit_date,
+        },
+    )
+    assert order_resp.status_code == 200
+    order = order_resp.json()["order"]
+    assert order["status"] == "pending"
+
+    settle_resp = client.post("/api/sim/settle")
+    assert settle_resp.status_code == 200
+    settle_body = settle_resp.json()
+    assert settle_body["settled_count"] >= 1
+    assert settle_body["filled_count"] >= 1
+
+    orders = client.get("/api/sim/orders", params={"status": "filled"}).json()["items"]
+    assert any(item["order_id"] == order["order_id"] for item in orders)
+
+    fills = client.get("/api/sim/fills", params={"symbol": "sz300750"}).json()["items"]
+    assert any(item["order_id"] == order["order_id"] for item in fills)
+
+
+def test_sim_no_next_day_fallback_close() -> None:
+    dates = _load_symbol_dates("sz300750")
+    last_date = dates[-1]
+
+    order = _post_buy("sz300750", last_date, quantity=100)
+    assert order["status"] == "pending"
+
+    settle_resp = client.post("/api/sim/settle")
+    assert settle_resp.status_code == 200
+
+    filled_orders = client.get("/api/sim/orders", params={"status": "filled"}).json()["items"]
+    target = next(item for item in filled_orders if item["order_id"] == order["order_id"])
+    assert target["status_reason"] == "NO_NEXT_DAY_FALLBACK_CLOSE"
+
+    fills = client.get("/api/sim/fills", params={"symbol": "sz300750"}).json()["items"]
+    fill = next(item for item in fills if item["order_id"] == order["order_id"])
+    assert fill["warning"] == "NO_NEXT_DAY_FALLBACK_CLOSE"
+
+
+def test_sim_sell_fifo_and_partial_lot_consumption() -> None:
+    symbol = "sh601899"
+    dates = _load_symbol_dates(symbol)
+    buy_date_1 = dates[-8]
+    buy_date_2 = dates[-7]
+    sell_date = dates[-5]
+
+    _post_buy(symbol, buy_date_1, quantity=100)
+    _post_buy(symbol, buy_date_2, quantity=100)
+    settle_resp = client.post("/api/sim/settle")
+    assert settle_resp.status_code == 200
+
+    sell_order = _post_sell(symbol, sell_date, quantity=100)
+    assert sell_order["status"] == "pending"
+    settle_resp2 = client.post("/api/sim/settle")
+    assert settle_resp2.status_code == 200
+
+    portfolio = client.get("/api/sim/portfolio").json()
+    pos = next((item for item in portfolio["positions"] if item["symbol"] == symbol), None)
+    assert pos is not None
+    assert pos["quantity"] == 100
+
+    review = client.get(
+        "/api/review/stats",
+        params={"date_from": dates[-15], "date_to": dates[-1], "date_axis": "sell"},
+    ).json()
+    assert review["trades"]
+    filled_buys = client.get(
+        "/api/sim/orders",
+        params={"status": "filled", "side": "buy", "symbol": symbol},
+    ).json()["items"]
+    assert filled_buys
+    earliest_buy_fill_date = min(item["filled_date"] for item in filled_buys if item.get("filled_date"))
+    assert any(trade["buy_date"] == earliest_buy_fill_date for trade in review["trades"])
+
+
+def test_sim_t_plus_one_buy_same_day_not_sellable() -> None:
+    symbol = "sz300750"
+    dates = _load_symbol_dates(symbol)
+    buy_date = dates[-6]
+
+    _post_buy(symbol, buy_date, quantity=100)
+    client.post("/api/sim/settle")
+
+    sell_same_day = client.post(
+        "/api/sim/orders",
+        json={
+            "symbol": symbol,
+            "side": "sell",
+            "quantity": 100,
+            "signal_date": buy_date,
+            "submit_date": buy_date,
+        },
+    )
+    assert sell_same_day.status_code == 400
+    body = sell_same_day.json()
+    assert body["code"] == "SIM_INSUFFICIENT_POSITION"
+
+
+def test_sim_cancel_pending_and_filled_not_cancelable() -> None:
+    symbol = "sz300750"
+    dates = _load_symbol_dates(symbol)
+    submit_date = dates[-6]
+
+    pending = _post_buy(symbol, submit_date, quantity=100)
+    cancel_resp = client.post(f"/api/sim/orders/{pending['order_id']}/cancel")
+    assert cancel_resp.status_code == 200
+    assert cancel_resp.json()["order"]["status"] == "cancelled"
+
+    second = _post_buy(symbol, submit_date, quantity=100)
+    client.post("/api/sim/settle")
+    cancel_filled = client.post(f"/api/sim/orders/{second['order_id']}/cancel")
+    assert cancel_filled.status_code == 400
+    assert cancel_filled.json()["code"] == "SIM_ORDER_NOT_CANCELABLE"
+
+
+def test_sim_reset_account_clears_positions_orders_and_fills() -> None:
+    symbol = "sh601899"
+    dates = _load_symbol_dates(symbol)
+    _post_buy(symbol, dates[-6], quantity=100)
+    client.post("/api/sim/settle")
+
+    reset_resp = client.post("/api/sim/reset")
+    assert reset_resp.status_code == 200
+    assert reset_resp.json()["success"] is True
+
+    orders = client.get("/api/sim/orders").json()
+    fills = client.get("/api/sim/fills").json()
+    portfolio = client.get("/api/sim/portfolio").json()
+    config = client.get("/api/sim/config").json()
+
+    assert orders["total"] == 0
+    assert fills["total"] == 0
+    assert portfolio["positions"] == []
+    assert abs(portfolio["cash"] - config["initial_capital"]) < 1e-6
+
+
+def test_sim_cost_calculation_min_commission_and_sell_stamp_tax() -> None:
+    symbol = "sh601899"
+    dates = _load_symbol_dates(symbol)
+    buy_date = dates[-7]
+    sell_date = dates[-5]
+
+    buy = _post_buy(symbol, buy_date, quantity=100)
+    assert buy["status"] == "pending"
+    client.post("/api/sim/settle")
+
+    buy_fill = next(
+        item
+        for item in client.get("/api/sim/fills", params={"side": "buy"}).json()["items"]
+        if item["order_id"] == buy["order_id"]
+    )
+    assert buy_fill["fee_commission"] >= 5
+    assert buy_fill["fee_stamp_tax"] == 0
+
+    sell = _post_sell(symbol, sell_date, quantity=100)
+    assert sell["status"] == "pending"
+    client.post("/api/sim/settle")
+    sell_fill = next(
+        item
+        for item in client.get("/api/sim/fills", params={"side": "sell"}).json()["items"]
+        if item["order_id"] == sell["order_id"]
+    )
+    assert sell_fill["fee_stamp_tax"] > 0
+
+
+def test_review_default_range_and_curve_fields() -> None:
+    symbol = "sh601899"
+    dates = _load_symbol_dates(symbol)
+    _post_buy(symbol, dates[-8], quantity=100)
+    client.post("/api/sim/settle")
+    _post_sell(symbol, dates[-5], quantity=100)
+    client.post("/api/sim/settle")
+
+    resp = client.get("/api/review/stats")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "range" in body
+    assert body["range"]["date_axis"] == "sell"
+    assert isinstance(body["equity_curve"], list)
+    assert isinstance(body["drawdown_curve"], list)
+    assert isinstance(body["monthly_returns"], list)
+    assert "profit_factor" in body["stats"]

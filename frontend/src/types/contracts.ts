@@ -197,35 +197,88 @@ export interface SimTradeOrder {
   signal_date: string
   submit_date: string
   status: 'pending' | 'filled' | 'cancelled' | 'rejected'
+  expected_fill_date?: string
+  filled_date?: string
+  estimated_price?: number
+  cash_impact?: number
+  status_reason?: string
   reject_reason?: string
 }
 
 export interface SimTradeFill {
   order_id: string
   symbol: string
+  side: 'buy' | 'sell'
+  quantity: number
   fill_date: string
   fill_price: number
   price_source: PriceSource
+  gross_amount: number
+  net_amount: number
   fee_commission: number
   fee_stamp_tax: number
   fee_transfer: number
   warning?: string
 }
 
+export interface SimTradingConfig {
+  initial_capital: number
+  commission_rate: number
+  min_commission: number
+  stamp_tax_rate: number
+  transfer_fee_rate: number
+  slippage_rate: number
+}
+
+export interface SimOrdersResponse {
+  items: SimTradeOrder[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface SimFillsResponse {
+  items: SimTradeFill[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface SimSettleResponse {
+  settled_count: number
+  filled_count: number
+  pending_count: number
+  as_of_date: string
+  last_settle_at: string
+}
+
+export interface SimResetResponse {
+  success: true
+  as_of_date: string
+  cash: number
+}
+
 export interface PortfolioPosition {
   symbol: string
   name: string
   quantity: number
+  available_quantity: number
   avg_cost: number
   current_price: number
+  market_value: number
+  pnl_amount: number
   pnl_ratio: number
   holding_days: number
 }
 
 export interface PortfolioSnapshot {
+  as_of_date: string
   total_asset: number
   cash: number
   position_value: number
+  realized_pnl: number
+  unrealized_pnl: number
+  pending_order_count: number
   positions: PortfolioPosition[]
 }
 
@@ -234,6 +287,10 @@ export interface ReviewStats {
   total_return: number
   max_drawdown: number
   avg_pnl_ratio: number
+  trade_count: number
+  win_count: number
+  loss_count: number
+  profit_factor: number
 }
 
 export interface TradeRecord {
@@ -242,9 +299,46 @@ export interface TradeRecord {
   buy_price: number
   sell_date: string
   sell_price: number
+  quantity: number
   holding_days: number
   pnl_amount: number
   pnl_ratio: number
+}
+
+export interface EquityPoint {
+  date: string
+  equity: number
+  realized_pnl: number
+}
+
+export interface DrawdownPoint {
+  date: string
+  drawdown: number
+}
+
+export interface MonthlyReturnPoint {
+  month: string
+  return_ratio: number
+  pnl_amount: number
+  trade_count: number
+}
+
+export interface ReviewRange {
+  date_from: string
+  date_to: string
+  date_axis: 'sell'
+}
+
+export interface ReviewResponse {
+  stats: ReviewStats
+  trades: TradeRecord[]
+  equity_curve: EquityPoint[]
+  drawdown_curve: DrawdownPoint[]
+  monthly_returns: MonthlyReturnPoint[]
+  top_trades: TradeRecord[]
+  bottom_trades: TradeRecord[]
+  cost_snapshot: SimTradingConfig
+  range: ReviewRange
 }
 
 export interface AIAnalysisRecord {

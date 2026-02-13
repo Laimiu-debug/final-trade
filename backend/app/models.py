@@ -197,6 +197,15 @@ class SignalsResponse(BaseModel):
     source_count: int = 0
 
 
+class SimTradingConfig(BaseModel):
+    initial_capital: float = Field(default=1_000_000, gt=0)
+    commission_rate: float = Field(default=0.0003, ge=0, le=0.01)
+    min_commission: float = Field(default=5.0, ge=0)
+    stamp_tax_rate: float = Field(default=0.001, ge=0, le=0.01)
+    transfer_fee_rate: float = Field(default=0.00001, ge=0, le=0.01)
+    slippage_rate: float = Field(default=0.0, ge=0, le=0.05)
+
+
 class SimTradeOrder(BaseModel):
     order_id: str
     symbol: str
@@ -205,15 +214,24 @@ class SimTradeOrder(BaseModel):
     signal_date: str
     submit_date: str
     status: Literal["pending", "filled", "cancelled", "rejected"]
+    expected_fill_date: str | None = None
+    filled_date: str | None = None
+    estimated_price: float | None = None
+    cash_impact: float | None = None
+    status_reason: str | None = None
     reject_reason: str | None = None
 
 
 class SimTradeFill(BaseModel):
     order_id: str
     symbol: str
+    side: Literal["buy", "sell"]
+    quantity: int
     fill_date: str
     fill_price: float
     price_source: PriceSource
+    gross_amount: float
+    net_amount: float
     fee_commission: float
     fee_stamp_tax: float
     fee_transfer: float
@@ -237,16 +255,23 @@ class PortfolioPosition(BaseModel):
     symbol: str
     name: str
     quantity: int
+    available_quantity: int
     avg_cost: float
     current_price: float
+    market_value: float
+    pnl_amount: float
     pnl_ratio: float
     holding_days: int
 
 
 class PortfolioSnapshot(BaseModel):
+    as_of_date: str
     total_asset: float
     cash: float
     position_value: float
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    pending_order_count: int = 0
     positions: list[PortfolioPosition]
 
 
@@ -255,6 +280,10 @@ class ReviewStats(BaseModel):
     total_return: float
     max_drawdown: float
     avg_pnl_ratio: float
+    trade_count: int = 0
+    win_count: int = 0
+    loss_count: int = 0
+    profit_factor: float = 0.0
 
 
 class TradeRecord(BaseModel):
@@ -263,14 +292,74 @@ class TradeRecord(BaseModel):
     buy_price: float
     sell_date: str
     sell_price: float
+    quantity: int = 0
     holding_days: int
     pnl_amount: float
     pnl_ratio: float
 
 
+class EquityPoint(BaseModel):
+    date: str
+    equity: float
+    realized_pnl: float
+
+
+class DrawdownPoint(BaseModel):
+    date: str
+    drawdown: float
+
+
+class MonthlyReturnPoint(BaseModel):
+    month: str
+    return_ratio: float
+    pnl_amount: float
+    trade_count: int
+
+
+class ReviewRange(BaseModel):
+    date_from: str
+    date_to: str
+    date_axis: Literal["sell"] = "sell"
+
+
 class ReviewResponse(BaseModel):
     stats: ReviewStats
     trades: list[TradeRecord]
+    equity_curve: list[EquityPoint] = Field(default_factory=list)
+    drawdown_curve: list[DrawdownPoint] = Field(default_factory=list)
+    monthly_returns: list[MonthlyReturnPoint] = Field(default_factory=list)
+    top_trades: list[TradeRecord] = Field(default_factory=list)
+    bottom_trades: list[TradeRecord] = Field(default_factory=list)
+    cost_snapshot: SimTradingConfig = Field(default_factory=SimTradingConfig)
+    range: ReviewRange
+
+
+class SimOrdersResponse(BaseModel):
+    items: list[SimTradeOrder]
+    total: int
+    page: int
+    page_size: int
+
+
+class SimFillsResponse(BaseModel):
+    items: list[SimTradeFill]
+    total: int
+    page: int
+    page_size: int
+
+
+class SimSettleResponse(BaseModel):
+    settled_count: int
+    filled_count: int
+    pending_count: int
+    as_of_date: str
+    last_settle_at: str
+
+
+class SimResetResponse(BaseModel):
+    success: Literal[True]
+    as_of_date: str
+    cash: float
 
 
 class AIAnalysisRecord(BaseModel):

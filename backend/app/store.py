@@ -40,8 +40,13 @@ from .models import (
     SignalScanMode,
     SignalResult,
     SignalsResponse,
+    SimFillsResponse,
+    SimOrdersResponse,
+    SimResetResponse,
+    SimSettleResponse,
     SimTradeFill,
     SimTradeOrder,
+    SimTradingConfig,
     Stage,
     StockAnalysis,
     StockAnalysisResponse,
@@ -50,6 +55,7 @@ from .models import (
     TradeRecord,
     TrendClass,
 )
+from .sim_engine import SimAccountEngine
 from .tdx_loader import (
     load_candles_for_symbol,
     load_input_pool_from_tdx,
@@ -85,6 +91,12 @@ class InMemoryStore:
         self._web_evidence_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
         self._quote_profile_cache: dict[str, tuple[float, dict[str, str]]] = {}
         self._signals_cache: dict[str, tuple[float, SignalsResponse]] = {}
+        self._sim_engine = SimAccountEngine(
+            get_candles=self._ensure_candles,
+            resolve_symbol_name=self._resolve_symbol_name,
+            now_date=self._now_date,
+            now_datetime=self._now_datetime,
+        )
 
     @staticmethod
     def _default_config() -> AppConfig:
@@ -3364,87 +3376,77 @@ class InMemoryStore:
         return payload
 
     def create_order(self, payload: CreateOrderRequest) -> CreateOrderResponse:
-        order_id = f"ord-{int(datetime.now().timestamp() * 1000)}-{random.randint(100, 999)}"
-        order = SimTradeOrder(
-            order_id=order_id,
-            symbol=payload.symbol,
-            side=payload.side,
-            quantity=payload.quantity,
-            signal_date=payload.signal_date,
-            submit_date=payload.submit_date,
-            status="filled",
-        )
-        fill = SimTradeFill(
-            order_id=order_id,
-            symbol=payload.symbol,
-            fill_date=payload.submit_date,
-            fill_price=86.35,
-            price_source="vwap",
-            fee_commission=5.0,
-            fee_stamp_tax=16.2 if payload.side == "sell" else 0.0,
-            fee_transfer=0.5,
-        )
-        return CreateOrderResponse(order=order, fill=fill)
+        return self._sim_engine.create_order(payload)
 
-    @staticmethod
-    def get_portfolio() -> PortfolioSnapshot:
-        return PortfolioSnapshot(
-            total_asset=1_082_000,
-            cash=308_000,
-            position_value=774_000,
-            positions=[
-                PortfolioPosition(
-                    symbol="sz300750",
-                    name="宁德时代",
-                    quantity=1500,
-                    avg_cost=165.3,
-                    current_price=174.2,
-                    pnl_ratio=0.0538,
-                    holding_days=9,
-                ),
-                PortfolioPosition(
-                    symbol="sh601899",
-                    name="紫金矿业",
-                    quantity=12000,
-                    avg_cost=16.8,
-                    current_price=17.6,
-                    pnl_ratio=0.0476,
-                    holding_days=14,
-                ),
-            ],
+    def list_orders(
+        self,
+        *,
+        status: Literal["pending", "filled", "cancelled", "rejected"] | None,
+        symbol: str | None,
+        side: Literal["buy", "sell"] | None,
+        date_from: str | None,
+        date_to: str | None,
+        page: int,
+        page_size: int,
+    ) -> SimOrdersResponse:
+        return self._sim_engine.list_orders(
+            status=status,
+            symbol=symbol,
+            side=side,
+            date_from=date_from,
+            date_to=date_to,
+            page=page,
+            page_size=page_size,
         )
 
-    @staticmethod
-    def get_review() -> ReviewResponse:
-        return ReviewResponse(
-            stats=ReviewStats(
-                win_rate=0.62,
-                total_return=0.128,
-                max_drawdown=0.071,
-                avg_pnl_ratio=0.034,
-            ),
-            trades=[
-                TradeRecord(
-                    symbol="sz300750",
-                    buy_date="2026-01-16",
-                    buy_price=160.5,
-                    sell_date="2026-01-23",
-                    sell_price=172.4,
-                    holding_days=7,
-                    pnl_amount=17_850,
-                    pnl_ratio=0.074,
-                ),
-                TradeRecord(
-                    symbol="sh601899",
-                    buy_date="2026-01-08",
-                    buy_price=15.6,
-                    sell_date="2026-01-20",
-                    sell_price=17.2,
-                    holding_days=12,
-                    pnl_amount=9_600,
-                    pnl_ratio=0.102,
-                ),
-            ],
+    def list_fills(
+        self,
+        *,
+        symbol: str | None,
+        side: Literal["buy", "sell"] | None,
+        date_from: str | None,
+        date_to: str | None,
+        page: int,
+        page_size: int,
+    ) -> SimFillsResponse:
+        return self._sim_engine.list_fills(
+            symbol=symbol,
+            side=side,
+            date_from=date_from,
+            date_to=date_to,
+            page=page,
+            page_size=page_size,
+        )
+
+    def cancel_order(self, order_id: str) -> CreateOrderResponse:
+        return self._sim_engine.cancel_order(order_id)
+
+    def settle_sim(self) -> SimSettleResponse:
+        return self._sim_engine.settle()
+
+    def reset_sim(self) -> SimResetResponse:
+        return self._sim_engine.reset()
+
+    def get_sim_config(self) -> SimTradingConfig:
+        return self._sim_engine.get_config()
+
+    def set_sim_config(self, payload: SimTradingConfig) -> SimTradingConfig:
+        return self._sim_engine.set_config(payload)
+
+    def get_portfolio(self) -> PortfolioSnapshot:
+        return self._sim_engine.get_portfolio()
+
+    def get_review(
+        self,
+        *,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        date_axis: Literal["sell"] = "sell",
+    ) -> ReviewResponse:
+        return self._sim_engine.get_review(
+            date_from=date_from,
+            date_to=date_to,
+            date_axis=date_axis,
         )
 
     def analyze_stock_with_ai(self, symbol: str) -> AIAnalysisRecord:

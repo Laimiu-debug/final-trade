@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import FastAPI, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +21,11 @@ from .models import (
     IntradayPayload,
     PortfolioSnapshot,
     ReviewResponse,
+    SimFillsResponse,
+    SimOrdersResponse,
+    SimResetResponse,
+    SimSettleResponse,
+    SimTradingConfig,
     SignalScanMode,
     ScreenerParams,
     ScreenerRunDetail,
@@ -27,6 +34,7 @@ from .models import (
     StockAnalysisResponse,
     StockAnnotation,
 )
+from .sim_engine import SimEngineError
 from .store import store
 
 app = FastAPI(title="TDX Trend Screener API", version="0.1.0")
@@ -65,6 +73,12 @@ def error_response(
 def handle_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
     detail = exc.errors()[0].get("msg") if exc.errors() else "请求参数不合法"
     return error_response(422, "VALIDATION_ERROR", str(detail))
+
+
+@app.exception_handler(SimEngineError)
+def handle_sim_error(_: Request, exc: SimEngineError) -> JSONResponse:
+    status_code = 404 if exc.code == "SIM_ORDER_NOT_FOUND" else 400
+    return error_response(status_code, exc.code, exc.message)
 
 
 @app.get("/health")
@@ -138,14 +152,83 @@ def post_order(payload: CreateOrderRequest) -> CreateOrderResponse:
     return store.create_order(payload)
 
 
+@app.get("/api/sim/orders", response_model=SimOrdersResponse)
+def get_orders(
+    status: Literal["pending", "filled", "cancelled", "rejected"] | None = Query(default=None),
+    symbol: str | None = Query(default=None, min_length=2, max_length=16),
+    side: Literal["buy", "sell"] | None = Query(default=None),
+    date_from: str | None = Query(default=None, min_length=10, max_length=10),
+    date_to: str | None = Query(default=None, min_length=10, max_length=10),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=500),
+) -> SimOrdersResponse:
+    return store.list_orders(
+        status=status,
+        symbol=symbol.strip().lower() if symbol else None,
+        side=side,
+        date_from=date_from,
+        date_to=date_to,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/api/sim/fills", response_model=SimFillsResponse)
+def get_fills(
+    symbol: str | None = Query(default=None, min_length=2, max_length=16),
+    side: Literal["buy", "sell"] | None = Query(default=None),
+    date_from: str | None = Query(default=None, min_length=10, max_length=10),
+    date_to: str | None = Query(default=None, min_length=10, max_length=10),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=500),
+) -> SimFillsResponse:
+    return store.list_fills(
+        symbol=symbol.strip().lower() if symbol else None,
+        side=side,
+        date_from=date_from,
+        date_to=date_to,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.post("/api/sim/orders/{order_id}/cancel", response_model=CreateOrderResponse)
+def post_cancel_order(order_id: str = Path(min_length=8, max_length=64)) -> CreateOrderResponse:
+    return store.cancel_order(order_id)
+
+
+@app.post("/api/sim/settle", response_model=SimSettleResponse)
+def post_sim_settle() -> SimSettleResponse:
+    return store.settle_sim()
+
+
+@app.post("/api/sim/reset", response_model=SimResetResponse)
+def post_sim_reset() -> SimResetResponse:
+    return store.reset_sim()
+
+
+@app.get("/api/sim/config", response_model=SimTradingConfig)
+def get_sim_config() -> SimTradingConfig:
+    return store.get_sim_config()
+
+
+@app.put("/api/sim/config", response_model=SimTradingConfig)
+def put_sim_config(payload: SimTradingConfig) -> SimTradingConfig:
+    return store.set_sim_config(payload)
+
+
 @app.get("/api/sim/portfolio", response_model=PortfolioSnapshot)
 def get_portfolio() -> PortfolioSnapshot:
     return store.get_portfolio()
 
 
 @app.get("/api/review/stats", response_model=ReviewResponse)
-def get_review_stats() -> ReviewResponse:
-    return store.get_review()
+def get_review_stats(
+    date_from: str | None = Query(default=None, min_length=10, max_length=10),
+    date_to: str | None = Query(default=None, min_length=10, max_length=10),
+    date_axis: Literal["sell"] = Query(default="sell"),
+) -> ReviewResponse:
+    return store.get_review(date_from=date_from, date_to=date_to, date_axis=date_axis)
 
 
 @app.get("/api/ai/records", response_model=AIRecordsResponse)
