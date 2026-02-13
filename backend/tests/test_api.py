@@ -117,9 +117,12 @@ def test_load_candles_with_configured_data_source(tmp_path: Path) -> None:
 
 
 def test_run_and_get_screener() -> None:
+    dates = _load_symbol_dates("sz300750")
+    as_of_date = dates[-8]
     payload = {
         "markets": ["sh", "sz"],
         "mode": "strict",
+        "as_of_date": as_of_date,
         "return_window_days": 40,
         "top_n": 500,
         "turnover_threshold": 0.05,
@@ -134,6 +137,7 @@ def test_run_and_get_screener() -> None:
     detail_resp = client.get(f"/api/screener/runs/{run_id}")
     assert detail_resp.status_code == 200
     body = detail_resp.json()
+    assert body["as_of_date"] == as_of_date
     assert body["step_summary"]["input_count"] > 0
     assert body["step_pools"]["input"][0]["name"] != "科技样本1"
 
@@ -321,10 +325,13 @@ def test_delete_ai_record_endpoint() -> None:
 
 
 def test_signals_endpoint_full_market_fields() -> None:
+    dates = _load_symbol_dates("sz300750")
+    as_of_date = dates[-8]
     resp = client.get(
         "/api/signals",
         params={
             "mode": "full_market",
+            "as_of_date": as_of_date,
             "window_days": 60,
             "min_score": 40,
             "require_sequence": False,
@@ -334,10 +341,12 @@ def test_signals_endpoint_full_market_fields() -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["mode"] == "full_market"
+    assert body["as_of_date"] == as_of_date
     assert "generated_at" in body
     assert "cache_hit" in body
     assert "source_count" in body
     assert isinstance(body["items"], list)
+    assert all(item["trigger_date"] <= as_of_date for item in body["items"])
     if body["items"]:
         first = body["items"][0]
         assert "wyckoff_phase" in first
@@ -347,9 +356,12 @@ def test_signals_endpoint_full_market_fields() -> None:
 
 
 def test_signals_endpoint_trend_pool_mode() -> None:
+    dates = _load_symbol_dates("sz300750")
+    as_of_date = dates[-8]
     run_payload = {
         "markets": ["sh", "sz"],
         "mode": "strict",
+        "as_of_date": as_of_date,
         "return_window_days": 40,
         "top_n": 500,
         "turnover_threshold": 0.05,
@@ -372,8 +384,10 @@ def test_signals_endpoint_trend_pool_mode() -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["mode"] == "trend_pool"
+    assert body["as_of_date"] == as_of_date
     assert body["source_count"] >= 0
     assert isinstance(body["items"], list)
+    assert all(item["trigger_date"] <= as_of_date for item in body["items"])
 
 
 def test_sim_order_buy_pending_then_settle_filled() -> None:

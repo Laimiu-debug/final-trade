@@ -35,6 +35,7 @@ class DataProviderStatus(BaseModel):
 class ScreenerParams(BaseModel):
     markets: list[Market] = Field(min_length=1)
     mode: ScreenerMode
+    as_of_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     return_window_days: int = Field(ge=5, le=120)
     top_n: int = Field(ge=100, le=2000)
     turnover_threshold: float = Field(ge=0.01, le=0.2)
@@ -97,6 +98,7 @@ class ScreenerRunResponse(BaseModel):
 class ScreenerRunDetail(BaseModel):
     run_id: str
     created_at: str
+    as_of_date: str | None = None
     params: ScreenerParams
     step_summary: ScreenerStepSummary
     step_pools: ScreenerStepPools
@@ -193,6 +195,7 @@ class SignalResult(BaseModel):
 class SignalsResponse(BaseModel):
     items: list[SignalResult]
     mode: SignalScanMode = "trend_pool"
+    as_of_date: str | None = None
     generated_at: str = ""
     cache_hit: bool = False
     degraded: bool = False

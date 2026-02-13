@@ -71,6 +71,7 @@ export function updateStockAnnotation(symbol: string, payload: StockAnnotation) 
 export function getSignals(params?: {
   mode?: SignalScanMode
   run_id?: string
+  as_of_date?: string
   refresh?: boolean
   window_days?: number
   min_score?: number
@@ -80,6 +81,7 @@ export function getSignals(params?: {
   const query = new URLSearchParams()
   if (params?.mode) query.set('mode', params.mode)
   if (params?.run_id) query.set('run_id', params.run_id)
+  if (params?.as_of_date) query.set('as_of_date', params.as_of_date)
   if (typeof params?.refresh === 'boolean') query.set('refresh', String(params.refresh))
   if (typeof params?.window_days === 'number') query.set('window_days', String(params.window_days))
   if (typeof params?.min_score === 'number') query.set('min_score', String(params.min_score))

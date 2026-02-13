@@ -8,6 +8,7 @@ import {
   Card,
   Checkbox,
   Col,
+  DatePicker,
   Empty,
   Input,
   InputNumber,
@@ -24,7 +25,7 @@ import type { ColumnsType } from 'antd/es/table'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import wyckoffCycleDiagram from '@/assets/wyckoff-cycle.svg'
 import { ApiError } from '@/shared/api/client'
-import { getSignals, postSimOrder } from '@/shared/api/endpoints'
+import { getScreenerRun, getSignals, postSimOrder } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { useUIStore } from '@/state/uiStore'
 import type { SignalResult, SignalScanMode, SignalType } from '@/types/contracts'
@@ -174,8 +175,11 @@ export function SignalsPage() {
   const setSelectedSymbol = useUIStore((state) => state.setSelectedSymbol)
   const [searchParams] = useSearchParams()
   const runId = searchParams.get('run_id') ?? undefined
+  const initialAsOfDate = searchParams.get('as_of_date') ?? ''
 
   const [mode, setMode] = useState<SignalScanMode>('trend_pool')
+  const [asOfDate, setAsOfDate] = useState(initialAsOfDate)
+  const [asOfDateTouched, setAsOfDateTouched] = useState(initialAsOfDate.length > 0)
   const [windowDays, setWindowDays] = useState(60)
   const [minScore, setMinScore] = useState(60)
   const [minEventCount, setMinEventCount] = useState(1)
@@ -189,18 +193,35 @@ export function SignalsPage() {
   const [guideExpanded, setGuideExpanded] = useState(false)
 
   const refreshTrackerRef = useRef(0)
-  const todayStartRef = useRef(dayjs().startOf('day'))
+
+  const runDetailQuery = useQuery({
+    queryKey: ['screener-run', runId],
+    queryFn: () => getScreenerRun(runId as string),
+    enabled: Boolean(runId),
+    staleTime: 60_000,
+  })
+
+  useEffect(() => {
+    if (mode !== 'trend_pool') return
+    if (asOfDateTouched) return
+    const runAsOfDate = runDetailQuery.data?.as_of_date?.trim() ?? ''
+    if (runAsOfDate) {
+      setAsOfDate(runAsOfDate)
+    }
+  }, [asOfDateTouched, mode, runDetailQuery.data?.as_of_date])
 
   const signalQuery = useQuery({
-    queryKey: ['signals', mode, runId, windowDays, minScore, minEventCount, requireSequence, refreshCounter],
+    queryKey: ['signals', mode, runId, asOfDate, windowDays, minScore, minEventCount, requireSequence, refreshCounter],
     queryFn: async () => {
       const shouldRefresh = refreshCounter > refreshTrackerRef.current
       if (shouldRefresh) {
         refreshTrackerRef.current = refreshCounter
       }
+      const normalizedAsOfDate = asOfDate.trim()
       return getSignals({
         mode,
         run_id: runId,
+        as_of_date: normalizedAsOfDate || undefined,
         refresh: shouldRefresh,
         window_days: windowDays,
         min_score: minScore,
@@ -216,6 +237,13 @@ export function SignalsPage() {
       setManualRefreshing(false)
     }
   }, [signalQuery.isFetching])
+
+  const referenceDate = useMemo(() => {
+    const raw = (signalQuery.data?.as_of_date ?? asOfDate).trim()
+    if (!raw) return dayjs().startOf('day')
+    const parsed = dayjs(raw).startOf('day')
+    return parsed.isValid() ? parsed : dayjs().startOf('day')
+  }, [asOfDate, signalQuery.data?.as_of_date])
 
   const quickBuyMutation = useMutation({
     mutationFn: (row: SignalTableRow) =>
@@ -235,8 +263,8 @@ export function SignalsPage() {
   })
 
   const allRows = useMemo(
-    () => (signalQuery.data?.items ?? []).map((item) => normalizeSignalRow(item, todayStartRef.current)),
-    [signalQuery.data?.items],
+    () => (signalQuery.data?.items ?? []).map((item) => normalizeSignalRow(item, referenceDate)),
+    [referenceDate, signalQuery.data?.items],
   )
 
   const kpi = useMemo(() => {
@@ -727,6 +755,22 @@ export function SignalsPage() {
             </Col>
           </Row>
 
+          <Row gutter={[12, 12]}>
+            <Col xs={24} md={12} lg={6}>
+              <Typography.Text type="secondary">快照日期（留空=最新）</Typography.Text>
+              <DatePicker
+                allowClear
+                value={asOfDate && dayjs(asOfDate).isValid() ? dayjs(asOfDate) : null}
+                format="YYYY-MM-DD"
+                style={{ width: '100%' }}
+                onChange={(value) => {
+                  setAsOfDateTouched(true)
+                  setAsOfDate(value ? value.format('YYYY-MM-DD') : '')
+                }}
+              />
+            </Col>
+          </Row>
+
           <Row gutter={[12, 12]} align="middle">
             <Col xs={24} lg={8}>
               <Input
@@ -767,6 +811,7 @@ export function SignalsPage() {
           <Row justify="space-between" gutter={[12, 12]}>
             <Col xs={24} lg={12}>
               <Typography.Text type="secondary">
+                快照 {signalQuery.data?.as_of_date || asOfDate || '最新'} |
                 生成时间 {signalQuery.data?.generated_at ?? '--'}
                 {signalQuery.data?.cache_hit ? '（缓存命中）' : '（实时计算）'}
               </Typography.Text>

@@ -1414,6 +1414,21 @@ class InMemoryStore:
                 return candle.time
         return candles[0].time
 
+    def _slice_candles_as_of(
+        self,
+        candles: list[CandlePoint],
+        as_of_date: str | None,
+    ) -> tuple[list[CandlePoint], str | None]:
+        if not candles:
+            return [], None
+        if not as_of_date:
+            return candles, candles[-1].time
+        aligned = self._align_date_to_candles(candles, as_of_date)
+        for idx, point in enumerate(candles):
+            if point.time == aligned:
+                return candles[: idx + 1], aligned
+        return candles, candles[-1].time
+
     def _infer_recent_rebreakout_index(self, candles: list[CandlePoint]) -> int | None:
         if len(candles) < 70:
             return None
@@ -1711,8 +1726,8 @@ class InMemoryStore:
             return baseline_aligned
         return raw_aligned
 
-    def _build_row_from_candles(self, symbol: str) -> ScreenerResult | None:
-        candles = self._ensure_candles(symbol)
+    def _build_row_from_candles(self, symbol: str, as_of_date: str | None = None) -> ScreenerResult | None:
+        candles, _ = self._slice_candles_as_of(self._ensure_candles(symbol), as_of_date)
         if len(candles) < 30:
             return None
 
@@ -2803,6 +2818,7 @@ class InMemoryStore:
             tdx_root=self._config.tdx_data_path,
             markets=params.markets,
             return_window_days=params.return_window_days,
+            as_of_date=params.as_of_date,
         )
         if real_input_pool:
             run_id = f"{int(datetime.now().timestamp() * 1000)}-{uuid4().hex[:6]}"
@@ -2820,6 +2836,7 @@ class InMemoryStore:
             detail = ScreenerRunDetail(
                 run_id=run_id,
                 created_at=self._now_datetime(),
+                as_of_date=params.as_of_date,
                 params=params,
                 step_summary=ScreenerStepSummary(
                     input_count=len(real_input_pool),
@@ -2883,6 +2900,7 @@ class InMemoryStore:
         detail = ScreenerRunDetail(
             run_id=run_id,
             created_at=self._now_datetime(),
+            as_of_date=params.as_of_date,
             params=params,
             step_summary=ScreenerStepSummary(
                 input_count=input_count,
@@ -3040,40 +3058,49 @@ class InMemoryStore:
         *,
         mode: SignalScanMode,
         run_id: str | None,
-    ) -> tuple[list[ScreenerResult], str | None, str | None]:
+        as_of_date: str | None = None,
+    ) -> tuple[list[ScreenerResult], str | None, str | None, str | None]:
         if mode == "trend_pool":
             resolved_run_id = run_id or self._latest_run_id()
             if not resolved_run_id:
-                return [], "TREND_POOL_RUN_NOT_FOUND", None
+                return [], "TREND_POOL_RUN_NOT_FOUND", None, as_of_date
             run = self._run_store.get(resolved_run_id)
             if run is None:
-                return [], "TREND_POOL_RUN_NOT_FOUND", resolved_run_id
+                return [], "TREND_POOL_RUN_NOT_FOUND", resolved_run_id, as_of_date
             source = run.step_pools.step4 or run.step_pools.step3
             if not source:
-                return [], "TREND_POOL_EMPTY", resolved_run_id
-            return source, run.degraded_reason if run.degraded else None, resolved_run_id
+                return [], "TREND_POOL_EMPTY", resolved_run_id, (as_of_date or run.as_of_date)
+            return source, run.degraded_reason if run.degraded else None, resolved_run_id, (as_of_date or run.as_of_date)
 
         source, error = load_input_pool_from_tdx(
             tdx_root=self._config.tdx_data_path,
             markets=self._config.markets,
             return_window_days=self._config.return_window_days,
+            as_of_date=as_of_date,
         )
         if not source:
             fallback_rows: list[ScreenerResult] = []
             for stock in STOCK_POOL:
-                row = self._build_row_from_candles(stock["symbol"])
+                row = self._build_row_from_candles(stock["symbol"], as_of_date=as_of_date)
                 if row:
                     fallback_rows.append(row)
             if fallback_rows:
-                return fallback_rows, error or "FULL_MARKET_TDX_UNAVAILABLE_FALLBACK_CANDLES", None
-            return [], error or "FULL_MARKET_SCAN_EMPTY", None
+                return fallback_rows, error or "FULL_MARKET_TDX_UNAVAILABLE_FALLBACK_CANDLES", None, as_of_date
+            return [], error or "FULL_MARKET_SCAN_EMPTY", None, as_of_date
 
         source.sort(key=lambda row: row.score + row.ai_confidence * 20, reverse=True)
         max_candidates = 1500
-        return source[:max_candidates], error, None
+        return source[:max_candidates], error, None, as_of_date
 
-    def _calc_wyckoff_snapshot(self, row: ScreenerResult, window_days: int) -> dict[str, object]:
-        candles = self._ensure_candles(row.symbol)
+    def _calc_wyckoff_snapshot(
+        self,
+        row: ScreenerResult,
+        window_days: int,
+        *,
+        as_of_date: str | None = None,
+    ) -> dict[str, object]:
+        candles, resolved_as_of_date = self._slice_candles_as_of(self._ensure_candles(row.symbol), as_of_date)
+        fallback_trigger_date = candles[-1].time if candles else (resolved_as_of_date or as_of_date or self._now_date())
         if len(candles) < 25:
             return {
                 "events": [],
@@ -3089,7 +3116,7 @@ class InMemoryStore:
                 "trend_score": 0.0,
                 "volatility_score": 0.0,
                 "entry_quality_score": 0.0,
-                "trigger_date": self._now_date(),
+                "trigger_date": fallback_trigger_date,
             }
 
         window = max(20, min(window_days, len(candles)))
@@ -3303,7 +3330,7 @@ class InMemoryStore:
             "UTAD",
         ]
         wyckoff_signal = next((event for event in signal_priority if event in event_dates), "")
-        trigger_date = event_dates.get(wyckoff_signal, dates[-1] if dates else self._now_date())
+        trigger_date = event_dates.get(wyckoff_signal, dates[-1] if dates else fallback_trigger_date)
 
         return {
             "events": events,
@@ -3327,6 +3354,7 @@ class InMemoryStore:
         *,
         mode: SignalScanMode,
         run_id: str | None,
+        as_of_date: str | None,
         window_days: int,
         min_score: float,
         require_sequence: bool,
@@ -3335,6 +3363,7 @@ class InMemoryStore:
         payload = {
             "mode": mode,
             "run_id": run_id or "",
+            "as_of_date": as_of_date or "",
             "window_days": window_days,
             "min_score": round(min_score, 3),
             "require_sequence": require_sequence,
@@ -3347,17 +3376,23 @@ class InMemoryStore:
         *,
         mode: SignalScanMode = "trend_pool",
         run_id: str | None = None,
+        as_of_date: str | None = None,
         refresh: bool = False,
         window_days: int = 60,
         min_score: float = 60,
         require_sequence: bool = False,
         min_event_count: int = 1,
     ) -> SignalsResponse:
-        candidates, degraded_reason, resolved_run_id = self._resolve_signal_candidates(mode=mode, run_id=run_id)
+        candidates, degraded_reason, resolved_run_id, resolved_as_of_date = self._resolve_signal_candidates(
+            mode=mode,
+            run_id=run_id,
+            as_of_date=as_of_date,
+        )
         source_count = len(candidates)
         cache_key = self._signals_cache_key(
             mode=mode,
             run_id=resolved_run_id if mode == "trend_pool" else run_id,
+            as_of_date=resolved_as_of_date,
             window_days=window_days,
             min_score=min_score,
             require_sequence=require_sequence,
@@ -3371,6 +3406,7 @@ class InMemoryStore:
             return cached_payload.model_copy(
                 update={
                     "cache_hit": True,
+                    "as_of_date": resolved_as_of_date or cached_payload.as_of_date,
                     "degraded": cached_payload.degraded or bool(degraded_reason),
                     "degraded_reason": degraded_reason or cached_payload.degraded_reason,
                     "source_count": source_count or cached_payload.source_count,
@@ -3383,7 +3419,7 @@ class InMemoryStore:
         for row in candidates:
             if row.symbol in seen_symbols:
                 continue
-            snapshot = self._calc_wyckoff_snapshot(row, window_days=window_days)
+            snapshot = self._calc_wyckoff_snapshot(row, window_days=window_days, as_of_date=resolved_as_of_date)
             events = snapshot["events"] if isinstance(snapshot["events"], list) else []
             risk_events = snapshot["risk_events"] if isinstance(snapshot["risk_events"], list) else []
             sequence_ok = bool(snapshot["sequence_ok"])
@@ -3466,6 +3502,7 @@ class InMemoryStore:
         payload = SignalsResponse(
             items=items,
             mode=mode,
+            as_of_date=resolved_as_of_date,
             generated_at=self._now_datetime(),
             cache_hit=False,
             degraded=degraded,

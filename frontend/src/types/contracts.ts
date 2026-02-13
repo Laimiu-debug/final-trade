@@ -27,6 +27,7 @@ export interface DataProviderStatus {
 export interface ScreenerParams {
   markets: Market[]
   mode: ScreenerMode
+  as_of_date?: string
   return_window_days: number
   top_n: number
   turnover_threshold: number
@@ -93,6 +94,7 @@ export interface ScreenerRunResponse {
 export interface ScreenerRunDetail {
   run_id: string
   created_at: string
+  as_of_date?: string
   params: ScreenerParams
   step_summary: ScreenerStepSummary
   step_pools: ScreenerStepPools
@@ -185,6 +187,7 @@ export interface SignalResult {
 export interface SignalsResponse {
   items: SignalResult[]
   mode: SignalScanMode
+  as_of_date?: string
   generated_at: string
   cache_hit: boolean
   degraded: boolean

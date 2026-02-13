@@ -1,5 +1,6 @@
 ﻿import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
+import dayjs from 'dayjs'
 import {
   App as AntdApp,
   Alert,
@@ -7,6 +8,7 @@ import {
   Card,
   Checkbox,
   Col,
+  DatePicker,
   Dropdown,
   Input,
   InputNumber,
@@ -46,6 +48,7 @@ import { formatLargeMoney, formatPct } from '@/shared/utils/format'
 const formSchema = z.object({
   board_filters: z.array(z.enum(['main', 'gem', 'star', 'beijing', 'st'])).min(1, '至少选择一个板块'),
   mode: z.enum(['strict', 'loose']),
+  as_of_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).or(z.literal('')),
   return_window_days: z.number().min(5).max(120),
   top_n: z.number().min(100).max(2000),
   turnover_threshold: z.number().min(0.01).max(0.2),
@@ -54,7 +57,7 @@ const formSchema = z.object({
 })
 
 type FormValues = z.infer<typeof formSchema>
-type ScreenerRunMeta = { runId: string; degraded: boolean; degradedReason?: string }
+type ScreenerRunMeta = { runId: string; degraded: boolean; degradedReason?: string; asOfDate?: string }
 
 interface StepConfigs {
   step1: {
@@ -127,6 +130,7 @@ const defaultStepConfigs: StepConfigs = {
 const defaultFormValues: FormValues = {
   board_filters: ['main', 'gem', 'star'],
   mode: 'strict',
+  as_of_date: '',
   return_window_days: 40,
   top_n: 500,
   turnover_threshold: 0.05,
@@ -544,8 +548,9 @@ function sanitizeStep3Config(raw: Partial<StepConfigs['step3']> | undefined): St
   }
 }
 
-function buildInputPoolKey(params: Pick<FormValues, 'return_window_days'>) {
-  return `${params.return_window_days}`
+function buildInputPoolKey(params: Pick<FormValues, 'return_window_days' | 'as_of_date'>) {
+  const asOfDate = (params.as_of_date ?? '').trim()
+  return `${params.return_window_days}:${asOfDate}`
 }
 
 function sanitizeColumnOrder(raw: unknown): ScreenerColumnKey[] {
@@ -914,6 +919,7 @@ export function ScreenerPage() {
       buildInputPoolKey({
         return_window_days:
           watchedFormValues?.return_window_days ?? defaultFormValues.return_window_days,
+        as_of_date: watchedFormValues?.as_of_date ?? defaultFormValues.as_of_date,
       }),
     [watchedFormValues],
   )
@@ -964,9 +970,11 @@ export function ScreenerPage() {
 
   function buildScreenerParams(values: FormValues): ScreenerParams {
     const markets = ['sh', 'sz', 'bj'] as const
+    const asOfDate = values.as_of_date.trim()
     return {
       markets: [...markets],
       mode: values.mode,
+      as_of_date: asOfDate || undefined,
       return_window_days: values.return_window_days,
       top_n: values.top_n,
       turnover_threshold: values.turnover_threshold,
@@ -1000,10 +1008,12 @@ export function ScreenerPage() {
         runId: detail.run_id,
         degraded: detail.degraded,
         degradedReason: detail.degraded_reason,
+        asOfDate: detail.as_of_date ?? undefined,
       })
       setInputPoolKey(
         buildInputPoolKey({
           return_window_days: values.return_window_days,
+          as_of_date: detail.as_of_date ?? values.as_of_date,
         }),
       )
       message.success(`已加载输入池（当前板块 ${inputPool.length} / 全量 ${sourceInputPool.length}）`)
@@ -1152,6 +1162,18 @@ export function ScreenerPage() {
           step4: stepPools.step4 ?? detail.results ?? [],
           final: prev.final,
         }))
+        setRunMeta({
+          runId: detail.run_id,
+          degraded: detail.degraded,
+          degradedReason: detail.degraded_reason,
+          asOfDate: detail.as_of_date ?? undefined,
+        })
+        setInputPoolKey(
+          buildInputPoolKey({
+            return_window_days: getValues('return_window_days'),
+            as_of_date: detail.as_of_date ?? getValues('as_of_date'),
+          }),
+        )
         const restoredStep = stepPools.step4?.length
           ? 4
           : stepPools.step3?.length
@@ -2191,7 +2213,7 @@ export function ScreenerPage() {
         <Space orientation="vertical" size={14} style={{ width: '100%' }}>
           <Typography.Text strong>筛选参数</Typography.Text>
           <Row gutter={[16, 12]}>
-            <Col xs={24} md={16}>
+            <Col xs={24} md={12}>
               <Controller
                 control={control}
                 name="board_filters"
@@ -2220,7 +2242,7 @@ export function ScreenerPage() {
                 )}
               />
             </Col>
-            <Col xs={24} md={8}>
+            <Col xs={24} md={6}>
               <Controller
                 control={control}
                 name="mode"
@@ -2238,6 +2260,31 @@ export function ScreenerPage() {
                     ]}
                   />
                 )}
+              />
+            </Col>
+            <Col xs={24} md={6}>
+              <Controller
+                control={control}
+                name="as_of_date"
+                render={({ field }) => {
+                  const value = field.value ? dayjs(field.value) : null
+                  const pickerValue = value && value.isValid() ? value : null
+                  return (
+                    <Space orientation="vertical" size={4} style={{ width: '100%' }}>
+                      <Typography.Text type="secondary">筛选日期（留空=最新）</Typography.Text>
+                      <DatePicker
+                        allowClear
+                        value={pickerValue}
+                        format="YYYY-MM-DD"
+                        style={{ width: '100%' }}
+                        onChange={(next) => {
+                          field.onChange(next ? next.format('YYYY-MM-DD') : '')
+                          invalidateFrom(1)
+                        }}
+                      />
+                    </Space>
+                  )
+                }}
               />
             </Col>
           </Row>
@@ -2510,6 +2557,14 @@ export function ScreenerPage() {
           showIcon
           title="本次筛选包含降级数据"
           description={runMeta.degradedReason}
+        />
+      ) : null}
+      {runMeta?.asOfDate ? (
+        <Alert
+          type="info"
+          showIcon
+          title={`当前筛选日期: ${runMeta.asOfDate}`}
+          description="该输入池与后续漏斗步骤均基于该日期（及以前）行情数据。"
         />
       ) : null}
       {inputPoolOutdated ? (

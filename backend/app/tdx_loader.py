@@ -257,7 +257,7 @@ def _is_a_share_symbol(symbol: str) -> bool:
     return False
 
 
-def _parse_day_file(file_path: Path, symbol: str) -> ParsedSeries | None:
+def _parse_day_file(file_path: Path, symbol: str, *, max_bars: int = 360) -> ParsedSeries | None:
     try:
         size = file_path.stat().st_size
     except OSError:
@@ -267,7 +267,7 @@ def _parse_day_file(file_path: Path, symbol: str) -> ParsedSeries | None:
         return None
 
     total_bars = size // DAY_RECORD.size
-    read_bars = min(total_bars, 360)
+    read_bars = min(total_bars, max(60, int(max_bars)))
     start_offset = (total_bars - read_bars) * DAY_RECORD.size
 
     dates: list[str] = []
@@ -426,17 +426,34 @@ def _count_pullback_days(closes: list[float]) -> int:
     return days
 
 
+def _resolve_series_end_index(dates: list[str], as_of_date: str | None) -> int | None:
+    if not dates:
+        return None
+    if not as_of_date:
+        return len(dates) - 1
+    for idx in range(len(dates) - 1, -1, -1):
+        if dates[idx] <= as_of_date:
+            return idx
+    return None
+
+
 def _build_row(
     series: ParsedSeries,
     return_window_days: int,
     float_shares: float | None,
+    as_of_date: str | None = None,
 ) -> ScreenerResult | None:
-    closes = series["close"]
-    highs = series["high"]
-    lows = series["low"]
-    opens = series["open"]
-    volumes = series["volume"]
-    amounts = series["amount"]
+    end_idx = _resolve_series_end_index(series["dates"], as_of_date)
+    if end_idx is None:
+        return None
+
+    effective_end = end_idx + 1
+    closes = series["close"][:effective_end]
+    highs = series["high"][:effective_end]
+    lows = series["low"][:effective_end]
+    opens = series["open"][:effective_end]
+    volumes = series["volume"][:effective_end]
+    amounts = series["amount"][:effective_end]
 
     if len(closes) < max(return_window_days + 1, 40):
         return None
@@ -678,6 +695,7 @@ def load_input_pool_from_tdx(
     tdx_root: str,
     markets: list[str],
     return_window_days: int,
+    as_of_date: str | None = None,
 ) -> tuple[list[ScreenerResult], str | None]:
     root = Path(tdx_root)
     if not root.exists():
@@ -696,10 +714,10 @@ def load_input_pool_from_tdx(
             symbol = _normalize_symbol(file_path.stem, market)
             if not symbol or not _is_a_share_symbol(symbol):
                 continue
-            parsed = _parse_day_file(file_path, symbol)
+            parsed = _parse_day_file(file_path, symbol, max_bars=3000 if as_of_date else 360)
             if not parsed:
                 continue
-            row = _build_row(parsed, return_window_days, float_shares_map.get(symbol))
+            row = _build_row(parsed, return_window_days, float_shares_map.get(symbol), as_of_date)
             if row:
                 mapped_name = symbol_name_map.get(symbol)
                 if mapped_name:

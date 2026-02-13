@@ -133,6 +133,7 @@ def put_stock_annotation(symbol: str, payload: StockAnnotation) -> AnnotationUpd
 def get_signals(
     mode: SignalScanMode = Query(default="trend_pool"),
     run_id: str = Query(default="", min_length=0, max_length=64),
+    as_of_date: str | None = Query(default=None, min_length=10, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     refresh: bool = Query(default=False),
     window_days: int = Query(default=60, ge=20, le=240),
     min_score: float = Query(default=60, ge=0, le=100),
@@ -142,6 +143,7 @@ def get_signals(
     return store.get_signals(
         mode=mode,
         run_id=run_id.strip() or None,
+        as_of_date=as_of_date,
         refresh=refresh,
         window_days=window_days,
         min_score=min_score,
