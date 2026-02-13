@@ -37,7 +37,9 @@ from .models import (
     ScreenerRunDetail,
     ScreenerStepPools,
     ScreenerStepSummary,
+    SignalScanMode,
     SignalResult,
+    SignalsResponse,
     SimTradeFill,
     SimTradeOrder,
     Stage,
@@ -67,6 +69,10 @@ STOCK_POOL: list[dict[str, str]] = [
 
 THEME_STAGES: tuple[ThemeStage, ThemeStage, ThemeStage] = ("发酵中", "高潮", "退潮")
 
+WYCKOFF_ACC_EVENTS: tuple[str, ...] = ("PS", "SC", "AR", "ST", "TSO", "Spring", "SOS", "JOC", "LPS")
+WYCKOFF_RISK_EVENTS: tuple[str, ...] = ("UTAD", "SOW", "LPSY")
+WYCKOFF_EVENT_ORDER: tuple[str, ...] = (*WYCKOFF_ACC_EVENTS, *WYCKOFF_RISK_EVENTS)
+
 
 class InMemoryStore:
     def __init__(self) -> None:
@@ -78,6 +84,7 @@ class InMemoryStore:
         self._ai_record_store: list[AIAnalysisRecord] = self._default_ai_records()
         self._web_evidence_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
         self._quote_profile_cache: dict[str, tuple[float, dict[str, str]]] = {}
+        self._signals_cache: dict[str, tuple[float, SignalsResponse]] = {}
 
     @staticmethod
     def _default_config() -> AppConfig:
@@ -2880,38 +2887,481 @@ class InMemoryStore:
         secondary = [s for s in unique[1:] if order[s] < order[primary]]
         return primary, secondary
 
-    def get_signals(self) -> list[SignalResult]:
-        raw = [
-            {
-                "symbol": "sz300750",
-                "name": "宁德时代",
-                "trigger_reason": "突破新高后缩量回踩",
-                "signals": ["A", "B"],
-            },
-            {
-                "symbol": "sh601899",
-                "name": "紫金矿业",
-                "trigger_reason": "板块分歧后转一致",
-                "signals": ["A", "C"],
-            },
-            {"symbol": "sh600519", "name": "贵州茅台", "trigger_reason": "MA10回踩确认", "signals": ["A"]},
+    @staticmethod
+    def _clamp_score(value: float, lower: float = 0.0, upper: float = 100.0) -> float:
+        return max(lower, min(upper, value))
+
+    @staticmethod
+    def _phase_hint(phase: str) -> str:
+        mapping = {
+            "吸筹A": "疑似筹码吸收初期，重点观察抛压衰减。",
+            "吸筹B": "震荡测试阶段，关注ST/TSO后的承接力度。",
+            "吸筹C": "Spring 触发区，需确认假跌破后的快速收复。",
+            "吸筹D": "SOS/JOC 强势确认，等待回踩与量能配合。",
+            "吸筹E": "LPS 附近，偏向趋势延续但需防止高位背离。",
+            "派发A": "出现派发迹象，建议降低仓位并谨慎追高。",
+            "派发B": "派发风险增强，优先规避或仅做观察。",
+            "派发C": "派发链路较完整，建议回避买入信号。",
+            "派发D": "中后段弱势结构，关注反弹失败风险。",
+            "派发E": "弱势延续概率高，等待新结构形成后再评估。",
+        }
+        return mapping.get(phase, "阶段未明，建议结合结构与量能进一步确认。")
+
+    @staticmethod
+    def _is_subsequence(sequence: list[str], target: tuple[str, ...]) -> bool:
+        if not sequence:
+            return False
+        idx = 0
+        for item in sequence:
+            if idx < len(target) and item == target[idx]:
+                idx += 1
+        return idx >= 5 and any(item in sequence for item in ("SOS", "JOC", "LPS"))
+
+    def _latest_run_id(self) -> str | None:
+        if not self._run_store:
+            return None
+        latest = max(self._run_store.values(), key=lambda run: run.created_at)
+        return latest.run_id
+
+    def _resolve_signal_candidates(
+        self,
+        *,
+        mode: SignalScanMode,
+        run_id: str | None,
+    ) -> tuple[list[ScreenerResult], str | None, str | None]:
+        if mode == "trend_pool":
+            resolved_run_id = run_id or self._latest_run_id()
+            if not resolved_run_id:
+                return [], "TREND_POOL_RUN_NOT_FOUND", None
+            run = self._run_store.get(resolved_run_id)
+            if run is None:
+                return [], "TREND_POOL_RUN_NOT_FOUND", resolved_run_id
+            source = run.step_pools.step4 or run.step_pools.step3
+            if not source:
+                return [], "TREND_POOL_EMPTY", resolved_run_id
+            return source, run.degraded_reason if run.degraded else None, resolved_run_id
+
+        source, error = load_input_pool_from_tdx(
+            tdx_root=self._config.tdx_data_path,
+            markets=self._config.markets,
+            return_window_days=self._config.return_window_days,
+        )
+        if not source:
+            fallback_rows: list[ScreenerResult] = []
+            for stock in STOCK_POOL:
+                row = self._build_row_from_candles(stock["symbol"])
+                if row:
+                    fallback_rows.append(row)
+            if fallback_rows:
+                return fallback_rows, error or "FULL_MARKET_TDX_UNAVAILABLE_FALLBACK_CANDLES", None
+            return [], error or "FULL_MARKET_SCAN_EMPTY", None
+
+        source.sort(key=lambda row: row.score + row.ai_confidence * 20, reverse=True)
+        max_candidates = 1500
+        return source[:max_candidates], error, None
+
+    def _calc_wyckoff_snapshot(self, row: ScreenerResult, window_days: int) -> dict[str, object]:
+        candles = self._ensure_candles(row.symbol)
+        if len(candles) < 25:
+            return {
+                "events": [],
+                "risk_events": [],
+                "phase": "阶段未明",
+                "phase_hint": self._phase_hint("阶段未明"),
+                "signal": "",
+                "structure_hhh": "-",
+                "sequence_ok": False,
+                "event_strength_score": 0.0,
+                "phase_score": 45.0,
+                "structure_score": 0.0,
+                "trend_score": 0.0,
+                "volatility_score": 0.0,
+                "entry_quality_score": 0.0,
+                "trigger_date": self._now_date(),
+            }
+
+        window = max(20, min(window_days, len(candles)))
+        segment = candles[-window:]
+        dates = [point.time for point in segment]
+        opens = [point.open for point in segment]
+        highs = [point.high for point in segment]
+        lows = [point.low for point in segment]
+        closes = [point.close for point in segment]
+        volumes = [max(0, int(point.volume)) for point in segment]
+
+        latest_close = closes[-1]
+        latest_high = highs[-1]
+        latest_low = lows[-1]
+        tr_high = max(highs)
+        tr_low = min(lows)
+        tr_width = max(tr_high - tr_low, 0.01)
+        tr_pos = (latest_close - tr_low) / tr_width
+        avg_v5 = self._safe_mean(volumes[-5:])
+        avg_v10 = self._safe_mean(volumes[-10:])
+        avg_v20 = self._safe_mean(volumes[-20:])
+        ma20 = self._safe_mean(closes[-20:])
+        ret10 = (latest_close - closes[-11]) / max(closes[-11], 0.01) if len(closes) > 10 else 0.0
+        ret20 = (latest_close - closes[-21]) / max(closes[-21], 0.01) if len(closes) > 20 else ret10
+
+        event_dates: dict[str, str] = {}
+
+        def push_event(name: str, condition: bool, idx: int | None = None) -> None:
+            if not condition:
+                return
+            target_idx = len(dates) - 1 if idx is None else max(0, min(idx, len(dates) - 1))
+            event_dates[name] = dates[target_idx]
+
+        # PS / SC / AR / ST
+        push_event("PS", tr_pos <= 0.38 and avg_v5 >= avg_v20 * 1.12)
+        look_sc_start = max(0, len(closes) - 30)
+        sc_idx = look_sc_start + max(
+            range(len(volumes[look_sc_start:])),
+            key=lambda idx: volumes[look_sc_start + idx],
+        )
+        sc_range = max(highs[sc_idx] - lows[sc_idx], 0.01)
+        sc_close_near_low = closes[sc_idx] <= lows[sc_idx] + sc_range * 0.38
+        push_event("SC", sc_close_near_low, sc_idx)
+
+        ar_idx: int | None = None
+        if "SC" in event_dates and sc_idx < len(closes) - 3:
+            rebound_slice = closes[sc_idx + 1 :]
+            rebound_max = max(rebound_slice) if rebound_slice else closes[sc_idx]
+            if rebound_max >= closes[sc_idx] * 1.08:
+                ar_idx = sc_idx + rebound_slice.index(rebound_max) + 1
+                push_event("AR", True, ar_idx)
+
+        if "SC" in event_dates and len(closes) >= sc_idx + 6:
+            sc_low = lows[sc_idx]
+            st_idx = None
+            for idx in range(sc_idx + 1, len(closes)):
+                near_sc_low = abs(lows[idx] - sc_low) / max(sc_low, 0.01) <= 0.04
+                lower_volume = volumes[idx] <= volumes[sc_idx] * 0.85
+                if near_sc_low and lower_volume:
+                    st_idx = idx
+            push_event("ST", st_idx is not None, st_idx)
+
+        # TSO / Spring / SOS / JOC / LPS
+        support_20 = min(lows[-20:])
+        prior_support = min(lows[-25:-5]) if len(lows) > 25 else support_20
+        push_event(
+            "TSO",
+            latest_low < prior_support * 0.99 and latest_close > prior_support and avg_v5 >= avg_v20,
+        )
+        push_event(
+            "Spring",
+            latest_low < support_20 * 0.985 and latest_close > support_20 and volumes[-1] >= avg_v20 * 1.15,
+        )
+        push_event(
+            "SOS",
+            latest_close > ma20 * 1.01 and ret10 > 0.05 and avg_v5 >= avg_v20 * 1.05,
+        )
+        prior_high_20 = max(highs[-21:-1]) if len(highs) > 21 else max(highs[:-1])
+        push_event(
+            "JOC",
+            latest_close >= prior_high_20 * 1.005 and volumes[-1] >= avg_v20 * 1.2,
+        )
+        push_event(
+            "LPS",
+            (("SOS" in event_dates) or ("JOC" in event_dates))
+            and latest_close > ma20
+            and row.pullback_volume_ratio <= 0.95
+            and row.pullback_days <= 4,
+        )
+
+        # Risk-side events
+        upper_shadow_ratio = (latest_high - max(opens[-1], closes[-1])) / max(latest_high - latest_low, 0.01)
+        push_event(
+            "UTAD",
+            latest_high >= prior_high_20 * 1.01
+            and latest_close < prior_high_20
+            and upper_shadow_ratio >= 0.5
+            and volumes[-1] >= avg_v20 * 1.2,
+        )
+        push_event(
+            "SOW",
+            ret10 <= -0.05 and latest_close < ma20 and avg_v5 >= avg_v20 * 1.1,
+        )
+        recent_high_5 = max(highs[-5:])
+        prev_high_5 = max(highs[-10:-5]) if len(highs) >= 10 else recent_high_5
+        push_event(
+            "LPSY",
+            ("SOW" in event_dates or "UTAD" in event_dates)
+            and latest_close < ma20
+            and recent_high_5 <= prev_high_5 * 0.99,
+        )
+
+        events = [event for event in WYCKOFF_ACC_EVENTS if event in event_dates]
+        risk_events = [event for event in WYCKOFF_RISK_EVENTS if event in event_dates]
+
+        ordered_events = sorted(
+            event_dates.items(),
+            key=lambda item: (item[1], WYCKOFF_EVENT_ORDER.index(item[0])),
+        )
+        sequence = [event for event, _ in ordered_events if event in WYCKOFF_ACC_EVENTS]
+        sequence_ok = self._is_subsequence(sequence, WYCKOFF_ACC_EVENTS)
+
+        hh = latest_high >= max(highs[-10:-1]) * 1.003 if len(highs) > 10 else False
+        hl = (
+            min(lows[-5:]) >= min(lows[-15:-5]) * 1.01
+            if len(lows) >= 15
+            else latest_low >= min(lows[:-1]) * 1.005
+        )
+        hc = closes[-1] > closes[-5] > closes[-10] if len(closes) >= 10 else closes[-1] > closes[-2]
+        structure_hhh = f"{'HH' if hh else '-'}|{'HL' if hl else '-'}|{'HC' if hc else '-'}"
+
+        if risk_events:
+            if "LPSY" in risk_events and ret20 <= -0.12:
+                phase = "派发D" if ret20 > -0.2 else "派发E"
+            elif "UTAD" in risk_events and "SOW" in risk_events:
+                phase = "派发B"
+            else:
+                phase = "派发A" if len(risk_events) == 1 else "派发C"
+        elif "LPS" in events:
+            phase = "吸筹E"
+        elif "JOC" in events or "SOS" in events:
+            phase = "吸筹D"
+        elif "Spring" in events:
+            phase = "吸筹C"
+        elif "ST" in events or "TSO" in events:
+            phase = "吸筹B"
+        elif {"PS", "SC", "AR"} & set(events):
+            phase = "吸筹A"
+        else:
+            phase = "阶段未明"
+
+        phase_scores: dict[str, float] = {
+            "吸筹A": 58,
+            "吸筹B": 66,
+            "吸筹C": 76,
+            "吸筹D": 86,
+            "吸筹E": 91,
+            "派发A": 36,
+            "派发B": 28,
+            "派发C": 20,
+            "派发D": 14,
+            "派发E": 10,
+            "阶段未明": 45,
+        }
+        phase_score = phase_scores.get(phase, 45)
+
+        positive_event_weights = {
+            "PS": 5,
+            "SC": 8,
+            "AR": 7,
+            "ST": 6,
+            "TSO": 6,
+            "Spring": 10,
+            "SOS": 11,
+            "JOC": 10,
+            "LPS": 10,
+        }
+        risk_event_penalty = {"UTAD": -10, "SOW": -9, "LPSY": -8}
+        event_strength_score = 48.0
+        for event in events:
+            event_strength_score += positive_event_weights.get(event, 0)
+        for event in risk_events:
+            event_strength_score += risk_event_penalty.get(event, 0)
+        event_strength_score = self._clamp_score(event_strength_score)
+
+        structure_score = self._clamp_score(35 + (22 if hh else 0) + (22 if hl else 0) + (21 if hc else 0))
+        trend_score = self._clamp_score(50 + row.ret40 * 110 - row.retrace20 * 35)
+        volatility_score = self._clamp_score(100 - row.amplitude20 * 620)
+        risk_penalty = len(risk_events) * 4.5
+        entry_quality_score = self._clamp_score(
+            phase_score * 0.34
+            + event_strength_score * 0.24
+            + structure_score * 0.20
+            + trend_score * 0.14
+            + volatility_score * 0.08
+            - risk_penalty
+        )
+
+        signal_priority = [
+            "LPS",
+            "JOC",
+            "SOS",
+            "Spring",
+            "TSO",
+            "ST",
+            "AR",
+            "SC",
+            "PS",
+            "LPSY",
+            "SOW",
+            "UTAD",
         ]
+        wyckoff_signal = next((event for event in signal_priority if event in event_dates), "")
+        trigger_date = event_dates.get(wyckoff_signal, dates[-1] if dates else self._now_date())
+
+        return {
+            "events": events,
+            "risk_events": risk_events,
+            "phase": phase,
+            "phase_hint": self._phase_hint(phase),
+            "signal": wyckoff_signal,
+            "structure_hhh": structure_hhh,
+            "sequence_ok": sequence_ok,
+            "event_strength_score": round(event_strength_score, 2),
+            "phase_score": round(phase_score, 2),
+            "structure_score": round(structure_score, 2),
+            "trend_score": round(trend_score, 2),
+            "volatility_score": round(volatility_score, 2),
+            "entry_quality_score": round(entry_quality_score, 2),
+            "trigger_date": trigger_date,
+        }
+
+    def _signals_cache_key(
+        self,
+        *,
+        mode: SignalScanMode,
+        run_id: str | None,
+        window_days: int,
+        min_score: float,
+        require_sequence: bool,
+        min_event_count: int,
+    ) -> str:
+        payload = {
+            "mode": mode,
+            "run_id": run_id or "",
+            "window_days": window_days,
+            "min_score": round(min_score, 3),
+            "require_sequence": require_sequence,
+            "min_event_count": min_event_count,
+        }
+        return json.dumps(payload, sort_keys=True, ensure_ascii=True)
+
+    def get_signals(
+        self,
+        *,
+        mode: SignalScanMode = "trend_pool",
+        run_id: str | None = None,
+        refresh: bool = False,
+        window_days: int = 60,
+        min_score: float = 60,
+        require_sequence: bool = False,
+        min_event_count: int = 1,
+    ) -> SignalsResponse:
+        candidates, degraded_reason, resolved_run_id = self._resolve_signal_candidates(mode=mode, run_id=run_id)
+        source_count = len(candidates)
+        cache_key = self._signals_cache_key(
+            mode=mode,
+            run_id=resolved_run_id if mode == "trend_pool" else run_id,
+            window_days=window_days,
+            min_score=min_score,
+            require_sequence=require_sequence,
+            min_event_count=min_event_count,
+        )
+        now_ts = time.time()
+        cache_ttl_sec = 180
+        cached = self._signals_cache.get(cache_key)
+        if not refresh and cached and now_ts - cached[0] <= cache_ttl_sec:
+            cached_payload = cached[1]
+            return cached_payload.model_copy(
+                update={
+                    "cache_hit": True,
+                    "degraded": cached_payload.degraded or bool(degraded_reason),
+                    "degraded_reason": degraded_reason or cached_payload.degraded_reason,
+                    "source_count": source_count or cached_payload.source_count,
+                }
+            )
+
         items: list[SignalResult] = []
-        for index, item in enumerate(raw):
-            primary, secondary = self._resolve_signal_priority(item["signals"])
+        seen_symbols: set[str] = set()
+
+        for row in candidates:
+            if row.symbol in seen_symbols:
+                continue
+            snapshot = self._calc_wyckoff_snapshot(row, window_days=window_days)
+            events = snapshot["events"] if isinstance(snapshot["events"], list) else []
+            risk_events = snapshot["risk_events"] if isinstance(snapshot["risk_events"], list) else []
+            sequence_ok = bool(snapshot["sequence_ok"])
+            entry_quality_score = float(snapshot["entry_quality_score"])
+
+            if len(events) < min_event_count:
+                continue
+            if require_sequence and not sequence_ok:
+                continue
+            if entry_quality_score < min_score:
+                continue
+
+            signal_tags: list[str] = []
+            if entry_quality_score >= 82:
+                signal_tags.append("B")
+            elif entry_quality_score >= 68:
+                signal_tags.append("A")
+            else:
+                signal_tags.append("C")
+            if risk_events:
+                signal_tags.append("C")
+            if str(snapshot["phase"]).startswith("吸筹D") or str(snapshot["phase"]).startswith("吸筹E"):
+                signal_tags.append("B")
+
+            primary, secondary = self._resolve_signal_priority(signal_tags)
+            trigger_date = str(snapshot["trigger_date"])
+            try:
+                trigger_dt = datetime.strptime(trigger_date, "%Y-%m-%d")
+            except ValueError:
+                trigger_dt = datetime.now()
+                trigger_date = trigger_dt.strftime("%Y-%m-%d")
+            expire_date = (trigger_dt + timedelta(days=2)).strftime("%Y-%m-%d")
+            wyckoff_signal = str(snapshot["signal"])
+            phase = str(snapshot["phase"])
+            phase_hint = str(snapshot["phase_hint"])
+            reason = f"{phase_hint} 关键事件={wyckoff_signal or '无'}"
+            if risk_events:
+                reason = f"{reason} 风险={','.join(risk_events)}"
+
             items.append(
                 SignalResult(
-                    symbol=item["symbol"],
-                    name=item["name"],
+                    symbol=row.symbol,
+                    name=row.name,
                     primary_signal=primary,  # type: ignore[arg-type]
                     secondary_signals=secondary,  # type: ignore[arg-type]
-                    trigger_date=self._days_ago(index),
-                    expire_date=(datetime.now() + timedelta(days=2 - index)).strftime("%Y-%m-%d"),
-                    trigger_reason=item["trigger_reason"],
+                    trigger_date=trigger_date,
+                    expire_date=expire_date,
+                    trigger_reason=reason,
                     priority=3 if primary == "B" else 2 if primary == "A" else 1,
+                    wyckoff_phase=phase,
+                    wyckoff_signal=wyckoff_signal,
+                    structure_hhh=str(snapshot["structure_hhh"]),
+                    wy_event_count=len(events),
+                    wy_sequence_ok=sequence_ok,
+                    entry_quality_score=entry_quality_score,
+                    wy_events=[str(event) for event in events],
+                    wy_risk_events=[str(event) for event in risk_events],
+                    phase_hint=phase_hint,
+                    scan_mode=mode,
+                    event_strength_score=float(snapshot["event_strength_score"]),
+                    phase_score=float(snapshot["phase_score"]),
+                    structure_score=float(snapshot["structure_score"]),
+                    trend_score=float(snapshot["trend_score"]),
+                    volatility_score=float(snapshot["volatility_score"]),
                 )
             )
-        return items
+            seen_symbols.add(row.symbol)
+
+        items.sort(
+            key=lambda item: (
+                item.entry_quality_score,
+                item.priority,
+                item.wy_event_count,
+                item.trigger_date,
+            ),
+            reverse=True,
+        )
+
+        degraded = bool(degraded_reason) or any(row.degraded for row in candidates)
+        payload = SignalsResponse(
+            items=items,
+            mode=mode,
+            generated_at=self._now_datetime(),
+            cache_hit=False,
+            degraded=degraded,
+            degraded_reason=degraded_reason,
+            source_count=source_count,
+        )
+        self._signals_cache[cache_key] = (now_ts, payload)
+        return payload
 
     def create_order(self, payload: CreateOrderRequest) -> CreateOrderResponse:
         order_id = f"ord-{int(datetime.now().timestamp() * 1000)}-{random.randint(100, 999)}"
@@ -3167,6 +3617,7 @@ class InMemoryStore:
         self._config = payload
         self._candles_map = {}
         self._latest_rows = {}
+        self._signals_cache = {}
         return self._config
 
 

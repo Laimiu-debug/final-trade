@@ -12,7 +12,8 @@ import type {
   ScreenerParams,
   ScreenerRunDetail,
   ScreenerRunResponse,
-  SignalResult,
+  SignalsResponse,
+  SignalScanMode,
   SimTradeFill,
   SimTradeOrder,
   StockAnalysis,
@@ -25,11 +26,14 @@ export function runScreener(params: ScreenerParams) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
+    timeoutMs: 60_000,
   })
 }
 
 export function getScreenerRun(runId: string) {
-  return apiRequest<ScreenerRunDetail>(`/api/screener/runs/${runId}`)
+  return apiRequest<ScreenerRunDetail>(`/api/screener/runs/${runId}`, {
+    timeoutMs: 60_000,
+  })
 }
 
 export function getStockCandles(symbol: string) {
@@ -57,8 +61,31 @@ export function updateStockAnnotation(symbol: string, payload: StockAnnotation) 
   })
 }
 
-export function getSignals() {
-  return apiRequest<{ items: SignalResult[] }>('/api/signals')
+export function getSignals(params?: {
+  mode?: SignalScanMode
+  run_id?: string
+  refresh?: boolean
+  window_days?: number
+  min_score?: number
+  require_sequence?: boolean
+  min_event_count?: number
+}) {
+  const query = new URLSearchParams()
+  if (params?.mode) query.set('mode', params.mode)
+  if (params?.run_id) query.set('run_id', params.run_id)
+  if (typeof params?.refresh === 'boolean') query.set('refresh', String(params.refresh))
+  if (typeof params?.window_days === 'number') query.set('window_days', String(params.window_days))
+  if (typeof params?.min_score === 'number') query.set('min_score', String(params.min_score))
+  if (typeof params?.require_sequence === 'boolean') {
+    query.set('require_sequence', String(params.require_sequence))
+  }
+  if (typeof params?.min_event_count === 'number') {
+    query.set('min_event_count', String(params.min_event_count))
+  }
+  const suffix = query.toString()
+  return apiRequest<SignalsResponse>(`/api/signals${suffix ? `?${suffix}` : ''}`, {
+    timeoutMs: 45_000,
+  })
 }
 
 export function postSimOrder(payload: Omit<SimTradeOrder, 'order_id' | 'status'>) {

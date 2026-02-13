@@ -83,9 +83,29 @@ export const handlers = [
     })
   }),
 
-  http.get('/api/signals', async () => {
+  http.get('/api/signals', async ({ request }) => {
     await delay(120)
-    return HttpResponse.json({ items: getSignals() })
+    const url = new URL(request.url)
+    const mode = (url.searchParams.get('mode') ?? 'trend_pool') as 'trend_pool' | 'full_market'
+    const refresh = url.searchParams.get('refresh') === 'true'
+    const windowDays = Number(url.searchParams.get('window_days') ?? 60)
+    const minScore = Number(url.searchParams.get('min_score') ?? 60)
+    const requireSequence = url.searchParams.get('require_sequence') === 'true'
+    const minEventCount = Number(url.searchParams.get('min_event_count') ?? 1)
+    return HttpResponse.json(
+      getSignals({
+        mode,
+        window_days: Number.isFinite(windowDays) ? windowDays : 60,
+        min_score: Number.isFinite(minScore) ? minScore : 60,
+        require_sequence: requireSequence,
+        min_event_count: Number.isFinite(minEventCount) ? minEventCount : 1,
+      }),
+      {
+        headers: {
+          'x-mock-refresh': String(refresh),
+        },
+      },
+    )
   }),
 
   http.post('/api/sim/orders', async ({ request }) => {

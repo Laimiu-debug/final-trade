@@ -30,6 +30,7 @@ import { jsPDF } from 'jspdf'
 import autoTable from 'jspdf-autotable'
 import * as XLSX from 'xlsx'
 import { PageHeader } from '@/shared/components/PageHeader'
+import { ApiError } from '@/shared/api/client'
 import { getScreenerRun, runScreener } from '@/shared/api/endpoints'
 import { useUIStore } from '@/state/uiStore'
 import type {
@@ -720,6 +721,19 @@ function csvEscape(raw: string) {
   return raw
 }
 
+function formatApiErrorMessage(error: unknown) {
+  if (error instanceof ApiError) {
+    if (error.code === 'REQUEST_TIMEOUT') {
+      return '请求超时，请稍后重试或缩小筛选范围。'
+    }
+    if (error.code.startsWith('HTTP_5')) {
+      return '后端服务不可用，请检查后端进程。'
+    }
+    return error.message
+  }
+  return '请求失败，请稍后重试。'
+}
+
 function formatTimestampForFile() {
   const now = new Date()
   const y = now.getFullYear()
@@ -993,6 +1007,9 @@ export function ScreenerPage() {
         }),
       )
       message.success(`已加载输入池（当前板块 ${inputPool.length} / 全量 ${sourceInputPool.length}）`)
+    },
+    onError: (error) => {
+      message.error(formatApiErrorMessage(error))
     },
   })
 
@@ -1510,9 +1527,13 @@ export function ScreenerPage() {
     }
     const ok = await ensureFormValid()
     if (!ok) return null
-    const detail = await loadInputMutation.mutateAsync(getValues())
-    const sourceInputPool = detail.step_pools?.input ?? detail.results
-    return filterRowsByBoards(sourceInputPool, getValues('board_filters'))
+    try {
+      const detail = await loadInputMutation.mutateAsync(getValues())
+      const sourceInputPool = detail.step_pools?.input ?? detail.results
+      return filterRowsByBoards(sourceInputPool, getValues('board_filters'))
+    } catch {
+      return null
+    }
   }
 
   function invalidateFrom(step: 1 | 2 | 3 | 4) {
@@ -2197,7 +2218,11 @@ export function ScreenerPage() {
             <Button
               loading={loadInputMutation.isPending && runningStep === null}
               onClick={handleSubmit(async (values) => {
-                await loadInputMutation.mutateAsync(values)
+                try {
+                  await loadInputMutation.mutateAsync(values)
+                } catch {
+                  // error handled by mutation onError
+                }
               })}
             >
               加载输入池
@@ -2317,7 +2342,11 @@ export function ScreenerPage() {
                         onClick={(event) => {
                           event.stopPropagation()
                           void handleSubmit(async (values) => {
-                            await loadInputMutation.mutateAsync(values)
+                            try {
+                              await loadInputMutation.mutateAsync(values)
+                            } catch {
+                              // error handled by mutation onError
+                            }
                           })()
                         }}
                       >

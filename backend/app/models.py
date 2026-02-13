@@ -9,6 +9,7 @@ ScreenerMode = Literal["strict", "loose"]
 TrendClass = Literal["A", "A_B", "B", "Unknown"]
 ThemeStage = Literal["发酵中", "高潮", "退潮", "Unknown"]
 SignalType = Literal["A", "B", "C"]
+SignalScanMode = Literal["trend_pool", "full_market"]
 PriceSource = Literal["vwap", "approx"]
 Stage = Literal["Early", "Mid", "Late"]
 
@@ -169,10 +170,31 @@ class SignalResult(BaseModel):
     expire_date: str
     trigger_reason: str
     priority: int
+    wyckoff_phase: str = "阶段未明"
+    wyckoff_signal: str = ""
+    structure_hhh: str = "-"
+    wy_event_count: int = 0
+    wy_sequence_ok: bool = False
+    entry_quality_score: float = 0.0
+    wy_events: list[str] = Field(default_factory=list)
+    wy_risk_events: list[str] = Field(default_factory=list)
+    phase_hint: str = ""
+    scan_mode: SignalScanMode = "trend_pool"
+    event_strength_score: float = 0.0
+    phase_score: float = 0.0
+    structure_score: float = 0.0
+    trend_score: float = 0.0
+    volatility_score: float = 0.0
 
 
 class SignalsResponse(BaseModel):
     items: list[SignalResult]
+    mode: SignalScanMode = "trend_pool"
+    generated_at: str = ""
+    cache_hit: bool = False
+    degraded: bool = False
+    degraded_reason: str | None = None
+    source_count: int = 0
 
 
 class SimTradeOrder(BaseModel):

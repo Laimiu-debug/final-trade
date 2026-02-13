@@ -125,3 +125,59 @@ def test_delete_ai_record_endpoint() -> None:
     assert delete_resp.status_code == 200
     delete_body = delete_resp.json()
     assert delete_body["deleted"] is True
+
+
+def test_signals_endpoint_full_market_fields() -> None:
+    resp = client.get(
+        "/api/signals",
+        params={
+            "mode": "full_market",
+            "window_days": 60,
+            "min_score": 40,
+            "require_sequence": False,
+            "min_event_count": 0,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["mode"] == "full_market"
+    assert "generated_at" in body
+    assert "cache_hit" in body
+    assert "source_count" in body
+    assert isinstance(body["items"], list)
+    if body["items"]:
+        first = body["items"][0]
+        assert "wyckoff_phase" in first
+        assert "wy_events" in first
+        assert "entry_quality_score" in first
+        assert "scan_mode" in first
+
+
+def test_signals_endpoint_trend_pool_mode() -> None:
+    run_payload = {
+        "markets": ["sh", "sz"],
+        "mode": "strict",
+        "return_window_days": 40,
+        "top_n": 500,
+        "turnover_threshold": 0.05,
+        "amount_threshold": 500000000,
+        "amplitude_threshold": 0.03,
+    }
+    run_resp = client.post("/api/screener/run", json=run_payload)
+    assert run_resp.status_code == 200
+    run_id = run_resp.json()["run_id"]
+
+    resp = client.get(
+        "/api/signals",
+        params={
+            "mode": "trend_pool",
+            "run_id": run_id,
+            "min_score": 40,
+            "min_event_count": 0,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["mode"] == "trend_pool"
+    assert body["source_count"] >= 0
+    assert isinstance(body["items"], list)

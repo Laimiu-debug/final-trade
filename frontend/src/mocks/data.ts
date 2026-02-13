@@ -12,7 +12,9 @@ import type {
   ScreenerParams,
   ScreenerResult,
   ScreenerRunDetail,
+  SignalScanMode,
   SignalResult,
+  SignalsResponse,
   StockAnalysis,
   StockAnnotation,
   ThemeStage,
@@ -397,14 +399,28 @@ export function saveAnnotation(annotation: StockAnnotation) {
   return annotation
 }
 
-export function getSignals(): SignalResult[] {
+export function getSignals(params?: {
+  mode?: SignalScanMode
+  window_days?: number
+  min_score?: number
+  require_sequence?: boolean
+  min_event_count?: number
+}): SignalsResponse {
   const raw: Array<{ symbol: string; name: string; trigger_reason: string; signals: Array<'A' | 'B' | 'C'> }> = [
     { symbol: 'sz300750', name: '宁德时代', trigger_reason: '突破前高后缩量回踩确认', signals: ['A', 'B'] },
     { symbol: 'sh601899', name: '紫金矿业', trigger_reason: '板块分歧后转一致', signals: ['A', 'C'] },
     { symbol: 'sh600519', name: '贵州茅台', trigger_reason: 'MA10回踩确认', signals: ['A'] },
   ]
-  return raw.map((item, index) => {
+  const mode = params?.mode ?? 'trend_pool'
+  const minScore = params?.min_score ?? 60
+  const minEventCount = params?.min_event_count ?? 1
+  const requireSequence = params?.require_sequence ?? false
+
+  const items: SignalResult[] = raw.map((item, index) => {
     const resolved = resolveSignalPriority(item.signals)
+    const wyEvents = ['SC', 'AR', 'ST', 'SOS', 'LPS'].slice(0, 3 + (index % 3))
+    const wyRisk = index === 1 ? ['UTAD'] : []
+    const score = 70 + (2 - index) * 8 - wyRisk.length * 6
     return {
       symbol: item.symbol,
       name: item.name,
@@ -414,8 +430,39 @@ export function getSignals(): SignalResult[] {
       expire_date: dayjs().add(2 - index, 'day').format('YYYY-MM-DD'),
       trigger_reason: item.trigger_reason,
       priority: resolved.primary === 'B' ? 3 : resolved.primary === 'A' ? 2 : 1,
+      wyckoff_phase: index === 0 ? '吸筹D' : index === 1 ? '派发A' : '吸筹B',
+      wyckoff_signal: wyEvents[wyEvents.length - 1] ?? '',
+      structure_hhh: index === 0 ? 'HH|HL|HC' : index === 1 ? 'HH|-|-' : '-|HL|-',
+      wy_event_count: wyEvents.length,
+      wy_sequence_ok: index !== 2,
+      entry_quality_score: score,
+      wy_events: wyEvents,
+      wy_risk_events: wyRisk,
+      phase_hint: index === 1 ? '出现派发迹象，建议降低仓位并谨慎追高。' : '结构偏强，可继续观察回踩承接。',
+      scan_mode: mode,
+      event_strength_score: 65 + index * 4,
+      phase_score: 60 + index * 5,
+      structure_score: 55 + index * 8,
+      trend_score: 62 + index * 6,
+      volatility_score: 58 + index * 4,
     }
   })
+
+  const filtered = items.filter((row) => {
+    if ((row.entry_quality_score ?? 0) < minScore) return false
+    if ((row.wy_event_count ?? 0) < minEventCount) return false
+    if (requireSequence && !row.wy_sequence_ok) return false
+    return true
+  })
+
+  return {
+    items: filtered,
+    mode,
+    generated_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    cache_hit: false,
+    degraded: false,
+    source_count: raw.length,
+  }
 }
 
 export function createOrder(payload: {

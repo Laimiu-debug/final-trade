@@ -1,4 +1,4 @@
-﻿import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import dayjs from 'dayjs'
 import { useMutation } from '@tanstack/react-query'
 import {
@@ -15,13 +15,21 @@ import {
   Tag,
   Typography,
 } from 'antd'
+import { useSearchParams } from 'react-router-dom'
 import { postSimOrder } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
 import type { SimTradeFill, SimTradeOrder } from '@/types/contracts'
 
+const defaultTradeFormValues: { side: 'buy' | 'sell'; quantity: number; symbol: string } = {
+  side: 'buy',
+  quantity: 1000,
+  symbol: 'sz300750',
+}
+
 export function TradePage() {
   const { message } = AntdApp.useApp()
   const [form] = Form.useForm()
+  const [searchParams] = useSearchParams()
   const [latestOrder, setLatestOrder] = useState<SimTradeOrder | null>(null)
   const [latestFill, setLatestFill] = useState<SimTradeFill | null>(null)
 
@@ -34,18 +42,41 @@ export function TradePage() {
     },
   })
 
+  useEffect(() => {
+    const symbol = searchParams.get('symbol')
+    const side = searchParams.get('side')
+    const quantity = searchParams.get('quantity')
+
+    const patch: Partial<typeof defaultTradeFormValues> = {}
+    if (symbol && symbol.trim().length >= 4) {
+      patch.symbol = symbol.trim()
+    }
+    if (side === 'buy' || side === 'sell') {
+      patch.side = side
+    }
+    if (quantity) {
+      const parsed = Number(quantity)
+      if (Number.isFinite(parsed) && parsed >= 100) {
+        patch.quantity = Math.round(parsed / 100) * 100
+      }
+    }
+    if (Object.keys(patch).length > 0) {
+      form.setFieldsValue(patch)
+    }
+  }, [form, searchParams])
+
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
-      <PageHeader title="模拟交易" subtitle="当前为原型阶段，订单通过MSW模拟成交，不执行真实撮合。" />
+      <PageHeader title="模拟交易" subtitle="当前为原型阶段，订单通过 MSW 或后端模拟成交。" />
       <Card className="glass-card" variant="borderless">
         <Form
           layout="vertical"
           form={form}
-          initialValues={{ side: 'buy', quantity: 1000, symbol: 'sz300750' }}
+          initialValues={defaultTradeFormValues}
           onFinish={(values) =>
             orderMutation.mutate({
               ...values,
-              signal_date: dayjs().format('YYYY-MM-DD'),
+              signal_date: searchParams.get('signal_date') || dayjs().format('YYYY-MM-DD'),
               submit_date: dayjs().format('YYYY-MM-DD'),
             })
           }

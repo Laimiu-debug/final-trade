@@ -3,6 +3,7 @@ export type ScreenerMode = 'strict' | 'loose'
 export type TrendClass = 'A' | 'A_B' | 'B' | 'Unknown'
 export type ThemeStage = '发酵中' | '高潮' | '退潮' | 'Unknown'
 export type SignalType = 'A' | 'B' | 'C'
+export type SignalScanMode = 'trend_pool' | 'full_market'
 export type PriceSource = 'vwap' | 'approx'
 
 export interface ApiErrorPayload {
@@ -161,6 +162,31 @@ export interface SignalResult {
   expire_date: string
   trigger_reason: string
   priority: number
+  wyckoff_phase?: string
+  wyckoff_signal?: string
+  structure_hhh?: string
+  wy_event_count?: number
+  wy_sequence_ok?: boolean
+  entry_quality_score?: number
+  wy_events?: string[]
+  wy_risk_events?: string[]
+  phase_hint?: string
+  scan_mode?: SignalScanMode
+  event_strength_score?: number
+  phase_score?: number
+  structure_score?: number
+  trend_score?: number
+  volatility_score?: number
+}
+
+export interface SignalsResponse {
+  items: SignalResult[]
+  mode: SignalScanMode
+  generated_at: string
+  cache_hit: boolean
+  degraded: boolean
+  degraded_reason?: string
+  source_count: number
 }
 
 export interface SimTradeOrder {

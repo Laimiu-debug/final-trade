@@ -78,7 +78,7 @@ export function ChartPage() {
 
   const signalsQuery = useQuery({
     queryKey: ['signals'],
-    queryFn: getSignals,
+    queryFn: () => getSignals(),
   })
 
   const aiRecordsQuery = useQuery({

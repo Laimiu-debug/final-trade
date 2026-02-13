@@ -19,6 +19,7 @@ from .models import (
     IntradayPayload,
     PortfolioSnapshot,
     ReviewResponse,
+    SignalScanMode,
     ScreenerParams,
     ScreenerRunDetail,
     ScreenerRunResponse,
@@ -112,8 +113,24 @@ def put_stock_annotation(symbol: str, payload: StockAnnotation) -> AnnotationUpd
 
 
 @app.get("/api/signals", response_model=SignalsResponse)
-def get_signals() -> SignalsResponse:
-    return SignalsResponse(items=store.get_signals())
+def get_signals(
+    mode: SignalScanMode = Query(default="trend_pool"),
+    run_id: str = Query(default="", min_length=0, max_length=64),
+    refresh: bool = Query(default=False),
+    window_days: int = Query(default=60, ge=20, le=240),
+    min_score: float = Query(default=60, ge=0, le=100),
+    require_sequence: bool = Query(default=False),
+    min_event_count: int = Query(default=1, ge=0, le=12),
+) -> SignalsResponse:
+    return store.get_signals(
+        mode=mode,
+        run_id=run_id.strip() or None,
+        refresh=refresh,
+        window_days=window_days,
+        min_score=min_score,
+        require_sequence=require_sequence,
+        min_event_count=min_event_count,
+    )
 
 
 @app.post("/api/sim/orders", response_model=CreateOrderResponse)
