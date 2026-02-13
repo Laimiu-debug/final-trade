@@ -4,6 +4,9 @@ export type TrendClass = 'A' | 'A_B' | 'B' | 'Unknown'
 export type ThemeStage = '发酵中' | '高潮' | '退潮' | 'Unknown'
 export type SignalType = 'A' | 'B' | 'C'
 export type SignalScanMode = 'trend_pool' | 'full_market'
+export type MarketDataSource = 'tdx_only' | 'tdx_then_akshare' | 'akshare_only'
+export type MarketSyncProvider = 'baostock'
+export type MarketSyncMode = 'incremental' | 'full'
 export type PriceSource = 'vwap' | 'approx'
 
 export interface ApiErrorPayload {
@@ -396,6 +399,8 @@ export interface AIProviderTestResponse {
 
 export interface AppConfig {
   tdx_data_path: string
+  market_data_source: MarketDataSource
+  akshare_cache_dir: string
   markets: Market[]
   return_window_days: number
   top_n: number
@@ -410,4 +415,46 @@ export interface AppConfig {
   api_key_path: string
   ai_providers: AIProviderConfig[]
   ai_sources: AISourceConfig[]
+}
+
+export interface SystemStorageStatus {
+  app_state_path: string
+  app_state_exists: boolean
+  sim_state_path: string
+  sim_state_exists: boolean
+  akshare_cache_dir: string
+  akshare_cache_dir_resolved: string
+  akshare_cache_dir_exists: boolean
+  akshare_cache_file_count: number
+  akshare_cache_candidates: string[]
+}
+
+export interface MarketDataSyncRequest {
+  provider: MarketSyncProvider
+  mode: MarketSyncMode
+  symbols: string
+  all_market: boolean
+  limit: number
+  start_date: string
+  end_date: string
+  initial_days: number
+  sleep_sec: number
+  out_dir: string
+}
+
+export interface MarketDataSyncResponse {
+  ok: boolean
+  provider: MarketSyncProvider
+  mode: MarketSyncMode
+  message: string
+  out_dir: string
+  symbol_count: number
+  ok_count: number
+  fail_count: number
+  skipped_count: number
+  new_rows_total: number
+  started_at: string
+  finished_at: string
+  duration_sec: number
+  errors: string[]
 }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -9,8 +10,14 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+TEST_STATE_ROOT = ROOT / ".test-state"
+TEST_STATE_ROOT.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("TDX_TREND_APP_STATE_PATH", str(TEST_STATE_ROOT / "app_state.json"))
+os.environ.setdefault("TDX_TREND_SIM_STATE_PATH", str(TEST_STATE_ROOT / "sim_state.json"))
 
 from app.main import app
+from app.store import store
+from app.tdx_loader import load_candles_for_symbol
 
 
 client = TestClient(app)
@@ -54,6 +61,59 @@ def _post_sell(symbol: str, submit_date: str, quantity: int = 100) -> dict[str, 
     resp = client.post("/api/sim/orders", json=payload)
     assert resp.status_code == 200
     return resp.json()["order"]
+
+
+def test_load_candles_fallback_to_akshare_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cache_file = tmp_path / "sz300750.csv"
+    cache_file.write_text(
+        "\n".join(
+            [
+                "date,open,high,low,close,volume,amount,symbol",
+                "2026-02-10,100,101,99,100.5,123400,123450000,sz300750",
+                "2026-02-11,101,102,100,101.5,133400,135450000,sz300750",
+                "2026-02-12,102,103,101,102.5,143400,147450000,sz300750",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AKSHARE_CACHE_DIR", str(tmp_path))
+    candles = load_candles_for_symbol(r"Z:\not-exists\vipdoc", "sz300750", window=2)
+    assert candles is not None
+    assert len(candles) == 2
+    assert candles[-1].time == "2026-02-12"
+    assert candles[-1].price_source == "approx"
+
+
+def test_load_candles_with_configured_data_source(tmp_path: Path) -> None:
+    cache_file = tmp_path / "sz300750.csv"
+    cache_file.write_text(
+        "\n".join(
+            [
+                "date,open,high,low,close,volume,amount,symbol",
+                "2026-02-12,102,103,101,102.5,143400,147450000,sz300750",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    candles = load_candles_for_symbol(
+        r"Z:\not-exists\vipdoc",
+        "sz300750",
+        window=1,
+        market_data_source="akshare_only",
+        akshare_cache_dir=str(tmp_path),
+    )
+    assert candles is not None
+    assert len(candles) == 1
+    assert candles[-1].time == "2026-02-12"
+
+    candles_tdx_only = load_candles_for_symbol(
+        r"Z:\not-exists\vipdoc",
+        "sz300750",
+        window=1,
+        market_data_source="tdx_only",
+        akshare_cache_dir=str(tmp_path),
+    )
+    assert candles_tdx_only is None
 
 
 def test_run_and_get_screener() -> None:
@@ -108,6 +168,89 @@ def test_config_update() -> None:
     update_resp = client.put("/api/config", json=config)
     assert update_resp.status_code == 200
     assert update_resp.json()["ai_provider"] == "deepseek"
+
+
+def test_config_akshare_switch_affects_candles_endpoint(tmp_path: Path) -> None:
+    cache_file = tmp_path / "sz300750.csv"
+    cache_file.write_text(
+        "\n".join(
+            [
+                "date,open,high,low,close,volume,amount,symbol",
+                "2026-02-12,102,103,101,102.5,143400,147450000,sz300750",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    original_config = client.get("/api/config").json()
+    changed_config = dict(original_config)
+    changed_config["tdx_data_path"] = r"Z:\not-exists\vipdoc"
+    changed_config["market_data_source"] = "akshare_only"
+    changed_config["akshare_cache_dir"] = str(tmp_path)
+
+    try:
+        update_resp = client.put("/api/config", json=changed_config)
+        assert update_resp.status_code == 200
+        candles_resp = client.get("/api/stocks/sz300750/candles")
+        assert candles_resp.status_code == 200
+        candles = candles_resp.json()["candles"]
+        assert len(candles) == 1
+        assert candles[0]["time"] == "2026-02-12"
+        assert candles[0]["price_source"] == "approx"
+    finally:
+        restore_resp = client.put("/api/config", json=original_config)
+        assert restore_resp.status_code == 200
+
+
+def test_system_storage_endpoint() -> None:
+    resp = client.get("/api/system/storage")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "app_state_path" in body
+    assert "sim_state_path" in body
+    assert "akshare_cache_candidates" in body
+    assert isinstance(body["akshare_cache_candidates"], list)
+
+
+def test_market_data_sync_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_sync_market_data(_payload):
+        return {
+            "ok": True,
+            "provider": "baostock",
+            "mode": "incremental",
+            "message": "mock sync done",
+            "out_dir": r"C:\\tmp\\market-data",
+            "symbol_count": 10,
+            "ok_count": 10,
+            "fail_count": 0,
+            "skipped_count": 6,
+            "new_rows_total": 8,
+            "started_at": "2026-02-13 10:00:00",
+            "finished_at": "2026-02-13 10:00:02",
+            "duration_sec": 2.0,
+            "errors": [],
+        }
+
+    monkeypatch.setattr(store, "sync_market_data", fake_sync_market_data)
+    resp = client.post(
+        "/api/system/sync-market-data",
+        json={
+            "provider": "baostock",
+            "mode": "incremental",
+            "symbols": "",
+            "all_market": True,
+            "limit": 100,
+            "start_date": "",
+            "end_date": "",
+            "initial_days": 180,
+            "sleep_sec": 0.0,
+            "out_dir": "",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["provider"] == "baostock"
+    assert body["new_rows_total"] == 8
 
 
 def test_intraday_endpoint_returns_points() -> None:

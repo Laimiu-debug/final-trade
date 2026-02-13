@@ -6,6 +6,8 @@ import type {
   AppConfig,
   CandlePoint,
   IntradayPoint,
+  MarketDataSyncRequest,
+  MarketDataSyncResponse,
   PortfolioPosition,
   PortfolioSnapshot,
   ReviewResponse,
@@ -25,6 +27,7 @@ import type {
   SignalsResponse,
   StockAnalysis,
   StockAnnotation,
+  SystemStorageStatus,
   ThemeStage,
   TradeRecord,
   TrendClass,
@@ -81,6 +84,8 @@ let aiRecordsStore: AIAnalysisRecord[] = [
 
 let configStore: AppConfig = {
   tdx_data_path: 'D:\\new_tdx\\vipdoc',
+  market_data_source: 'tdx_then_akshare',
+  akshare_cache_dir: '%USERPROFILE%\\.tdx-trend\\akshare\\daily',
   markets: ['sh', 'sz'],
   return_window_days: 40,
   top_n: 500,
@@ -1026,4 +1031,53 @@ export function getConfigStore() {
 export function setConfigStore(payload: AppConfig) {
   configStore = payload
   return configStore
+}
+
+export function getSystemStorageStore(): SystemStorageStatus {
+  const configured = configStore.akshare_cache_dir || ''
+  const normalized = configured.replace(/%USERPROFILE%/gi, 'C:\\Users\\demo')
+  const resolved = normalized || 'C:\\Users\\demo\\.tdx-trend\\akshare\\daily'
+  return {
+    app_state_path: 'C:\\Users\\demo\\.tdx-trend\\app_state.json',
+    app_state_exists: true,
+    sim_state_path: 'C:\\Users\\demo\\.tdx-trend\\sim_state.json',
+    sim_state_exists: true,
+    akshare_cache_dir: configured,
+    akshare_cache_dir_resolved: resolved,
+    akshare_cache_dir_exists: true,
+    akshare_cache_file_count: 12,
+    akshare_cache_candidates: [
+      resolved,
+      'C:\\Users\\demo\\.tdx-trend\\akshare\\daily',
+      'D:\\data\\akshare\\daily',
+    ],
+  }
+}
+
+export function syncMarketDataStore(payload: MarketDataSyncRequest): MarketDataSyncResponse {
+  const provider = payload.provider || 'baostock'
+  const mode = payload.mode || 'incremental'
+  const symbolCount = payload.all_market ? Math.min(Math.max(payload.limit || 300, 1), 3000) : 8
+  const okCount = Math.max(1, Math.floor(symbolCount * 0.98))
+  const failCount = Math.max(0, symbolCount - okCount)
+  const skippedCount = mode === 'incremental' ? Math.floor(symbolCount * 0.7) : 0
+  const newRowsTotal = mode === 'incremental' ? Math.max(1, Math.floor(symbolCount * 1.2)) : symbolCount * 180
+  const now = dayjs().format('YYYY-MM-DD HH:mm:ss')
+  const outDir = payload.out_dir?.trim() || configStore.akshare_cache_dir
+  return {
+    ok: failCount === 0,
+    provider,
+    mode,
+    message: `Mock ${provider} 同步完成：成功 ${okCount}，失败 ${failCount}，跳过 ${skippedCount}，新增 ${newRowsTotal} 行`,
+    out_dir: outDir,
+    symbol_count: symbolCount,
+    ok_count: okCount,
+    fail_count: failCount,
+    skipped_count: skippedCount,
+    new_rows_total: newRowsTotal,
+    started_at: now,
+    finished_at: now,
+    duration_sec: 0.8,
+    errors: failCount > 0 ? ['mock: 网络波动导致少量失败'] : [],
+  }
 }

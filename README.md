@@ -53,6 +53,20 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+### 可选：AkShare 日线同步（无行情 API 时）
+
+```bash
+cd backend
+pip install -r requirements-akshare.txt
+python scripts/sync_akshare_daily.py --symbols 600519,300750,601899
+```
+
+缓存目录：
+
+`~/.tdx-trend/akshare/daily/*.csv`
+
+后端在 TDX `.day` 文件不可用时，会自动回退读取该缓存。
+
 ### 前端
 
 ```bash
@@ -101,3 +115,32 @@ npm run build
 ## PDF 中文字体
 
 已使用 `frontend/public/fonts/LXGWWenKai-Regular.ttf`，避免中文导出乱码回归。
+
+## Persistence Notes
+
+- System config / AI records / annotations are persisted at `~/.tdx-trend/app_state.json`.
+- Sim trading / portfolio / review state is persisted at `~/.tdx-trend/sim_state.json`.
+- Runtime endpoint: `GET /api/system/storage` can be used to inspect local state paths and cache status.
+
+## AkShare Incremental Sync
+
+Default behavior is incremental per symbol (only fetches dates after the latest local row).
+
+```bash
+cd backend
+python scripts/sync_akshare_daily.py --all-market --limit 300
+```
+
+Force full-history refresh:
+
+```bash
+python scripts/sync_akshare_daily.py --symbols 600519 --full-history --start-date 2024-01-01
+```
+
+## Baostock Incremental Sync (Home page button uses this)
+
+```bash
+cd backend
+pip install -r requirements-baostock.txt
+python scripts/sync_baostock_daily.py --all-market --limit 300 --mode incremental
+```

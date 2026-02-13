@@ -24,14 +24,14 @@ import type { MenuProps } from 'antd'
 import { Controller, useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { DownOutlined, SettingOutlined, UpOutlined } from '@ant-design/icons'
+import { CloudDownloadOutlined, DownOutlined, SettingOutlined, UpOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import { jsPDF } from 'jspdf'
 import autoTable from 'jspdf-autotable'
 import * as XLSX from 'xlsx'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { ApiError } from '@/shared/api/client'
-import { getScreenerRun, runScreener } from '@/shared/api/endpoints'
+import { getScreenerRun, runScreener, syncMarketData } from '@/shared/api/endpoints'
 import { useUIStore } from '@/state/uiStore'
 import type {
   ScreenerParams,
@@ -1007,6 +1007,34 @@ export function ScreenerPage() {
         }),
       )
       message.success(`已加载输入池（当前板块 ${inputPool.length} / 全量 ${sourceInputPool.length}）`)
+    },
+    onError: (error) => {
+      message.error(formatApiErrorMessage(error))
+    },
+  })
+
+  const syncMarketDataMutation = useMutation({
+    mutationFn: () =>
+      syncMarketData({
+        provider: 'baostock',
+        mode: 'incremental',
+        symbols: '',
+        all_market: true,
+        limit: 300,
+        start_date: '',
+        end_date: '',
+        initial_days: 420,
+        sleep_sec: 0.01,
+        out_dir: '',
+      }),
+    onSuccess: (result) => {
+      if (result.ok) {
+        message.success(
+          `Baostock 已更新：成功 ${result.ok_count}，跳过 ${result.skipped_count}，新增 ${result.new_rows_total} 行`,
+        )
+      } else {
+        message.warning(result.message || 'Baostock 同步完成，但存在失败项')
+      }
     },
     onError: (error) => {
       message.error(formatApiErrorMessage(error))
@@ -2215,6 +2243,15 @@ export function ScreenerPage() {
           </Row>
 
           <Space>
+            <Button
+              icon={<CloudDownloadOutlined />}
+              loading={syncMarketDataMutation.isPending}
+              onClick={() => {
+                void syncMarketDataMutation.mutateAsync()
+              }}
+            >
+              一键增量更新行情（Baostock）
+            </Button>
             <Button
               loading={loadInputMutation.isPending && runningStep === null}
               onClick={handleSubmit(async (values) => {

@@ -17,14 +17,22 @@ import {
   getSimConfigStore,
   getScreenerRun,
   getSignals,
+  getSystemStorageStore,
   resetAccount,
   saveAnnotation,
   setSimConfigStore,
+  syncMarketDataStore,
   settleOrders,
   setConfigStore,
   testAIProvider,
 } from '@/mocks/data'
-import type { AIProviderTestRequest, AppConfig, ScreenerParams, StockAnnotation } from '@/types/contracts'
+import type {
+  AIProviderTestRequest,
+  AppConfig,
+  MarketDataSyncRequest,
+  ScreenerParams,
+  StockAnnotation,
+} from '@/types/contracts'
 
 export const handlers = [
   http.post('/api/screener/run', async ({ request }) => {
@@ -249,5 +257,16 @@ export const handlers = [
     const payload = (await request.json()) as AppConfig
     await delay(120)
     return HttpResponse.json(setConfigStore(payload))
+  }),
+
+  http.get('/api/system/storage', async () => {
+    await delay(100)
+    return HttpResponse.json(getSystemStorageStore())
+  }),
+
+  http.post('/api/system/sync-market-data', async ({ request }) => {
+    const payload = (await request.json()) as MarketDataSyncRequest
+    await delay(400)
+    return HttpResponse.json(syncMarketDataStore(payload))
   }),
 ]

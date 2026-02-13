@@ -9,6 +9,8 @@ import time
 import html
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
+from pathlib import Path
+from threading import RLock
 from typing import Literal
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -27,6 +29,8 @@ from .models import (
     CreateOrderResponse,
     IntradayPayload,
     IntradayPoint,
+    MarketDataSyncRequest,
+    MarketDataSyncResponse,
     PortfolioPosition,
     PortfolioSnapshot,
     ReviewResponse,
@@ -40,6 +44,7 @@ from .models import (
     SignalScanMode,
     SignalResult,
     SignalsResponse,
+    SystemStorageStatus,
     SimFillsResponse,
     SimOrdersResponse,
     SimResetResponse,
@@ -55,6 +60,7 @@ from .models import (
     TradeRecord,
     TrendClass,
 )
+from .market_data_sync import sync_baostock_daily
 from .sim_engine import SimAccountEngine
 from .tdx_loader import (
     load_candles_for_symbol,
@@ -81,7 +87,10 @@ WYCKOFF_EVENT_ORDER: tuple[str, ...] = (*WYCKOFF_ACC_EVENTS, *WYCKOFF_RISK_EVENT
 
 
 class InMemoryStore:
-    def __init__(self) -> None:
+    _APP_STATE_SCHEMA_VERSION = 1
+
+    def __init__(self, app_state_path: str | None = None, sim_state_path: str | None = None) -> None:
+        self._lock = RLock()
         self._candles_map: dict[str, list[CandlePoint]] = {}
         self._run_store: dict[str, ScreenerRunDetail] = {}
         self._annotation_store: dict[str, StockAnnotation] = {}
@@ -91,17 +100,102 @@ class InMemoryStore:
         self._web_evidence_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
         self._quote_profile_cache: dict[str, tuple[float, dict[str, str]]] = {}
         self._signals_cache: dict[str, tuple[float, SignalsResponse]] = {}
+        self._app_state_path = self._resolve_app_state_path(app_state_path)
+        self._load_or_init_app_state()
         self._sim_engine = SimAccountEngine(
             get_candles=self._ensure_candles,
             resolve_symbol_name=self._resolve_symbol_name,
             now_date=self._now_date,
             now_datetime=self._now_datetime,
+            state_path=sim_state_path or os.getenv("TDX_TREND_SIM_STATE_PATH", "").strip() or None,
         )
+
+    @staticmethod
+    def _resolve_user_path(value: str) -> Path:
+        expanded = os.path.expandvars(os.path.expanduser(str(value).strip()))
+        return Path(expanded)
+
+    @classmethod
+    def _resolve_app_state_path(cls, app_state_path: str | None = None) -> Path:
+        if app_state_path and str(app_state_path).strip():
+            return cls._resolve_user_path(app_state_path)
+        env_value = os.getenv("TDX_TREND_APP_STATE_PATH", "").strip()
+        if env_value:
+            return cls._resolve_user_path(env_value)
+        return Path.home() / ".tdx-trend" / "app_state.json"
+
+    def _build_app_state_payload(self) -> dict[str, object]:
+        return {
+            "schema_version": self._APP_STATE_SCHEMA_VERSION,
+            "config": self._config.model_dump(),
+            "ai_records": [item.model_dump() for item in self._ai_record_store],
+            "annotations": {symbol: item.model_dump() for symbol, item in self._annotation_store.items()},
+            "audit": {
+                "updated_at": self._now_datetime(),
+            },
+        }
+
+    def _write_app_state_payload(self, payload: dict[str, object]) -> None:
+        self._app_state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self._app_state_path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self._app_state_path)
+
+    def _persist_app_state(self) -> None:
+        try:
+            self._write_app_state_payload(self._build_app_state_payload())
+        except Exception:
+            # Keep runtime available even if local persistence failed.
+            pass
+
+    def _load_or_init_app_state(self) -> None:
+        if not self._app_state_path.exists():
+            self._persist_app_state()
+            return
+        try:
+            raw = json.loads(self._app_state_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("invalid app state payload")
+            default_config = self._default_config()
+            config_raw = raw.get("config")
+            if isinstance(config_raw, dict):
+                merged = {**default_config.model_dump(), **config_raw}
+                self._config = AppConfig(**merged)
+            annotations_raw = raw.get("annotations")
+            if isinstance(annotations_raw, dict):
+                restored_annotations: dict[str, StockAnnotation] = {}
+                for symbol, item in annotations_raw.items():
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        restored_annotations[str(symbol)] = StockAnnotation(**item)
+                    except Exception:
+                        continue
+                self._annotation_store = restored_annotations
+            ai_records_raw = raw.get("ai_records")
+            if isinstance(ai_records_raw, list):
+                restored_records: list[AIAnalysisRecord] = []
+                for item in ai_records_raw:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        restored_records.append(AIAnalysisRecord(**item))
+                    except Exception:
+                        continue
+                self._ai_record_store = restored_records
+            self._persist_app_state()
+        except Exception:
+            self._persist_app_state()
 
     @staticmethod
     def _default_config() -> AppConfig:
         return AppConfig(
             tdx_data_path=r"D:\new_tdx\vipdoc",
+            market_data_source="tdx_then_akshare",
+            akshare_cache_dir=str(Path.home() / ".tdx-trend" / "akshare" / "daily"),
             markets=["sh", "sz"],
             return_window_days=40,
             top_n=500,
@@ -2535,7 +2629,12 @@ class InMemoryStore:
 
     def _ensure_candles(self, symbol: str) -> list[CandlePoint]:
         if symbol not in self._candles_map:
-            real_candles = load_candles_for_symbol(self._config.tdx_data_path, symbol)
+            real_candles = load_candles_for_symbol(
+                self._config.tdx_data_path,
+                symbol,
+                market_data_source=self._config.market_data_source,
+                akshare_cache_dir=self._config.akshare_cache_dir,
+            )
             if real_candles:
                 self._candles_map[symbol] = real_candles
             else:
@@ -2887,6 +2986,7 @@ class InMemoryStore:
 
     def save_annotation(self, annotation: StockAnnotation) -> StockAnnotation:
         self._annotation_store[annotation.symbol] = annotation
+        self._persist_app_state()
         return annotation
 
     @staticmethod
@@ -3595,6 +3695,7 @@ class InMemoryStore:
         self._ai_record_store.insert(0, record)
         if len(self._ai_record_store) > 200:
             self._ai_record_store = self._ai_record_store[:200]
+        self._persist_app_state()
         return record
 
     def get_ai_records(self) -> list[AIAnalysisRecord]:
@@ -3609,6 +3710,7 @@ class InMemoryStore:
             if provider is not None and item.provider != provider:
                 continue
             del self._ai_record_store[index]
+            self._persist_app_state()
             return True
         return False
 
@@ -3620,7 +3722,109 @@ class InMemoryStore:
         self._candles_map = {}
         self._latest_rows = {}
         self._signals_cache = {}
+        self._persist_app_state()
         return self._config
+
+    def get_system_storage_status(self) -> SystemStorageStatus:
+        configured = (self._config.akshare_cache_dir or "").strip()
+        if configured:
+            resolved_cache_dir = self._resolve_user_path(configured)
+        else:
+            resolved_cache_dir = Path.home() / ".tdx-trend" / "akshare" / "daily"
+        cache_exists = resolved_cache_dir.exists() and resolved_cache_dir.is_dir()
+        cache_file_count = len(list(resolved_cache_dir.glob("*.csv"))) if cache_exists else 0
+
+        candidates: set[str] = set()
+        candidates.add(str(resolved_cache_dir))
+        default_cache_dir = Path.home() / ".tdx-trend" / "akshare" / "daily"
+        candidates.add(str(default_cache_dir))
+        env_cache_dir = os.getenv("AKSHARE_CACHE_DIR", "").strip()
+        if env_cache_dir:
+            candidates.add(str(self._resolve_user_path(env_cache_dir)))
+        home_cache_root = Path.home() / ".tdx-trend" / "akshare"
+        if home_cache_root.exists() and home_cache_root.is_dir():
+            for path in home_cache_root.glob("**"):
+                if not path.is_dir():
+                    continue
+                if any(path.glob("*.csv")):
+                    candidates.add(str(path))
+        ordered_candidates = sorted(path for path in candidates if path.strip())
+
+        sim_state_env = os.getenv("TDX_TREND_SIM_STATE_PATH", "").strip()
+        sim_state_path = self._resolve_user_path(sim_state_env) if sim_state_env else Path.home() / ".tdx-trend" / "sim_state.json"
+        return SystemStorageStatus(
+            app_state_path=str(self._app_state_path),
+            app_state_exists=self._app_state_path.exists(),
+            sim_state_path=str(sim_state_path),
+            sim_state_exists=sim_state_path.exists(),
+            akshare_cache_dir=configured,
+            akshare_cache_dir_resolved=str(resolved_cache_dir),
+            akshare_cache_dir_exists=cache_exists,
+            akshare_cache_file_count=cache_file_count,
+            akshare_cache_candidates=ordered_candidates,
+        )
+
+    def sync_market_data(self, payload: MarketDataSyncRequest) -> MarketDataSyncResponse:
+        out_dir = (payload.out_dir or "").strip() or (self._config.akshare_cache_dir or "").strip()
+        if not out_dir:
+            out_dir = str(Path.home() / ".tdx-trend" / "akshare" / "daily")
+
+        started = self._now_datetime()
+        try:
+            summary = sync_baostock_daily(
+                symbols_text=payload.symbols,
+                all_market=payload.all_market,
+                limit=payload.limit,
+                mode=payload.mode,
+                start_date=payload.start_date,
+                end_date=payload.end_date,
+                initial_days=payload.initial_days,
+                sleep_sec=payload.sleep_sec,
+                out_dir=out_dir,
+            )
+            if int(summary.get("ok_count", 0)) > 0:
+                # Ensure subsequent APIs reload latest local files after sync.
+                self._candles_map = {}
+                self._latest_rows = {}
+                self._signals_cache = {}
+            errors = [str(item) for item in summary.get("errors", []) if str(item).strip()]
+            failed = int(summary.get("fail_count", 0))
+            ok = failed == 0
+            message = (
+                f"Baostock 同步完成: 成功 {summary.get('ok_count', 0)} / "
+                f"失败 {failed} / 跳过 {summary.get('skipped_count', 0)} / "
+                f"新增 {summary.get('new_rows_total', 0)} 行"
+            )
+            if not ok and errors:
+                message = f"{message}（首个错误: {errors[0]}）"
+            return MarketDataSyncResponse(
+                ok=ok,
+                provider="baostock",
+                mode="full" if payload.mode == "full" else "incremental",
+                message=message,
+                out_dir=str(summary.get("out_dir", out_dir)),
+                symbol_count=int(summary.get("symbol_count", 0)),
+                ok_count=int(summary.get("ok_count", 0)),
+                fail_count=failed,
+                skipped_count=int(summary.get("skipped_count", 0)),
+                new_rows_total=int(summary.get("new_rows_total", 0)),
+                started_at=str(summary.get("started_at", started)),
+                finished_at=str(summary.get("finished_at", self._now_datetime())),
+                duration_sec=float(summary.get("duration_sec", 0.0)),
+                errors=errors[:50],
+            )
+        except Exception as exc:
+            return MarketDataSyncResponse(
+                ok=False,
+                provider="baostock",
+                mode="full" if payload.mode == "full" else "incremental",
+                message=f"Baostock 同步失败: {type(exc).__name__}: {exc}",
+                out_dir=out_dir,
+                started_at=started,
+                finished_at=self._now_datetime(),
+                duration_sec=0.0,
+                errors=[str(exc)],
+            )
 
 
 store = InMemoryStore()

@@ -1,6 +1,7 @@
 ﻿import { useEffect, useState } from 'react'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  Alert,
   App as AntdApp,
   Button,
   Card,
@@ -20,7 +21,7 @@ import { DeleteOutlined, PlusOutlined } from '@ant-design/icons'
 import { Controller, useFieldArray, useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { getConfig, testAIProvider, updateConfig } from '@/shared/api/endpoints'
+import { getConfig, getSystemStorage, testAIProvider, updateConfig } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
 import type { AppConfig } from '@/types/contracts'
 
@@ -55,6 +56,8 @@ const sourceSchema = z.object({
 
 const schema = z.object({
   tdx_data_path: z.string().min(3),
+  market_data_source: z.enum(['tdx_only', 'tdx_then_akshare', 'akshare_only']),
+  akshare_cache_dir: z.string(),
   markets: z.array(z.enum(['sh', 'sz', 'bj'])).min(1),
   return_window_days: z.number().min(5).max(120),
   top_n: z.number().min(100).max(2000),
@@ -96,6 +99,8 @@ function newSource(nextIndex: number): FormValues['ai_sources'][number] {
 
 const DEFAULT_FORM_VALUES: FormValues = {
   tdx_data_path: 'D:\\new_tdx\\vipdoc',
+  market_data_source: 'tdx_then_akshare',
+  akshare_cache_dir: '%USERPROFILE%\\.tdx-trend\\akshare\\daily',
   markets: ['sh', 'sz'],
   return_window_days: 40,
   top_n: 500,
@@ -114,12 +119,18 @@ const DEFAULT_FORM_VALUES: FormValues = {
 
 export function SettingsPage() {
   const { message } = AntdApp.useApp()
+  const queryClient = useQueryClient()
+  const isMockEnabled = import.meta.env.DEV && import.meta.env.VITE_ENABLE_MSW === 'true'
   const configQuery = useQuery({
     queryKey: ['config'],
     queryFn: getConfig,
   })
+  const storageQuery = useQuery({
+    queryKey: ['system-storage'],
+    queryFn: getSystemStorage,
+  })
 
-  const { control, getValues, handleSubmit, reset } = useForm<FormValues>({
+  const { control, getValues, handleSubmit, reset, setValue } = useForm<FormValues>({
     resolver: zodResolver(schema),
     defaultValues: DEFAULT_FORM_VALUES,
   })
@@ -149,6 +160,7 @@ export function SettingsPage() {
   useEffect(() => {
     if (!configQuery.data) return
     reset({
+      ...DEFAULT_FORM_VALUES,
       ...configQuery.data,
       api_key: '',
       api_key_path: '',
@@ -157,7 +169,11 @@ export function SettingsPage() {
 
   const saveMutation = useMutation({
     mutationFn: (values: FormValues) => updateConfig(values as AppConfig),
-    onSuccess: () => message.success('配置已保存'),
+    onSuccess: () => {
+      message.success('配置已保存')
+      void queryClient.invalidateQueries({ queryKey: ['config'] })
+      void queryClient.invalidateQueries({ queryKey: ['system-storage'] })
+    },
   })
 
   function validateAndSave(values: FormValues) {
@@ -230,6 +246,13 @@ export function SettingsPage() {
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
       <PageHeader title="系统设置" subtitle="支持自定义 AI Provider 与信息源，满足多来源接入。" />
+      {isMockEnabled ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="当前启用了 MSW Mock 模式，交易/复盘/AI 记录不会写入真实后端持久化文件。"
+        />
+      ) : null}
       <Card className="glass-card" variant="borderless">
         <Form layout="vertical" onFinish={handleSubmit(validateAndSave)}>
           <Row gutter={12}>
@@ -239,6 +262,60 @@ export function SettingsPage() {
                   name="tdx_data_path"
                   control={control}
                   render={({ field }) => <Input {...field} />}
+                />
+              </Form.Item>
+            </Col>
+
+            <Col xs={24} md={12}>
+              <Form.Item label="行情数据源策略">
+                <Controller
+                  name="market_data_source"
+                  control={control}
+                  render={({ field }) => (
+                    <Select
+                      value={field.value}
+                      onChange={field.onChange}
+                      options={[
+                        { label: '优先 TDX，缺失回退 AkShare（推荐）', value: 'tdx_then_akshare' },
+                        { label: '仅 TDX', value: 'tdx_only' },
+                        { label: '仅 AkShare 缓存', value: 'akshare_only' },
+                      ]}
+                    />
+                  )}
+                />
+              </Form.Item>
+            </Col>
+
+            <Col xs={24} md={12}>
+              <Form.Item label="本地行情目录（CSV）">
+                <Controller
+                  name="akshare_cache_dir"
+                  control={control}
+                  render={({ field }) => (
+                    <Input
+                      {...field}
+                      placeholder="%USERPROFILE%\\.tdx-trend\\market-data\\daily"
+                    />
+                  )}
+                />
+              </Form.Item>
+            </Col>
+
+            <Col xs={24} md={12}>
+              <Form.Item label="本地行情目录候选">
+                <Select
+                  allowClear
+                  showSearch
+                  placeholder={
+                    storageQuery.data?.akshare_cache_candidates.length
+                      ? '从已发现目录中选择'
+                      : '暂无已发现目录，可手动填写'
+                  }
+                  options={(storageQuery.data?.akshare_cache_candidates ?? []).map((value) => ({
+                    value,
+                    label: value,
+                  }))}
+                  onChange={(value) => setValue('akshare_cache_dir', value || '')}
                 />
               </Form.Item>
             </Col>
@@ -336,7 +413,13 @@ export function SettingsPage() {
             </Col>
             <Col xs={24}>
               <Typography.Text type="secondary">
-                漏斗参数（涨幅窗口、TopN、20日阈值）已统一在选股漏斗页面配置，此处仅保留系统级参数。
+                行情数据源可选 TDX 或本地行情目录回退（可由 AkShare/Baostock 生成 CSV）。漏斗参数（涨幅窗口、TopN、20日阈值）已统一在选股漏斗页面配置，此处仅保留系统级参数。
+              </Typography.Text>
+              <br />
+              <Typography.Text type="secondary">
+                本地状态: 配置{storageQuery.data?.app_state_exists ? '已持久化' : '未持久化'}，
+                模拟账户{storageQuery.data?.sim_state_exists ? '已持久化' : '未持久化'}，
+                本地行情文件数 {storageQuery.data?.akshare_cache_file_count ?? 0}。
               </Typography.Text>
             </Col>
           </Row>

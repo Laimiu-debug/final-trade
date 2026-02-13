@@ -7,6 +7,8 @@ import type {
   CandlePoint,
   DeleteAIRecordResponse,
   IntradayPayload,
+  MarketDataSyncRequest,
+  MarketDataSyncResponse,
   PortfolioSnapshot,
   ReviewResponse,
   ScreenerParams,
@@ -23,6 +25,7 @@ import type {
   SimTradingConfig,
   StockAnalysis,
   StockAnnotation,
+  SystemStorageStatus,
 } from '@/types/contracts'
 
 export function runScreener(params: ScreenerParams) {
@@ -244,5 +247,18 @@ export function updateConfig(payload: AppConfig) {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+  })
+}
+
+export function getSystemStorage() {
+  return apiRequest<SystemStorageStatus>('/api/system/storage')
+}
+
+export function syncMarketData(payload: MarketDataSyncRequest) {
+  return apiRequest<MarketDataSyncResponse>('/api/system/sync-market-data', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 180_000,
   })
 }

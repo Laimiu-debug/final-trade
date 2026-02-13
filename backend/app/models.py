@@ -12,6 +12,9 @@ SignalType = Literal["A", "B", "C"]
 SignalScanMode = Literal["trend_pool", "full_market"]
 PriceSource = Literal["vwap", "approx"]
 Stage = Literal["Early", "Mid", "Late"]
+MarketDataSource = Literal["tdx_only", "tdx_then_akshare", "akshare_only"]
+MarketSyncProvider = Literal["baostock"]
+MarketSyncMode = Literal["incremental", "full"]
 
 
 class ApiErrorPayload(BaseModel):
@@ -406,6 +409,8 @@ class AISourceConfig(BaseModel):
 
 class AppConfig(BaseModel):
     tdx_data_path: str
+    market_data_source: MarketDataSource = "tdx_then_akshare"
+    akshare_cache_dir: str = ""
     markets: list[Market]
     return_window_days: int
     top_n: int
@@ -420,6 +425,48 @@ class AppConfig(BaseModel):
     api_key_path: str
     ai_providers: list[AIProviderConfig]
     ai_sources: list[AISourceConfig]
+
+
+class SystemStorageStatus(BaseModel):
+    app_state_path: str
+    app_state_exists: bool
+    sim_state_path: str
+    sim_state_exists: bool
+    akshare_cache_dir: str
+    akshare_cache_dir_resolved: str
+    akshare_cache_dir_exists: bool
+    akshare_cache_file_count: int
+    akshare_cache_candidates: list[str] = Field(default_factory=list)
+
+
+class MarketDataSyncRequest(BaseModel):
+    provider: MarketSyncProvider = "baostock"
+    mode: MarketSyncMode = "incremental"
+    symbols: str = ""
+    all_market: bool = True
+    limit: int = Field(default=300, ge=1, le=5000)
+    start_date: str = ""
+    end_date: str = ""
+    initial_days: int = Field(default=420, ge=1, le=3000)
+    sleep_sec: float = Field(default=0.01, ge=0.0, le=1.0)
+    out_dir: str = ""
+
+
+class MarketDataSyncResponse(BaseModel):
+    ok: bool
+    provider: MarketSyncProvider = "baostock"
+    mode: MarketSyncMode = "incremental"
+    message: str
+    out_dir: str
+    symbol_count: int = 0
+    ok_count: int = 0
+    fail_count: int = 0
+    skipped_count: int = 0
+    new_rows_total: int = 0
+    started_at: str
+    finished_at: str
+    duration_sec: float = 0.0
+    errors: list[str] = Field(default_factory=list)
 
 
 class AIProviderTestRequest(BaseModel):

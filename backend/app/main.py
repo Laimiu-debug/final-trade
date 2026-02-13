@@ -19,6 +19,8 @@ from .models import (
     CreateOrderResponse,
     DeleteAIRecordResponse,
     IntradayPayload,
+    MarketDataSyncRequest,
+    MarketDataSyncResponse,
     PortfolioSnapshot,
     ReviewResponse,
     SimFillsResponse,
@@ -26,6 +28,7 @@ from .models import (
     SimResetResponse,
     SimSettleResponse,
     SimTradingConfig,
+    SystemStorageStatus,
     SignalScanMode,
     ScreenerParams,
     ScreenerRunDetail,
@@ -274,3 +277,13 @@ def get_config() -> AppConfig:
 @app.put("/api/config", response_model=AppConfig)
 def put_config(payload: AppConfig) -> AppConfig:
     return store.set_config(payload)
+
+
+@app.get("/api/system/storage", response_model=SystemStorageStatus)
+def get_system_storage() -> SystemStorageStatus:
+    return store.get_system_storage_status()
+
+
+@app.post("/api/system/sync-market-data", response_model=MarketDataSyncResponse)
+def post_sync_market_data(payload: MarketDataSyncRequest) -> MarketDataSyncResponse:
+    return store.sync_market_data(payload)

@@ -1,5 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import csv
+import os
 import struct
 from pathlib import Path
 from typing import TypedDict
@@ -47,6 +49,16 @@ def _resolve_tdx_base_dir(tdx_root: str) -> Path:
     if base.name.lower() == "vipdoc":
         return base.parent
     return base
+
+
+def _akshare_cache_root(akshare_cache_dir: str = "") -> Path:
+    override = str(akshare_cache_dir).strip()
+    if override:
+        return Path(os.path.expanduser(os.path.expandvars(override)))
+    override = os.getenv("AKSHARE_CACHE_DIR", "").strip()
+    if override:
+        return Path(os.path.expanduser(os.path.expandvars(override)))
+    return Path.home() / ".tdx-trend" / "akshare" / "daily"
 
 
 def _normalize_symbol(stem: str, market: str) -> str | None:
@@ -317,6 +329,86 @@ def _parse_day_file(file_path: Path, symbol: str) -> ParsedSeries | None:
     )
 
 
+def _to_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    raw = raw.replace(",", "")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _load_candles_from_akshare_cache(
+    symbol: str,
+    window: int = 120,
+    akshare_cache_dir: str = "",
+) -> list[CandlePoint] | None:
+    root = _akshare_cache_root(akshare_cache_dir)
+    if len(symbol) < 8:
+        return None
+    symbol = symbol.lower()
+    code = symbol[2:]
+    candidates = [root / f"{symbol}.csv", root / f"{code}.csv"]
+    target = next((path for path in candidates if path.exists()), None)
+    if target is None:
+        return None
+
+    rows: list[CandlePoint] = []
+    try:
+        with target.open("r", encoding="utf-8-sig") as fp:
+            reader = csv.DictReader(fp)
+            for row in reader:
+                date_text = str(row.get("date") or row.get("日期") or "").strip()
+                if len(date_text) < 10:
+                    continue
+                date_text = date_text[:10]
+                open_price = _to_float(row.get("open") or row.get("开盘"))
+                high_price = _to_float(row.get("high") or row.get("最高"))
+                low_price = _to_float(row.get("low") or row.get("最低"))
+                close_price = _to_float(row.get("close") or row.get("收盘"))
+                volume_value = _to_float(row.get("volume") or row.get("成交量"))
+                amount_value = _to_float(row.get("amount") or row.get("成交额"))
+                if (
+                    open_price is None
+                    or high_price is None
+                    or low_price is None
+                    or close_price is None
+                    or open_price <= 0
+                    or high_price <= 0
+                    or low_price <= 0
+                    or close_price <= 0
+                ):
+                    continue
+                if high_price < low_price:
+                    high_price, low_price = low_price, high_price
+                volume = int(max(0.0, volume_value or 0.0))
+                amount = float(amount_value) if amount_value is not None else float(close_price * max(volume, 1))
+                rows.append(
+                    CandlePoint(
+                        time=date_text,
+                        open=round(open_price, 2),
+                        high=round(high_price, 2),
+                        low=round(low_price, 2),
+                        close=round(close_price, 2),
+                        volume=volume,
+                        amount=float(amount),
+                        price_source="approx",
+                    )
+                )
+    except OSError:
+        return None
+
+    if not rows:
+        return None
+    rows.sort(key=lambda item: item.time)
+    start = max(0, len(rows) - max(window, 1))
+    return rows[start:]
+
+
 def _ma_at(prices: list[float], idx: int, period: int) -> float | None:
     if idx + 1 < period:
         return None
@@ -519,24 +611,45 @@ def _build_row(
     )
 
 
-def load_candles_for_symbol(tdx_root: str, symbol: str, window: int = 120) -> list[CandlePoint] | None:
+def load_candles_for_symbol(
+    tdx_root: str,
+    symbol: str,
+    window: int = 120,
+    market_data_source: str = "tdx_then_akshare",
+    akshare_cache_dir: str = "",
+) -> list[CandlePoint] | None:
+    if market_data_source not in {"tdx_only", "tdx_then_akshare", "akshare_only"}:
+        market_data_source = "tdx_then_akshare"
+    use_tdx = market_data_source in {"tdx_only", "tdx_then_akshare"}
+    use_akshare = market_data_source in {"akshare_only", "tdx_then_akshare"}
+    if not use_tdx:
+        return _load_candles_from_akshare_cache(symbol, window, akshare_cache_dir) if use_akshare else None
+
     root = Path(tdx_root)
     if not root.exists() or len(symbol) < 8:
+        if use_akshare:
+            return _load_candles_from_akshare_cache(symbol, window, akshare_cache_dir)
         return None
 
     market = symbol[:2]
     market_dir = root / market / "lday"
     if not market_dir.exists():
+        if use_akshare:
+            return _load_candles_from_akshare_cache(symbol, window, akshare_cache_dir)
         return None
 
     file_path = market_dir / f"{symbol}.day"
     if not file_path.exists() and symbol[2:].isdigit():
         file_path = market_dir / f"{symbol[2:]}.day"
     if not file_path.exists():
+        if use_akshare:
+            return _load_candles_from_akshare_cache(symbol, window, akshare_cache_dir)
         return None
 
     parsed = _parse_day_file(file_path, symbol)
     if not parsed:
+        if use_akshare:
+            return _load_candles_from_akshare_cache(symbol, window, akshare_cache_dir)
         return None
 
     start = max(0, len(parsed["close"]) - window)
@@ -554,7 +667,11 @@ def load_candles_for_symbol(tdx_root: str, symbol: str, window: int = 120) -> li
                 price_source="vwap",
             )
         )
-    return points
+    if points:
+        return points
+    if use_akshare:
+        return _load_candles_from_akshare_cache(symbol, window, akshare_cache_dir)
+    return None
 
 
 def load_input_pool_from_tdx(
