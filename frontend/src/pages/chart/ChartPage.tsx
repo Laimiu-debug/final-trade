@@ -22,6 +22,7 @@ import { Controller, useForm } from 'react-hook-form'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   analyzeStockWithAI,
+  getAIRecords,
   getSignals,
   getStockAnalysis,
   getStockCandles,
@@ -52,12 +53,15 @@ export function ChartPage() {
   const navigate = useNavigate()
   const symbol = useParams().symbol ?? ''
   const stockName = useUIStore((state) => state.stockNameMap[symbol])
+  const cachedAIRecord = useUIStore((state) => state.latestAIBySymbol[symbol])
   const [intradayDate, setIntradayDate] = useState<string | null>(null)
   const [lastAIRecord, setLastAIRecord] = useState<AIAnalysisRecord | null>(null)
   const cachedDraft = useUIStore((state) => state.annotationDrafts[symbol])
   const upsertDraft = useUIStore((state) => state.upsertDraft)
+  const upsertLatestAIRecord = useUIStore((state) => state.upsertLatestAIRecord)
   const symbolText = symbol.toUpperCase()
-  const stockTitle = stockName ? `${stockName} (${symbolText})` : symbolText
+  const resolvedName = stockName || lastAIRecord?.name || cachedAIRecord?.name
+  const stockTitle = resolvedName ? `${resolvedName} (${symbolText})` : symbolText
 
   const candlesQuery = useQuery({
     queryKey: ['candles', symbol],
@@ -76,15 +80,21 @@ export function ChartPage() {
     queryFn: getSignals,
   })
 
+  const aiRecordsQuery = useQuery({
+    queryKey: ['ai-records'],
+    queryFn: getAIRecords,
+  })
+
   const intradayQuery = useQuery({
     queryKey: ['intraday', symbol, intradayDate],
     queryFn: () => getStockIntraday(symbol, intradayDate ?? ''),
     enabled: Boolean(symbol && intradayDate),
   })
 
-  const { control, handleSubmit, reset } = useForm<StockAnnotation>({
+  const { control, getValues, handleSubmit, reset, setValue, watch } = useForm<StockAnnotation>({
     defaultValues: defaultAnnotation(symbol),
   })
+  const manualStartDate = watch('start_date')
 
   useEffect(() => {
     if (!analysisQuery.data) return
@@ -102,6 +112,18 @@ export function ChartPage() {
     )
   }, [analysisQuery.data, cachedDraft, reset, symbol])
 
+  useEffect(() => {
+    const latestFromServer = (aiRecordsQuery.data?.items ?? []).find((item) => item.symbol === symbol)
+    if (latestFromServer) {
+      setLastAIRecord(latestFromServer)
+      upsertLatestAIRecord(latestFromServer)
+      return
+    }
+    if (cachedAIRecord) {
+      setLastAIRecord(cachedAIRecord)
+    }
+  }, [aiRecordsQuery.data?.items, cachedAIRecord, symbol, upsertLatestAIRecord])
+
   const saveMutation = useMutation({
     mutationFn: (payload: StockAnnotation) => updateStockAnnotation(symbol, payload),
     onSuccess: (_, payload) => {
@@ -115,6 +137,7 @@ export function ChartPage() {
     mutationFn: () => analyzeStockWithAI(symbol),
     onSuccess: (record) => {
       setLastAIRecord(record)
+      upsertLatestAIRecord(record)
       void queryClient.invalidateQueries({ queryKey: ['analysis', symbol] })
       void queryClient.invalidateQueries({ queryKey: ['ai-records'] })
       message.success('AI分析完成')
@@ -138,6 +161,35 @@ export function ChartPage() {
     setIntradayDate(date)
   }
 
+  function toTrendClassFromAIBullType(value?: string): StockAnnotation['trend_class'] {
+    const raw = value ?? ''
+    if (raw.includes('A_B')) return 'A_B'
+    if (raw.startsWith('A')) return 'A'
+    if (raw.startsWith('B')) return 'B'
+    return 'Unknown'
+  }
+
+  function toStageFromConclusion(value?: string): StockAnnotation['stage'] {
+    if (value === '发酵中') return 'Early'
+    if (value === '高潮') return 'Mid'
+    if (value === '退潮') return 'Late'
+    return getValues('stage')
+  }
+
+  function applyAIToManual() {
+    if (!lastAIRecord) return
+    const current = getValues()
+    if (lastAIRecord.breakout_date) {
+      setValue('start_date', lastAIRecord.breakout_date, { shouldDirty: true })
+    }
+    setValue('trend_class', toTrendClassFromAIBullType(lastAIRecord.trend_bull_type), { shouldDirty: true })
+    setValue('stage', toStageFromConclusion(lastAIRecord.conclusion), { shouldDirty: true })
+    const aiNote = `[AI ${lastAIRecord.fetched_at}] 结论=${lastAIRecord.conclusion} 题材=${lastAIRecord.theme_name ?? '--'} 原因=${(lastAIRecord.rise_reasons ?? []).join('；')}`
+    const mergedNotes = current.notes?.trim() ? `${current.notes.trim()}\n${aiNote}` : aiNote
+    setValue('notes', mergedNotes, { shouldDirty: true })
+    message.success('已将 AI 结论回填到人工标注，请确认后点击“保存人工标注”')
+  }
+
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
       <Button icon={<ArrowLeftOutlined />} onClick={backToPrev} style={{ width: 'fit-content' }}>
@@ -145,7 +197,7 @@ export function ChartPage() {
       </Button>
       <PageHeader
         title={`K线标注 - ${stockTitle}`}
-        subtitle="支持启动日、阶段、趋势类型和交易决策的人工覆盖；双击K线可查看对应分时图。"
+        subtitle="K线上已叠加人工启动日与AI起爆日标记；双击K线可查看对应分时图。"
         badge="手工优先"
       />
 
@@ -180,8 +232,34 @@ export function ChartPage() {
         <KLineChart
           candles={candlesQuery.data?.candles ?? []}
           signals={symbolSignals}
+          manualStartDate={manualStartDate}
+          aiBreakoutDate={lastAIRecord?.breakout_date}
           onCandleDoubleClick={openIntradayForDate}
         />
+        <Space style={{ marginTop: 10 }}>
+          <Button
+            size="small"
+            disabled={!manualStartDate}
+            onClick={() => {
+              if (manualStartDate) {
+                openIntradayForDate(manualStartDate)
+              }
+            }}
+          >
+            查看人工启动日分时
+          </Button>
+          <Button
+            size="small"
+            disabled={!lastAIRecord?.breakout_date}
+            onClick={() => {
+              if (lastAIRecord?.breakout_date) {
+                openIntradayForDate(lastAIRecord.breakout_date)
+              }
+            }}
+          >
+            查看AI起爆日分时
+          </Button>
+        </Space>
       </Card>
 
       <Card
@@ -293,6 +371,9 @@ export function ChartPage() {
             >
               AI分析本股
             </Button>
+            <Button disabled={!lastAIRecord} onClick={applyAIToManual}>
+              一键应用AI到人工标注
+            </Button>
             <Button
               type="primary"
               loading={saveMutation.isPending}
@@ -316,6 +397,12 @@ export function ChartPage() {
               message={`AI结论: ${lastAIRecord.conclusion} | 置信度 ${lastAIRecord.confidence}`}
               description={
                 <Space direction="vertical" size={4}>
+                  <Typography.Text>
+                    起爆日期: {lastAIRecord.breakout_date || '--'} | 趋势牛: {lastAIRecord.trend_bull_type || '--'} | 题材: {lastAIRecord.theme_name || '--'}
+                  </Typography.Text>
+                  <Typography.Text>
+                    上涨原因: {(lastAIRecord.rise_reasons ?? []).length > 0 ? (lastAIRecord.rise_reasons ?? []).join('；') : '--'}
+                  </Typography.Text>
                   <Typography.Text>{lastAIRecord.summary}</Typography.Text>
                   <Typography.Text type="secondary">
                     来源: {lastAIRecord.source_urls.join(' | ') || '无'}

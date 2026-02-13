@@ -224,12 +224,22 @@ export interface TradeRecord {
 export interface AIAnalysisRecord {
   provider: string
   symbol: string
+  name: string
   fetched_at: string
   source_urls: string[]
   summary: string
   conclusion: string
   confidence: number
+  breakout_date?: string
+  trend_bull_type?: string
+  theme_name?: string
+  rise_reasons?: string[]
   error_code?: string
+}
+
+export interface DeleteAIRecordResponse {
+  deleted: boolean
+  remaining: number
 }
 
 export interface AIProviderConfig {
@@ -247,6 +257,21 @@ export interface AISourceConfig {
   name: string
   url: string
   enabled: boolean
+}
+
+export interface AIProviderTestRequest {
+  provider: AIProviderConfig
+  fallback_api_key: string
+  fallback_api_key_path: string
+  timeout_sec: number
+}
+
+export interface AIProviderTestResponse {
+  ok: boolean
+  provider_id: string
+  latency_ms: number
+  message: string
+  error_code?: string
 }
 
 export interface AppConfig {

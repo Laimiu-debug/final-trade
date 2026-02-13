@@ -1,4 +1,4 @@
-﻿import { useEffect } from 'react'
+﻿import { useEffect, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   App as AntdApp,
@@ -20,34 +20,36 @@ import { DeleteOutlined, PlusOutlined } from '@ant-design/icons'
 import { Controller, useFieldArray, useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { getConfig, updateConfig } from '@/shared/api/endpoints'
+import { getConfig, testAIProvider, updateConfig } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
 import type { AppConfig } from '@/types/contracts'
 
-const providerSchema = z.object({
-  id: z.string().min(1, 'ID必填'),
-  label: z.string().min(1, '名称必填'),
-  base_url: z.string().url('请输入有效URL'),
-  model: z.string().min(1, '模型必填'),
-  api_key: z.string(),
-  api_key_path: z.string(),
-  enabled: z.boolean(),
-}).superRefine((value, ctx) => {
-  const hasInlineKey = value.api_key.trim().length > 0
-  const hasPath = value.api_key_path.trim().length > 0
-  if (!hasInlineKey && !hasPath) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: '请至少填写 API 密钥或 API Key 路径',
-      path: ['api_key'],
-    })
-  }
-})
+const providerSchema = z
+  .object({
+    id: z.string().min(1, 'ID 必填'),
+    label: z.string().min(1, '名称必填'),
+    base_url: z.string().url('请输入有效 URL'),
+    model: z.string().min(1, '模型必填'),
+    api_key: z.string(),
+    api_key_path: z.string(),
+    enabled: z.boolean(),
+  })
+  .superRefine((value, ctx) => {
+    const hasInlineKey = value.api_key.trim().length > 0
+    const hasPath = value.api_key_path.trim().length > 0
+    if (!hasInlineKey && !hasPath) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: '请至少填写 API 密钥 或 API Key 路径',
+        path: ['api_key'],
+      })
+    }
+  })
 
 const sourceSchema = z.object({
-  id: z.string().min(1, 'ID必填'),
+  id: z.string().min(1, 'ID 必填'),
   name: z.string().min(1, '名称必填'),
-  url: z.string().url('请输入有效URL'),
+  url: z.string().url('请输入有效 URL'),
   enabled: z.boolean(),
 })
 
@@ -65,7 +67,7 @@ const schema = z.object({
   ai_retry_count: z.number().min(0).max(5),
   api_key: z.string(),
   api_key_path: z.string(),
-  ai_providers: z.array(providerSchema).min(1, '至少保留一个AI Provider'),
+  ai_providers: z.array(providerSchema).min(1, '至少保留一个 AI Provider'),
   ai_sources: z.array(sourceSchema).min(1, '至少保留一个信息源'),
 })
 
@@ -92,6 +94,24 @@ function newSource(nextIndex: number): FormValues['ai_sources'][number] {
   }
 }
 
+const DEFAULT_FORM_VALUES: FormValues = {
+  tdx_data_path: 'D:\\new_tdx\\vipdoc',
+  markets: ['sh', 'sz'],
+  return_window_days: 40,
+  top_n: 500,
+  turnover_threshold: 0.05,
+  amount_threshold: 5e8,
+  amplitude_threshold: 0.03,
+  initial_capital: 1_000_000,
+  ai_provider: 'openai',
+  ai_timeout_sec: 10,
+  ai_retry_count: 2,
+  api_key: '',
+  api_key_path: '',
+  ai_providers: [newProvider(1)],
+  ai_sources: [newSource(1)],
+}
+
 export function SettingsPage() {
   const { message } = AntdApp.useApp()
   const configQuery = useQuery({
@@ -99,9 +119,11 @@ export function SettingsPage() {
     queryFn: getConfig,
   })
 
-  const { control, handleSubmit, reset } = useForm<FormValues>({
+  const { control, getValues, handleSubmit, reset } = useForm<FormValues>({
     resolver: zodResolver(schema),
+    defaultValues: DEFAULT_FORM_VALUES,
   })
+  const [testingProviderId, setTestingProviderId] = useState<string | null>(null)
 
   const providerArray = useFieldArray({
     control,
@@ -113,10 +135,12 @@ export function SettingsPage() {
     name: 'ai_sources',
   })
 
-  const providers = useWatch({
-    control,
-    name: 'ai_providers',
-  }) ?? []
+  const providers =
+    useWatch({
+      control,
+      name: 'ai_providers',
+    }) ?? []
+
   const providerOptions = providers.map((provider) => ({
     label: `${provider.label} (${provider.id})`,
     value: provider.id,
@@ -124,7 +148,11 @@ export function SettingsPage() {
 
   useEffect(() => {
     if (!configQuery.data) return
-    reset(configQuery.data)
+    reset({
+      ...configQuery.data,
+      api_key: '',
+      api_key_path: '',
+    })
   }, [configQuery.data, reset])
 
   const saveMutation = useMutation({
@@ -152,19 +180,51 @@ export function SettingsPage() {
 
     const activeProvider = values.ai_providers.find((provider) => provider.id === values.ai_provider)
     if (!activeProvider) {
-      message.error('当前激活 Provider 不存在，请重新选择。')
+      message.error('当前激活 Provider 不存在，请重新选择')
       return
     }
     if (!activeProvider.enabled) {
-      message.error('当前激活 Provider 已被禁用，请切换到可用 Provider。')
+      message.error('当前激活 Provider 已禁用，请切换到可用 Provider')
       return
     }
     if (!hasCredential(activeProvider)) {
-      message.error('当前激活 Provider 缺少凭证，请填写 API 密钥或 Key 路径。')
+      message.error('当前激活 Provider 缺少凭证，请填写 API 密钥或 Key 路径')
       return
     }
 
-    saveMutation.mutate(values)
+    saveMutation.mutate({
+      ...values,
+      api_key: '',
+      api_key_path: '',
+    })
+  }
+
+  async function handleProviderTest(index: number) {
+    const values = getValues()
+    const provider = values.ai_providers[index]
+    if (!provider) {
+      message.error('Provider 不存在')
+      return
+    }
+
+    setTestingProviderId(provider.id)
+    try {
+      const result = await testAIProvider({
+        provider,
+        fallback_api_key: '',
+        fallback_api_key_path: '',
+        timeout_sec: values.ai_timeout_sec,
+      })
+      if (result.ok) {
+        message.success(`[${provider.id}] ${result.message}`)
+      } else {
+        message.warning(`[${provider.id}] ${result.message}${result.error_code ? ` (${result.error_code})` : ''}`)
+      }
+    } catch {
+      message.error(`[${provider.id}] 测试失败，请检查网络与配置`)
+    } finally {
+      setTestingProviderId(null)
+    }
   }
 
   return (
@@ -177,29 +237,6 @@ export function SettingsPage() {
               <Form.Item label="TDX 数据路径">
                 <Controller
                   name="tdx_data_path"
-                  control={control}
-                  render={({ field }) => <Input {...field} />}
-                />
-              </Form.Item>
-            </Col>
-            <Col xs={24} md={8}>
-              <Form.Item label="默认 API 密钥（可选）">
-                <Controller
-                  name="api_key"
-                  control={control}
-                  render={({ field }) => (
-                    <Input.Password
-                      {...field}
-                      placeholder="直接填写时优先使用"
-                    />
-                  )}
-                />
-              </Form.Item>
-            </Col>
-            <Col xs={24} md={16}>
-              <Form.Item label="默认 API Key 路径（可选）">
-                <Controller
-                  name="api_key_path"
                   control={control}
                   render={({ field }) => <Input {...field} />}
                 />
@@ -225,6 +262,7 @@ export function SettingsPage() {
                 />
               </Form.Item>
             </Col>
+
             <Col xs={24} md={12}>
               <Form.Item label="激活 AI Provider">
                 <Controller
@@ -243,48 +281,63 @@ export function SettingsPage() {
             </Col>
 
             <Col xs={12} md={6}>
-              <Form.Item label="涨幅窗口">
-                <Controller
-                  name="return_window_days"
-                  control={control}
-                  render={({ field }) => (
-                    <InputNumber min={5} max={120} value={field.value} onChange={(v) => field.onChange(v ?? 40)} />
-                  )}
-                />
-              </Form.Item>
-            </Col>
-            <Col xs={12} md={6}>
-              <Form.Item label="TopN">
-                <Controller
-                  name="top_n"
-                  control={control}
-                  render={({ field }) => (
-                    <InputNumber min={100} max={2000} step={50} value={field.value} onChange={(v) => field.onChange(v ?? 500)} />
-                  )}
-                />
-              </Form.Item>
-            </Col>
-            <Col xs={12} md={6}>
-              <Form.Item label="AI超时(秒)">
+              <Form.Item label="AI 超时(秒)">
                 <Controller
                   name="ai_timeout_sec"
                   control={control}
                   render={({ field }) => (
-                    <InputNumber min={3} max={60} value={field.value} onChange={(v) => field.onChange(v ?? 10)} />
+                    <InputNumber
+                      min={3}
+                      max={60}
+                      value={field.value}
+                      onChange={(v) => field.onChange(v ?? 10)}
+                      style={{ width: '100%' }}
+                    />
                   )}
                 />
               </Form.Item>
             </Col>
+
             <Col xs={12} md={6}>
-              <Form.Item label="AI重试次数">
+              <Form.Item label="AI 重试次数">
                 <Controller
                   name="ai_retry_count"
                   control={control}
                   render={({ field }) => (
-                    <InputNumber min={0} max={5} value={field.value} onChange={(v) => field.onChange(v ?? 2)} />
+                    <InputNumber
+                      min={0}
+                      max={5}
+                      value={field.value}
+                      onChange={(v) => field.onChange(v ?? 2)}
+                      style={{ width: '100%' }}
+                    />
                   )}
                 />
               </Form.Item>
+            </Col>
+
+            <Col xs={12} md={6}>
+              <Form.Item label="模拟初始资金">
+                <Controller
+                  name="initial_capital"
+                  control={control}
+                  render={({ field }) => (
+                    <InputNumber
+                      min={10_000}
+                      max={100_000_000}
+                      step={10_000}
+                      value={field.value}
+                      onChange={(v) => field.onChange(v ?? 1_000_000)}
+                      style={{ width: '100%' }}
+                    />
+                  )}
+                />
+              </Form.Item>
+            </Col>
+            <Col xs={24}>
+              <Typography.Text type="secondary">
+                漏斗参数（涨幅窗口、TopN、20日阈值）已统一在选股漏斗页面配置，此处仅保留系统级参数。
+              </Typography.Text>
             </Col>
           </Row>
 
@@ -293,7 +346,7 @@ export function SettingsPage() {
             {providerArray.fields.map((item, index) => (
               <Card key={item.id} className="glass-card" size="small" variant="borderless">
                 <Row gutter={[10, 10]}>
-                  <Col xs={24} md={4}>
+                  <Col xs={24} md={6}>
                     <Form.Item label="Provider ID">
                       <Controller
                         name={`ai_providers.${index}.id`}
@@ -302,7 +355,7 @@ export function SettingsPage() {
                       />
                     </Form.Item>
                   </Col>
-                  <Col xs={24} md={4}>
+                  <Col xs={24} md={6}>
                     <Form.Item label="显示名称">
                       <Controller
                         name={`ai_providers.${index}.label`}
@@ -311,7 +364,7 @@ export function SettingsPage() {
                       />
                     </Form.Item>
                   </Col>
-                  <Col xs={24} md={6}>
+                  <Col xs={24} md={8}>
                     <Form.Item label="Base URL">
                       <Controller
                         name={`ai_providers.${index}.base_url`}
@@ -320,46 +373,14 @@ export function SettingsPage() {
                       />
                     </Form.Item>
                   </Col>
-                  <Col xs={24} md={4}>
-                    <Form.Item label="默认模型">
-                      <Controller
-                        name={`ai_providers.${index}.model`}
-                        control={control}
-                        render={({ field }) => <Input {...field} />}
-                      />
-                    </Form.Item>
-                  </Col>
-                  <Col xs={24} md={8}>
-                    <Form.Item label="API 密钥（可选）">
-                      <Controller
-                        name={`ai_providers.${index}.api_key`}
-                        control={control}
-                        render={({ field }) => (
-                          <Input.Password
-                            {...field}
-                            placeholder="直接填写时优先使用"
-                          />
-                        )}
-                      />
-                    </Form.Item>
-                  </Col>
-                  <Col xs={24} md={7}>
-                    <Form.Item label="API Key 路径（可选）">
-                      <Controller
-                        name={`ai_providers.${index}.api_key_path`}
-                        control={control}
-                        render={({ field }) => <Input {...field} />}
-                      />
-                    </Form.Item>
-                  </Col>
-                  <Col xs={12} md={1}>
+                  <Col xs={12} md={4}>
                     <Form.Item label="启用">
                       <Controller
                         name={`ai_providers.${index}.enabled`}
                         control={control}
                         render={({ field }) => (
                           <Switch
-                            checked={field.value}
+                            checked={Boolean(field.value)}
                             onChange={field.onChange}
                             checkedChildren="开"
                             unCheckedChildren="关"
@@ -368,17 +389,57 @@ export function SettingsPage() {
                       />
                     </Form.Item>
                   </Col>
+
+                  <Col xs={24} md={6}>
+                    <Form.Item label="默认模型">
+                      <Controller
+                        name={`ai_providers.${index}.model`}
+                        control={control}
+                        render={({ field }) => <Input {...field} />}
+                      />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={9}>
+                    <Form.Item label="API 密钥（可选）">
+                      <Controller
+                        name={`ai_providers.${index}.api_key`}
+                        control={control}
+                        render={({ field }) => <Input.Password {...field} placeholder="直接填写优先使用" />}
+                      />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={9}>
+                    <Form.Item label="API Key 路径（可选）">
+                      <Controller
+                        name={`ai_providers.${index}.api_key_path`}
+                        control={control}
+                        render={({ field }) => <Input {...field} />}
+                      />
+                    </Form.Item>
+                  </Col>
                 </Row>
-                <Button
-                  danger
-                  icon={<DeleteOutlined />}
-                  disabled={providerArray.fields.length <= 1}
-                  onClick={() => providerArray.remove(index)}
-                >
-                  删除 Provider
-                </Button>
+
+                <Space>
+                  <Button
+                    onClick={() => {
+                      void handleProviderTest(index)
+                    }}
+                    loading={testingProviderId === (providers[index]?.id ?? '')}
+                  >
+                    测试可用性
+                  </Button>
+                  <Button
+                    danger
+                    icon={<DeleteOutlined />}
+                    disabled={providerArray.fields.length <= 1}
+                    onClick={() => providerArray.remove(index)}
+                  >
+                    删除 Provider
+                  </Button>
+                </Space>
               </Card>
             ))}
+
             <Button
               icon={<PlusOutlined />}
               onClick={() => providerArray.append(newProvider(providerArray.fields.length + 1))}
@@ -393,7 +454,7 @@ export function SettingsPage() {
               <Card key={item.id} className="glass-card" size="small" variant="borderless">
                 <Row gutter={[10, 10]}>
                   <Col xs={24} md={4}>
-                    <Form.Item label="来源ID">
+                    <Form.Item label="来源 ID">
                       <Controller
                         name={`ai_sources.${index}.id`}
                         control={control}
@@ -419,14 +480,14 @@ export function SettingsPage() {
                       />
                     </Form.Item>
                   </Col>
-                  <Col xs={12} md={1}>
+                  <Col xs={12} md={2}>
                     <Form.Item label="启用">
                       <Controller
                         name={`ai_sources.${index}.enabled`}
                         control={control}
                         render={({ field }) => (
                           <Switch
-                            checked={field.value}
+                            checked={Boolean(field.value)}
                             onChange={field.onChange}
                             checkedChildren="开"
                             unCheckedChildren="关"
@@ -436,6 +497,7 @@ export function SettingsPage() {
                     </Form.Item>
                   </Col>
                 </Row>
+
                 <Button
                   danger
                   icon={<DeleteOutlined />}
@@ -446,6 +508,7 @@ export function SettingsPage() {
                 </Button>
               </Card>
             ))}
+
             <Button
               icon={<PlusOutlined />}
               onClick={() => sourceArray.append(newSource(sourceArray.fields.length + 1))}
@@ -456,11 +519,10 @@ export function SettingsPage() {
 
           <Space orientation="vertical" size={6} style={{ marginTop: 14 }}>
             <Typography.Text type="warning">
-              支持两种凭证方式：直接填 API 密钥 或 配置 Key 路径。读取优先级为
-              <Typography.Text strong> api_key &gt; api_key_path </Typography.Text>。
+              每个 Provider 需配置 API 密钥或 Key 路径之一，优先读取 `api_key`。
             </Typography.Text>
             <Typography.Text type="warning">
-              原型阶段仍为本地明文存储，请使用最小权限 Key 并定期轮换。
+              当前仍为本地明文存储，请使用最小权限密钥并定期轮换。
             </Typography.Text>
             <Button type="primary" htmlType="submit" loading={saveMutation.isPending}>
               保存配置

@@ -73,4 +73,47 @@ def test_ai_analyze_stock_endpoint() -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["symbol"] == "sz300750"
+    assert body["name"]
     assert "summary" in body and body["summary"]
+    assert "breakout_date" in body and body["breakout_date"]
+    assert "rise_reasons" in body and isinstance(body["rise_reasons"], list)
+
+
+def test_ai_provider_test_endpoint() -> None:
+    payload = {
+        "provider": {
+            "id": "custom-test",
+            "label": "Custom",
+            "base_url": "https://example.com/v1",
+            "model": "demo-model",
+            "api_key": "",
+            "api_key_path": "",
+            "enabled": True,
+        },
+        "fallback_api_key": "",
+        "fallback_api_key_path": "",
+        "timeout_sec": 5,
+    }
+    resp = client.post("/api/ai/providers/test", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["error_code"] == "AI_KEY_MISSING"
+
+
+def test_delete_ai_record_endpoint() -> None:
+    create_resp = client.post("/api/stocks/sz300750/ai-analyze")
+    assert create_resp.status_code == 200
+    record = create_resp.json()
+
+    delete_resp = client.delete(
+        "/api/ai/records",
+        params={
+            "symbol": record["symbol"],
+            "fetched_at": record["fetched_at"],
+            "provider": record["provider"],
+        },
+    )
+    assert delete_resp.status_code == 200
+    delete_body = delete_resp.json()
+    assert delete_body["deleted"] is True

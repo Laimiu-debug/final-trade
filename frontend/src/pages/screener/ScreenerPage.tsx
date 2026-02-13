@@ -344,6 +344,7 @@ type TableSortField =
   | 'retrace20'
   | 'latest_price'
   | 'day_change_pct'
+  | 'theme_stage'
 type TableSortDirection = 'asc' | 'desc'
 
 const trendClassLabelMap: Record<TrendClass, string> = {
@@ -367,7 +368,7 @@ const boardFilterLabelMap: Record<BoardFilterKey, string> = {
   st: 'ST',
 }
 
-const numericSortFields: TableSortField[] = [
+const sortableFields: TableSortField[] = [
   'score',
   'ret40',
   'turnover20',
@@ -376,6 +377,7 @@ const numericSortFields: TableSortField[] = [
   'retrace20',
   'latest_price',
   'day_change_pct',
+  'theme_stage',
 ]
 
 function isTableSortField(value: string): value is TableSortField {
@@ -389,6 +391,7 @@ function isTableSortField(value: string): value is TableSortField {
     || value === 'retrace20'
     || value === 'latest_price'
     || value === 'day_change_pct'
+    || value === 'theme_stage'
   )
 }
 
@@ -398,6 +401,10 @@ function isTrendClass(value: string): value is TrendClass {
 
 function isStageType(value: string): value is StageType {
   return value === 'Early' || value === 'Mid' || value === 'Late'
+}
+
+function isThemeStage(value: string): value is ThemeStage {
+  return value === '发酵中' || value === '高潮' || value === '退潮' || value === 'Unknown'
 }
 
 function isScreenerColumnKey(value: string): value is ScreenerColumnKey {
@@ -788,6 +795,7 @@ export function ScreenerPage() {
   const [keywordFilter, setKeywordFilter] = useState('')
   const [trendFilters, setTrendFilters] = useState<TrendClass[]>([])
   const [stageFilters, setStageFilters] = useState<StageType[]>([])
+  const [themeStageFilters, setThemeStageFilters] = useState<ThemeStage[]>([])
   const [sortField, setSortField] = useState<TableSortField>('manual')
   const [sortDirection, setSortDirection] = useState<TableSortDirection>('desc')
   const [tablePage, setTablePage] = useState(1)
@@ -942,6 +950,9 @@ export function ScreenerPage() {
       if (stageFilters.length > 0 && !stageFilters.includes(row.stage as StageType)) {
         return false
       }
+      if (themeStageFilters.length > 0 && !themeStageFilters.includes(row.theme_stage)) {
+        return false
+      }
       return true
     })
 
@@ -958,11 +969,11 @@ export function ScreenerPage() {
       return String(va ?? '').localeCompare(String(vb ?? ''), 'zh-CN')
     })
     return sortDirection === 'asc' ? sorted : sorted.reverse()
-  }, [keywordFilter, rows, sortDirection, sortField, stageFilters, trendFilters])
+  }, [keywordFilter, rows, sortDirection, sortField, stageFilters, themeStageFilters, trendFilters])
 
   useEffect(() => {
     setTablePage(1)
-  }, [activePool, keywordFilter, trendFilters, stageFilters, sortField, sortDirection])
+  }, [activePool, keywordFilter, trendFilters, stageFilters, themeStageFilters, sortField, sortDirection])
 
   useEffect(() => {
     const maxPage = Math.max(1, Math.ceil(filteredRows.length / tablePageSize))
@@ -989,7 +1000,7 @@ export function ScreenerPage() {
     return poolOrder[currentIndex + 1]
   }, [activePool])
   const inputPoolOutdated = pools.input.length > 0 && inputPoolKey !== '' && inputPoolKey !== currentInputPoolKey
-  const hasTableFilters = keywordFilter.trim().length > 0 || trendFilters.length > 0 || stageFilters.length > 0
+  const hasTableFilters = keywordFilter.trim().length > 0 || trendFilters.length > 0 || stageFilters.length > 0 || themeStageFilters.length > 0
   const canReorderInTable = sortField === 'manual' && !hasTableFilters && rows.length > 1
   const canDragRows = Boolean(nextPoolKey) || canReorderInTable
 
@@ -1147,7 +1158,7 @@ export function ScreenerPage() {
           title: columnTitleMap[key],
         }
 
-        if (numericSortFields.includes(key as TableSortField)) {
+        if (sortableFields.includes(key as TableSortField)) {
           column.sorter = true
           column.sortOrder = sortField === key
             ? (sortDirection === 'asc' ? 'ascend' : 'descend')
@@ -1170,6 +1181,12 @@ export function ScreenerPage() {
             value,
           }))
           column.filteredValue = stageFilters.length > 0 ? stageFilters : null
+        }
+
+        if (key === 'theme_stage') {
+          const options: ThemeStage[] = ['发酵中', '高潮', '退潮', 'Unknown']
+          column.filters = options.map((value) => ({ text: value, value }))
+          column.filteredValue = themeStageFilters.length > 0 ? themeStageFilters : null
         }
 
         if (key === 'symbol') {
@@ -1216,6 +1233,7 @@ export function ScreenerPage() {
     sortDirection,
     sortField,
     stageFilters,
+    themeStageFilters,
     trendFilters,
   ])
 
@@ -2336,6 +2354,7 @@ export function ScreenerPage() {
                   setKeywordFilter('')
                   setTrendFilters([])
                   setStageFilters([])
+                  setThemeStageFilters([])
                   setSortField('manual')
                   setSortDirection('desc')
                 }}
@@ -2359,12 +2378,18 @@ export function ScreenerPage() {
                     .map((value) => String(value))
                     .filter((value): value is StageType => isStageType(value))
                 : []
+              const themeStageValues = Array.isArray(filters.theme_stage)
+                ? filters.theme_stage
+                    .map((value) => String(value))
+                    .filter((value): value is ThemeStage => isThemeStage(value))
+                : []
               const keywordValue = Array.isArray(filters.symbol) && filters.symbol.length > 0
                 ? String(filters.symbol[0] ?? '')
                 : ''
 
               setTrendFilters(trendValues)
               setStageFilters(stageValues)
+              setThemeStageFilters(themeStageValues)
               setKeywordFilter(keywordValue)
 
               const sorterObj = Array.isArray(sorter) ? sorter[0] : sorter

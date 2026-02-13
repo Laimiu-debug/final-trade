@@ -1,6 +1,8 @@
-import dayjs from 'dayjs'
+﻿import dayjs from 'dayjs'
 import type {
   AIAnalysisRecord,
+  AIProviderTestRequest,
+  AIProviderTestResponse,
   AppConfig,
   CandlePoint,
   IntradayPoint,
@@ -30,27 +32,40 @@ const stockPool: Array<{ symbol: string; name: string; trend: TrendClass; stage:
   { symbol: 'sz002230', name: '科大讯飞', trend: 'A_B', stage: 'Mid' },
 ]
 
+const THEME_STAGES: ThemeStage[] = ['发酵中' as ThemeStage, '高潮' as ThemeStage, '退潮' as ThemeStage]
+
 const candlesMap = new Map<string, CandlePoint[]>()
 const runStore = new Map<string, ScreenerRunDetail>()
 const annotationStore = new Map<string, StockAnnotation>()
+
 let aiRecordsStore: AIAnalysisRecord[] = [
   {
     provider: 'openai',
     symbol: 'sz300750',
+    name: '宁德时代',
     fetched_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
-    source_urls: ['https://example.com/news/ev-1', 'https://example.com/forum/battery'],
-    summary: '板块热度延续，龙头与补涨梯队结构完整。',
+    source_urls: ['https://finance.eastmoney.com/', 'https://www.cls.cn/'],
+    summary: '新能源主线保持活跃，回撤阶段承接较好。',
     conclusion: '发酵中',
     confidence: 0.78,
+    breakout_date: dayjs().subtract(17, 'day').format('YYYY-MM-DD'),
+    trend_bull_type: 'A_B 慢牛加速',
+    theme_name: '固态电池',
+    rise_reasons: ['20日量能斜率为正', '回调缩量且未破关键均线', '板块热度维持在发酵区间'],
   },
   {
     provider: 'openai',
     symbol: 'sh600519',
+    name: '贵州茅台',
     fetched_at: dayjs().subtract(1, 'day').format('YYYY-MM-DD HH:mm:ss'),
-    source_urls: ['https://example.com/news/consumption'],
-    summary: '消费主线延续，成交结构稳定。',
+    source_urls: ['https://www.cninfo.com.cn/'],
+    summary: '消费龙头资金抱团明显，高位换手可控。',
     conclusion: '高潮',
     confidence: 0.66,
+    breakout_date: dayjs().subtract(26, 'day').format('YYYY-MM-DD'),
+    trend_bull_type: 'A 阶梯慢牛',
+    theme_name: '高端消费',
+    rise_reasons: ['龙头资金抱团', '回撤幅度有限', '基本面预期稳定'],
   },
 ]
 
@@ -107,7 +122,7 @@ let configStore: AppConfig = {
     },
     {
       id: 'custom-1',
-      label: '自定义 Provider',
+      label: '自定义Provider',
       base_url: 'https://your-provider.example.com/v1',
       model: 'custom-model',
       api_key: '',
@@ -121,6 +136,15 @@ let configStore: AppConfig = {
     { id: 'cls', name: '财联社', url: 'https://www.cls.cn/', enabled: true },
     { id: 'xueqiu', name: '雪球', url: 'https://xueqiu.com/', enabled: false },
   ],
+}
+
+function hashSeed(text: string) {
+  return text.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)
+}
+
+function mean(values: number[]) {
+  if (values.length === 0) return 0
+  return values.reduce((acc, value) => acc + value, 0) / values.length
 }
 
 function genCandles(seed: number, startPrice = 40): CandlePoint[] {
@@ -149,10 +173,7 @@ function genCandles(seed: number, startPrice = 40): CandlePoint[] {
 
 function ensureCandles(symbol: string) {
   if (!candlesMap.has(symbol)) {
-    const seed = symbol
-      .split('')
-      .map((char) => char.charCodeAt(0))
-      .reduce((acc, cur) => acc + cur, 0)
+    const seed = hashSeed(symbol)
     candlesMap.set(symbol, genCandles(seed, 20 + (seed % 70)))
   }
   return candlesMap.get(symbol) ?? []
@@ -176,10 +197,7 @@ function buildIntradayTimeAxis() {
 
 function genIntradayPoints(symbol: string, date: string, basePrice: number): IntradayPoint[] {
   const times = buildIntradayTimeAxis()
-  const seed = `${symbol}-${date}`
-    .split('')
-    .map((char) => char.charCodeAt(0))
-    .reduce((acc, cur) => acc + cur, 0)
+  const seed = hashSeed(`${symbol}-${date}`)
 
   const points: IntradayPoint[] = []
   let price = basePrice
@@ -193,10 +211,7 @@ function genIntradayPoints(symbol: string, date: string, basePrice: number): Int
     price = Math.max(1, price + wave * 0.05 + drift * 0.03 + micro)
     const roundedPrice = Number(price.toFixed(2))
 
-    const volume = Math.max(
-      1200,
-      Math.floor(4000 + Math.sin((index + seed) / 8) * 1300 + (seed % 7) * 180),
-    )
+    const volume = Math.max(1200, Math.floor(4000 + Math.sin((index + seed) / 8) * 1300 + (seed % 7) * 180))
     totalVolume += volume
     turnover += roundedPrice * volume
     const avgPrice = Number((turnover / totalVolume).toFixed(2))
@@ -213,45 +228,6 @@ function genIntradayPoints(symbol: string, date: string, basePrice: number): Int
   return points
 }
 
-function buildResult(input: typeof stockPool[number], index: number, mode: ScreenerMode): ScreenerResult {
-  const modeOffset = mode === 'strict' ? 0 : 4
-  const score = 86 - index * 4 + modeOffset
-  const degraded = input.symbol === 'sz002230'
-  const themeStageList: ThemeStage[] = ['发酵中', '高潮', '退潮']
-  const themeStage = themeStageList[index % themeStageList.length]
-  return {
-    symbol: input.symbol,
-    name: input.name,
-    latest_price: Number((42 + index * 3.6).toFixed(2)),
-    day_change: Number(((-1.2 + (index % 5) * 0.8)).toFixed(2)),
-    day_change_pct: Number(((-0.018 + (index % 6) * 0.009)).toFixed(4)),
-    score,
-    ret40: 0.22 + index * 0.031,
-    turnover20: 0.053 + index * 0.008,
-    amount20: 580_000_000 + index * 80_000_000,
-    amplitude20: 0.032 + index * 0.003,
-    retrace20: 0.06 + index * 0.02,
-    pullback_days: 1 + (index % 4),
-    ma10_above_ma20_days: 8 + (index % 7),
-    ma5_above_ma10_days: 6 + (index % 5),
-    price_vs_ma20: 0.008 + (index % 6) * 0.005,
-    vol_slope20: 0.14 + (index % 8) * 0.05,
-    up_down_volume_ratio: 1.26 + (index % 6) * 0.1,
-    pullback_volume_ratio: 0.5 + (index % 5) * 0.07,
-    has_blowoff_top: index % 21 === 0,
-    has_divergence_5d: index % 13 === 0,
-    has_upper_shadow_risk: index % 17 === 0,
-    ai_confidence: 0.63 + (index % 4) * 0.08,
-    theme_stage: themeStage,
-    trend_class: input.trend,
-    stage: input.stage,
-    labels: ['活跃', input.trend === 'B' ? '高波动' : '趋势延续'],
-    reject_reasons: [],
-    degraded,
-    degraded_reason: degraded ? 'FLOAT_SHARES_CACHE_USED' : undefined,
-  }
-}
-
 function createMockSymbol(index: number) {
   const market = index % 2 === 0 ? 'sh' : 'sz'
   const code = `${100000 + index}`.padStart(6, '0').slice(-6)
@@ -260,23 +236,23 @@ function createMockSymbol(index: number) {
 
 function createMockName(index: number) {
   const sectors = ['科技', '医药', '消费', '金融', '能源', '制造', '材料', '军工']
-  return `${sectors[index % sectors.length]}鏍锋湰${index + 1}`
+  return `${sectors[index % sectors.length]}样本${index + 1}`
 }
 
-function createPoolRecord(index: number, mode: ScreenerMode, stage: 'input' | 'step1' | 'step2' | 'step3' | 'step4'): ScreenerResult {
+function createPoolRecord(index: number, mode: ScreenerMode, stage: 'input' | 'step1' | 'step2' | 'step3'): ScreenerResult {
   const strictOffset = mode === 'strict' ? 0 : 0.015
   const baseRet = 0.06 + ((index % 200) / 1000) + strictOffset
   const trend: TrendClass = index % 17 === 0 ? 'B' : index % 5 === 0 ? 'A_B' : 'A'
   const stageLabel = index % 3 === 0 ? 'Early' : index % 3 === 1 ? 'Mid' : 'Late'
   const degraded = stage !== 'input' && index % 211 === 0
-  const themeStageList: ThemeStage[] = ['发酵中', '高潮', '退潮']
-  const themeStage = themeStageList[index % themeStageList.length]
+  const themeStage = THEME_STAGES[index % THEME_STAGES.length]
+
   return {
     symbol: createMockSymbol(index),
     name: createMockName(index),
     latest_price: Number((8 + (index % 220) * 0.9).toFixed(2)),
-    day_change: Number(((-2.1 + (index % 11) * 0.42)).toFixed(2)),
-    day_change_pct: Number(((-0.03 + (index % 15) * 0.0045)).toFixed(4)),
+    day_change: Number((-2.1 + (index % 11) * 0.42).toFixed(2)),
+    day_change_pct: Number((-0.03 + (index % 15) * 0.0045).toFixed(4)),
     score: Math.max(20, 92 - (index % 70)),
     ret40: baseRet,
     turnover20: 0.035 + (index % 25) * 0.002,
@@ -317,30 +293,24 @@ export function createScreenerRun(params: ScreenerParams) {
   const step3Count = mode === 'strict' ? 26 : 37
 
   const inputPool = createPoolRange(0, inputCount, mode, 'input')
-  const step1Pool = inputPool.slice(0, step1Count).map((row, index) => ({
-    ...row,
-    score: 78 - (index % 30),
-    labels: ['活跃强势池'],
-  }))
-  const step2Pool = step1Pool.slice(0, step2Count).map((row, index) => ({
-    ...row,
-    score: 82 - (index % 28),
-    labels: ['图形待确认'],
-  }))
-  const step3Pool = step2Pool.slice(0, step3Count).map((row, index) => ({
-    ...row,
-    score: 86 - (index % 20),
-    labels: ['閲忚兘鍋ュ悍'],
-  }))
+  const step1Pool = inputPool.slice(0, step1Count).map((row, index) => ({ ...row, score: 78 - (index % 30), labels: ['活跃强势池'] }))
+  const step2Pool = step1Pool.slice(0, step2Count).map((row, index) => ({ ...row, score: 82 - (index % 28), labels: ['图形待确认'] }))
+  const step3Pool = step2Pool.slice(0, step3Count).map((row, index) => ({ ...row, score: 86 - (index % 20), labels: ['量能健康'] }))
 
-  const finalBase = mode === 'strict' ? stockPool.slice(0, 5) : stockPool
-  const step4Pool = finalBase.map((item, index) => ({
-    ...buildResult(item, index, mode),
-    symbol: step3Pool[index]?.symbol ?? buildResult(item, index, mode).symbol,
-    name: step3Pool[index]?.name ?? item.name,
-    labels: ['题材发酵', '待买观察'],
-  }))
-  const results = step4Pool
+  const step4Pool = stockPool.slice(0, mode === 'strict' ? 5 : stockPool.length).map((item, index) => {
+    const source = step3Pool[index] ?? step2Pool[index] ?? step1Pool[index] ?? inputPool[index]
+    return {
+      ...source,
+      symbol: source?.symbol ?? item.symbol,
+      name: source?.name ?? item.name,
+      trend_class: item.trend,
+      stage: item.stage,
+      theme_stage: THEME_STAGES[index % THEME_STAGES.length],
+      labels: ['题材发酵', '待买观察'],
+      score: 90 - index,
+      ai_confidence: 0.62 + index * 0.05,
+    }
+  })
 
   const detail: ScreenerRunDetail = {
     run_id: runId,
@@ -351,7 +321,7 @@ export function createScreenerRun(params: ScreenerParams) {
       step1_count: step1Count,
       step2_count: step2Count,
       step3_count: step3Count,
-      step4_count: results.length,
+      step4_count: step4Pool.length,
       final_count: 0,
     },
     step_pools: {
@@ -362,9 +332,9 @@ export function createScreenerRun(params: ScreenerParams) {
       step4: step4Pool,
       final: [],
     },
-    results,
-    degraded: results.some((item) => item.degraded),
-    degraded_reason: results.some((item) => item.degraded) ? 'PARTIAL_FLOAT_SHARES_FROM_CACHE' : undefined,
+    results: step4Pool,
+    degraded: step4Pool.some((item) => item.degraded),
+    degraded_reason: step4Pool.some((item) => item.degraded) ? 'PARTIAL_FLOAT_SHARES_FROM_CACHE' : undefined,
   }
   runStore.set(runId, detail)
   return detail
@@ -408,11 +378,11 @@ export function getAnalysis(symbol: string): { analysis: StockAnalysis; annotati
   const analysis: StockAnalysis = {
     symbol,
     suggest_start_date: dayjs().subtract(53, 'day').format('YYYY-MM-DD'),
-    suggest_stage: base?.stage ?? 'Mid',
-    suggest_trend_class: base?.trend ?? 'Unknown',
+    suggest_stage: (base?.stage ?? 'Mid') as StockAnalysis['suggest_stage'],
+    suggest_trend_class: (base?.trend ?? 'Unknown') as TrendClass,
     confidence: 0.74,
     reason: '均线结构稳定，回调量能可控，板块热度仍在发酵。',
-    theme_stage: '发酵中',
+    theme_stage: ('发酵中' as ThemeStage),
     degraded: symbol === 'sz002230',
     degraded_reason: symbol === 'sz002230' ? 'AI_TIMEOUT_CACHE_FALLBACK' : undefined,
   }
@@ -544,22 +514,107 @@ export function getAIRecords(): AIAnalysisRecord[] {
   return aiRecordsStore
 }
 
+function guessTheme(symbol: string) {
+  const themes = ['固态电池', '机器人', '算力应用', '高端消费', '有色资源', '创新药']
+  return themes[hashSeed(symbol) % themes.length]
+}
+
+function inferTrendBullType(trend: TrendClass) {
+  if (trend === 'A') return 'A 阶梯慢牛'
+  if (trend === 'A_B') return 'A_B 慢牛加速'
+  if (trend === 'B') return 'B 脉冲涨停牛'
+  return 'Unknown'
+}
+
 export function analyzeStockWithAI(symbol: string): AIAnalysisRecord {
   const base = stockPool.find((item) => item.symbol === symbol)
-  const conclusion = base?.trend === 'B' ? '高潮' : '发酵中'
-  const confidence = base?.trend === 'B' ? 0.72 : 0.68
+  const candles = ensureCandles(symbol)
+  const latest = candles[candles.length - 1]
+  const start20 = candles[Math.max(0, candles.length - 20)]
+  const ret20 = latest && start20 ? (latest.close - start20.close) / Math.max(start20.close, 0.01) : 0
+  const volumes20 = candles.slice(-20).map((item) => item.volume)
+  const recentVolume = mean(volumes20.slice(-5))
+  const prevVolume = mean(volumes20.slice(0, 5))
+
+  const trend = base?.trend ?? (ret20 > 0.25 ? 'A_B' : 'A')
+  const conclusion = ret20 > 0.45 ? '高潮' : ret20 > 0.05 ? '发酵中' : 'Unknown'
+  const confidence = ret20 > 0.45 ? 0.74 : 0.67
+
   const record: AIAnalysisRecord = {
     provider: configStore.ai_provider,
     symbol,
+    name: base?.name ?? symbol.toUpperCase(),
     fetched_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
-    source_urls: configStore.ai_sources.filter((item) => item.enabled).slice(0, 3).map((item) => item.url),
-    summary: `已完成 ${symbol} 的题材与量价联合分析，建议结合当前分时承接与回撤结构确认买点。`,
+    source_urls: configStore.ai_sources
+      .filter((item) => item.enabled)
+      .slice(0, 4)
+      .map((item) => item.url),
+    summary: `已完成 ${base?.name ?? symbol} 的题材与量价联合分析：近20日涨幅 ${(ret20 * 100).toFixed(2)}%，建议结合分时承接确认节奏。`,
     conclusion,
     confidence,
+    breakout_date: dayjs().subtract(12 + (hashSeed(symbol) % 10), 'day').format('YYYY-MM-DD'),
+    trend_bull_type: inferTrendBullType(trend),
+    theme_name: guessTheme(symbol),
+    rise_reasons: [
+      recentVolume >= prevVolume ? '近端量能维持放大，资金活跃' : '量能趋稳，等待二次放量确认',
+      ret20 > 0.1 ? '价格中枢上移，趋势结构保持多头' : '价格仍在构建底部区间',
+      conclusion === '高潮' ? '题材一致性较高，但需防止高位波动' : '题材仍有扩散空间，可继续跟踪',
+    ],
   }
+
   aiRecordsStore = [record, ...aiRecordsStore].slice(0, 200)
   return record
 }
+
+export function deleteAIRecord(symbol: string, fetchedAt: string, provider?: string) {
+  const before = aiRecordsStore.length
+  aiRecordsStore = aiRecordsStore.filter((item) => {
+    if (item.symbol !== symbol) return true
+    if (item.fetched_at !== fetchedAt) return true
+    if (provider && item.provider !== provider) return true
+    return false
+  })
+  return {
+    deleted: aiRecordsStore.length < before,
+    remaining: aiRecordsStore.length,
+  }
+}
+
+export function testAIProvider(payload: AIProviderTestRequest): AIProviderTestResponse {
+  const hasCredential =
+    payload.provider.api_key.trim().length > 0
+    || payload.provider.api_key_path.trim().length > 0
+    || payload.fallback_api_key.trim().length > 0
+    || payload.fallback_api_key_path.trim().length > 0
+
+  if (!payload.provider.base_url.trim() || !payload.provider.model.trim()) {
+    return {
+      ok: false,
+      provider_id: payload.provider.id,
+      latency_ms: 0,
+      message: '缺少 base_url 或 model',
+      error_code: 'INVALID_PROVIDER_CONFIG',
+    }
+  }
+
+  if (!hasCredential) {
+    return {
+      ok: false,
+      provider_id: payload.provider.id,
+      latency_ms: 0,
+      message: '缺少 API 凭证，请填写 api_key 或 api_key_path',
+      error_code: 'AI_KEY_MISSING',
+    }
+  }
+
+  return {
+    ok: true,
+    provider_id: payload.provider.id,
+    latency_ms: 120,
+    message: '连接成功，耗时 120ms',
+  }
+}
+
 export function getConfigStore() {
   return configStore
 }
@@ -568,4 +623,3 @@ export function setConfigStore(payload: AppConfig) {
   configStore = payload
   return configStore
 }
-

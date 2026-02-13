@@ -7,12 +7,15 @@ from fastapi.responses import JSONResponse
 
 from .models import (
     AIAnalysisRecord,
+    AIProviderTestRequest,
+    AIProviderTestResponse,
     AIRecordsResponse,
     AnnotationUpdateResponse,
     ApiErrorPayload,
     AppConfig,
     CreateOrderRequest,
     CreateOrderResponse,
+    DeleteAIRecordResponse,
     IntradayPayload,
     PortfolioSnapshot,
     ReviewResponse,
@@ -136,6 +139,26 @@ def get_ai_records() -> AIRecordsResponse:
 @app.post("/api/stocks/{symbol}/ai-analyze", response_model=AIAnalysisRecord)
 def post_stock_ai_analyze(symbol: str) -> AIAnalysisRecord:
     return store.analyze_stock_with_ai(symbol)
+
+
+@app.delete("/api/ai/records", response_model=DeleteAIRecordResponse)
+def delete_ai_record(
+    symbol: str = Query(min_length=2),
+    fetched_at: str = Query(min_length=10),
+    provider: str | None = Query(default=None),
+) -> DeleteAIRecordResponse:
+    deleted = store.delete_ai_record(symbol=symbol, fetched_at=fetched_at, provider=provider)
+    return DeleteAIRecordResponse(deleted=deleted, remaining=len(store.get_ai_records()))
+
+
+@app.post("/api/ai/providers/test", response_model=AIProviderTestResponse)
+def post_ai_provider_test(payload: AIProviderTestRequest) -> AIProviderTestResponse:
+    return store.test_ai_provider(
+        payload.provider,
+        fallback_api_key=payload.fallback_api_key,
+        fallback_api_key_path=payload.fallback_api_key_path,
+        timeout_sec=payload.timeout_sec,
+    )
 
 
 @app.get("/api/config", response_model=AppConfig)

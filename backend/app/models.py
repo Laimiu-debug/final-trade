@@ -254,16 +254,26 @@ class ReviewResponse(BaseModel):
 class AIAnalysisRecord(BaseModel):
     provider: str
     symbol: str
+    name: str
     fetched_at: str
     source_urls: list[str]
     summary: str
     conclusion: str
     confidence: float
+    breakout_date: str | None = None
+    trend_bull_type: str | None = None
+    theme_name: str | None = None
+    rise_reasons: list[str] = Field(default_factory=list)
     error_code: str | None = None
 
 
 class AIRecordsResponse(BaseModel):
     items: list[AIAnalysisRecord]
+
+
+class DeleteAIRecordResponse(BaseModel):
+    deleted: bool
+    remaining: int
 
 
 class AIProviderConfig(BaseModel):
@@ -299,3 +309,18 @@ class AppConfig(BaseModel):
     api_key_path: str
     ai_providers: list[AIProviderConfig]
     ai_sources: list[AISourceConfig]
+
+
+class AIProviderTestRequest(BaseModel):
+    provider: AIProviderConfig
+    fallback_api_key: str = ""
+    fallback_api_key_path: str = ""
+    timeout_sec: int = Field(ge=3, le=60, default=10)
+
+
+class AIProviderTestResponse(BaseModel):
+    ok: bool
+    provider_id: str
+    latency_ms: int
+    message: str
+    error_code: str | None = None

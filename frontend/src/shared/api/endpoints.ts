@@ -1,8 +1,11 @@
 import { apiRequest } from '@/shared/api/client'
 import type {
   AIAnalysisRecord,
+  AIProviderTestRequest,
+  AIProviderTestResponse,
   AppConfig,
   CandlePoint,
+  DeleteAIRecordResponse,
   IntradayPayload,
   PortfolioSnapshot,
   ReviewStats,
@@ -81,6 +84,24 @@ export function getAIRecords() {
 export function analyzeStockWithAI(symbol: string) {
   return apiRequest<AIAnalysisRecord>(`/api/stocks/${symbol}/ai-analyze`, {
     method: 'POST',
+  })
+}
+
+export function deleteAIRecord(symbol: string, fetchedAt: string, provider?: string) {
+  const params = new URLSearchParams({ symbol, fetched_at: fetchedAt })
+  if (provider) {
+    params.set('provider', provider)
+  }
+  return apiRequest<DeleteAIRecordResponse>(`/api/ai/records?${params.toString()}`, {
+    method: 'DELETE',
+  })
+}
+
+export function testAIProvider(payload: AIProviderTestRequest) {
+  return apiRequest<AIProviderTestResponse>('/api/ai/providers/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
   })
 }
 

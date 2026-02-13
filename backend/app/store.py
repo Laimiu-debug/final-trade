@@ -1,9 +1,11 @@
 ﻿from __future__ import annotations
 
 import math
+import json
 import os
 import random
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Literal
 from uuid import uuid4
@@ -12,6 +14,7 @@ import httpx
 
 from .models import (
     AIAnalysisRecord,
+    AIProviderTestResponse,
     AISourceConfig,
     AIProviderConfig,
     AppConfig,
@@ -172,20 +175,38 @@ class InMemoryStore:
             AIAnalysisRecord(
                 provider="openai",
                 symbol="sz300750",
+                name="宁德时代",
                 fetched_at=self._now_datetime(),
                 source_urls=["https://example.com/news/ev-1", "https://example.com/forum/battery"],
                 summary="板块热度持续，头部与补涨梯队完整。",
                 conclusion="发酵中",
                 confidence=0.78,
+                breakout_date=self._days_ago(17),
+                trend_bull_type="A_B 慢牛加速",
+                theme_name="固态电池",
+                rise_reasons=[
+                    "近20日量能斜率为正，资金持续流入",
+                    "回调缩量且未破关键均线",
+                    "题材热度维持在发酵区间",
+                ],
             ),
             AIAnalysisRecord(
                 provider="openai",
                 symbol="sh600519",
+                name="贵州茅台",
                 fetched_at=(datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
                 source_urls=["https://example.com/news/consumption"],
                 summary="消费主线维持，成交稳定。",
                 conclusion="高潮",
                 confidence=0.66,
+                breakout_date=self._days_ago(26),
+                trend_bull_type="A 阶梯慢牛",
+                theme_name="高端消费",
+                rise_reasons=[
+                    "龙头股资金抱团明显",
+                    "高位换手可控，回撤幅度有限",
+                    "行业基本面预期稳定",
+                ],
             ),
         ]
 
@@ -211,11 +232,19 @@ class InMemoryStore:
         except OSError:
             return ""
 
-    def _resolve_provider_api_key(self, provider: AIProviderConfig | None) -> str:
+    def _resolve_provider_api_key(
+        self,
+        provider: AIProviderConfig | None,
+        *,
+        fallback_api_key: str = "",
+        fallback_api_key_path: str = "",
+    ) -> str:
         if provider and provider.api_key.strip():
             return provider.api_key.strip()
         if self._config.api_key.strip():
             return self._config.api_key.strip()
+        if fallback_api_key.strip():
+            return fallback_api_key.strip()
         if provider and provider.api_key_path.strip():
             key = self._read_api_key_file(provider.api_key_path)
             if key:
@@ -224,7 +253,322 @@ class InMemoryStore:
             key = self._read_api_key_file(self._config.api_key_path)
             if key:
                 return key
+        if fallback_api_key_path.strip():
+            key = self._read_api_key_file(fallback_api_key_path)
+            if key:
+                return key
         return ""
+
+    @staticmethod
+    def _trend_bull_type_label(trend: TrendClass) -> str:
+        if trend == "A":
+            return "A 阶梯慢牛"
+        if trend == "A_B":
+            return "A_B 慢牛加速"
+        if trend == "B":
+            return "B 脉冲涨停牛"
+        return "Unknown"
+
+    def _resolve_symbol_name(self, symbol: str, row: ScreenerResult | None = None) -> str:
+        def _valid_name(name: str | None) -> str | None:
+            if not name:
+                return None
+            value = name.strip()
+            if not value:
+                return None
+            if value.upper() == symbol.upper():
+                return None
+            return value
+
+        if row:
+            resolved = _valid_name(row.name)
+            if resolved:
+                return resolved
+
+        cached = self._latest_rows.get(symbol)
+        if cached:
+            resolved = _valid_name(cached.name)
+            if resolved:
+                return resolved
+
+        for run in reversed(list(self._run_store.values())):
+            for pool in (
+                run.step_pools.step4,
+                run.step_pools.step3,
+                run.step_pools.step2,
+                run.step_pools.step1,
+                run.step_pools.input,
+            ):
+                found = next((item for item in pool if item.symbol == symbol), None)
+                if not found:
+                    continue
+                resolved = _valid_name(found.name)
+                if resolved:
+                    return resolved
+
+        base = next((item for item in STOCK_POOL if item["symbol"] == symbol), None)
+        if base and base.get("name"):
+            return str(base["name"])
+        return symbol.upper()
+
+    @staticmethod
+    def _safe_mean(values: list[float] | list[int]) -> float:
+        if not values:
+            return 0.0
+        return float(sum(values) / len(values))
+
+    def _build_row_from_candles(self, symbol: str) -> ScreenerResult | None:
+        candles = self._ensure_candles(symbol)
+        if len(candles) < 30:
+            return None
+
+        closes = [item.close for item in candles]
+        highs = [item.high for item in candles]
+        lows = [item.low for item in candles]
+        opens = [item.open for item in candles]
+        volumes = [max(0, int(item.volume)) for item in candles]
+        amounts = [max(0.0, float(item.amount)) for item in candles]
+
+        latest = closes[-1]
+        prev = closes[-2]
+        look20 = min(20, len(closes))
+        look40 = min(40, len(closes) - 1)
+        if look40 < 5:
+            return None
+
+        start20 = len(closes) - look20
+        start40 = len(closes) - look40
+        start40_close = closes[start40]
+        ret40 = (latest - start40_close) / max(start40_close, 0.01)
+
+        high20 = max(highs[start20:])
+        retrace20 = max(0.0, (high20 - latest) / max(high20, 0.01))
+        amount20 = self._safe_mean(amounts[start20:])
+        amplitude20 = self._safe_mean(
+            [
+                (highs[idx] - lows[idx]) / max(closes[idx], 0.01)
+                for idx in range(start20, len(closes))
+            ]
+        )
+
+        avg_vol10 = self._safe_mean(volumes[-10:])
+        avg_vol_prev10 = self._safe_mean(volumes[-20:-10]) if len(volumes) >= 20 else avg_vol10
+        vol_slope20 = (avg_vol10 - avg_vol_prev10) / max(avg_vol_prev10, 1.0)
+
+        up_volumes: list[int] = []
+        down_volumes: list[int] = []
+        for idx in range(1, len(closes)):
+            if closes[idx] >= closes[idx - 1]:
+                up_volumes.append(volumes[idx])
+            else:
+                down_volumes.append(volumes[idx])
+        up_down_volume_ratio = self._safe_mean(up_volumes) / max(self._safe_mean(down_volumes), 1.0)
+
+        pullback_days = 0
+        for idx in range(len(closes) - 1, 0, -1):
+            if closes[idx] <= closes[idx - 1]:
+                pullback_days += 1
+            else:
+                break
+        recent_pullback_volume = volumes[-pullback_days:] if pullback_days > 0 else []
+        pullback_volume_ratio = (
+            self._safe_mean(recent_pullback_volume) / max(self._safe_mean(volumes[-5:]), 1.0)
+            if recent_pullback_volume
+            else 0.85
+        )
+
+        ma20 = self._safe_mean(closes[-20:])
+        ma10 = self._safe_mean(closes[-10:])
+        ma5 = self._safe_mean(closes[-5:])
+        price_vs_ma20 = (latest - ma20) / max(ma20, 0.01)
+
+        ma10_above_ma20_days = 0
+        ma5_above_ma10_days = 0
+        for idx in range(len(closes) - 1, max(len(closes) - 20, 1), -1):
+            ma10_i = self._safe_mean(closes[max(0, idx - 9) : idx + 1])
+            ma20_i = self._safe_mean(closes[max(0, idx - 19) : idx + 1])
+            ma5_i = self._safe_mean(closes[max(0, idx - 4) : idx + 1])
+            if ma10_i >= ma20_i:
+                ma10_above_ma20_days += 1
+            if ma5_i >= ma10_i:
+                ma5_above_ma10_days += 1
+
+        if ret40 >= 0.8 or (latest - prev) / max(prev, 0.01) >= 0.08:
+            trend_class: TrendClass = "B"
+        elif ret40 >= 0.3 and vol_slope20 > 0:
+            trend_class = "A_B"
+        elif ret40 >= 0.12:
+            trend_class = "A"
+        else:
+            trend_class = "Unknown"
+
+        if ret40 < 0.3:
+            stage: Stage = "Early"
+        elif ret40 <= 0.8:
+            stage = "Mid"
+        else:
+            stage = "Late"
+
+        if ret40 >= 0.8:
+            theme_stage: ThemeStage = "高潮"
+        elif vol_slope20 > 0 and up_down_volume_ratio >= 1.1:
+            theme_stage = "发酵中"
+        elif ret40 <= 0.05 and retrace20 > 0.15:
+            theme_stage = "退潮"
+        else:
+            theme_stage = "Unknown"
+
+        has_blowoff_top = False
+        for idx in range(max(0, len(closes) - 20), len(closes)):
+            if volumes[idx] > max(avg_vol10, 1.0) * 2.5 and closes[idx] <= opens[idx]:
+                has_blowoff_top = True
+                break
+
+        has_divergence_5d = False
+        if len(closes) >= 10:
+            price_rise = closes[-1] > closes[-6]
+            avg_v5 = self._safe_mean(volumes[-5:])
+            avg_prev5 = self._safe_mean(volumes[-10:-5])
+            has_divergence_5d = price_rise and avg_v5 < avg_prev5 * 0.9
+
+        has_upper_shadow_risk = False
+        for idx in range(max(0, len(closes) - 5), len(closes)):
+            bar_range = highs[idx] - lows[idx]
+            if bar_range <= 0:
+                continue
+            body_high = max(opens[idx], closes[idx])
+            upper_shadow = highs[idx] - body_high
+            if upper_shadow / bar_range > 0.5 and closes[idx] <= opens[idx]:
+                has_upper_shadow_risk = True
+                break
+
+        pseudo_float_shares = 2_000_000_000.0 + (self._hash_seed(symbol) % 500) * 10_000_000.0
+        turnover20 = self._safe_mean(
+            [max(0.0, float(vol)) / pseudo_float_shares for vol in volumes[start20:]]
+        )
+
+        score_raw = (
+            45
+            + ret40 * 95
+            + up_down_volume_ratio * 8
+            - pullback_volume_ratio * 14
+            + max(0.0, (0.08 - abs(price_vs_ma20)) * 180)
+        )
+        score = int(round(max(0.0, min(100.0, score_raw))))
+        ai_confidence = max(
+            0.35,
+            min(
+                0.95,
+                0.50
+                + ret40 * 0.30
+                + (up_down_volume_ratio - 1.0) * 0.10
+                - max(0.0, pullback_volume_ratio - 0.8) * 0.20,
+            ),
+        )
+        has_approx = any(point.price_source == "approx" for point in candles)
+
+        return ScreenerResult(
+            symbol=symbol,
+            name=self._resolve_symbol_name(symbol),
+            latest_price=round(latest, 2),
+            day_change=round(latest - prev, 2),
+            day_change_pct=round((latest - prev) / max(prev, 0.01), 4),
+            score=score,
+            ret40=round(ret40, 4),
+            turnover20=round(turnover20, 4),
+            amount20=float(amount20),
+            amplitude20=round(amplitude20, 4),
+            retrace20=round(retrace20, 4),
+            pullback_days=pullback_days,
+            ma10_above_ma20_days=ma10_above_ma20_days,
+            ma5_above_ma10_days=ma5_above_ma10_days,
+            price_vs_ma20=round(price_vs_ma20, 4),
+            vol_slope20=round(vol_slope20, 4),
+            up_down_volume_ratio=round(up_down_volume_ratio, 4),
+            pullback_volume_ratio=round(pullback_volume_ratio, 4),
+            has_blowoff_top=has_blowoff_top,
+            has_divergence_5d=has_divergence_5d,
+            has_upper_shadow_risk=has_upper_shadow_risk,
+            ai_confidence=round(ai_confidence, 2),
+            theme_stage=theme_stage,
+            trend_class=trend_class,
+            stage=stage,
+            labels=["K线上下文补全"],
+            reject_reasons=[],
+            degraded=has_approx,
+            degraded_reason="MINUTE_DATA_MISSING_PARTIAL" if has_approx else None,
+        )
+
+    def _build_ai_context_text(self, symbol: str, row: ScreenerResult | None) -> str:
+        candles = self._ensure_candles(symbol)
+        if not candles:
+            return "kline=unavailable"
+
+        closes = [item.close for item in candles]
+        latest = closes[-1]
+        look20 = min(20, len(closes) - 1)
+        ret20 = 0.0
+        if look20 > 0:
+            start_price = closes[-look20]
+            ret20 = (latest - start_price) / max(start_price, 0.01)
+        ma20 = self._safe_mean(closes[-20:])
+        annotation = self._annotation_store.get(symbol)
+        annotation_text = "manual=none"
+        if annotation:
+            annotation_text = (
+                f"manual_start={annotation.start_date}, manual_stage={annotation.stage}, "
+                f"manual_trend={annotation.trend_class}, decision={annotation.decision}"
+            )
+        row_text = "row=none"
+        if row:
+            row_text = (
+                f"row_ret40={row.ret40:.4f}, row_stage={row.stage}, row_trend={row.trend_class}, "
+                f"row_theme={row.theme_stage}, row_score={row.score}"
+            )
+        return (
+            f"latest={latest:.2f}, ret20={ret20:.4f}, price_vs_ma20={(latest - ma20) / max(ma20, 0.01):.4f}, "
+            f"{row_text}, {annotation_text}"
+        )
+
+    def _guess_theme_name(self, symbol: str, row: ScreenerResult | None) -> str:
+        if row and row.theme_stage == "高潮":
+            return "主线热点"
+        theme_candidates = [
+            "固态电池",
+            "算力与AI应用",
+            "有色资源",
+            "机器人",
+            "高端消费",
+            "创新药",
+            "低空经济",
+            "半导体设备",
+        ]
+        seed = self._hash_seed(symbol)
+        return theme_candidates[seed % len(theme_candidates)]
+
+    def _infer_breakout_date(self, symbol: str, row: ScreenerResult | None) -> str:
+        if row is None:
+            return self._days_ago(12 + self._hash_seed(symbol) % 12)
+        offset = 8 + int(max(0.0, min(30.0, row.retrace20 * 100 / 2)))
+        return self._days_ago(offset)
+
+    def _infer_rise_reasons(self, row: ScreenerResult | None) -> list[str]:
+        if row is None:
+            return ["缺少可用日线数据，需先补齐行情后再评估"]
+        reasons: list[str] = []
+        if row.vol_slope20 > 0:
+            reasons.append("20日量能斜率为正，成交活跃度提升")
+        if row.up_down_volume_ratio >= 1.2:
+            reasons.append("上涨日量能显著大于下跌日，资金承接较强")
+        if row.pullback_volume_ratio <= 0.75:
+            reasons.append("回调阶段缩量，抛压释放相对充分")
+        if row.price_vs_ma20 >= 0:
+            reasons.append("价格站上MA20，趋势结构保持多头")
+        if row.theme_stage in ("发酵中", "高潮"):
+            reasons.append(f"题材阶段处于{row.theme_stage}，具备跟踪价值")
+        if not reasons:
+            reasons.append("量价结构中性，建议结合分时确认是否介入")
+        return reasons[:4]
 
     def _heuristic_ai_analysis(
         self,
@@ -233,16 +577,26 @@ class InMemoryStore:
         source_urls: list[str],
     ) -> AIAnalysisRecord:
         provider = self._config.ai_provider
+        stock_name = self._resolve_symbol_name(symbol, row)
+        breakout_date = self._infer_breakout_date(symbol, row)
+        trend_bull_type = self._trend_bull_type_label(row.trend_class) if row else "Unknown"
+        theme_name = self._guess_theme_name(symbol, row)
+        rise_reasons = self._infer_rise_reasons(row)
         if row is None:
             return AIAnalysisRecord(
                 provider=provider,
                 symbol=symbol,
+                name=stock_name,
                 fetched_at=self._now_datetime(),
                 source_urls=source_urls,
-                summary="缺少筛选上下文，按默认规则给出保守建议：先观察量价是否共振，再决定是否纳入跟踪。",
+                summary="已尝试补全上下文但可用行情不足，建议先确认近20日量价结构再决定是否介入。",
                 conclusion="Unknown",
-                confidence=0.52,
-                error_code="AI_CONTEXT_MISSING",
+                confidence=0.5,
+                breakout_date=breakout_date,
+                trend_bull_type=trend_bull_type,
+                theme_name=theme_name,
+                rise_reasons=rise_reasons,
+                error_code="AI_KLINE_CONTEXT_MISSING",
             )
 
         ret_text = f"{row.ret40 * 100:.2f}%"
@@ -264,11 +618,16 @@ class InMemoryStore:
         return AIAnalysisRecord(
             provider=provider,
             symbol=symbol,
+            name=stock_name,
             fetched_at=self._now_datetime(),
             source_urls=source_urls,
             summary=summary,
             conclusion=conclusion,
             confidence=round(confidence, 2),
+            breakout_date=breakout_date,
+            trend_bull_type=trend_bull_type,
+            theme_name=theme_name,
+            rise_reasons=rise_reasons,
             error_code=None,
         )
 
@@ -305,25 +664,31 @@ class InMemoryStore:
         if not api_key:
             return None
 
-        row_text = "无近期筛选上下文"
+        baseline = self._heuristic_ai_analysis(symbol, row, source_urls)
+        row_text = "no_recent_context"
         if row:
             row_text = (
                 f"trend={row.trend_class}, stage={row.stage}, ret={row.ret40:.4f}, "
                 f"turnover20={row.turnover20:.4f}, retrace20={row.retrace20:.4f}, "
                 f"vol_ratio={row.up_down_volume_ratio:.4f}, theme={row.theme_stage}"
             )
+        context_text = self._build_ai_context_text(symbol, row)
+        stock_name = self._resolve_symbol_name(symbol, row)
         prompt = (
-            "请基于股票技术面与题材热度给出简短结论。"
-            "输出格式: 结论(发酵中/高潮/退潮/Unknown) + 置信度(0-1) + 2句摘要。\n"
+            "Return JSON only with keys: "
+            "conclusion, confidence, summary, breakout_date, rise_reasons, trend_bull_type, theme_name. "
+            "conclusion must be one of 发酵中/高潮/退潮/Unknown.\n"
             f"symbol={symbol}\n"
+            f"name={stock_name}\n"
             f"features={row_text}\n"
+            f"context={context_text}\n"
             f"sources={source_urls}"
         )
         body = {
             "model": provider.model,
-            "temperature": 0.2,
+            "temperature": 0.1,
             "messages": [
-                {"role": "system", "content": "你是A股短线趋势分析助手。"},
+                {"role": "system", "content": "You are an A-share short-term trend analyst."},
                 {"role": "user", "content": prompt},
             ],
         }
@@ -347,41 +712,173 @@ class InMemoryStore:
                 raise ValueError("AI_EMPTY_CONTENT")
 
             fallback_confidence = row.ai_confidence if row else 0.6
-            conclusion = self._extract_conclusion_from_text(content)
-            confidence = self._extract_confidence_from_text(content, fallback_confidence)
-            summary = content.replace("\n", " ").strip()
+            parsed: dict[str, object] | None = None
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                json_match = re.search(r"\{[\s\S]+\}", content)
+                if json_match:
+                    try:
+                        parsed = json.loads(json_match.group(0))
+                    except json.JSONDecodeError:
+                        parsed = None
+
+            conclusion = (
+                str(parsed.get("conclusion", "")).strip()
+                if parsed
+                else self._extract_conclusion_from_text(content)
+            ) or self._extract_conclusion_from_text(content)
+            confidence = (
+                float(parsed.get("confidence", fallback_confidence))
+                if parsed
+                else self._extract_confidence_from_text(content, fallback_confidence)
+            )
+            confidence = max(0.0, min(1.0, float(confidence)))
+            summary = (
+                str(parsed.get("summary", "")).strip() if parsed else content.replace("\n", " ").strip()
+            )
+            if not summary:
+                summary = baseline.summary
             if len(summary) > 220:
                 summary = f"{summary[:220]}..."
+
+            breakout_date = str(parsed.get("breakout_date", "")).strip() if parsed else ""
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", breakout_date):
+                breakout_date = baseline.breakout_date or self._now_date()
+
+            trend_bull_type = str(parsed.get("trend_bull_type", "")).strip() if parsed else ""
+            if not trend_bull_type:
+                trend_bull_type = baseline.trend_bull_type or "Unknown"
+
+            theme_name = str(parsed.get("theme_name", "")).strip() if parsed else ""
+            if not theme_name:
+                theme_name = baseline.theme_name or "未知题材"
+
+            rise_reasons: list[str] = []
+            if parsed and isinstance(parsed.get("rise_reasons"), list):
+                rise_reasons = [str(item).strip() for item in parsed["rise_reasons"] if str(item).strip()]
+            if not rise_reasons:
+                rise_reasons = baseline.rise_reasons
+
             return AIAnalysisRecord(
                 provider=provider.id,
                 symbol=symbol,
+                name=stock_name,
                 fetched_at=self._now_datetime(),
                 source_urls=source_urls,
                 summary=summary,
                 conclusion=conclusion,
                 confidence=round(confidence, 2),
+                breakout_date=breakout_date,
+                trend_bull_type=trend_bull_type,
+                theme_name=theme_name,
+                rise_reasons=rise_reasons[:6],
                 error_code=None,
             )
         except httpx.TimeoutException:
-            return AIAnalysisRecord(
-                provider=provider.id,
-                symbol=symbol,
-                fetched_at=self._now_datetime(),
-                source_urls=source_urls,
-                summary="AI请求超时，已回退本地规则分析。",
-                conclusion="Unknown",
-                confidence=0.45,
-                error_code="AI_TIMEOUT",
+            return baseline.model_copy(
+                update={
+                    "provider": provider.id,
+                    "summary": "AI请求超时，已回退本地规则分析。",
+                    "error_code": "AI_TIMEOUT",
+                }
             )
         except Exception:
-            return AIAnalysisRecord(
-                provider=provider.id,
-                symbol=symbol,
-                fetched_at=self._now_datetime(),
-                source_urls=source_urls,
-                summary="AI请求失败，已回退本地规则分析。",
-                conclusion="Unknown",
-                confidence=0.45,
+            return baseline.model_copy(
+                update={
+                    "provider": provider.id,
+                    "summary": "AI请求失败，已回退本地规则分析。",
+                    "error_code": "AI_PROVIDER_ERROR",
+                }
+            )
+
+    def test_ai_provider(
+        self,
+        provider: AIProviderConfig,
+        *,
+        fallback_api_key: str = "",
+        fallback_api_key_path: str = "",
+        timeout_sec: int = 10,
+    ) -> AIProviderTestResponse:
+        if not provider.base_url.strip() or not provider.model.strip():
+            return AIProviderTestResponse(
+                ok=False,
+                provider_id=provider.id,
+                latency_ms=0,
+                message="缺少 base_url 或 model",
+                error_code="INVALID_PROVIDER_CONFIG",
+            )
+
+        api_key = self._resolve_provider_api_key(
+            provider,
+            fallback_api_key=fallback_api_key,
+            fallback_api_key_path=fallback_api_key_path,
+        )
+        if not api_key:
+            return AIProviderTestResponse(
+                ok=False,
+                provider_id=provider.id,
+                latency_ms=0,
+                message="缺少 API 凭证，请填写 api_key 或 api_key_path",
+                error_code="AI_KEY_MISSING",
+            )
+
+        body = {
+            "model": provider.model,
+            "temperature": 0.0,
+            "messages": [
+                {"role": "system", "content": "You are a connectivity probe."},
+                {"role": "user", "content": "Reply only OK"},
+            ],
+        }
+        started = time.perf_counter()
+        try:
+            with httpx.Client(timeout=float(timeout_sec)) as client:
+                resp = client.post(
+                    f"{provider.base_url.rstrip('/')}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json=body,
+                )
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            resp.raise_for_status()
+            payload = resp.json()
+            content = (
+                payload.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            if not content:
+                return AIProviderTestResponse(
+                    ok=False,
+                    provider_id=provider.id,
+                    latency_ms=latency_ms,
+                    message="返回为空，Provider 可能不可用",
+                    error_code="AI_EMPTY_CONTENT",
+                )
+            return AIProviderTestResponse(
+                ok=True,
+                provider_id=provider.id,
+                latency_ms=latency_ms,
+                message=f"连接成功，耗时 {latency_ms}ms",
+                error_code=None,
+            )
+        except httpx.TimeoutException:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            return AIProviderTestResponse(
+                ok=False,
+                provider_id=provider.id,
+                latency_ms=latency_ms,
+                message=f"请求超时（{timeout_sec}s）",
+                error_code="AI_TIMEOUT",
+            )
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            return AIProviderTestResponse(
+                ok=False,
+                provider_id=provider.id,
+                latency_ms=latency_ms,
+                message=f"请求失败: {type(exc).__name__}",
                 error_code="AI_PROVIDER_ERROR",
             )
 
@@ -616,7 +1113,9 @@ class InMemoryStore:
                 degraded=has_degraded_rows,
                 degraded_reason=real_error if has_degraded_rows else None,
             )
-            self._latest_rows = {row.symbol: row for row in real_input_pool}
+            latest_rows = {row.symbol: row for row in real_input_pool}
+            latest_rows.update({row.symbol: row for row in step4_pool})
+            self._latest_rows = latest_rows
             self._run_store[run_id] = detail
             return detail
 
@@ -679,7 +1178,9 @@ class InMemoryStore:
             if any(item.degraded for item in step4_pool)
             else None,
         )
-        self._latest_rows = {row.symbol: row for row in step4_pool}
+        latest_rows = {row.symbol: row for row in input_pool}
+        latest_rows.update({row.symbol: row for row in step4_pool})
+        self._latest_rows = latest_rows
         self._run_store[run_id] = detail
         return detail
 
@@ -889,13 +1390,21 @@ class InMemoryStore:
         )
 
     def analyze_stock_with_ai(self, symbol: str) -> AIAnalysisRecord:
-        row = self._latest_rows.get(symbol)
+        row = self._latest_rows.get(symbol) or self._build_row_from_candles(symbol)
+        if row and symbol not in self._latest_rows:
+            self._latest_rows[symbol] = row
         source_urls = self._enabled_ai_source_urls()
         fallback = self._heuristic_ai_analysis(symbol, row, source_urls)
         provider_result = self._call_provider_for_stock(symbol, row, source_urls)
         record = provider_result or fallback
         if provider_result and provider_result.error_code:
-            record = fallback.model_copy(update={"error_code": provider_result.error_code})
+            record = fallback.model_copy(
+                update={
+                    "provider": provider_result.provider,
+                    "summary": provider_result.summary,
+                    "error_code": provider_result.error_code,
+                }
+            )
 
         self._ai_record_store.insert(0, record)
         if len(self._ai_record_store) > 200:
@@ -904,6 +1413,18 @@ class InMemoryStore:
 
     def get_ai_records(self) -> list[AIAnalysisRecord]:
         return self._ai_record_store
+
+    def delete_ai_record(self, symbol: str, fetched_at: str, provider: str | None = None) -> bool:
+        for index, item in enumerate(self._ai_record_store):
+            if item.symbol != symbol:
+                continue
+            if item.fetched_at != fetched_at:
+                continue
+            if provider is not None and item.provider != provider:
+                continue
+            del self._ai_record_store[index]
+            return True
+        return False
 
     def get_config(self) -> AppConfig:
         return self._config

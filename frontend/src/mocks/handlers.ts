@@ -3,6 +3,7 @@ import {
   analyzeStockWithAI,
   createOrder,
   createScreenerRun,
+  deleteAIRecord,
   getAIRecords,
   getAnalysis,
   getCandlePayload,
@@ -14,8 +15,9 @@ import {
   getSignals,
   saveAnnotation,
   setConfigStore,
+  testAIProvider,
 } from '@/mocks/data'
-import type { AppConfig, ScreenerParams, StockAnnotation } from '@/types/contracts'
+import type { AIProviderTestRequest, AppConfig, ScreenerParams, StockAnnotation } from '@/types/contracts'
 
 export const handlers = [
   http.post('/api/screener/run', async ({ request }) => {
@@ -111,6 +113,21 @@ export const handlers = [
   http.get('/api/ai/records', async () => {
     await delay(160)
     return HttpResponse.json({ items: getAIRecords() })
+  }),
+
+  http.delete('/api/ai/records', async ({ request }) => {
+    await delay(140)
+    const url = new URL(request.url)
+    const symbol = url.searchParams.get('symbol') ?? ''
+    const fetchedAt = url.searchParams.get('fetched_at') ?? ''
+    const provider = url.searchParams.get('provider') ?? undefined
+    return HttpResponse.json(deleteAIRecord(symbol, fetchedAt, provider))
+  }),
+
+  http.post('/api/ai/providers/test', async ({ request }) => {
+    await delay(260)
+    const payload = (await request.json()) as AIProviderTestRequest
+    return HttpResponse.json(testAIProvider(payload))
   }),
 
   http.get('/api/config', async () => {
