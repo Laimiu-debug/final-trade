@@ -84,6 +84,7 @@ export function getAIRecords() {
 export function analyzeStockWithAI(symbol: string) {
   return apiRequest<AIAnalysisRecord>(`/api/stocks/${symbol}/ai-analyze`, {
     method: 'POST',
+    timeoutMs: 45_000,
   })
 }
 
@@ -102,6 +103,7 @@ export function testAIProvider(payload: AIProviderTestRequest) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+    timeoutMs: 20_000,
   })
 }
 

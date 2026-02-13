@@ -81,10 +81,15 @@ export function AiPage() {
       title: '股票',
       key: 'stock',
       width: 140,
-      render: (_, record) => <Typography.Text strong>{record.name || record.symbol.toUpperCase()}</Typography.Text>,
+      ellipsis: true,
+      render: (_, record) => (
+        <Typography.Text strong ellipsis={{ tooltip: record.name || record.symbol.toUpperCase() }}>
+          {record.name || record.symbol.toUpperCase()}
+        </Typography.Text>
+      ),
     },
-    { title: 'Provider', dataIndex: 'provider', width: 100 },
-    { title: '抓取时间', dataIndex: 'fetched_at', width: 170 },
+    { title: 'Provider', dataIndex: 'provider', width: 100, ellipsis: true },
+    { title: '抓取时间', dataIndex: 'fetched_at', width: 170, ellipsis: true },
     {
       title: '结论',
       dataIndex: 'conclusion',
@@ -103,16 +108,17 @@ export function AiPage() {
       title: '趋势牛类型',
       dataIndex: 'trend_bull_type',
       width: 140,
+      ellipsis: true,
       render: (value: string | undefined) => value || '--',
     },
     {
       title: '题材',
       dataIndex: 'theme_name',
       width: 120,
+      ellipsis: true,
       render: (value: string | undefined) => value || '--',
     },
     { title: '置信度', dataIndex: 'confidence', width: 90 },
-    { title: '摘要', dataIndex: 'summary' },
     {
       title: '操作',
       key: 'actions',
@@ -128,7 +134,7 @@ export function AiPage() {
             okText="删除"
             cancelText="取消"
             onConfirm={() => {
-              void deleteMutation.mutateAsync(record)
+              return deleteMutation.mutateAsync(record).catch(() => undefined)
             }}
           >
             <Button size="small" danger loading={deleteMutation.isPending}>

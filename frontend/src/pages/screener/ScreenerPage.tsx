@@ -109,7 +109,7 @@ const defaultStepConfigs: StepConfigs = {
   step3: {
     min_vol_slope20: 0.05,
     min_up_down_volume_ratio: 1.3,
-    max_pullback_volume_ratio: 0.75,
+    max_pullback_volume_ratio: 0.9,
     allow_blowoff_top: false,
     allow_divergence_5d: false,
     allow_upper_shadow_risk: false,
@@ -332,6 +332,9 @@ const exportFormatLabelMap: Record<ExportFormat, string> = {
 
 const MANUAL_LABEL = '手工添加'
 const SCREENER_CACHE_KEY = 'tdx-trend-screener-cache-v4'
+const PDF_CJK_FONT_FILE = 'LXGWWenKai-Regular.ttf'
+const PDF_CJK_FONT_NAME = 'LxgwWenKai'
+const PDF_CJK_FONT_URL = '/fonts/LXGWWenKai-Regular.ttf'
 type StageType = 'Early' | 'Mid' | 'Late'
 type BoardFilterKey = 'main' | 'gem' | 'star' | 'beijing' | 'st'
 type TableSortField =
@@ -491,6 +494,13 @@ interface ScreenerCachePayload {
 }
 
 let memoryScreenerCache: ScreenerCachePayload | null = null
+let pdfCjkFontBinaryCache: string | null = null
+let pdfCjkFontLoadingPromise: Promise<string> | null = null
+
+type JsPdfFontApi = jsPDF & {
+  addFileToVFS: (filename: string, filecontent: string) => void
+  addFont: (filename: string, fontname: string, fontstyle: string) => void
+}
 
 function defaultColumnVisibleState() {
   return defaultColumnOrder.reduce(
@@ -513,6 +523,23 @@ function createDefaultScreenerCache(): ScreenerCachePayload {
     column_visible: defaultColumnVisibleState(),
     input_pool_key: '',
     raw_input_pool: [],
+  }
+}
+
+function sanitizeStep3Config(raw: Partial<StepConfigs['step3']> | undefined): StepConfigs['step3'] {
+  const merged = { ...defaultStepConfigs.step3, ...(raw ?? {}) }
+  const isLegacyDefault =
+    merged.min_vol_slope20 === 0.05
+    && merged.min_up_down_volume_ratio === 1.3
+    && merged.max_pullback_volume_ratio === 0.75
+    && !merged.allow_blowoff_top
+    && !merged.allow_divergence_5d
+    && !merged.allow_upper_shadow_risk
+    && !merged.allow_degraded
+  if (!isLegacyDefault) return merged
+  return {
+    ...merged,
+    max_pullback_volume_ratio: defaultStepConfigs.step3.max_pullback_volume_ratio,
   }
 }
 
@@ -588,7 +615,7 @@ function loadScreenerCache(): ScreenerCachePayload {
     const stepConfigs = {
       step1: { ...defaultStepConfigs.step1, ...(parsed.step_configs?.step1 ?? {}) },
       step2: { ...defaultStepConfigs.step2, ...(parsed.step_configs?.step2 ?? {}) },
-      step3: { ...defaultStepConfigs.step3, ...(parsed.step_configs?.step3 ?? {}) },
+      step3: sanitizeStep3Config(parsed.step_configs?.step3),
       step4: { ...defaultStepConfigs.step4, ...(parsed.step_configs?.step4 ?? {}) },
     }
 
@@ -638,6 +665,51 @@ function saveScreenerCache(payload: ScreenerCachePayload) {
     window.localStorage.setItem(SCREENER_CACHE_KEY, JSON.stringify(persistedPayload))
   } catch {
     // ignore quota and serialization errors; runtime state remains available
+  }
+}
+
+async function loadPdfCjkFontBinary() {
+  if (pdfCjkFontBinaryCache) return pdfCjkFontBinaryCache
+  if (pdfCjkFontLoadingPromise) return pdfCjkFontLoadingPromise
+
+  pdfCjkFontLoadingPromise = (async () => {
+    const response = await fetch(PDF_CJK_FONT_URL)
+    if (!response.ok) {
+      throw new Error(`字体文件加载失败 (${response.status})`)
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer())
+    // jsPDF 的 VFS 需要 8-bit binary string。
+    let binary = ''
+    try {
+      binary = new TextDecoder('latin1').decode(bytes)
+    } catch {
+      const chunkSize = 0x8000
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.subarray(i, i + chunkSize)
+        binary += String.fromCharCode(...chunk)
+      }
+    }
+    pdfCjkFontBinaryCache = binary
+    return binary
+  })()
+
+  try {
+    return await pdfCjkFontLoadingPromise
+  } finally {
+    pdfCjkFontLoadingPromise = null
+  }
+}
+
+async function applyPdfCjkFont(doc: jsPDF) {
+  try {
+    const binary = await loadPdfCjkFontBinary()
+    const fontDoc = doc as JsPdfFontApi
+    fontDoc.addFileToVFS(PDF_CJK_FONT_FILE, binary)
+    fontDoc.addFont(PDF_CJK_FONT_FILE, PDF_CJK_FONT_NAME, 'normal')
+    doc.setFont(PDF_CJK_FONT_NAME, 'normal')
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -1353,7 +1425,7 @@ export function ScreenerPage() {
     URL.revokeObjectURL(url)
   }
 
-  function exportPool(poolKey: ScreenerPoolKey, format: ExportFormat) {
+  async function exportPool(poolKey: ScreenerPoolKey, format: ExportFormat) {
     const dataset = buildExportDataset(poolKey)
     if (!dataset) {
       message.info(`${poolLabelMap[poolKey]}暂无可导出数据`)
@@ -1376,14 +1448,25 @@ export function ScreenerPage() {
       XLSX.writeFile(workbook, `${baseFileName}.xlsx`)
     } else {
       const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' })
+      const hasCjkFont = await applyPdfCjkFont(doc)
+      if (!hasCjkFont) {
+        message.warning('PDF中文字体加载失败，中文可能显示为乱码')
+      }
       doc.setFontSize(12)
       doc.text(`${poolLabelMap[poolKey]} 导出`, 40, 30)
       autoTable(doc, {
         startY: 40,
         head: [header],
         body: lines,
-        styles: { fontSize: 8, cellPadding: 3 },
-        headStyles: { fillColor: [15, 139, 111] },
+        styles: {
+          font: hasCjkFont ? PDF_CJK_FONT_NAME : 'helvetica',
+          fontSize: 8,
+          cellPadding: 3,
+        },
+        headStyles: {
+          font: hasCjkFont ? PDF_CJK_FONT_NAME : 'helvetica',
+          fillColor: [15, 139, 111],
+        },
         margin: { left: 20, right: 20 },
       })
       doc.save(`${baseFileName}.pdf`)
@@ -1403,7 +1486,7 @@ export function ScreenerPage() {
         info.domEvent.stopPropagation()
         const key = String(info.key)
         if (key === 'csv' || key === 'xlsx' || key === 'pdf') {
-          exportPool(poolKey, key as ExportFormat)
+          void exportPool(poolKey, key as ExportFormat)
         }
       },
     }
@@ -1934,7 +2017,7 @@ export function ScreenerPage() {
   const stepConfigHint: Record<Exclude<ScreenerPoolKey, 'input' | 'final'>, string> = {
     step1: `${returnWindowDays}日 | Top${stepConfigs.step1.top_n} | 换手>=${formatPct(stepConfigs.step1.turnover_threshold)}`,
     step2: `回撤${formatPct(stepConfigs.step2.retrace_min)}~${formatPct(stepConfigs.step2.retrace_max)} | 回调<=${stepConfigs.step2.max_pullback_days}天`,
-    step3: `斜率>=${stepConfigs.step3.min_vol_slope20.toFixed(2)} | 量比>=${stepConfigs.step3.min_up_down_volume_ratio.toFixed(2)}`,
+    step3: `斜率>=${stepConfigs.step3.min_vol_slope20.toFixed(2)} | 量比>=${stepConfigs.step3.min_up_down_volume_ratio.toFixed(2)} | 回调量比<=${stepConfigs.step3.max_pullback_volume_ratio.toFixed(2)}`,
     step4: `Top=${stepConfigs.step4.final_top_n} | AI>=${stepConfigs.step4.min_ai_confidence.toFixed(2)}`,
   }
 

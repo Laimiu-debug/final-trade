@@ -141,6 +141,11 @@ def post_stock_ai_analyze(symbol: str) -> AIAnalysisRecord:
     return store.analyze_stock_with_ai(symbol)
 
 
+@app.get("/api/stocks/{symbol}/ai-prompt-preview")
+def get_stock_ai_prompt_preview(symbol: str) -> dict[str, object]:
+    return store.get_ai_prompt_preview(symbol)
+
+
 @app.delete("/api/ai/records", response_model=DeleteAIRecordResponse)
 def delete_ai_record(
     symbol: str = Query(min_length=2),

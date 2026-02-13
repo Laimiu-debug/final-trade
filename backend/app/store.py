@@ -6,9 +6,13 @@ import os
 import random
 import re
 import time
+import html
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Literal
+from urllib.parse import urlparse
 from uuid import uuid4
+import xml.etree.ElementTree as ET
 
 import httpx
 
@@ -72,6 +76,8 @@ class InMemoryStore:
         self._config: AppConfig = self._default_config()
         self._latest_rows: dict[str, ScreenerResult] = {}
         self._ai_record_store: list[AIAnalysisRecord] = self._default_ai_records()
+        self._web_evidence_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
+        self._quote_profile_cache: dict[str, tuple[float, dict[str, str]]] = {}
 
     @staticmethod
     def _default_config() -> AppConfig:
@@ -214,6 +220,960 @@ class InMemoryStore:
         urls = [item.url for item in self._config.ai_sources if item.enabled and item.url.strip()]
         return urls[:limit]
 
+    @staticmethod
+    def _clean_whitespace(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _strip_html_tags(text: str) -> str:
+        return re.sub(r"<[^>]+>", "", text)
+
+    @staticmethod
+    def _extract_domain(raw_url: str) -> str:
+        parsed = urlparse(raw_url.strip())
+        host = parsed.netloc.lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+
+    @staticmethod
+    def _registrable_domain(host: str) -> str:
+        parts = [part for part in host.lower().split(".") if part]
+        if len(parts) <= 2:
+            return ".".join(parts)
+        if len(parts) >= 3 and parts[-2:] == ["com", "cn"]:
+            return ".".join(parts[-3:])
+        if len(parts) >= 3 and parts[-2:] == ["net", "cn"]:
+            return ".".join(parts[-3:])
+        return ".".join(parts[-2:])
+
+    def _source_domains(self, source_urls: list[str]) -> set[str]:
+        domains: set[str] = set()
+        for item in source_urls:
+            domain = self._extract_domain(item)
+            if domain:
+                domains.add(domain)
+                root = self._registrable_domain(domain)
+                if root:
+                    domains.add(root)
+        return domains
+
+    @staticmethod
+    def _url_in_domains(url: str, domains: set[str]) -> bool:
+        if not domains:
+            return True
+        host = urlparse(url).netloc.lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        if not host:
+            return False
+        host_root = InMemoryStore._registrable_domain(host)
+        return any(
+            host == domain
+            or host.endswith(f".{domain}")
+            or (host_root and host_root == domain)
+            for domain in domains
+        )
+
+    @staticmethod
+    def _is_low_quality_source(source_name: str, source_url: str) -> bool:
+        haystack = f"{source_name} {source_url}".lower()
+        blocked_keywords = (
+            "guba",
+            "mguba",
+            "股吧",
+            "财富号",
+            "caifuhao",
+            "论坛",
+            "社区",
+            "xueqiu",
+            "雪球",
+            "博客",
+            "blog",
+            "tieba",
+        )
+        return any(keyword in haystack for keyword in blocked_keywords)
+
+    @staticmethod
+    def _is_low_signal_title(title: str) -> bool:
+        value = title.lower()
+        noisy_keywords = (
+            "早盘",
+            "盘前",
+            "盘后",
+            "复盘",
+            "午评",
+            "收评",
+            "走势",
+            "观察分享",
+            "股吧",
+            "技术分析",
+            "看盘",
+            "点评",
+            "开盘",
+            "龙虎榜复盘",
+            "强势涨停",
+            "果断上车",
+            "牛股",
+            "主升浪",
+            "标杆",
+        )
+        return any(keyword in value for keyword in noisy_keywords)
+
+    @staticmethod
+    def _clean_event_text(text: str) -> str:
+        cleaned = InMemoryStore._clean_whitespace(text)
+        cleaned = re.sub(r"^\[[^\]]+\]\s*", "", cleaned)
+        cleaned = re.sub(r"^(新闻线索|信息源摘要|来源)[:：]\s*", "", cleaned)
+        cleaned = re.sub(r"https?://\S+", "", cleaned)
+        media = (
+            "东方财富|财联社|巨潮资讯|同花顺|新浪财经|新浪网|证券时报|每日经济新闻|雪球|股吧|"
+            "凤凰网|凤凰财经|SOHU|sohu|腾讯网|网易财经|和讯网|金融界"
+        )
+        cleaned = re.sub(rf"({media})\s*[|｜]", "", cleaned)
+        cleaned = re.sub(rf"[（(]({media})[^)）]*[)）]", "", cleaned)
+        cleaned = InMemoryStore._clean_whitespace(cleaned)
+        cleaned = re.sub(rf"\s*[-|｜]\s*({media})\s*$", "", cleaned)
+        cleaned = re.sub(rf"\s*({media})\s*$", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -|｜")
+        return cleaned[:96]
+
+    @staticmethod
+    def _normalize_rise_reasons(reasons: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        high_signal_keywords = (
+            "收购",
+            "并购",
+            "重组",
+            "增资",
+            "注入",
+            "标的",
+            "订单",
+            "中标",
+            "合同",
+            "签约",
+            "业绩",
+            "预增",
+            "利润",
+            "扭亏",
+            "政策",
+            "涨价",
+            "新品",
+            "合作",
+            "回购",
+            "激励",
+            "投产",
+            "扩产",
+            "停牌",
+            "核查",
+            "问询",
+            "监管",
+            "警示",
+            "入主",
+            "景气",
+            "需求",
+            "供给",
+            "回暖",
+            "复苏",
+            "资金",
+        )
+        for item in reasons:
+            value = InMemoryStore._clean_event_text(item)
+            if not value:
+                continue
+            lowered = value.lower()
+            if value in seen:
+                continue
+            seen.add(value)
+            cleaned.append(value)
+
+        prioritized = [item for item in cleaned if any(keyword in item.lower() for keyword in high_signal_keywords)]
+        if prioritized:
+            return prioritized[:4]
+        return cleaned[:4]
+
+    @staticmethod
+    def _extract_code_tokens(text: str) -> set[str]:
+        tokens: set[str] = set()
+        for raw in re.findall(r"(?:sh|sz|bj)?\d{6}", text.lower()):
+            if raw.startswith(("sh", "sz", "bj")):
+                tokens.add(raw[2:])
+            else:
+                tokens.add(raw)
+        return tokens
+
+    @staticmethod
+    def _truncate_reason(text: str, max_len: int = 26) -> str:
+        value = InMemoryStore._clean_whitespace(text).rstrip("。；;，, ")
+        if len(value) <= max_len:
+            return value
+        return value[:max_len].rstrip("。；;，, ")
+
+    @staticmethod
+    def _extract_industry_label(industry_event_candidates: list[str] | None) -> str:
+        for item in industry_event_candidates or []:
+            text = InMemoryStore._clean_event_text(item)
+            match = re.search(r"行业驱动[:：]?\s*([^\s，。；;]{2,12}?)(?:板块|行业)", text)
+            if match:
+                return match.group(1).strip()
+            match = re.search(r"([^\s，。；;]{2,12}?)(?:板块|行业)", text)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    def _compact_reason_by_keywords(
+        self,
+        text: str,
+        *,
+        industry_mode: bool = False,
+        industry_label: str = "",
+    ) -> str | None:
+        raw = self._clean_event_text(text)
+        if not raw:
+            return None
+
+        # Remove long quoted headline fragments and trailing source-like tails.
+        raw = re.sub(r"[“\"].{8,48}?[”\"]", "", raw)
+        raw = re.sub(r"\s*[-|｜:：]\s*(财联社|东方财富|同花顺|新浪|证券时报|每日经济新闻).*$", "", raw)
+        raw = self._clean_whitespace(raw).strip("。；;，, ")
+        if not raw:
+            return None
+
+        bucket = industry_label or "相关行业"
+
+        if any(word in raw for word in ("收购", "并购", "重组", "拟购", "资产注入", "入主")):
+            return self._truncate_reason(
+                f"{'行业驱动：' if industry_mode else ''}{bucket if industry_mode else ''}并购重组预期升温"
+            )
+        if any(word in raw for word in ("订单", "中标", "合同", "签约")):
+            return self._truncate_reason(
+                f"{'行业驱动：' if industry_mode else ''}{bucket if industry_mode else ''}订单与项目预期改善"
+            )
+        if any(word in raw for word in ("业绩", "预增", "利润", "扭亏")):
+            return self._truncate_reason(
+                f"{'行业驱动：' if industry_mode else ''}{bucket if industry_mode else ''}业绩改善预期强化"
+            )
+        if any(word in raw for word in ("政策", "补贴", "规划", "支持", "国补", "降准", "降息")):
+            return self._truncate_reason(
+                f"{'行业驱动：' if industry_mode else ''}{bucket if industry_mode else ''}政策催化提升景气"
+            )
+        if any(word in raw for word in ("涨价", "提价")):
+            return self._truncate_reason(
+                f"{'行业驱动：' if industry_mode else ''}{bucket if industry_mode else ''}价格上行带动预期"
+            )
+        if any(word in raw for word in ("出海", "海外", "出口")):
+            return self._truncate_reason(
+                f"{'行业驱动：' if industry_mode else ''}{bucket if industry_mode else ''}海外需求扩张"
+            )
+        if any(word in raw for word in ("算力", "AI", "人工智能")):
+            return self._truncate_reason(
+                f"{'行业驱动：' if industry_mode else ''}{bucket if industry_mode else ''}AI需求拉动景气"
+            )
+        if any(word in raw for word in ("扩产", "投产", "产能")):
+            return self._truncate_reason(
+                f"{'行业驱动：' if industry_mode else ''}{bucket if industry_mode else ''}产能扩张预期增强"
+            )
+        if any(word in raw for word in ("景气", "需求", "回暖", "复苏", "供给")):
+            return self._truncate_reason(
+                f"{'行业驱动：' if industry_mode else ''}{bucket if industry_mode else ''}景气与需求回暖"
+            )
+
+        if industry_mode:
+            return self._truncate_reason(f"行业驱动：{bucket}板块资金共振")
+        if len(raw) < 8:
+            return None
+        return self._truncate_reason(raw)
+
+    def _sanitize_ai_rise_reasons(
+        self,
+        reasons: list[str],
+        *,
+        symbol: str,
+        core_event_candidates: list[str] | None = None,
+        industry_event_candidates: list[str] | None = None,
+        industry_hint: str = "",
+    ) -> list[str]:
+        symbol_code = symbol.lower().replace("sh", "").replace("sz", "").replace("bj", "")
+        industry_label = self._extract_industry_label(industry_event_candidates) or self._clean_whitespace(industry_hint)
+        combined: list[str] = []
+        if core_event_candidates:
+            combined.extend(core_event_candidates)
+        if industry_event_candidates:
+            combined.extend(industry_event_candidates)
+        combined.extend(reasons)
+
+        filtered: list[str] = []
+        event_keywords = (
+            "收购",
+            "并购",
+            "重组",
+            "拟购",
+            "增资",
+            "注入",
+            "标的",
+            "订单",
+            "中标",
+            "合同",
+            "签约",
+            "业绩",
+            "预增",
+            "利润",
+            "扭亏",
+            "政策",
+            "涨价",
+            "新品",
+            "合作",
+            "回购",
+            "激励",
+            "投产",
+            "扩产",
+            "停牌",
+            "核查",
+            "问询",
+            "监管",
+            "警示",
+            "入主",
+            "景气",
+            "需求",
+            "供给",
+            "回暖",
+            "复苏",
+            "资金",
+        )
+        banned_phrases = (
+            "强势涨停",
+            "果断上车",
+            "上车",
+            "主升浪",
+            "牛股",
+            "龙头",
+            "看多",
+            "建议关注",
+            "跟随",
+            "股价连涨",
+            "恐难支撑",
+            "压力位",
+            "支撑位",
+            "摇摇欲坠",
+            "引爆股价",
+        )
+
+        if (not core_event_candidates) and industry_event_candidates:
+            industry_normalized = self._normalize_rise_reasons(industry_event_candidates)
+            industry_event_only = [item for item in industry_normalized if any(keyword in item for keyword in event_keywords)]
+            if industry_event_only:
+                tagged: list[str] = []
+                for item in industry_event_only[:2]:
+                    compact = self._compact_reason_by_keywords(
+                        item,
+                        industry_mode=True,
+                        industry_label=industry_label,
+                    )
+                    if compact:
+                        tagged.append(compact)
+                if tagged:
+                    return list(dict.fromkeys(tagged))
+
+        for item in combined:
+            for piece in re.split(r"[；;。]\s*", str(item)):
+                text = self._clean_event_text(piece)
+                if not text:
+                    continue
+                if self._is_low_signal_title(text):
+                    continue
+                if any(phrase in text for phrase in banned_phrases):
+                    continue
+                codes = self._extract_code_tokens(text)
+                if codes and any(code != symbol_code for code in codes):
+                    continue
+                if len(text) < 6:
+                    continue
+                if text.count("、") >= 2 and not any(k in text for k in ("收购", "并购", "重组", "订单", "中标", "业绩", "预增")):
+                    continue
+                is_industry_text = text.startswith("行业驱动：") or any(
+                    self._clean_event_text(candidate) in text or text in self._clean_event_text(candidate)
+                    for candidate in (industry_event_candidates or [])
+                )
+                compact = self._compact_reason_by_keywords(
+                    text,
+                    industry_mode=is_industry_text,
+                    industry_label=industry_label,
+                )
+                if compact:
+                    filtered.append(compact)
+
+        normalized = self._normalize_rise_reasons(filtered)
+        event_only = [item for item in normalized if any(keyword in item for keyword in event_keywords)]
+        if event_only:
+            concise = [
+                self._compact_reason_by_keywords(
+                    item,
+                    industry_mode=item.startswith("行业驱动："),
+                    industry_label=industry_label,
+                )
+                for item in event_only[:4]
+            ]
+            return [item for item in concise if item]
+
+        core_normalized = self._normalize_rise_reasons(core_event_candidates or [])
+        core_event_only = [item for item in core_normalized if any(keyword in item for keyword in event_keywords)]
+        if core_event_only:
+            concise = [
+                self._compact_reason_by_keywords(item, industry_mode=False, industry_label=industry_label)
+                for item in core_event_only[:4]
+            ]
+            return [item for item in concise if item]
+
+        industry_normalized = self._normalize_rise_reasons(industry_event_candidates or [])
+        industry_event_only = [item for item in industry_normalized if any(keyword in item for keyword in event_keywords)]
+        if industry_event_only:
+            tagged: list[str] = []
+            for item in industry_event_only[:2]:
+                compact = self._compact_reason_by_keywords(
+                    item,
+                    industry_mode=True,
+                    industry_label=industry_label,
+                )
+                if compact:
+                    tagged.append(compact)
+            if tagged:
+                return list(dict.fromkeys(tagged))
+        return []
+
+    def _sanitize_theme_name(
+        self,
+        theme_name: str,
+        *,
+        evidence: list[dict[str, str]],
+        inferred_sector: str,
+    ) -> str:
+        value = self._clean_whitespace(theme_name)
+        generic = {"", "Unknown", "未知题材", "潜在热点", "主线热点"}
+        if value in generic:
+            inferred_theme = self._infer_theme_from_web_evidence(evidence)
+            if inferred_theme != "Unknown":
+                return inferred_theme
+            return inferred_sector if inferred_sector != "Unknown" else "Unknown"
+
+        corpus = " ".join(
+            f"{item.get('title', '')} {item.get('snippet', '')}" for item in evidence
+        )
+        if value not in corpus and inferred_sector != "Unknown":
+            inferred_theme = self._infer_theme_from_web_evidence(evidence)
+            if inferred_theme != "Unknown":
+                return inferred_theme
+            return inferred_sector
+        return value
+
+    def _build_compact_ai_summary(
+        self,
+        *,
+        symbol: str,
+        breakout_date: str | None,
+        board_label: str,
+        inferred_sector: str,
+        rise_reasons: list[str],
+        raw_summary: str,
+        row: ScreenerResult | None = None,
+    ) -> str:
+        lead = rise_reasons[0].rstrip("。；; ") if rise_reasons else ""
+        summary = self._clean_event_text(raw_summary)
+        extras: list[str] = []
+        if summary and lead and summary != lead:
+            first = re.split(r"[。；;]", summary)[0].strip()
+            if first and first != lead and len(first) >= 8 and (lead not in first and first not in lead) and "核心催化" not in first:
+                extras.append(first[:36].rstrip("。；; "))
+        head = f"{lead}。" if lead.startswith("行业驱动：") else (f"核心催化：{lead}。" if lead else "")
+        sector_text = inferred_sector if inferred_sector and inferred_sector != "Unknown" else "待确认"
+        body = f"板块={board_label}，行业={sector_text}。"
+        tail = f"补充：{extras[0]}。" if extras else ""
+        quant = ""
+        candles = self._ensure_candles(symbol)
+        if candles:
+            aligned_breakout = self._align_date_to_candles(candles, breakout_date or candles[-1].time)
+            index_by_date = {item.time: idx for idx, item in enumerate(candles)}
+            start_idx = index_by_date.get(aligned_breakout, len(candles) - 1)
+            start_idx = max(0, min(start_idx, len(candles) - 1))
+            start_close = max(0.01, candles[start_idx].close)
+            latest_close = candles[-1].close
+            high_slice = [item.high for item in candles[start_idx:]]
+            peak_rel = max(range(len(high_slice)), key=lambda i: high_slice[i]) if high_slice else 0
+            peak_idx = start_idx + peak_rel
+            peak_high = max(0.01, candles[peak_idx].high)
+            peak_date = candles[peak_idx].time
+
+            rise_to_peak = (peak_high - start_close) / start_close
+            current_vs_breakout = (latest_close - start_close) / start_close
+            pullback_from_peak = max(0.0, (peak_high - latest_close) / peak_high)
+            in_pullback = peak_idx < len(candles) - 1 and pullback_from_peak >= 0.015
+
+            quant = (
+                f"量化：起爆{aligned_breakout}→高点{peak_date}涨幅{rise_to_peak * 100:.2f}%，"
+                f"当前较起爆{current_vs_breakout * 100:.2f}%，"
+                f"{'高点回撤' + format(pullback_from_peak * 100, '.2f') + '%。' if in_pullback else '尚未明显回撤。'}"
+            )
+        if row is not None:
+            amount20_yi = row.amount20 / 1e8 if row.amount20 > 0 else 0.0
+            liquidity = (
+                f"流动性：20日平均换手{row.turnover20 * 100:.2f}%"
+                f"{f'，20日平均成交额{amount20_yi:.2f}亿' if amount20_yi > 0 else ''}。"
+            )
+            quant = f"{quant}{liquidity}" if quant else liquidity
+        return f"{head}{body}{tail}{quant}"
+
+    @staticmethod
+    def _extract_core_event_candidates(evidence: list[dict[str, str]]) -> list[str]:
+        event_keywords = (
+            "收购",
+            "并购",
+            "重组",
+            "拟购",
+            "增资",
+            "中标",
+            "订单",
+            "合同",
+            "签约",
+            "业绩",
+            "预增",
+            "扭亏",
+            "涨价",
+        )
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for item in evidence[:10]:
+            text = InMemoryStore._clean_event_text(str(item.get("title", "")))
+            if not text:
+                continue
+            if not any(keyword in text for keyword in event_keywords):
+                continue
+            if text in seen:
+                continue
+            seen.add(text)
+            candidates.append(text[:96])
+            if len(candidates) >= 4:
+                break
+        return candidates
+
+    def _extract_industry_event_candidates(
+        self,
+        industry: str,
+        evidence: list[dict[str, str]],
+    ) -> list[str]:
+        industry_name = self._clean_whitespace(industry)
+        if not industry_name:
+            return []
+        event_keywords = (
+            "政策",
+            "补贴",
+            "景气",
+            "需求",
+            "供给",
+            "涨价",
+            "扩产",
+            "产能",
+            "订单",
+            "库存",
+            "周期",
+            "国产替代",
+            "降息",
+            "降准",
+        )
+        banned = ("个股", "股价", "涨停", "跌停", "龙头", "复盘", "早盘", "午评", "收评")
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for item in evidence[:12]:
+            text = self._clean_event_text(
+                f"{item.get('title', '')} {item.get('snippet', '')}"
+            )
+            if not text:
+                continue
+            if industry_name not in text:
+                continue
+            if any(
+                token in text
+                for token in ("基金", "份额", "净值", "产品资料概要", "发起式", "证券投资基金", "公告更新", "招募说明书")
+            ):
+                continue
+            if any(word in text for word in banned):
+                continue
+            if any(code != "" for code in self._extract_code_tokens(text)):
+                continue
+            if "、" in text and not any(word in text for word in ("政策", "需求", "供给", "涨价", "景气", "订单", "产能")):
+                continue
+            if not any(word in text for word in event_keywords):
+                continue
+            if text in seen:
+                continue
+            seen.add(text)
+            candidates.append(text[:60])
+            if len(candidates) >= 3:
+                break
+        return candidates
+
+    def _build_industry_fallback_reasons(
+        self,
+        industry: str,
+        row: ScreenerResult | None,
+    ) -> list[str]:
+        industry_name = self._clean_whitespace(industry)
+        if not industry_name or industry_name == "Unknown":
+            return []
+        reasons: list[str] = [f"行业驱动：{industry_name}板块近期放量走强，行业资金共振带动个股补涨。"]
+        if row is not None:
+            if row.up_down_volume_ratio >= 1.1:
+                reasons.append(f"行业驱动：{industry_name}上涨日量能占优，短线资金风险偏好回升。")
+            elif row.retrace20 <= 0.12:
+                reasons.append(f"行业驱动：{industry_name}板块回撤受控，行业资金维持轮动配置。")
+            else:
+                reasons.append(f"行业驱动：{industry_name}景气预期回暖，行业资金从核心向二线扩散。")
+        return reasons[:2]
+
+    @staticmethod
+    def _parse_rss_pub_date(date_text: str) -> datetime | None:
+        if not date_text.strip():
+            return None
+        try:
+            parsed = parsedate_to_datetime(date_text.strip())
+            if parsed.tzinfo is not None:
+                return parsed.astimezone().replace(tzinfo=None)
+            return parsed
+        except Exception:
+            return None
+
+    @staticmethod
+    def _market_board_label(symbol: str) -> str:
+        code = symbol.lower().strip()
+        if code.startswith("sz300") or code.startswith("sz301"):
+            return "创业板"
+        if code.startswith("sh688"):
+            return "科创板"
+        if code.startswith("bj"):
+            return "北交所"
+        return "主板"
+
+    @staticmethod
+    def _symbol_to_secid(symbol: str) -> str | None:
+        raw = symbol.lower().strip()
+        market = ""
+        code = ""
+        if raw.startswith("sz"):
+            market, code = "0", raw[2:]
+        elif raw.startswith("sh"):
+            market, code = "1", raw[2:]
+        elif raw.startswith("bj"):
+            market, code = "0", raw[2:]
+        elif re.fullmatch(r"\d{6}", raw):
+            code = raw
+            market = "1" if raw.startswith(("5", "6", "9")) else "0"
+        if not code or not re.fullmatch(r"\d{6}", code):
+            return None
+        return f"{market}.{code}"
+
+    def _fetch_quote_profile(self, symbol: str) -> dict[str, str]:
+        cache_key = symbol.lower()
+        now_ts = time.time()
+        cached = self._quote_profile_cache.get(cache_key)
+        if cached and now_ts - cached[0] <= 3600:
+            return cached[1]
+
+        secid = self._symbol_to_secid(symbol)
+        if secid is None:
+            profile = {"name": "", "industry": "", "region": ""}
+            self._quote_profile_cache[cache_key] = (now_ts, profile)
+            return profile
+
+        profile = {"name": "", "industry": "", "region": ""}
+        try:
+            with httpx.Client(timeout=6.0, follow_redirects=True) as client:
+                resp = client.get(
+                    "https://push2.eastmoney.com/api/qt/stock/get",
+                    params={"secid": secid, "fields": "f57,f58,f127,f128"},
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                        )
+                    },
+                )
+            resp.raise_for_status()
+            payload = resp.json()
+            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            profile = {
+                "name": str(data.get("f58", "")).strip(),
+                "industry": str(data.get("f127", "")).strip(),
+                "region": str(data.get("f128", "")).strip(),
+            }
+        except Exception:
+            profile = {"name": "", "industry": "", "region": ""}
+
+        self._quote_profile_cache[cache_key] = (now_ts, profile)
+        return profile
+
+    def _build_web_search_queries(
+        self,
+        symbol: str,
+        stock_name: str,
+        source_domains: set[str],
+        focus_date: str | None = None,
+    ) -> list[str]:
+        base_queries = [
+            f"{symbol} {stock_name} 收购 并购 重组",
+            f"{symbol} {stock_name} 并购 标的 公告",
+            f"{symbol} {stock_name} 上涨原因 题材 新闻",
+            f"{symbol} {stock_name} 涨停 原因 公告",
+            f"{symbol} {stock_name} 板块 热点",
+            f"{symbol} {stock_name} 公告 业绩",
+        ]
+        parsed_focus = self._parse_date(focus_date or "")
+        if parsed_focus is not None:
+            month_key = parsed_focus.strftime("%Y-%m")
+            base_queries.insert(0, f"{symbol} {stock_name} {month_key} 公告 热点")
+            base_queries.insert(1, f"{symbol} {stock_name} {month_key} 板块 题材")
+        queries: list[str] = []
+        for domain in list(source_domains)[:4]:
+            queries.append(f"{symbol} {stock_name} 上涨原因 site:{domain}")
+            queries.append(f"{symbol} {stock_name} 题材 site:{domain}")
+        queries.extend(base_queries)
+        return queries
+
+    def _build_industry_search_queries(
+        self,
+        industry: str,
+        source_domains: set[str],
+        focus_date: str | None = None,
+    ) -> list[str]:
+        base_queries = [
+            f"{industry} 板块 大涨 原因",
+            f"{industry} 行业 景气 政策",
+            f"{industry} 需求 供给 价格",
+            f"{industry} 产业链 催化",
+        ]
+        parsed_focus = self._parse_date(focus_date or "")
+        if parsed_focus is not None:
+            month_key = parsed_focus.strftime("%Y-%m")
+            base_queries.insert(0, f"{industry} {month_key} 板块 大涨 原因")
+            base_queries.insert(1, f"{industry} {month_key} 政策 催化")
+        queries: list[str] = []
+        for domain in list(source_domains)[:4]:
+            queries.append(f"{industry} 大涨 原因 site:{domain}")
+            queries.append(f"{industry} 行业 催化 site:{domain}")
+        queries.extend(base_queries)
+        return queries
+
+    def _collect_web_evidence(
+        self,
+        symbol: str,
+        stock_name: str,
+        source_urls: list[str],
+        *,
+        focus_date: str | None = None,
+        max_items: int = 8,
+    ) -> list[dict[str, str]]:
+        cache_key = f"{symbol}:{focus_date or ''}:{','.join(source_urls)}"
+        now_ts = time.time()
+        cached = self._web_evidence_cache.get(cache_key)
+        if cached and now_ts - cached[0] <= 600:
+            return cached[1]
+
+        allowed_domains = self._source_domains(source_urls)
+        queries = self._build_web_search_queries(symbol, stock_name, allowed_domains, focus_date)
+        timeout = max(5.0, min(float(self._config.ai_timeout_sec), 12.0))
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        }
+
+        results: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+
+        def parse_rss(xml_text: str, domain_filter: set[str]) -> list[dict[str, str]]:
+            parsed_items: list[dict[str, str]] = []
+            try:
+                root = ET.fromstring(xml_text)
+            except ET.ParseError:
+                return parsed_items
+            for item in root.findall("./channel/item"):
+                link = (item.findtext("link") or "").strip()
+                source_node = item.find("source")
+                source_name = ""
+                source_url = ""
+                if source_node is not None:
+                    source_name = (source_node.text or "").strip()
+                    source_url = (source_node.attrib.get("url") or "").strip()
+                if self._is_low_quality_source(source_name, source_url):
+                    continue
+                filter_url = source_url or link
+                display_url = source_url or link
+                if display_url in seen_urls and link and link not in seen_urls:
+                    display_url = link
+                dedupe_key = display_url
+                if not display_url or dedupe_key in seen_urls:
+                    continue
+                if not self._url_in_domains(filter_url, domain_filter):
+                    continue
+                title_raw = html.unescape((item.findtext("title") or "").strip())
+                desc_raw = html.unescape((item.findtext("description") or "").strip())
+                title = self._clean_whitespace(self._strip_html_tags(title_raw))
+                snippet = self._clean_whitespace(self._strip_html_tags(desc_raw))
+                if self._is_low_signal_title(title):
+                    continue
+                if stock_name and stock_name not in f"{title} {snippet}" and symbol.lower() not in f"{title} {snippet}".lower():
+                    continue
+                if not title and not snippet:
+                    continue
+                parsed_items.append(
+                    {
+                        "title": title[:120] if title else "无标题",
+                        "url": display_url,
+                        "snippet": (f"{source_name} | {snippet}" if source_name else snippet)[:260] if snippet else "无摘要",
+                        "pub_date": (item.findtext("pubDate") or "").strip()[:40],
+                        "source_name": source_name[:40],
+                    }
+                )
+                seen_urls.add(dedupe_key)
+                if len(results) + len(parsed_items) >= max_items:
+                    break
+            return parsed_items
+
+        try:
+            with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers) as client:
+                for query in queries:
+                    if len(results) >= max_items:
+                        break
+                    response = client.get(
+                        "https://news.google.com/rss/search",
+                        params={
+                            "q": query,
+                            "hl": "zh-CN",
+                            "gl": "CN",
+                            "ceid": "CN:zh-Hans",
+                        },
+                    )
+                    response.raise_for_status()
+
+                    parsed_items = parse_rss(response.text, allowed_domains)
+                    if not parsed_items and allowed_domains:
+                        parsed_items = parse_rss(response.text, set())
+                    results.extend(parsed_items)
+                    if len(results) >= max_items:
+                        break
+        except Exception:
+            results = []
+
+        results = results[:max_items]
+        self._web_evidence_cache[cache_key] = (now_ts, results)
+        return results
+
+    def _collect_industry_evidence(
+        self,
+        industry: str,
+        source_urls: list[str],
+        *,
+        focus_date: str | None = None,
+        max_items: int = 8,
+    ) -> list[dict[str, str]]:
+        industry_name = self._clean_whitespace(industry)
+        if not industry_name or industry_name == "Unknown":
+            return []
+        cache_key = f"industry:{industry_name}:{focus_date or ''}:{','.join(source_urls)}"
+        now_ts = time.time()
+        cached = self._web_evidence_cache.get(cache_key)
+        if cached and now_ts - cached[0] <= 600:
+            return cached[1]
+
+        allowed_domains = self._source_domains(source_urls)
+        queries = self._build_industry_search_queries(industry_name, allowed_domains, focus_date)
+        timeout = max(5.0, min(float(self._config.ai_timeout_sec), 12.0))
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        }
+
+        results: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+
+        def parse_rss(xml_text: str, domain_filter: set[str]) -> list[dict[str, str]]:
+            parsed_items: list[dict[str, str]] = []
+            try:
+                root = ET.fromstring(xml_text)
+            except ET.ParseError:
+                return parsed_items
+            for item in root.findall("./channel/item"):
+                link = (item.findtext("link") or "").strip()
+                source_node = item.find("source")
+                source_name = ""
+                source_url = ""
+                if source_node is not None:
+                    source_name = (source_node.text or "").strip()
+                    source_url = (source_node.attrib.get("url") or "").strip()
+                if self._is_low_quality_source(source_name, source_url):
+                    continue
+                filter_url = source_url or link
+                display_url = source_url or link
+                if display_url in seen_urls and link and link not in seen_urls:
+                    display_url = link
+                if not display_url or display_url in seen_urls:
+                    continue
+                if not self._url_in_domains(filter_url, domain_filter):
+                    continue
+                title_raw = html.unescape((item.findtext("title") or "").strip())
+                desc_raw = html.unescape((item.findtext("description") or "").strip())
+                title = self._clean_whitespace(self._strip_html_tags(title_raw))
+                snippet = self._clean_whitespace(self._strip_html_tags(desc_raw))
+                if self._is_low_signal_title(title):
+                    continue
+                if industry_name not in f"{title} {snippet}":
+                    continue
+                if not title and not snippet:
+                    continue
+                parsed_items.append(
+                    {
+                        "title": title[:120] if title else "无标题",
+                        "url": display_url,
+                        "snippet": (f"{source_name} | {snippet}" if source_name else snippet)[:260] if snippet else "无摘要",
+                        "pub_date": (item.findtext("pubDate") or "").strip()[:40],
+                        "source_name": source_name[:40],
+                    }
+                )
+                seen_urls.add(display_url)
+                if len(results) + len(parsed_items) >= max_items:
+                    break
+            return parsed_items
+
+        try:
+            with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers) as client:
+                for query in queries:
+                    if len(results) >= max_items:
+                        break
+                    response = client.get(
+                        "https://news.google.com/rss/search",
+                        params={
+                            "q": query,
+                            "hl": "zh-CN",
+                            "gl": "CN",
+                            "ceid": "CN:zh-Hans",
+                        },
+                    )
+                    response.raise_for_status()
+
+                    parsed_items = parse_rss(response.text, allowed_domains)
+                    if not parsed_items and allowed_domains:
+                        parsed_items = parse_rss(response.text, set())
+                    results.extend(parsed_items)
+                    if len(results) >= max_items:
+                        break
+        except Exception:
+            results = []
+
+        results = results[:max_items]
+        self._web_evidence_cache[cache_key] = (now_ts, results)
+        return results
+
     def _active_ai_provider(self) -> AIProviderConfig | None:
         for provider in self._config.ai_providers:
             if provider.id == self._config.ai_provider and provider.enabled:
@@ -306,6 +1266,11 @@ class InMemoryStore:
                 if resolved:
                     return resolved
 
+        profile = self._fetch_quote_profile(symbol)
+        resolved = _valid_name(profile.get("name"))
+        if resolved:
+            return resolved
+
         base = next((item for item in STOCK_POOL if item["symbol"] == symbol), None)
         if base and base.get("name"):
             return str(base["name"])
@@ -336,9 +1301,232 @@ class InMemoryStore:
                 return candle.time
         return candles[0].time
 
+    def _infer_recent_rebreakout_index(self, candles: list[CandlePoint]) -> int | None:
+        if len(candles) < 70:
+            return None
+        closes = [point.close for point in candles]
+        highs = [point.high for point in candles]
+        lows = [point.low for point in candles]
+        volumes = [max(0, int(point.volume)) for point in candles]
+
+        # Focus on the recent 45 bars to avoid returning an old rally ignition.
+        start = max(45, len(candles) - 45)
+        end = len(candles) - 2
+        for idx in range(start, end + 1):
+            prior_window_start = idx - 20
+            if prior_window_start < 20:
+                continue
+            prior_high20 = max(highs[prior_window_start:idx])
+            prior_low20 = min(lows[prior_window_start:idx])
+            if prior_low20 <= 0:
+                continue
+
+            breakout = closes[idx] >= prior_high20 * 1.01
+            avg_vol20 = self._safe_mean(volumes[prior_window_start:idx])
+            volume_confirmed = volumes[idx] >= avg_vol20 * 1.15 if avg_vol20 > 0 else False
+
+            consolidation_range = (prior_high20 - prior_low20) / max(prior_low20, 0.01)
+            ma20_curr = self._safe_mean(closes[idx - 19 : idx + 1])
+            ma20_prev = self._safe_mean(closes[idx - 29 : idx - 9])
+            ma20_flat = abs(ma20_curr - ma20_prev) / max(ma20_prev, 0.01) <= 0.05
+
+            pre_peak_start = max(0, idx - 60)
+            pre_peak_end = max(pre_peak_start + 1, idx - 20)
+            pre_peak = max(highs[pre_peak_start:pre_peak_end])
+            prior_run_existed = pre_peak >= prior_high20 * 1.08
+
+            ignition = (
+                closes[idx] >= ma20_curr * 1.005
+                and closes[idx] >= closes[idx - 1] * 1.015
+                and volume_confirmed
+            )
+            if not (ma20_flat and consolidation_range <= 0.24 and prior_run_existed and (breakout or ignition)):
+                continue
+
+            forward_end = min(len(candles), idx + 11)
+            if forward_end <= idx + 1:
+                continue
+            forward_high = max(highs[idx + 1 : forward_end])
+            forward_ret = (forward_high - closes[idx]) / max(closes[idx], 0.01)
+            if forward_ret >= 0.05:
+                return idx
+        return None
+
+    def _collect_volume_price_breakout_candidates(
+        self,
+        candles: list[CandlePoint],
+        *,
+        lookback: int = 55,
+        max_items: int = 4,
+    ) -> list[tuple[int, float, float, bool, bool]]:
+        if len(candles) < 35:
+            return []
+
+        closes = [point.close for point in candles]
+        highs = [point.high for point in candles]
+        lows = [point.low for point in candles]
+        volumes = [max(0, int(point.volume)) for point in candles]
+        start = max(20, len(candles) - lookback)
+        end = len(candles) - 2
+        if end <= start:
+            return []
+
+        scored: list[tuple[float, int, float, float, bool, bool, int]] = []
+        for idx in range(start, end + 1):
+            prev_close = closes[idx - 1]
+            if prev_close <= 0:
+                continue
+            day_ret = (closes[idx] - prev_close) / prev_close
+            avg_vol10 = self._safe_mean(volumes[max(0, idx - 10) : idx])
+            if avg_vol10 <= 0:
+                continue
+            vol_ratio10 = volumes[idx] / avg_vol10
+            prior_high20 = max(highs[idx - 20 : idx])
+            is_breakout = closes[idx] >= prior_high20 * 1.005
+
+            pre_start = max(0, idx - 15)
+            pre_low = min(lows[pre_start:idx]) if idx > pre_start else lows[idx]
+            pre_high = max(highs[pre_start:idx]) if idx > pre_start else highs[idx]
+            pre_range = (pre_high - pre_low) / max(pre_low, 0.01)
+            is_consolidation_end = pre_range <= 0.26 and closes[idx] >= pre_high * 0.995
+            ma10_curr = self._safe_mean(closes[max(0, idx - 9) : idx + 1])
+            ma20_curr = self._safe_mean(closes[max(0, idx - 19) : idx + 1])
+            ma20_prev = self._safe_mean(closes[max(0, idx - 20) : idx]) if idx >= 20 else ma20_curr
+            is_ma_ignition = (
+                closes[idx] >= ma10_curr * 1.005
+                and closes[idx] >= ma20_curr * 1.02
+                and ma20_curr >= ma20_prev * 0.997
+            )
+            is_washout_reversal = False
+            anchor_idx = idx
+            if idx >= 6:
+                prev5_high = max(closes[idx - 5 : idx])
+                prev_drop_ratio = (closes[idx - 1] - prev5_high) / max(prev5_high, 0.01)
+                intraday_rebound = (closes[idx] - lows[idx]) / max(lows[idx], 0.01)
+                is_washout_reversal = (
+                    day_ret >= 0.08
+                    and vol_ratio10 >= 1.45
+                    and prev_drop_ratio <= -0.10
+                    and intraday_rebound >= 0.08
+                )
+                if is_washout_reversal:
+                    low_start = max(0, idx - 4)
+                    low_end = idx
+                    if low_end > low_start:
+                        anchor_idx = min(range(low_start, low_end), key=lambda i: closes[i])
+
+            forward_end = min(len(candles), idx + 8)
+            if forward_end <= idx + 1:
+                continue
+            forward_high = max(highs[idx + 1 : forward_end])
+            forward_ret = (forward_high - closes[idx]) / max(closes[idx], 0.01)
+
+            if day_ret < 0.04:
+                continue
+            if vol_ratio10 < 1.45:
+                continue
+            if not (is_breakout or is_consolidation_end or is_ma_ignition or is_washout_reversal):
+                continue
+            if forward_ret < 0.04:
+                continue
+
+            recency = (idx - start) / max(1, (end - start))
+            score = (
+                day_ret * 100
+                + vol_ratio10 * 5.0
+                + (3.0 if is_breakout else 0.0)
+                + (2.0 if is_consolidation_end else 0.0)
+                + (1.5 if is_ma_ignition else 0.0)
+                + (2.5 if is_washout_reversal else 0.0)
+                + forward_ret * 30
+                + recency * 4.0
+            )
+            scored.append((score, anchor_idx, day_ret, vol_ratio10, is_breakout, is_washout_reversal, idx))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        selected: list[tuple[int, float, float, bool, bool]] = []
+        for _, idx, day_ret, vol_ratio10, is_breakout, is_washout_reversal, _ in scored:
+            if any(abs(idx - picked_idx) <= 2 for picked_idx, _, _, _, _ in selected):
+                continue
+            selected.append((idx, day_ret, vol_ratio10, is_breakout, is_washout_reversal))
+            if len(selected) >= max_items:
+                break
+        return selected
+
+    def _build_recent_price_volume_snapshot(
+        self,
+        candles: list[CandlePoint],
+        *,
+        lookback: int = 16,
+    ) -> str:
+        if len(candles) < 2:
+            return "insufficient_recent_kline"
+        closes = [point.close for point in candles]
+        highs = [point.high for point in candles]
+        volumes = [max(0, int(point.volume)) for point in candles]
+        start = max(1, len(candles) - lookback)
+        lines: list[str] = []
+        for idx in range(start, len(candles)):
+            prev_close = closes[idx - 1]
+            day_ret = (closes[idx] - prev_close) / max(prev_close, 0.01)
+            avg_vol10 = self._safe_mean(volumes[max(0, idx - 10) : idx])
+            vol_ratio10 = volumes[idx] / max(avg_vol10, 1.0)
+            prior_high20 = max(highs[max(0, idx - 20) : idx]) if idx > 0 else highs[idx]
+            break20 = closes[idx] >= prior_high20 * 1.005 if idx >= 20 else False
+            lines.append(
+                (
+                    f"{candles[idx].time}"
+                    f"|close={closes[idx]:.2f}"
+                    f"|pct={day_ret * 100:.2f}%"
+                    f"|vol10x={vol_ratio10:.2f}"
+                    f"|break20={1 if break20 else 0}"
+                )
+            )
+        return "\n".join(lines)
+
+    def _adjust_to_cluster_lead_index(self, candles: list[CandlePoint], index: int) -> int:
+        if index <= 0 or len(candles) < 25:
+            return index
+        closes = [point.close for point in candles]
+        highs = [point.high for point in candles]
+        volumes = [max(0, int(point.volume)) for point in candles]
+        start = max(1, index - 3)
+        lead = index
+        for idx in range(index, start - 1, -1):
+            prev_close = closes[idx - 1]
+            day_ret = (closes[idx] - prev_close) / max(prev_close, 0.01)
+            avg_vol10 = self._safe_mean(volumes[max(0, idx - 10) : idx])
+            vol_ratio10 = volumes[idx] / max(avg_vol10, 1.0)
+            prior_high20 = max(highs[max(0, idx - 20) : idx]) if idx > 0 else highs[idx]
+            breakout_like = closes[idx] >= prior_high20 * 0.995
+            ma10_curr = self._safe_mean(closes[max(0, idx - 9) : idx + 1])
+            ma20_curr = self._safe_mean(closes[max(0, idx - 19) : idx + 1])
+            ma20_prev = self._safe_mean(closes[max(0, idx - 20) : idx]) if idx >= 20 else ma20_curr
+            ma_ignition = (
+                closes[idx] >= ma10_curr * 1.005
+                and closes[idx] >= ma20_curr * 1.02
+                and ma20_curr >= ma20_prev * 0.997
+            )
+            if day_ret >= 0.025 and vol_ratio10 >= 1.3 and (breakout_like or ma_ignition):
+                lead = idx
+        return lead
+
     def _infer_breakout_index_from_candles(self, candles: list[CandlePoint]) -> int | None:
         if len(candles) < 40:
             return None
+
+        # First priority: recent volume-price ignition (放量+长阳+突破/结束盘整).
+        volume_price_candidates = self._collect_volume_price_breakout_candidates(candles, lookback=55, max_items=3)
+        if volume_price_candidates:
+            candidate_idx, _, _, _, is_washout_reversal = volume_price_candidates[0]
+            if is_washout_reversal:
+                return candidate_idx
+            return self._adjust_to_cluster_lead_index(candles, candidate_idx)
+
+        # Prefer "二次启动" when a clear consolidation followed by a fresh breakout exists.
+        recent_rebreakout = self._infer_recent_rebreakout_index(candles)
+        if recent_rebreakout is not None:
+            return recent_rebreakout
 
         closes = [point.close for point in candles]
         highs = [point.high for point in candles]
@@ -626,18 +1814,116 @@ class InMemoryStore:
     def _guess_theme_name(self, symbol: str, row: ScreenerResult | None) -> str:
         if row and row.theme_stage == "高潮":
             return "主线热点"
-        theme_candidates = [
-            "固态电池",
-            "算力与AI应用",
-            "有色资源",
-            "机器人",
-            "高端消费",
-            "创新药",
-            "低空经济",
-            "半导体设备",
+        if row and row.theme_stage == "发酵中":
+            return "潜在热点"
+        return "Unknown"
+
+    def _infer_theme_from_web_evidence(self, evidence: list[dict[str, str]]) -> str:
+        if not evidence:
+            return "Unknown"
+        corpus = " ".join(
+            f"{item.get('title', '')} {item.get('snippet', '')}" for item in evidence
+        ).lower()
+        theme_keywords: list[tuple[str, tuple[str, ...]]] = [
+            ("创新药", ("创新药", "医药", "制药", "生物")),
+            ("机器人", ("机器人", "自动化", "工业母机")),
+            ("半导体", ("芯片", "半导体", "算力")),
+            ("新能源", ("锂电", "电池", "光伏", "储能", "新能源")),
+            ("军工", ("军工", "航天", "航空", "卫星")),
+            ("高端消费", ("消费", "白酒", "食品饮料")),
+            ("化工", ("化工", "材料", "涨价")),
         ]
-        seed = self._hash_seed(symbol)
-        return theme_candidates[seed % len(theme_candidates)]
+        best_label = "Unknown"
+        best_score = 0
+        for label, words in theme_keywords:
+            score = sum(corpus.count(word.lower()) for word in words)
+            if score > best_score:
+                best_score = score
+                best_label = label
+        return best_label if best_score > 0 else "Unknown"
+
+    def _infer_sector_from_context(
+        self,
+        symbol: str,
+        stock_name: str,
+        evidence: list[dict[str, str]],
+    ) -> str:
+        profile = self._fetch_quote_profile(symbol)
+        profile_industry = self._clean_whitespace(profile.get("industry", ""))
+        if profile_industry:
+            return profile_industry
+        corpus = " ".join(
+            [stock_name, symbol, *[f"{item.get('title', '')} {item.get('snippet', '')}" for item in evidence]]
+        ).lower()
+        rules: list[tuple[str, tuple[str, ...]]] = [
+            ("通信设备", ("通信", "运营商", "算力", "光模块", "网络", "信息")),
+            ("创新药", ("创新药", "医药", "制药", "生物")),
+            ("机器人", ("机器人", "工业自动化", "机器视觉", "工业母机")),
+            ("半导体", ("芯片", "半导体", "算力", "封装", "光刻")),
+            ("新能源", ("锂电", "电池", "光伏", "储能", "风电", "新能源")),
+            ("军工", ("军工", "航天", "航空", "卫星", "雷达")),
+            ("消费", ("消费", "食品饮料", "白酒", "家电")),
+            ("化工", ("化工", "材料", "涨价", "聚酯", "化纤")),
+        ]
+        best_label = "Unknown"
+        best_score = 0
+        for label, words in rules:
+            score = sum(corpus.count(word.lower()) for word in words)
+            if score > best_score:
+                best_score = score
+                best_label = label
+        return best_label if best_score > 0 else "Unknown"
+
+    def _pick_breakout_hotspot_titles(
+        self,
+        evidence: list[dict[str, str]],
+        breakout_date: str | None,
+        *,
+        max_items: int = 2,
+    ) -> list[str]:
+        if not evidence:
+            return []
+        parsed_breakout = self._parse_date(breakout_date or "")
+        with_parsed: list[tuple[dict[str, str], datetime | None]] = [
+            (item, self._parse_rss_pub_date(str(item.get("pub_date", ""))))
+            for item in evidence
+        ]
+        selected: list[dict[str, str]] = []
+        if parsed_breakout is not None:
+            start = parsed_breakout - timedelta(days=5)
+            end = parsed_breakout + timedelta(days=10)
+            for item, parsed in with_parsed:
+                if parsed is None:
+                    continue
+                if start <= parsed <= end:
+                    selected.append(item)
+                if len(selected) >= max_items:
+                    break
+        if parsed_breakout is None and not selected:
+            selected = [item for item, _ in with_parsed[:max_items]]
+        if parsed_breakout is not None and not selected:
+            return []
+
+        titles: list[str] = []
+        for item in selected[:max_items]:
+            title = self._clean_event_text(str(item.get("title", "")))
+            if not title:
+                continue
+            titles.append(title)
+        return titles
+
+    @staticmethod
+    def _infer_rise_reasons_from_web_evidence(evidence: list[dict[str, str]]) -> list[str]:
+        reasons: list[str] = []
+        seen_titles: set[str] = set()
+        for item in evidence[:6]:
+            title = InMemoryStore._clean_event_text(item.get("title", ""))
+            if title and title not in seen_titles:
+                seen_titles.add(title)
+                reasons.append(title)
+            if len(reasons) >= 4:
+                break
+        return InMemoryStore._normalize_rise_reasons(reasons)
 
     def _infer_breakout_date(self, symbol: str, row: ScreenerResult | None) -> str:
         candles = self._ensure_candles(symbol)
@@ -685,7 +1971,11 @@ class InMemoryStore:
         stock_name = self._resolve_symbol_name(symbol, row)
         breakout_date = self._infer_breakout_date(symbol, row)
         trend_bull_type = self._trend_bull_type_label(row.trend_class) if row else "Unknown"
+        board_label = self._market_board_label(symbol)
+        sector_label = self._infer_sector_from_context(symbol, stock_name, [])
         theme_name = self._guess_theme_name(symbol, row)
+        if theme_name == "Unknown" and sector_label != "Unknown":
+            theme_name = sector_label
         rise_reasons = self._infer_rise_reasons(row)
         if row is None:
             return AIAnalysisRecord(
@@ -715,7 +2005,7 @@ class InMemoryStore:
             conclusion = "高潮" if row.theme_stage == "高潮" else "发酵中"
 
         summary = (
-            f"趋势类型 {row.trend_class}，阶段 {row.stage}，窗口涨幅 {ret_text}，"
+            f"所属板块 {board_label}，趋势类型 {row.trend_class}，阶段 {row.stage}，窗口涨幅 {ret_text}，"
             f"回撤 {retrace_text}，20日平均换手 {turnover_text}。"
             "建议结合分时承接与板块联动确认节奏。"
         )
@@ -756,6 +2046,142 @@ class InMemoryStore:
             value = float(token)
         return max(0.0, min(1.0, value))
 
+    def _compose_ai_prompt_context(
+        self,
+        symbol: str,
+        row: ScreenerResult | None,
+        source_urls: list[str],
+    ) -> dict[str, object]:
+        baseline = self._heuristic_ai_analysis(symbol, row, source_urls)
+        row_text = "no_recent_context"
+        if row:
+            row_text = (
+                f"trend={row.trend_class}, stage={row.stage}, ret={row.ret40:.4f}, "
+                f"turnover20={row.turnover20:.4f}, retrace20={row.retrace20:.4f}, "
+                f"vol_ratio={row.up_down_volume_ratio:.4f}, theme={row.theme_stage}"
+            )
+        context_text = self._build_ai_context_text(symbol, row)
+        stock_name = self._resolve_symbol_name(symbol, row)
+        board_label = self._market_board_label(symbol)
+        web_evidence = self._collect_web_evidence(
+            symbol,
+            stock_name,
+            source_urls,
+            focus_date=baseline.breakout_date,
+        )
+        evidence_urls = [item["url"] for item in web_evidence if item.get("url")]
+        inferred_sector = self._infer_sector_from_context(symbol, stock_name, web_evidence)
+        industry_evidence = self._collect_industry_evidence(
+            inferred_sector,
+            source_urls,
+            focus_date=baseline.breakout_date,
+        )
+        industry_event_candidates = self._extract_industry_event_candidates(
+            inferred_sector,
+            industry_evidence,
+        )
+        if not industry_event_candidates:
+            industry_event_candidates = self._build_industry_fallback_reasons(inferred_sector, row)
+        evidence_urls.extend([item["url"] for item in industry_evidence if item.get("url")])
+        hotspot_titles = self._pick_breakout_hotspot_titles(web_evidence, baseline.breakout_date, max_items=2)
+        core_event_candidates = self._extract_core_event_candidates(web_evidence)
+        evidence_text = "\n".join(
+            [
+                (
+                    f"- [{idx + 1}] title={self._clean_event_text(str(item.get('title', '')))}; "
+                    f"date={item.get('pub_date', '')}; "
+                    f"source={item.get('source_name', '')}; "
+                    f"url={item.get('url', '')}"
+                )
+                for idx, item in enumerate(web_evidence)
+            ]
+        )
+        if not evidence_text:
+            evidence_text = "no_high_signal_web_evidence"
+        industry_evidence_text = "\n".join(
+            [
+                (
+                    f"- [{idx + 1}] title={self._clean_event_text(str(item.get('title', '')))}; "
+                    f"date={item.get('pub_date', '')}; "
+                    f"source={item.get('source_name', '')}; "
+                    f"url={item.get('url', '')}"
+                )
+                for idx, item in enumerate(industry_evidence)
+            ]
+        )
+        if not industry_evidence_text:
+            industry_evidence_text = "no_industry_evidence"
+        candles = self._ensure_candles(symbol)
+        trading_dates_tail = ",".join([point.time for point in candles[-45:]]) if candles else ""
+        baseline_breakout = baseline.breakout_date or self._now_date()
+        today = self._now_date()
+        recent_kline = self._build_recent_price_volume_snapshot(candles, lookback=16)
+        breakout_candidate_details = self._collect_volume_price_breakout_candidates(candles, lookback=55, max_items=4)
+        breakout_candidates: list[str] = []
+        breakout_candidates_text_parts: list[str] = []
+        for idx, day_ret, vol_ratio10, is_breakout, is_washout_reversal in breakout_candidate_details:
+            day = candles[idx].time
+            breakout_candidates.append(day)
+            breakout_candidates_text_parts.append(
+                (
+                    f"{day}"
+                    f"(pct={day_ret * 100:.2f}%,vol10x={vol_ratio10:.2f},"
+                    f"break20={1 if is_breakout else 0},washout={1 if is_washout_reversal else 0})"
+                )
+            )
+        if not breakout_candidates:
+            breakout_candidates = [baseline_breakout]
+            breakout_candidates_text_parts = [f"{baseline_breakout}(baseline)"]
+        breakout_candidates_text = ", ".join(breakout_candidates_text_parts)
+
+        prompt = (
+            "你是A股短线量价分析助手。只输出 JSON，不要任何解释。\n"
+            "JSON keys 固定为: conclusion, confidence, summary, breakout_date, rise_reasons, trend_bull_type, theme_name。\n"
+            "任务只做两件事：\n"
+            "A) 从候选交易日中选出“当前这一轮”的起爆日 breakout_date。\n"
+            "B) 给出 1~2 条上涨原因 rise_reasons（优先公司事件，缺失时给行业驱动）。\n"
+            "硬约束：\n"
+            "1) breakout_date 必须从 breakout_candidates 中选择。\n"
+            "2) 起爆日优先满足量价共振：当日涨幅>=4%、当日成交量>=前10日均量1.5倍，且突破近20日高点或结束盘整。\n"
+            "3) 若历史有上一轮炒作且中间有明显盘整，必须选择新一轮起爆日，不得回到旧周期。\n"
+            "4) rise_reasons 每条<=26字，禁止媒体名/网址/其他股票代码。\n"
+            "5) 若个股无明确利好，rise_reasons 第一条必须写“行业驱动：...”。\n"
+            "6) summary 仅一句话，<=40字。\n"
+            f"symbol={symbol}\n"
+            f"name={stock_name}\n"
+            f"board={board_label}\n"
+            f"inferred_sector={inferred_sector}\n"
+            f"today={today}\n"
+            f"features={row_text}\n"
+            f"context={context_text}\n"
+            f"baseline_breakout={baseline_breakout}\n"
+            f"breakout_candidates={breakout_candidates_text}\n"
+            f"recent_kline=\n{recent_kline}\n"
+            f"core_event_candidates={core_event_candidates}\n"
+            f"industry_event_candidates={industry_event_candidates}\n"
+            f"breakout_hotspot_titles={hotspot_titles}\n"
+            f"configured_sources={source_urls}\n"
+            f"trading_dates_tail={trading_dates_tail}\n"
+            f"web_evidence_count={len(web_evidence)}\n"
+            f"web_evidence=\n{evidence_text}\n"
+            f"industry_evidence_count={len(industry_evidence)}\n"
+            f"industry_evidence=\n{industry_evidence_text}"
+        )
+        evidence_urls = list(dict.fromkeys([url for url in evidence_urls if url]))
+        return {
+            "prompt": prompt,
+            "baseline": baseline,
+            "web_evidence": web_evidence,
+            "evidence_urls": evidence_urls,
+            "inferred_sector": inferred_sector,
+            "board_label": board_label,
+            "hotspot_titles": hotspot_titles,
+            "core_event_candidates": core_event_candidates,
+            "industry_event_candidates": industry_event_candidates,
+            "breakout_candidates": breakout_candidates,
+            "industry_evidence": industry_evidence,
+        }
+
     def _call_provider_for_stock(
         self,
         symbol: str,
@@ -769,38 +2195,50 @@ class InMemoryStore:
         if not api_key:
             return None
 
-        baseline = self._heuristic_ai_analysis(symbol, row, source_urls)
-        row_text = "no_recent_context"
-        if row:
-            row_text = (
-                f"trend={row.trend_class}, stage={row.stage}, ret={row.ret40:.4f}, "
-                f"turnover20={row.turnover20:.4f}, retrace20={row.retrace20:.4f}, "
-                f"vol_ratio={row.up_down_volume_ratio:.4f}, theme={row.theme_stage}"
-            )
-        context_text = self._build_ai_context_text(symbol, row)
-        stock_name = self._resolve_symbol_name(symbol, row)
-        candles = self._ensure_candles(symbol)
-        trading_dates_tail = ",".join([point.time for point in candles[-45:]]) if candles else ""
-        baseline_breakout = baseline.breakout_date or self._now_date()
-        prompt = (
-            "Return JSON only with keys: "
-            "conclusion, confidence, summary, breakout_date, rise_reasons, trend_bull_type, theme_name. "
-            "conclusion must be one of 发酵中/高潮/退潮/Unknown.\n"
-            "breakout_date must be the FIRST confirmed breakout day of the current trend, "
-            "not the latest acceleration day.\n"
-            f"symbol={symbol}\n"
-            f"name={stock_name}\n"
-            f"features={row_text}\n"
-            f"context={context_text}\n"
-            f"baseline_breakout={baseline_breakout}\n"
-            f"trading_dates_tail={trading_dates_tail}\n"
-            f"sources={source_urls}"
+        prompt_ctx = self._compose_ai_prompt_context(symbol, row, source_urls)
+        baseline = prompt_ctx["baseline"]  # type: ignore[assignment]
+        web_evidence = prompt_ctx["web_evidence"]  # type: ignore[assignment]
+        evidence_urls = prompt_ctx["evidence_urls"]  # type: ignore[assignment]
+        industry_evidence = (
+            prompt_ctx.get("industry_evidence")
+            if isinstance(prompt_ctx.get("industry_evidence"), list)
+            else []
         )
+        inferred_sector = str(prompt_ctx.get("inferred_sector", "")).strip() or "Unknown"
+        board_label = str(prompt_ctx.get("board_label", "")).strip() or self._market_board_label(symbol)
+        core_event_candidates = (
+            prompt_ctx.get("core_event_candidates")
+            if isinstance(prompt_ctx.get("core_event_candidates"), list)
+            else []
+        )
+        industry_event_candidates = (
+            prompt_ctx.get("industry_event_candidates")
+            if isinstance(prompt_ctx.get("industry_event_candidates"), list)
+            else []
+        )
+        breakout_candidates = (
+            prompt_ctx.get("breakout_candidates")
+            if isinstance(prompt_ctx.get("breakout_candidates"), list)
+            else []
+        )
+        prompt = str(prompt_ctx["prompt"])
+        if not isinstance(baseline, AIAnalysisRecord):
+            baseline = self._heuristic_ai_analysis(symbol, row, source_urls)
+        if not isinstance(web_evidence, list):
+            web_evidence = []
+        if not isinstance(evidence_urls, list):
+            evidence_urls = []
+        if not isinstance(industry_evidence, list):
+            industry_evidence = []
+        combined_evidence: list[dict[str, str]] = []
+        combined_evidence.extend(web_evidence)
+        combined_evidence.extend(industry_evidence)
+        stock_name = self._resolve_symbol_name(symbol, row)
         body = {
             "model": provider.model,
-            "temperature": 0.1,
+            "temperature": 0.0,
             "messages": [
-                {"role": "system", "content": "You are an A-share short-term trend analyst."},
+                {"role": "system", "content": "You are an A-share short-term trend analyst. Output JSON only."},
                 {"role": "user", "content": prompt},
             ],
         }
@@ -851,8 +2289,8 @@ class InMemoryStore:
             )
             if not summary:
                 summary = baseline.summary
-            if len(summary) > 220:
-                summary = f"{summary[:220]}..."
+            if len(summary) > 120:
+                summary = f"{summary[:120]}..."
 
             breakout_raw = str(parsed.get("breakout_date", "")).strip() if parsed else ""
             breakout_date = self._sanitize_breakout_date(
@@ -860,6 +2298,16 @@ class InMemoryStore:
                 breakout_raw,
                 baseline.breakout_date or self._now_date(),
             )
+            if breakout_candidates:
+                candles = self._ensure_candles(symbol)
+                normalized_candidates = {
+                    self._align_date_to_candles(candles, str(item))
+                    for item in breakout_candidates
+                    if str(item).strip()
+                }
+                normalized_candidates.discard("")
+                if normalized_candidates and breakout_date not in normalized_candidates:
+                    breakout_date = sorted(normalized_candidates)[0]
 
             trend_bull_type = str(parsed.get("trend_bull_type", "")).strip() if parsed else ""
             if not trend_bull_type:
@@ -874,26 +2322,51 @@ class InMemoryStore:
                 rise_reasons = [str(item).strip() for item in parsed["rise_reasons"] if str(item).strip()]
             if not rise_reasons:
                 rise_reasons = baseline.rise_reasons
+            rise_reasons = self._sanitize_ai_rise_reasons(
+                rise_reasons,
+                symbol=symbol,
+                core_event_candidates=core_event_candidates,
+                industry_event_candidates=industry_event_candidates,
+                industry_hint=inferred_sector,
+            )
+
+            theme_name = self._sanitize_theme_name(
+                theme_name,
+                evidence=combined_evidence,
+                inferred_sector=inferred_sector,
+            )
+            if rise_reasons and rise_reasons[0].startswith("行业驱动：") and inferred_sector != "Unknown":
+                theme_name = inferred_sector
+            summary = self._build_compact_ai_summary(
+                symbol=symbol,
+                breakout_date=breakout_date,
+                board_label=board_label,
+                inferred_sector=inferred_sector,
+                rise_reasons=rise_reasons,
+                raw_summary=summary,
+                row=row,
+            )
 
             return AIAnalysisRecord(
                 provider=provider.id,
                 symbol=symbol,
                 name=stock_name,
                 fetched_at=self._now_datetime(),
-                source_urls=source_urls,
+                source_urls=evidence_urls[:8] or source_urls,
                 summary=summary,
                 conclusion=conclusion,
                 confidence=round(confidence, 2),
                 breakout_date=breakout_date,
                 trend_bull_type=trend_bull_type,
                 theme_name=theme_name,
-                rise_reasons=rise_reasons[:6],
+                rise_reasons=rise_reasons[:2],
                 error_code=None,
             )
         except httpx.TimeoutException:
             return baseline.model_copy(
                 update={
                     "provider": provider.id,
+                    "source_urls": evidence_urls[:8] or source_urls,
                     "summary": "AI请求超时，已回退本地规则分析。",
                     "error_code": "AI_TIMEOUT",
                 }
@@ -902,6 +2375,7 @@ class InMemoryStore:
             return baseline.model_copy(
                 update={
                     "provider": provider.id,
+                    "source_urls": evidence_urls[:8] or source_urls,
                     "summary": "AI请求失败，已回退本地规则分析。",
                     "error_code": "AI_PROVIDER_ERROR",
                 }
@@ -996,6 +2470,25 @@ class InMemoryStore:
                 message=f"请求失败: {type(exc).__name__}",
                 error_code="AI_PROVIDER_ERROR",
             )
+
+    def get_ai_prompt_preview(self, symbol: str) -> dict[str, object]:
+        row = self._latest_rows.get(symbol) or self._build_row_from_candles(symbol)
+        if row and symbol not in self._latest_rows:
+            self._latest_rows[symbol] = row
+        source_urls = self._enabled_ai_source_urls()
+        prompt_ctx = self._compose_ai_prompt_context(symbol, row, source_urls)
+        baseline = prompt_ctx.get("baseline")
+        return {
+            "symbol": symbol,
+            "name": self._resolve_symbol_name(symbol, row),
+            "provider": self._config.ai_provider,
+            "prompt": str(prompt_ctx.get("prompt", "")),
+            "web_evidence_count": len(prompt_ctx.get("web_evidence", []))
+            if isinstance(prompt_ctx.get("web_evidence"), list)
+            else 0,
+            "inferred_sector": str(prompt_ctx.get("inferred_sector", "")),
+            "baseline_breakout": baseline.breakout_date if isinstance(baseline, AIAnalysisRecord) else None,
+        }
 
     def _gen_candles(self, seed: int, start_price: float = 40.0) -> list[CandlePoint]:
         points: list[CandlePoint] = []
@@ -1509,7 +3002,95 @@ class InMemoryStore:
         if row and symbol not in self._latest_rows:
             self._latest_rows[symbol] = row
         source_urls = self._enabled_ai_source_urls()
+        stock_name = self._resolve_symbol_name(symbol, row)
+        board_label = self._market_board_label(symbol)
         fallback = self._heuristic_ai_analysis(symbol, row, source_urls)
+        web_evidence = self._collect_web_evidence(
+            symbol,
+            stock_name,
+            source_urls,
+            focus_date=fallback.breakout_date,
+        )
+        evidence_urls = [item["url"] for item in web_evidence if item.get("url")]
+        fallback = fallback.model_copy(update={"source_urls": evidence_urls[:8] or source_urls})
+        inferred_sector = self._infer_sector_from_context(symbol, stock_name, web_evidence)
+        industry_evidence = self._collect_industry_evidence(
+            inferred_sector,
+            source_urls,
+            focus_date=fallback.breakout_date,
+        )
+        industry_event_candidates = self._extract_industry_event_candidates(
+            inferred_sector,
+            industry_evidence,
+        )
+        if not industry_event_candidates:
+            industry_event_candidates = self._build_industry_fallback_reasons(inferred_sector, row)
+        combined_evidence: list[dict[str, str]] = []
+        combined_evidence.extend(web_evidence)
+        combined_evidence.extend(industry_evidence)
+        core_event_candidates = self._extract_core_event_candidates(web_evidence)
+        hotspot_titles = self._pick_breakout_hotspot_titles(web_evidence, fallback.breakout_date, max_items=2)
+        if web_evidence:
+            inferred_theme = self._infer_theme_from_web_evidence(web_evidence)
+            inferred_reasons = self._infer_rise_reasons_from_web_evidence(web_evidence)
+            enriched_reasons = [*core_event_candidates, *inferred_reasons, *hotspot_titles, *industry_event_candidates]
+            if not enriched_reasons:
+                enriched_reasons = fallback.rise_reasons
+            sanitized_fallback_reasons = self._sanitize_ai_rise_reasons(
+                enriched_reasons,
+                symbol=symbol,
+                core_event_candidates=core_event_candidates,
+                industry_event_candidates=industry_event_candidates,
+                industry_hint=inferred_sector,
+            )
+            fallback = fallback.model_copy(
+                update={
+                    "source_urls": evidence_urls[:8] or source_urls,
+                    "theme_name": self._sanitize_theme_name(
+                        inferred_theme if inferred_theme != "Unknown" else (fallback.theme_name or ""),
+                        evidence=combined_evidence,
+                        inferred_sector=inferred_sector,
+                    ),
+                    "rise_reasons": sanitized_fallback_reasons[:2],
+                    "summary": self._build_compact_ai_summary(
+                        symbol=symbol,
+                        breakout_date=fallback.breakout_date,
+                        board_label=board_label,
+                        inferred_sector=inferred_sector,
+                        rise_reasons=sanitized_fallback_reasons,
+                        raw_summary=fallback.summary,
+                        row=row,
+                    ),
+                }
+            )
+        else:
+            sanitized_fallback_reasons = self._sanitize_ai_rise_reasons(
+                [*fallback.rise_reasons, *industry_event_candidates],
+                symbol=symbol,
+                core_event_candidates=core_event_candidates,
+                industry_event_candidates=industry_event_candidates,
+                industry_hint=inferred_sector,
+            )
+            fallback = fallback.model_copy(
+                update={
+                    "theme_name": self._sanitize_theme_name(
+                        fallback.theme_name or "",
+                        evidence=combined_evidence,
+                        inferred_sector=inferred_sector,
+                    ),
+                    "rise_reasons": sanitized_fallback_reasons[:2],
+                    "summary": self._build_compact_ai_summary(
+                        symbol=symbol,
+                        breakout_date=fallback.breakout_date,
+                        board_label=board_label,
+                        inferred_sector=inferred_sector,
+                        rise_reasons=sanitized_fallback_reasons,
+                        raw_summary=fallback.summary,
+                        row=row,
+                    ),
+                }
+            )
+
         provider_result = self._call_provider_for_stock(symbol, row, source_urls)
         record = provider_result or fallback
         if provider_result and provider_result.error_code:
@@ -1520,6 +3101,44 @@ class InMemoryStore:
                     "error_code": provider_result.error_code,
                 }
             )
+
+        final_reasons_source = [
+            *(core_event_candidates or []),
+            *(industry_event_candidates or []),
+            *(record.rise_reasons or []),
+            *hotspot_titles,
+        ]
+        final_reasons = self._sanitize_ai_rise_reasons(
+            final_reasons_source,
+            symbol=symbol,
+            core_event_candidates=core_event_candidates,
+            industry_event_candidates=industry_event_candidates,
+            industry_hint=inferred_sector,
+        )
+        final_theme = self._sanitize_theme_name(
+            record.theme_name or "",
+            evidence=combined_evidence,
+            inferred_sector=inferred_sector,
+        )
+        if final_reasons and final_reasons[0].startswith("行业驱动：") and inferred_sector != "Unknown":
+            final_theme = inferred_sector
+        final_summary = self._build_compact_ai_summary(
+            symbol=symbol,
+            breakout_date=record.breakout_date,
+            board_label=board_label,
+            inferred_sector=inferred_sector,
+            rise_reasons=final_reasons,
+            raw_summary=record.summary,
+            row=row,
+        )
+        record = record.model_copy(
+            update={
+                "theme_name": final_theme,
+                "rise_reasons": final_reasons[:2],
+                "summary": final_summary,
+                "source_urls": evidence_urls[:8] or source_urls,
+            }
+        )
 
         self._ai_record_store.insert(0, record)
         if len(self._ai_record_store) > 200:

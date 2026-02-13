@@ -79,6 +79,14 @@ def test_ai_analyze_stock_endpoint() -> None:
     assert "rise_reasons" in body and isinstance(body["rise_reasons"], list)
 
 
+def test_ai_prompt_preview_endpoint() -> None:
+    resp = client.get("/api/stocks/sz000070/ai-prompt-preview")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["symbol"] == "sz000070"
+    assert "prompt" in body and "rise_reasons" in body["prompt"]
+
+
 def test_ai_provider_test_endpoint() -> None:
     payload = {
         "provider": {

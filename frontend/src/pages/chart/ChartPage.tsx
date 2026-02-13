@@ -368,7 +368,7 @@ export function ChartPage() {
             <Button
               loading={analyzeMutation.isPending}
               onClick={() => {
-                void analyzeMutation.mutateAsync()
+                analyzeMutation.mutate()
               }}
             >
               AI分析本股
@@ -406,9 +406,6 @@ export function ChartPage() {
                     上涨原因: {(lastAIRecord.rise_reasons ?? []).length > 0 ? (lastAIRecord.rise_reasons ?? []).join('；') : '--'}
                   </Typography.Text>
                   <Typography.Text>{lastAIRecord.summary}</Typography.Text>
-                  <Typography.Text type="secondary">
-                    来源: {lastAIRecord.source_urls.join(' | ') || '无'}
-                  </Typography.Text>
                   {lastAIRecord.error_code ? (
                     <Typography.Text type="warning">
                       回退原因: {lastAIRecord.error_code}
