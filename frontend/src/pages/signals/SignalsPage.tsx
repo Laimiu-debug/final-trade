@@ -22,6 +22,7 @@ import {
 import { LineChartOutlined, ReloadOutlined, ShoppingCartOutlined, SwapOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { useNavigate, useSearchParams } from 'react-router-dom'
+import wyckoffCycleDiagram from '@/assets/wyckoff-cycle.svg'
 import { ApiError } from '@/shared/api/client'
 import { getSignals, postSimOrder } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
@@ -73,21 +74,30 @@ const wyckoffEventGuide: Array<{ event: string; name: string; description: strin
   { event: 'SC', name: '卖出高潮', description: '恐慌抛售集中释放，常伴随放量与长下影。' },
   { event: 'AR', name: '自动反弹', description: 'SC 后技术性反抽，形成区间上沿参考。' },
   { event: 'ST', name: '二次测试', description: '回测 SC 区域，确认供给是否继续减少。' },
-  { event: 'TSO', name: '上冲受阻', description: '冲高后被快速压回，代表上方抛压仍在。' },
+  { event: 'TSO', name: '终极洗盘', description: '吸筹末段最后一次假跌破（常与 Spring 同义/变体）。' },
   { event: 'Spring', name: '弹簧', description: '短暂跌破区间下沿后快速收回，洗盘特征明显。' },
   { event: 'SOS', name: '强势信号', description: '放量上攻并站稳关键位，需求主导增强。' },
-  { event: 'JOC', name: '越区确认', description: '有效越过区间上沿，结构由震荡转向上行。' },
+  { event: 'JOC', name: '越区确认', description: '放量突破吸筹区上沿（Creek），是进入拉升段的关键确认。' },
   { event: 'LPS', name: '最后支撑点', description: '突破后回踩承接，常作为更稳妥介入位。' },
   { event: 'UTAD', name: '上冲假突破', description: '派发端假突破，多为风险预警而非买点。' },
   { event: 'SOW', name: '弱势信号', description: '破位下行并放量，供给重新占优。' },
   { event: 'LPSY', name: '最后供给点', description: '反抽无力后再走弱，派发风险延续。' },
 ]
 
+const distributionIntroGuide: Array<{ event: string; description: string }> = [
+  { event: 'PSY', description: '派发初步供给：上涨动能开始钝化，供给端逐渐抬头。' },
+  { event: 'BC', description: '买入高潮：冲高放量后难以持续，常为派发区的重要高点。' },
+  { event: 'AR(d)', description: '派发自动反应：从 BC 高位快速回落，形成区间下沿参考。' },
+  { event: 'ST(d)', description: '派发二次测试：反抽测试上沿但承接不足，弱势结构更清晰。' },
+]
+
 const wyckoffLogicGuide = [
-  '候选集 -> 量价特征提取 -> 12事件识别 -> 阶段判定（吸筹/派发）-> 综合评分与排序。',
-  '派发类事件（UTAD / SOW / LPSY）主要用于风险扣分与预警，不直接转成主买入信号。',
-  '主信号由评分与风险共同决定：通常 B > A > C；分数越高、事件越完整，优先级越高。',
-  '“要求序列完整”打开后，系统只保留事件链条更连贯的标的。',
+  '威科夫核心思想是“价格反映结果，成交量揭示意图”：看价格位置，也看放量/缩量背后的主导力量。',
+  '完整周期通常经历 吸筹 -> 拉升 -> 派发 -> 下跌；事件是这些阶段中主力行为留下的痕迹。',
+  'A-E 分段可理解为：A 终止前趋势，B 区间建仓/换手，C 假突破测试，D 方向确认，E 趋势延续。',
+  '买点更偏向吸筹后段的确认（如 SOS/LPS/JOC），派发侧事件（UTAD/SOW/LPSY）更多是风险信号。',
+  '事件不是机械顺序，关键在于“价量是否匹配”：上涨若无量常不稳，回踩若缩量更利于趋势延续。',
+  '示意图已补充派发前段的 PSY/BC/AR/ST，并与 UTAD/SOW/LPSY 衔接成完整派发链。',
 ]
 
 function formatSignalError(error: unknown) {
@@ -526,12 +536,12 @@ export function SignalsPage() {
 
           {!guideExpanded ? (
             <Typography.Text type="secondary">
-              点击“展开说明”查看 ABC 主信号定义、12 个威科夫事件释义和整体事件判定流程。
+              点击“展开说明”查看 ABC 主信号定义、12 个威科夫事件释义、威科夫量价思想与标准周期示意图。
             </Typography.Text>
           ) : (
             <>
               <Typography.Text type="secondary">
-                说明用于帮助理解当前信号来源，不替代交易决策。请结合K线结构与风险控制使用。
+                这里介绍的是威科夫量价事件的市场思想，用于理解主力行为与阶段转换，不是软件计算流程说明。
               </Typography.Text>
 
               <Row gutter={[12, 12]}>
@@ -550,6 +560,26 @@ export function SignalsPage() {
                 ))}
               </Row>
 
+              <Card size="small">
+                <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+                  <Typography.Text strong>标准威科夫事件周期示意图</Typography.Text>
+                  <img
+                    src={wyckoffCycleDiagram}
+                    alt="标准威科夫周期示意图：吸筹、拉升、派发、下跌及关键事件"
+                    style={{
+                      width: '100%',
+                      maxWidth: 980,
+                      border: '1px solid rgba(44,62,80,0.12)',
+                      borderRadius: 10,
+                      background: '#fff',
+                    }}
+                  />
+                  <Typography.Text type="secondary">
+                    图示为教学模板。真实市场中事件可能重叠、变形或跳步，需结合量价强弱与市场环境综合判断。
+                  </Typography.Text>
+                </Space>
+              </Card>
+
               <Table
                 size="small"
                 rowKey="event"
@@ -567,8 +597,20 @@ export function SignalsPage() {
                 ]}
               />
 
+              <Card size="small">
+                <Space orientation="vertical" size={6} style={{ width: '100%' }}>
+                  <Typography.Text strong>派发前段补充事件（教学扩展）</Typography.Text>
+                  {distributionIntroGuide.map((item) => (
+                    <Typography.Text key={item.event} type="secondary">
+                      <Tag color="gold">{item.event}</Tag>
+                      {item.description}
+                    </Typography.Text>
+                  ))}
+                </Space>
+              </Card>
+
               <Space orientation="vertical" size={4} style={{ width: '100%' }}>
-                <Typography.Text strong>威科夫整体事件逻辑</Typography.Text>
+                <Typography.Text strong>威科夫量价思想与事件逻辑</Typography.Text>
                 {wyckoffLogicGuide.map((item, index) => (
                   <Typography.Text key={item} type="secondary">
                     {index + 1}. {item}
