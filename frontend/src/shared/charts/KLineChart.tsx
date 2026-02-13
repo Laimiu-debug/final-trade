@@ -1,12 +1,15 @@
 import ReactECharts from 'echarts-for-react'
 import type { CandlePoint, SignalResult, SignalType } from '@/types/contracts'
 import { movingAverage } from '@/shared/utils/chart'
+import { resolveNearestTradingDateIndex } from '@/shared/utils/candleStats'
 
 interface KLineChartProps {
   candles: CandlePoint[]
   signals?: SignalResult[]
   manualStartDate?: string
   aiBreakoutDate?: string
+  statsRangeStartDate?: string
+  statsRangeEndDate?: string
   onCandleDoubleClick?: (date: string) => void
 }
 
@@ -39,21 +42,10 @@ type StageRangeItem = [
   },
 ]
 
-function resolveNearestTradingDateIndex(targetDate: string, tradingDates: string[]) {
-  if (tradingDates.length === 0) return -1
-  const exactIndex = tradingDates.indexOf(targetDate)
-  if (exactIndex >= 0) return exactIndex
-
-  const targetTs = Date.parse(targetDate)
-  if (Number.isNaN(targetTs)) return -1
-
-  for (let index = 0; index < tradingDates.length; index += 1) {
-    const currentTs = Date.parse(tradingDates[index])
-    if (Number.isNaN(currentTs)) continue
-    if (currentTs >= targetTs) return index
-  }
-
-  return tradingDates.length - 1
+interface AxisTooltipParam {
+  seriesName?: string
+  axisValue?: string
+  dataIndex?: number
 }
 
 function resolveSignalColor(signal: SignalType) {
@@ -69,9 +61,40 @@ function resolveSignalShape(signal: SignalType) {
 }
 
 function resolvePhaseAreaColor(phase: string) {
-  if (phase.startsWith('吸筹')) return 'rgba(22, 119, 255, 0.10)'
-  if (phase.startsWith('派发')) return 'rgba(245, 34, 45, 0.10)'
+  if (phase.includes('\u5438\u7b79') || phase.toLowerCase().includes('accum')) return 'rgba(22, 119, 255, 0.10)'
+  if (phase.includes('\u6d3e\u53d1') || phase.toLowerCase().includes('distrib')) return 'rgba(245, 34, 45, 0.10)'
   return 'rgba(120, 136, 153, 0.08)'
+}
+
+function toPrice(value: number) {
+  if (!Number.isFinite(value)) return '--'
+  return value.toFixed(2)
+}
+
+function toLargeNumber(value: number) {
+  if (!Number.isFinite(value)) return '--'
+  const abs = Math.abs(value)
+  if (abs >= 100000000) return `${(value / 100000000).toFixed(2)}\u4ebf`
+  if (abs >= 10000) return `${(value / 10000).toFixed(2)}\u4e07`
+  return value.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
+}
+
+function toSignedNumber(value: number, digits = 2) {
+  if (!Number.isFinite(value)) return '--'
+  if (value > 0) return `+${value.toFixed(digits)}`
+  return value.toFixed(digits)
+}
+
+function toSignedPercent(value: number, digits = 2) {
+  if (!Number.isFinite(value)) return '--'
+  const pct = value * 100
+  if (pct > 0) return `+${pct.toFixed(digits)}%`
+  return `${pct.toFixed(digits)}%`
+}
+
+function toMaybeNumber(value: number | '-' | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '--'
+  return value.toFixed(2)
 }
 
 function buildStackOffsetsAbove(count: number) {
@@ -106,11 +129,27 @@ function toStackedMarkPoints(points: MarkPointDraft[]) {
   return stacked
 }
 
+function resolveDateMarkLine(date: string | undefined, xData: string[], name: string, color: string) {
+  if (!date) return null
+  const index = resolveNearestTradingDateIndex(date, xData)
+  if (index < 0) return null
+  const mappedDate = xData[index]
+  const mappedSuffix = mappedDate === date ? '' : `\uff08\u6620\u5c04\u5230 ${mappedDate}\uff09`
+  return {
+    name,
+    xAxis: mappedDate,
+    lineStyle: { color, width: 1.4 },
+    label: { formatter: `${name}${mappedSuffix}` },
+  }
+}
+
 export function KLineChart({
   candles,
   signals = [],
   manualStartDate,
   aiBreakoutDate,
+  statsRangeStartDate,
+  statsRangeEndDate,
   onCandleDoubleClick,
 }: KLineChartProps) {
   const xData = candles.map((item) => item.time)
@@ -123,6 +162,7 @@ export function KLineChart({
   const markPointDrafts: MarkPointDraft[] = []
   const stageRangeSet = new Set<string>()
   const stageRangeData: StageRangeItem[] = []
+  const signalSummaryByDate = new Map<string, string[]>()
 
   for (const signal of signals) {
     const triggerIndex = resolveNearestTradingDateIndex(signal.trigger_date, xData)
@@ -130,14 +170,14 @@ export function KLineChart({
 
     const mappedTriggerDate = xData[triggerIndex]
     const mappedHint = mappedTriggerDate === signal.trigger_date ? '' : ` -> ${mappedTriggerDate}`
-    const phase = signal.wyckoff_phase?.trim() || '阶段未明'
-    const event = signal.wyckoff_signal?.trim() || signal.wy_events?.[signal.wy_events.length - 1] || '无事件'
+    const phase = signal.wyckoff_phase?.trim() || '\u9636\u6bb5\u672a\u660e'
+    const event = signal.wyckoff_signal?.trim() || signal.wy_events?.[signal.wy_events.length - 1] || '\u65e0\u4e8b\u4ef6'
 
     const signalSequence: SignalType[] = [signal.primary_signal, ...signal.secondary_signals]
     const dedupedSequence = Array.from(new Set(signalSequence))
     dedupedSequence.forEach((signalType, sequenceIndex) => {
       const isPrimary = sequenceIndex === 0
-      const markerName = isPrimary ? `${signalType}主信号` : `${signalType}次信号`
+      const markerName = isPrimary ? `${signalType}\u4e3b\u4fe1\u53f7` : `${signalType}\u6b21\u4fe1\u53f7`
       markPointDrafts.push({
         dateKey: mappedTriggerDate,
         name: markerName,
@@ -145,12 +185,20 @@ export function KLineChart({
         value: signalType,
         symbol: resolveSignalShape(signalType),
         symbolSize: isPrimary ? 16 : 12,
-        tooltipText: `${markerName} | 阶段:${phase} | 事件:${event} | 触发:${signal.trigger_date}${mappedHint}`,
+        tooltipText: `${markerName} | \u9636\u6bb5:${phase} | \u4e8b\u4ef6:${event} | \u89e6\u53d1:${signal.trigger_date}${mappedHint}`,
         itemStyle: {
           color: resolveSignalColor(signalType),
         },
       })
     })
+
+    const summaryLine = `${dedupedSequence.join('/')} | ${phase} | ${event}`
+    const existedSummary = signalSummaryByDate.get(mappedTriggerDate)
+    if (existedSummary) {
+      existedSummary.push(summaryLine)
+    } else {
+      signalSummaryByDate.set(mappedTriggerDate, [summaryLine])
+    }
 
     const expireSource = signal.expire_date || signal.trigger_date
     const expireIndexRaw = resolveNearestTradingDateIndex(expireSource, xData)
@@ -170,7 +218,7 @@ export function KLineChart({
       stageRangeSet.add(rangeKey)
       stageRangeData.push([
         {
-          name: `阶段:${phase}`,
+          name: `\u9636\u6bb5:${phase}`,
           xAxis: rangeStart,
           itemStyle: { color: resolvePhaseAreaColor(phase) },
           label: {
@@ -182,6 +230,31 @@ export function KLineChart({
         },
         {
           xAxis: rangeEnd,
+        },
+      ])
+    }
+  }
+
+  if (statsRangeStartDate && statsRangeEndDate && xData.length > 0) {
+    const rangeStartIndex = resolveNearestTradingDateIndex(statsRangeStartDate, xData)
+    const rangeEndIndex = resolveNearestTradingDateIndex(statsRangeEndDate, xData)
+    if (rangeStartIndex >= 0 && rangeEndIndex >= 0) {
+      const left = Math.min(rangeStartIndex, rangeEndIndex)
+      const right = Math.max(rangeStartIndex, rangeEndIndex)
+      stageRangeData.push([
+        {
+          name: '\u7edf\u8ba1\u533a\u95f4',
+          xAxis: xData[left],
+          itemStyle: { color: 'rgba(250, 173, 20, 0.12)' },
+          label: {
+            show: false,
+            formatter: '\u7edf\u8ba1\u533a\u95f4',
+            color: '#8a5a00',
+            fontSize: 11,
+          },
+        },
+        {
+          xAxis: xData[right],
         },
       ])
     }
@@ -209,11 +282,11 @@ export function KLineChart({
     }
   }
 
-  const manualPoint = makeDateMarkPoint(manualStartDate, '人工启动日', 'low', '#13c2c2')
+  const manualPoint = makeDateMarkPoint(manualStartDate, '\u4eba\u5de5\u542f\u52a8\u65e5', 'low', '#13c2c2')
   if (manualPoint) {
     markPointDrafts.push(manualPoint)
   }
-  const aiPoint = makeDateMarkPoint(aiBreakoutDate, 'AI起爆日', 'high', '#fa8c16')
+  const aiPoint = makeDateMarkPoint(aiBreakoutDate, 'AI\u8d77\u7206\u65e5', 'high', '#fa8c16')
   if (aiPoint) {
     markPointDrafts.push(aiPoint)
   }
@@ -221,22 +294,8 @@ export function KLineChart({
   const allMarkPoints = toStackedMarkPoints(markPointDrafts)
 
   const markLineData = [
-    manualStartDate && xData.includes(manualStartDate)
-      ? {
-          name: '人工启动日',
-          xAxis: manualStartDate,
-          lineStyle: { color: '#13c2c2', width: 1.4 },
-          label: { formatter: '人工启动日' },
-        }
-      : null,
-    aiBreakoutDate && xData.includes(aiBreakoutDate)
-      ? {
-          name: 'AI起爆日',
-          xAxis: aiBreakoutDate,
-          lineStyle: { color: '#fa8c16', width: 1.4 },
-          label: { formatter: 'AI起爆日' },
-        }
-      : null,
+    resolveDateMarkLine(manualStartDate, xData, '\u4eba\u5de5\u542f\u52a8\u65e5', '#13c2c2'),
+    resolveDateMarkLine(aiBreakoutDate, xData, 'AI\u8d77\u7206\u65e5', '#fa8c16'),
   ].filter(Boolean)
 
   const option = {
@@ -247,23 +306,73 @@ export function KLineChart({
         color: '#2f5452',
       },
       data: [
-        '日K',
+        '\u65e5K',
         'MA5',
         'MA10',
         'MA20',
-        '成交量',
-        'B信号(三角)',
-        'A信号(菱形)',
-        'C信号(圆形)',
-        '人工启动日',
-        'AI起爆日',
-        '吸筹阶段区间',
-        '派发阶段区间',
-        '阶段未明区间',
+        '\u6210\u4ea4\u91cf',
+        'B\u4fe1\u53f7(\u4e09\u89d2)',
+        'A\u4fe1\u53f7(\u83f1\u5f62)',
+        'C\u4fe1\u53f7(\u5706\u5f62)',
+        '\u4eba\u5de5\u542f\u52a8\u65e5',
+        'AI\u8d77\u7206\u65e5',
+        '\u5438\u7b79\u9636\u6bb5\u533a\u95f4',
+        '\u6d3e\u53d1\u9636\u6bb5\u533a\u95f4',
+        '\u9636\u6bb5\u672a\u660e\u533a\u95f4',
+        '\u7edf\u8ba1\u533a\u95f4',
       ],
     },
     tooltip: {
       trigger: 'axis',
+      formatter: (rawParams: AxisTooltipParam | AxisTooltipParam[]) => {
+        const params = Array.isArray(rawParams) ? rawParams : [rawParams]
+        const candleParam = params.find((item) => item.seriesName === '\u65e5K')
+        const dataIndex = candleParam?.dataIndex ?? -1
+        if (dataIndex < 0 || dataIndex >= candles.length) return ''
+
+        const candle = candles[dataIndex]
+        const prevClose = dataIndex > 0 ? candles[dataIndex - 1].close : candle.open
+        const change = candle.close - prevClose
+        const changePct = prevClose > 0 ? change / prevClose : 0
+        const amplitudePct = prevClose > 0 ? (candle.high - candle.low) / prevClose : 0
+        const bodyPct = candle.open > 0 ? Math.abs(candle.close - candle.open) / candle.open : 0
+        const upperShadow = candle.high - Math.max(candle.open, candle.close)
+        const lowerShadow = Math.min(candle.open, candle.close) - candle.low
+
+        const lookback = Math.min(5, dataIndex + 1)
+        let volume5Avg = 0
+        for (let i = dataIndex - lookback + 1; i <= dataIndex; i += 1) {
+          volume5Avg += candles[i].volume
+        }
+        volume5Avg /= Math.max(lookback, 1)
+        const volumeRatio = volume5Avg > 0 ? candle.volume / volume5Avg : 0
+
+        const changeColor = change >= 0 ? '#ce5649' : '#1a8b66'
+        const ma5Value = ma5[dataIndex]
+        const ma10Value = ma10[dataIndex]
+        const ma20Value = ma20[dataIndex]
+        const signalSummary = signalSummaryByDate.get(candle.time) ?? []
+
+        const lines = [
+          `<div style="min-width: 280px">`,
+          `<div style="font-weight: 600; margin-bottom: 6px">${candle.time}</div>`,
+          `<div>\u5f00\u76d8\uff1a${toPrice(candle.open)}\u3000\u6536\u76d8\uff1a${toPrice(candle.close)}</div>`,
+          `<div>\u6700\u9ad8\uff1a${toPrice(candle.high)}\u3000\u6700\u4f4e\uff1a${toPrice(candle.low)}</div>`,
+          `<div>\u6da8\u8dcc\uff1a<span style="color:${changeColor};font-weight:600">${toSignedNumber(change)} (${toSignedPercent(changePct)})</span></div>`,
+          `<div>\u632f\u5e45\uff1a${toSignedPercent(amplitudePct)}\u3000\u5b9e\u4f53\uff1a${toSignedPercent(bodyPct)}</div>`,
+          `<div>\u4e0a\u5f71\uff1a${toPrice(upperShadow)}\u3000\u4e0b\u5f71\uff1a${toPrice(lowerShadow)}</div>`,
+          `<div>\u6210\u4ea4\u91cf\uff1a${toLargeNumber(candle.volume)}\uff08\u91cf\u6bd45\u65e5\uff1a${volumeRatio.toFixed(2)}\uff09</div>`,
+          `<div>\u6210\u4ea4\u989d\uff1a${toLargeNumber(candle.amount)}</div>`,
+          `<div>\u5747\u7ebf\uff1aMA5 ${toMaybeNumber(ma5Value)} / MA10 ${toMaybeNumber(ma10Value)} / MA20 ${toMaybeNumber(ma20Value)}</div>`,
+        ]
+
+        if (signalSummary.length > 0) {
+          lines.push(`<div style="margin-top: 4px">\u5a01\u79d1\u592b\uff1a${signalSummary.join('\uff1b')}</div>`)
+        }
+
+        lines.push('</div>')
+        return lines.join('')
+      },
     },
     axisPointer: {
       link: [{ xAxisIndex: [0, 1] }],
@@ -313,7 +422,7 @@ export function KLineChart({
     ],
     series: [
       {
-        name: '日K',
+        name: '\u65e5K',
         type: 'candlestick',
         data: candleData,
         itemStyle: {
@@ -373,7 +482,7 @@ export function KLineChart({
         lineStyle: { width: 1.5, color: '#3160db' },
       },
       {
-        name: '成交量',
+        name: '\u6210\u4ea4\u91cf',
         type: 'bar',
         xAxisIndex: 1,
         yAxisIndex: 1,
@@ -383,7 +492,7 @@ export function KLineChart({
         },
       },
       {
-        name: 'B信号(三角)',
+        name: 'B\u4fe1\u53f7(\u4e09\u89d2)',
         type: 'scatter',
         data: [],
         symbol: 'triangle',
@@ -391,7 +500,7 @@ export function KLineChart({
         itemStyle: { color: '#eb8f34' },
       },
       {
-        name: 'A信号(菱形)',
+        name: 'A\u4fe1\u53f7(\u83f1\u5f62)',
         type: 'scatter',
         data: [],
         symbol: 'diamond',
@@ -399,7 +508,7 @@ export function KLineChart({
         itemStyle: { color: '#1677ff' },
       },
       {
-        name: 'C信号(圆形)',
+        name: 'C\u4fe1\u53f7(\u5706\u5f62)',
         type: 'scatter',
         data: [],
         symbol: 'circle',
@@ -407,7 +516,7 @@ export function KLineChart({
         itemStyle: { color: '#7f8c8d' },
       },
       {
-        name: '人工启动日',
+        name: '\u4eba\u5de5\u542f\u52a8\u65e5',
         type: 'scatter',
         data: [],
         symbol: 'pin',
@@ -415,7 +524,7 @@ export function KLineChart({
         itemStyle: { color: '#13c2c2' },
       },
       {
-        name: 'AI起爆日',
+        name: 'AI\u8d77\u7206\u65e5',
         type: 'scatter',
         data: [],
         symbol: 'pin',
@@ -423,7 +532,7 @@ export function KLineChart({
         itemStyle: { color: '#fa8c16' },
       },
       {
-        name: '吸筹阶段区间',
+        name: '\u5438\u7b79\u9636\u6bb5\u533a\u95f4',
         type: 'scatter',
         data: [],
         symbol: 'rect',
@@ -431,7 +540,7 @@ export function KLineChart({
         itemStyle: { color: 'rgba(22, 119, 255, 0.50)' },
       },
       {
-        name: '派发阶段区间',
+        name: '\u6d3e\u53d1\u9636\u6bb5\u533a\u95f4',
         type: 'scatter',
         data: [],
         symbol: 'rect',
@@ -439,12 +548,20 @@ export function KLineChart({
         itemStyle: { color: 'rgba(245, 34, 45, 0.50)' },
       },
       {
-        name: '阶段未明区间',
+        name: '\u9636\u6bb5\u672a\u660e\u533a\u95f4',
         type: 'scatter',
         data: [],
         symbol: 'rect',
         symbolSize: 10,
         itemStyle: { color: 'rgba(120, 136, 153, 0.50)' },
+      },
+      {
+        name: '\u7edf\u8ba1\u533a\u95f4',
+        type: 'scatter',
+        data: [],
+        symbol: 'rect',
+        symbolSize: 10,
+        itemStyle: { color: 'rgba(250, 173, 20, 0.50)' },
       },
     ],
   }

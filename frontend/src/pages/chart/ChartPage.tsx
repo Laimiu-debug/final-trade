@@ -1,5 +1,5 @@
-﻿import { useEffect, useState } from 'react'
-import dayjs from 'dayjs'
+import { useEffect, useMemo, useState } from 'react'
+import dayjs, { type Dayjs } from 'dayjs'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   App as AntdApp,
@@ -8,6 +8,7 @@ import {
   Card,
   Col,
   DatePicker,
+  Descriptions,
   Input,
   Modal,
   Radio,
@@ -32,6 +33,7 @@ import {
 import { IntradayChart } from '@/shared/charts/IntradayChart'
 import { KLineChart } from '@/shared/charts/KLineChart'
 import { PageHeader } from '@/shared/components/PageHeader'
+import { computeCandleRangeStats } from '@/shared/utils/candleStats'
 import { useUIStore } from '@/state/uiStore'
 import type { AIAnalysisRecord, SignalScanMode, StockAnnotation } from '@/types/contracts'
 
@@ -47,6 +49,31 @@ function defaultAnnotation(symbol: string): StockAnnotation {
   }
 }
 
+function formatPrice(value: number) {
+  return Number.isFinite(value) ? value.toFixed(2) : '--'
+}
+
+function formatSigned(value: number, digits = 2) {
+  if (!Number.isFinite(value)) return '--'
+  if (value > 0) return `+${value.toFixed(digits)}`
+  return value.toFixed(digits)
+}
+
+function formatSignedPct(value: number, digits = 2) {
+  if (!Number.isFinite(value)) return '--'
+  const pct = value * 100
+  if (pct > 0) return `+${pct.toFixed(digits)}%`
+  return `${pct.toFixed(digits)}%`
+}
+
+function formatLarge(value: number) {
+  if (!Number.isFinite(value)) return '--'
+  const abs = Math.abs(value)
+  if (abs >= 100000000) return `${(value / 100000000).toFixed(2)}亿`
+  if (abs >= 10000) return `${(value / 10000).toFixed(2)}万`
+  return value.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
+}
+
 export function ChartPage() {
   const { message } = AntdApp.useApp()
   const queryClient = useQueryClient()
@@ -59,6 +86,7 @@ export function ChartPage() {
   const [intradayDate, setIntradayDate] = useState<string | null>(null)
   const [intradayChartReady, setIntradayChartReady] = useState(false)
   const [lastAIRecord, setLastAIRecord] = useState<AIAnalysisRecord | null>(null)
+  const [statsRange, setStatsRange] = useState<[string | null, string | null]>([null, null])
   const cachedDraft = useUIStore((state) => state.annotationDrafts[symbol])
   const upsertDraft = useUIStore((state) => state.upsertDraft)
   const upsertLatestAIRecord = useUIStore((state) => state.upsertLatestAIRecord)
@@ -186,6 +214,32 @@ export function ChartPage() {
   const symbolSignals = (signalsQuery.data?.items ?? []).filter(
     (item) => item.symbol.toLowerCase() === symbol.toLowerCase(),
   )
+  const candles = candlesQuery.data?.candles ?? []
+
+  useEffect(() => {
+    setStatsRange([null, null])
+  }, [symbol])
+
+  useEffect(() => {
+    if (candles.length === 0) {
+      setStatsRange([null, null])
+      return
+    }
+    setStatsRange((prev) => {
+      if (prev[0] && prev[1]) return prev
+      const end = candles[candles.length - 1].time
+      const start = candles[Math.max(0, candles.length - 20)].time
+      return [start, end]
+    })
+  }, [candles, symbol])
+
+  const rangeStats = useMemo(
+    () => computeCandleRangeStats(candles, statsRange[0], statsRange[1]),
+    [candles, statsRange],
+  )
+
+  const rangePickerValue: [Dayjs, Dayjs] | null =
+    statsRange[0] && statsRange[1] ? [dayjs(statsRange[0]), dayjs(statsRange[1])] : null
 
   function backToPrev() {
     if (window.history.length > 1) {
@@ -198,6 +252,13 @@ export function ChartPage() {
   function openIntradayForDate(date: string) {
     setIntradayChartReady(false)
     setIntradayDate(date)
+  }
+
+  function applyRecentRange(days: number) {
+    if (candles.length === 0) return
+    const end = candles[candles.length - 1].time
+    const start = candles[Math.max(0, candles.length - days)].time
+    setStatsRange([start, end])
   }
 
   function toTrendClassFromAIBullType(value?: string): StockAnnotation['trend_class'] {
@@ -269,10 +330,12 @@ export function ChartPage() {
         }
       >
         <KLineChart
-          candles={candlesQuery.data?.candles ?? []}
+          candles={candles}
           signals={symbolSignals}
           manualStartDate={manualStartDate}
           aiBreakoutDate={lastAIRecord?.breakout_date}
+          statsRangeStartDate={statsRange[0] ?? undefined}
+          statsRangeEndDate={statsRange[1] ?? undefined}
           onCandleDoubleClick={openIntradayForDate}
         />
         <Space style={{ marginTop: 10 }}>
@@ -298,6 +361,73 @@ export function ChartPage() {
           >
             查看AI起爆日分时
           </Button>
+        </Space>
+        <Space orientation="vertical" size={10} style={{ width: '100%', marginTop: 14 }}>
+          <Space wrap>
+            <Typography.Text type="secondary">区间统计</Typography.Text>
+            <DatePicker.RangePicker
+              value={rangePickerValue}
+              onChange={(values) => {
+                if (!values || !values[0] || !values[1]) {
+                  setStatsRange([null, null])
+                  return
+                }
+                setStatsRange([values[0].format('YYYY-MM-DD'), values[1].format('YYYY-MM-DD')])
+              }}
+              allowClear
+            />
+            <Button size="small" onClick={() => applyRecentRange(20)}>
+              近20日
+            </Button>
+            <Button size="small" onClick={() => applyRecentRange(60)}>
+              近60日
+            </Button>
+            <Button size="small" onClick={() => applyRecentRange(120)}>
+              近120日
+            </Button>
+          </Space>
+          {rangeStats ? (
+            <Descriptions size="small" bordered column={3}>
+              <Descriptions.Item label="统计区间">
+                {rangeStats.startDate} ~ {rangeStats.endDate}
+              </Descriptions.Item>
+              <Descriptions.Item label="K线数量">{rangeStats.bars}</Descriptions.Item>
+              <Descriptions.Item label="区间涨跌">
+                {formatSigned(rangeStats.change)} ({formatSignedPct(rangeStats.changePct)})
+              </Descriptions.Item>
+              <Descriptions.Item label="起止收盘">
+                {formatPrice(rangeStats.startClose)} {' -> '} {formatPrice(rangeStats.endClose)}
+              </Descriptions.Item>
+              <Descriptions.Item label="区间最高">
+                {formatPrice(rangeStats.highest)} ({rangeStats.highestDate})
+              </Descriptions.Item>
+              <Descriptions.Item label="区间最低">
+                {formatPrice(rangeStats.lowest)} ({rangeStats.lowestDate})
+              </Descriptions.Item>
+              <Descriptions.Item label="区间振幅">{formatSignedPct(rangeStats.amplitudePct)}</Descriptions.Item>
+              <Descriptions.Item label="阳/阴/平">
+                {rangeStats.upDays}/{rangeStats.downDays}/{rangeStats.flatDays}
+              </Descriptions.Item>
+              <Descriptions.Item label="阳线占比">{formatSignedPct(rangeStats.upRatio)}</Descriptions.Item>
+              <Descriptions.Item label="最大回撤">
+                {formatSignedPct(-rangeStats.maxDrawdownPct)} ({rangeStats.maxDrawdownDate})
+              </Descriptions.Item>
+              <Descriptions.Item label="最大单日涨幅">
+                {formatSignedPct(rangeStats.maxDailyGainPct)} ({rangeStats.maxDailyGainDate})
+              </Descriptions.Item>
+              <Descriptions.Item label="最大单日跌幅">
+                {formatSignedPct(rangeStats.maxDailyLossPct)} ({rangeStats.maxDailyLossDate})
+              </Descriptions.Item>
+              <Descriptions.Item label="成交量(合计/日均)">
+                {formatLarge(rangeStats.totalVolume)} / {formatLarge(rangeStats.avgVolume)}
+              </Descriptions.Item>
+              <Descriptions.Item label="成交额(合计/日均)">
+                {formatLarge(rangeStats.totalAmount)} / {formatLarge(rangeStats.avgAmount)}
+              </Descriptions.Item>
+            </Descriptions>
+          ) : (
+            <Typography.Text type="secondary">暂无可统计区间</Typography.Text>
+          )}
         </Space>
       </Card>
 
