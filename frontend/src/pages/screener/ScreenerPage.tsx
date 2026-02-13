@@ -1,4 +1,4 @@
-﻿import { type CSSProperties, useCallback, useEffect, useMemo, useState } from 'react'
+﻿import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import {
   App as AntdApp,
@@ -836,8 +836,8 @@ export function ScreenerPage() {
     [returnWindowDays],
   )
 
-  useEffect(() => {
-    saveScreenerCache({
+  const cacheSnapshot = useMemo<ScreenerCachePayload>(
+    () => ({
       version: 1,
       updated_at: new Date().toISOString(),
       form_values: watchedFormValues ?? defaultFormValues,
@@ -850,19 +850,31 @@ export function ScreenerPage() {
       column_visible: columnVisible,
       input_pool_key: inputPoolKey,
       raw_input_pool: rawInputPool,
-    })
-  }, [
-    activePool,
-    executedStep,
-    pools,
-    runMeta,
-    stepConfigs,
-    columnOrder,
-    columnVisible,
-    inputPoolKey,
-    rawInputPool,
-    watchedFormValues,
-  ])
+    }),
+    [
+      activePool,
+      executedStep,
+      pools,
+      runMeta,
+      stepConfigs,
+      columnOrder,
+      columnVisible,
+      inputPoolKey,
+      rawInputPool,
+      watchedFormValues,
+    ],
+  )
+  const latestCacheSnapshotRef = useRef<ScreenerCachePayload>(cacheSnapshot)
+  const recoveredFromRunRef = useRef(false)
+
+  useEffect(() => {
+    latestCacheSnapshotRef.current = cacheSnapshot
+    saveScreenerCache(cacheSnapshot)
+  }, [cacheSnapshot])
+
+  useEffect(() => () => {
+    saveScreenerCache(latestCacheSnapshotRef.current)
+  }, [])
 
   function buildScreenerParams(values: FormValues): ScreenerParams {
     const markets = ['sh', 'sz', 'bj'] as const
@@ -993,6 +1005,57 @@ export function ScreenerPage() {
     }),
     [pools],
   )
+  const hasAnyPoolData = useMemo(
+    () => poolOrder.some((key) => pools[key].length > 0),
+    [pools],
+  )
+
+  useEffect(() => {
+    if (hasAnyPoolData) return
+    if (!runMeta?.runId) return
+    if (recoveredFromRunRef.current) return
+
+    recoveredFromRunRef.current = true
+    let cancelled = false
+
+    ;(async () => {
+      try {
+        const detail = await getScreenerRun(runMeta.runId)
+        if (cancelled) return
+        const sourceInputPool = detail.step_pools?.input ?? detail.results
+        const boardFilters = getValues('board_filters')
+        const inputPool = filterRowsByBoards(sourceInputPool, boardFilters)
+        const stepPools = detail.step_pools
+        setRawInputPool(sourceInputPool)
+        setPools((prev) => ({
+          input: inputPool,
+          step1: stepPools.step1 ?? [],
+          step2: stepPools.step2 ?? [],
+          step3: stepPools.step3 ?? [],
+          step4: stepPools.step4 ?? detail.results ?? [],
+          final: prev.final,
+        }))
+        const restoredStep = stepPools.step4?.length
+          ? 4
+          : stepPools.step3?.length
+            ? 3
+            : stepPools.step2?.length
+              ? 2
+              : stepPools.step1?.length
+                ? 1
+                : 0
+        setExecutedStep(restoredStep)
+        setActivePool(restoredStep === 0 ? 'input' : (`step${restoredStep}` as ScreenerPoolKey))
+        message.info('已恢复上次筛选数据')
+      } catch {
+        // keep current empty state when run is unavailable
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [getValues, hasAnyPoolData, message, runMeta?.runId])
 
   const nextPoolKey = useMemo<ScreenerPoolKey | null>(() => {
     const currentIndex = poolOrder.indexOf(activePool)
@@ -1963,6 +2026,7 @@ export function ScreenerPage() {
           <Button
             type="link"
             onClick={() => {
+              saveScreenerCache(latestCacheSnapshotRef.current)
               setSelectedSymbol(row.symbol, row.name)
               navigate(`/stocks/${row.symbol}/chart`)
             }}
@@ -2295,7 +2359,7 @@ export function ScreenerPage() {
         <Alert
           type="warning"
           showIcon
-          message="本次筛选包含降级数据"
+          title="本次筛选包含降级数据"
           description={runMeta.degradedReason}
         />
       ) : null}
@@ -2303,7 +2367,7 @@ export function ScreenerPage() {
         <Alert
           type="info"
           showIcon
-          message="输入池参数已变更，当前展示的是旧输入池"
+          title="输入池参数已变更，当前展示的是旧输入池"
           description="点击“运行第1步”或“加载输入池”后将自动按新参数重算。"
         />
       ) : null}
@@ -2454,7 +2518,7 @@ export function ScreenerPage() {
               current: tablePage,
               pageSize: tablePageSize,
               total: filteredRows.length,
-              position: ['bottomRight'],
+              placement: ['bottomEnd'],
               showSizeChanger: true,
               pageSizeOptions: [8, 16, 24, 50],
               showQuickJumper: true,
@@ -2474,5 +2538,6 @@ export function ScreenerPage() {
     </Space>
   )
 }
+
 
 

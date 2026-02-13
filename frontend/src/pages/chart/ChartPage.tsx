@@ -55,6 +55,7 @@ export function ChartPage() {
   const stockName = useUIStore((state) => state.stockNameMap[symbol])
   const cachedAIRecord = useUIStore((state) => state.latestAIBySymbol[symbol])
   const [intradayDate, setIntradayDate] = useState<string | null>(null)
+  const [intradayChartReady, setIntradayChartReady] = useState(false)
   const [lastAIRecord, setLastAIRecord] = useState<AIAnalysisRecord | null>(null)
   const cachedDraft = useUIStore((state) => state.annotationDrafts[symbol])
   const upsertDraft = useUIStore((state) => state.upsertDraft)
@@ -158,6 +159,7 @@ export function ChartPage() {
   }
 
   function openIntradayForDate(date: string) {
+    setIntradayChartReady(false)
     setIntradayDate(date)
   }
 
@@ -205,7 +207,7 @@ export function ChartPage() {
         <Alert
           type="warning"
           showIcon
-          message="题材分析使用降级结果"
+          title="题材分析使用降级结果"
           description={analysisQuery.data.analysis.degraded_reason}
         />
       ) : null}
@@ -214,7 +216,7 @@ export function ChartPage() {
         <Alert
           type="info"
           showIcon
-          message="存在分钟线缺失"
+          title="存在分钟线缺失"
           description={`${candlesQuery.data.degraded_reason}，已使用近似价 price_source=approx`}
         />
       ) : null}
@@ -270,7 +272,7 @@ export function ChartPage() {
         <Space orientation="vertical" size={14} style={{ width: '100%' }}>
           <Row gutter={[16, 12]}>
             <Col xs={24} md={8}>
-              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+              <Space orientation="vertical" size={4} style={{ width: '100%' }}>
                 <Typography.Text type="secondary">启动日</Typography.Text>
                 <Controller
                   name="start_date"
@@ -287,7 +289,7 @@ export function ChartPage() {
               </Space>
             </Col>
             <Col xs={12} md={4}>
-              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+              <Space orientation="vertical" size={4} style={{ width: '100%' }}>
                 <Typography.Text type="secondary">阶段</Typography.Text>
                 <Controller
                   name="stage"
@@ -307,7 +309,7 @@ export function ChartPage() {
               </Space>
             </Col>
             <Col xs={12} md={4}>
-              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+              <Space orientation="vertical" size={4} style={{ width: '100%' }}>
                 <Typography.Text type="secondary">趋势类型</Typography.Text>
                 <Controller
                   name="trend_class"
@@ -328,7 +330,7 @@ export function ChartPage() {
               </Space>
             </Col>
             <Col xs={24} md={8}>
-              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+              <Space orientation="vertical" size={4} style={{ width: '100%' }}>
                 <Typography.Text type="secondary">交易决策</Typography.Text>
                 <Controller
                   name="decision"
@@ -394,9 +396,9 @@ export function ChartPage() {
             <Alert
               type={lastAIRecord.error_code ? 'warning' : 'success'}
               showIcon
-              message={`AI结论: ${lastAIRecord.conclusion} | 置信度 ${lastAIRecord.confidence}`}
+              title={`AI结论: ${lastAIRecord.conclusion} | 置信度 ${lastAIRecord.confidence}`}
               description={
-                <Space direction="vertical" size={4}>
+                <Space orientation="vertical" size={4}>
                   <Typography.Text>
                     起爆日期: {lastAIRecord.breakout_date || '--'} | 趋势牛: {lastAIRecord.trend_bull_type || '--'} | 题材: {lastAIRecord.theme_name || '--'}
                   </Typography.Text>
@@ -423,20 +425,23 @@ export function ChartPage() {
         title={`${stockTitle} ${intradayQuery.data?.date ?? intradayDate ?? ''} 分时图`}
         open={Boolean(intradayDate)}
         onCancel={() => setIntradayDate(null)}
+        afterOpenChange={(open) => {
+          setIntradayChartReady(open)
+        }}
         footer={null}
         width={980}
-        destroyOnClose
+        destroyOnHidden
       >
         {intradayQuery.data?.degraded ? (
           <Alert
             type="warning"
             showIcon
             style={{ marginBottom: 12 }}
-            message="分时图包含近似数据"
+            title="分时图包含近似数据"
             description={intradayQuery.data.degraded_reason}
           />
         ) : null}
-        <IntradayChart points={intradayQuery.data?.points ?? []} />
+        {intradayChartReady ? <IntradayChart points={intradayQuery.data?.points ?? []} /> : <div style={{ height: 420 }} />}
       </Modal>
     </Space>
   )

@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import ReactECharts from 'echarts-for-react'
 import type { IntradayPoint } from '@/types/contracts'
 
@@ -6,6 +7,7 @@ interface IntradayChartProps {
 }
 
 export function IntradayChart({ points }: IntradayChartProps) {
+  const chartRef = useRef<ReactECharts>(null)
   const xData = points.map((item) => item.time)
   const priceData = points.map((item) => item.price)
   const avgPriceData = points.map((item) => item.avg_price)
@@ -86,6 +88,21 @@ export function IntradayChart({ points }: IntradayChartProps) {
     ],
   }
 
-  return <ReactECharts option={option} style={{ width: '100%', height: 420 }} />
-}
+  useEffect(() => {
+    if (points.length === 0) return
+    const frameId = window.requestAnimationFrame(() => {
+      chartRef.current?.getEchartsInstance().resize()
+    })
+    return () => {
+      window.cancelAnimationFrame(frameId)
+    }
+  }, [points.length])
 
+  return (
+    <ReactECharts
+      ref={chartRef}
+      option={option}
+      style={{ width: '100%', height: 420 }}
+    />
+  )
+}

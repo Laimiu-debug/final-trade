@@ -141,7 +141,7 @@ export function AiPage() {
   ]
 
   return (
-    <Space direction="vertical" size={16} style={{ width: '100%' }}>
+    <Space orientation="vertical" size={16} style={{ width: '100%' }}>
       <PageHeader title="AI题材分析" subtitle="支持删除历史记录，并与个股K线标注页联动。" />
       <Card className="glass-card" variant="borderless">
         <Space wrap style={{ width: '100%', marginBottom: 12, justifyContent: 'space-between' }}>
@@ -191,13 +191,13 @@ export function AiPage() {
           scroll={{ x: 1350 }}
           expandable={{
             expandedRowRender: (record) => (
-              <Space direction="vertical" size={6} style={{ width: '100%' }}>
+              <Space orientation="vertical" size={6} style={{ width: '100%' }}>
                 <Typography.Text>
                   上涨原因: {(record.rise_reasons ?? []).length > 0 ? (record.rise_reasons ?? []).join('；') : '--'}
                 </Typography.Text>
                 <Typography.Text type="secondary">来源:</Typography.Text>
                 {(record.source_urls ?? []).length > 0 ? (
-                  <Space direction="vertical" size={2}>
+                  <Space orientation="vertical" size={2}>
                     {record.source_urls.map((url) => (
                       <a key={url} href={url} target="_blank" rel="noreferrer">
                         {url}
@@ -219,3 +219,4 @@ export function AiPage() {
     </Space>
   )
 }
+

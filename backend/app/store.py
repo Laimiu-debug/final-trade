@@ -317,6 +317,99 @@ class InMemoryStore:
             return 0.0
         return float(sum(values) / len(values))
 
+    @staticmethod
+    def _parse_date(date_text: str) -> datetime | None:
+        try:
+            return datetime.strptime(date_text, "%Y-%m-%d")
+        except ValueError:
+            return None
+
+    def _align_date_to_candles(self, candles: list[CandlePoint], date_text: str) -> str:
+        if not candles:
+            return date_text
+        parsed_target = self._parse_date(date_text)
+        if parsed_target is None:
+            return candles[-1].time
+        for candle in reversed(candles):
+            parsed_candle = self._parse_date(candle.time)
+            if parsed_candle and parsed_candle <= parsed_target:
+                return candle.time
+        return candles[0].time
+
+    def _infer_breakout_index_from_candles(self, candles: list[CandlePoint]) -> int | None:
+        if len(candles) < 40:
+            return None
+
+        closes = [point.close for point in candles]
+        highs = [point.high for point in candles]
+        volumes = [max(0, int(point.volume)) for point in candles]
+        start = max(20, len(candles) - 110)
+        end = len(candles) - 8
+        if end <= start:
+            return None
+
+        # Primary rule: first confirmed breakout + trend alignment + volume expansion.
+        for idx in range(start, end):
+            prior_high20 = max(highs[idx - 20 : idx])
+            if prior_high20 <= 0:
+                continue
+            ma20 = self._safe_mean(closes[idx - 19 : idx + 1])
+            ma10 = self._safe_mean(closes[idx - 9 : idx + 1])
+            ma5 = self._safe_mean(closes[idx - 4 : idx + 1])
+            avg_vol20 = self._safe_mean(volumes[idx - 20 : idx])
+            if avg_vol20 <= 0:
+                continue
+
+            breakout = closes[idx] >= prior_high20 * 1.01
+            trend_aligned = ma5 > ma10 > ma20 and closes[idx] >= ma20 * 1.005
+            volume_confirmed = volumes[idx] >= avg_vol20 * 1.2
+            forward_high = max(highs[idx + 1 : idx + 9])
+            forward_ret = (forward_high - closes[idx]) / max(closes[idx], 0.01)
+            if breakout and trend_aligned and volume_confirmed and forward_ret >= 0.10:
+                return idx
+
+        # Secondary rule: MA20上穿并在短期内有延续。
+        for idx in range(start + 1, end):
+            ma20_prev = self._safe_mean(closes[idx - 20 : idx])
+            ma20_curr = self._safe_mean(closes[idx - 19 : idx + 1])
+            if closes[idx - 1] <= ma20_prev and closes[idx] > ma20_curr and ma20_curr >= ma20_prev * 0.997:
+                forward_high = max(highs[idx + 1 : idx + 9])
+                forward_ret = (forward_high - closes[idx]) / max(closes[idx], 0.01)
+                if forward_ret >= 0.08:
+                    return idx
+
+        # Final fallback: lowest point in recent trend window before acceleration.
+        recent_start = max(0, len(candles) - 45)
+        recent_end = max(recent_start + 1, len(candles) - 5)
+        if recent_end > recent_start:
+            return min(range(recent_start, recent_end), key=lambda i: closes[i])
+        return None
+
+    def _sanitize_breakout_date(self, symbol: str, raw_date: str, baseline_date: str) -> str:
+        candles = self._ensure_candles(symbol)
+        if not candles:
+            return baseline_date
+        baseline_aligned = self._align_date_to_candles(candles, baseline_date)
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_date):
+            return baseline_aligned
+
+        raw_aligned = self._align_date_to_candles(candles, raw_date)
+        date_to_index = {point.time: idx for idx, point in enumerate(candles)}
+        raw_index = date_to_index.get(raw_aligned)
+        baseline_index = date_to_index.get(baseline_aligned)
+        if raw_index is None:
+            return baseline_aligned
+        if baseline_index is None:
+            return raw_aligned
+
+        # Clamp AI hallucination: breakout day should not drift too far from K-line baseline.
+        if abs(raw_index - baseline_index) > 18:
+            return baseline_aligned
+        # Too close to current end usually means "latest acceleration", not "起爆".
+        if raw_index >= len(candles) - 3:
+            return baseline_aligned
+        return raw_aligned
+
     def _build_row_from_candles(self, symbol: str) -> ScreenerResult | None:
         candles = self._ensure_candles(symbol)
         if len(candles) < 30:
@@ -547,10 +640,22 @@ class InMemoryStore:
         return theme_candidates[seed % len(theme_candidates)]
 
     def _infer_breakout_date(self, symbol: str, row: ScreenerResult | None) -> str:
+        candles = self._ensure_candles(symbol)
+        breakout_index = self._infer_breakout_index_from_candles(candles)
+        if breakout_index is not None:
+            return candles[breakout_index].time
+
         if row is None:
-            return self._days_ago(12 + self._hash_seed(symbol) % 12)
-        offset = 8 + int(max(0.0, min(30.0, row.retrace20 * 100 / 2)))
-        return self._days_ago(offset)
+            fallback = self._days_ago(18 + self._hash_seed(symbol) % 18)
+            return self._align_date_to_candles(candles, fallback)
+
+        offset = 12 + int(max(0.0, min(50.0, row.retrace20 * 150)))
+        if row.trend_class in ("A", "A_B"):
+            offset += 8
+        elif row.trend_class == "B":
+            offset = max(6, offset - 4)
+        fallback = self._days_ago(offset)
+        return self._align_date_to_candles(candles, fallback)
 
     def _infer_rise_reasons(self, row: ScreenerResult | None) -> list[str]:
         if row is None:
@@ -674,14 +779,21 @@ class InMemoryStore:
             )
         context_text = self._build_ai_context_text(symbol, row)
         stock_name = self._resolve_symbol_name(symbol, row)
+        candles = self._ensure_candles(symbol)
+        trading_dates_tail = ",".join([point.time for point in candles[-45:]]) if candles else ""
+        baseline_breakout = baseline.breakout_date or self._now_date()
         prompt = (
             "Return JSON only with keys: "
             "conclusion, confidence, summary, breakout_date, rise_reasons, trend_bull_type, theme_name. "
             "conclusion must be one of 发酵中/高潮/退潮/Unknown.\n"
+            "breakout_date must be the FIRST confirmed breakout day of the current trend, "
+            "not the latest acceleration day.\n"
             f"symbol={symbol}\n"
             f"name={stock_name}\n"
             f"features={row_text}\n"
             f"context={context_text}\n"
+            f"baseline_breakout={baseline_breakout}\n"
+            f"trading_dates_tail={trading_dates_tail}\n"
             f"sources={source_urls}"
         )
         body = {
@@ -742,9 +854,12 @@ class InMemoryStore:
             if len(summary) > 220:
                 summary = f"{summary[:220]}..."
 
-            breakout_date = str(parsed.get("breakout_date", "")).strip() if parsed else ""
-            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", breakout_date):
-                breakout_date = baseline.breakout_date or self._now_date()
+            breakout_raw = str(parsed.get("breakout_date", "")).strip() if parsed else ""
+            breakout_date = self._sanitize_breakout_date(
+                symbol,
+                breakout_raw,
+                baseline.breakout_date or self._now_date(),
+            )
 
             trend_bull_type = str(parsed.get("trend_bull_type", "")).strip() if parsed else ""
             if not trend_bull_type:
