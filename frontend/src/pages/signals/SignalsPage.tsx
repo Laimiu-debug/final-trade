@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+﻿import { useEffect, useMemo, useRef, useState } from 'react'
 import dayjs from 'dayjs'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
@@ -52,6 +52,43 @@ const signalWeight: Record<SignalType, number> = {
   A: 2,
   C: 1,
 }
+
+const signalMeaningGuide: Array<{ code: SignalType; description: string }> = [
+  {
+    code: 'B',
+    description: '强确认信号：阶段与事件结构更完整、综合评分更高，优先级最高。',
+  },
+  {
+    code: 'A',
+    description: '标准待买信号：量价结构较健康，满足核心条件，可跟踪择机参与。',
+  },
+  {
+    code: 'C',
+    description: '弱确认/风险偏高：常见于结构未完全确认或存在风险事件，需谨慎。',
+  },
+]
+
+const wyckoffEventGuide: Array<{ event: string; name: string; description: string }> = [
+  { event: 'PS', name: '初步支撑', description: '下跌尾段首次出现明显承接，卖压开始衰减。' },
+  { event: 'SC', name: '卖出高潮', description: '恐慌抛售集中释放，常伴随放量与长下影。' },
+  { event: 'AR', name: '自动反弹', description: 'SC 后技术性反抽，形成区间上沿参考。' },
+  { event: 'ST', name: '二次测试', description: '回测 SC 区域，确认供给是否继续减少。' },
+  { event: 'TSO', name: '上冲受阻', description: '冲高后被快速压回，代表上方抛压仍在。' },
+  { event: 'Spring', name: '弹簧', description: '短暂跌破区间下沿后快速收回，洗盘特征明显。' },
+  { event: 'SOS', name: '强势信号', description: '放量上攻并站稳关键位，需求主导增强。' },
+  { event: 'JOC', name: '越区确认', description: '有效越过区间上沿，结构由震荡转向上行。' },
+  { event: 'LPS', name: '最后支撑点', description: '突破后回踩承接，常作为更稳妥介入位。' },
+  { event: 'UTAD', name: '上冲假突破', description: '派发端假突破，多为风险预警而非买点。' },
+  { event: 'SOW', name: '弱势信号', description: '破位下行并放量，供给重新占优。' },
+  { event: 'LPSY', name: '最后供给点', description: '反抽无力后再走弱，派发风险延续。' },
+]
+
+const wyckoffLogicGuide = [
+  '候选集 -> 量价特征提取 -> 12事件识别 -> 阶段判定（吸筹/派发）-> 综合评分与排序。',
+  '派发类事件（UTAD / SOW / LPSY）主要用于风险扣分与预警，不直接转成主买入信号。',
+  '主信号由评分与风险共同决定：通常 B > A > C；分数越高、事件越完整，优先级越高。',
+  '“要求序列完整”打开后，系统只保留事件链条更连贯的标的。',
+]
 
 function formatSignalError(error: unknown) {
   if (error instanceof ApiError) {
@@ -139,6 +176,7 @@ export function SignalsPage() {
   const [quickQuantity, setQuickQuantity] = useState(1000)
   const [refreshCounter, setRefreshCounter] = useState(0)
   const [manualRefreshing, setManualRefreshing] = useState(false)
+  const [guideExpanded, setGuideExpanded] = useState(false)
 
   const refreshTrackerRef = useRef(0)
   const todayStartRef = useRef(dayjs().startOf('day'))
@@ -472,6 +510,75 @@ export function SignalsPage() {
           description={signalQuery.data.degraded_reason ?? '数据源部分不可用，已使用降级结果。'}
         />
       ) : null}
+
+      <Card className="glass-card" variant="borderless">
+        <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+          <Row justify="space-between" align="middle">
+            <Col>
+              <Typography.Text strong>信号说明（ABC / 威科夫事件 / 判定逻辑）</Typography.Text>
+            </Col>
+            <Col>
+              <Button type="link" onClick={() => setGuideExpanded((previous) => !previous)}>
+                {guideExpanded ? '收起说明' : '展开说明'}
+              </Button>
+            </Col>
+          </Row>
+
+          {!guideExpanded ? (
+            <Typography.Text type="secondary">
+              点击“展开说明”查看 ABC 主信号定义、12 个威科夫事件释义和整体事件判定流程。
+            </Typography.Text>
+          ) : (
+            <>
+              <Typography.Text type="secondary">
+                说明用于帮助理解当前信号来源，不替代交易决策。请结合K线结构与风险控制使用。
+              </Typography.Text>
+
+              <Row gutter={[12, 12]}>
+                {signalMeaningGuide.map((item) => (
+                  <Col key={item.code} xs={24} md={8}>
+                    <Card size="small">
+                      <Space orientation="vertical" size={6} style={{ width: '100%' }}>
+                        <Space>
+                          <Typography.Text strong>主信号</Typography.Text>
+                          <Tag color={signalColor[item.code]}>{item.code}</Tag>
+                        </Space>
+                        <Typography.Text type="secondary">{item.description}</Typography.Text>
+                      </Space>
+                    </Card>
+                  </Col>
+                ))}
+              </Row>
+
+              <Table
+                size="small"
+                rowKey="event"
+                pagination={false}
+                dataSource={wyckoffEventGuide}
+                columns={[
+                  {
+                    title: '事件',
+                    dataIndex: 'event',
+                    width: 90,
+                    render: (value: string) => <Tag color="blue">{value}</Tag>,
+                  },
+                  { title: '中文含义', dataIndex: 'name', width: 130 },
+                  { title: '说明', dataIndex: 'description' },
+                ]}
+              />
+
+              <Space orientation="vertical" size={4} style={{ width: '100%' }}>
+                <Typography.Text strong>威科夫整体事件逻辑</Typography.Text>
+                {wyckoffLogicGuide.map((item, index) => (
+                  <Typography.Text key={item} type="secondary">
+                    {index + 1}. {item}
+                  </Typography.Text>
+                ))}
+              </Space>
+            </>
+          )}
+        </Space>
+      </Card>
 
       <Row gutter={[12, 12]}>
         <Col xs={24} sm={12} md={8} lg={4}>
