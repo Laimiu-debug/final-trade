@@ -207,7 +207,7 @@ export function updateSimConfig(payload: SimTradingConfig) {
 export function getReviewStats(params?: {
   date_from?: string
   date_to?: string
-  date_axis?: 'sell'
+  date_axis?: 'sell' | 'buy'
 }) {
   const query = new URLSearchParams()
   if (params?.date_from) query.set('date_from', params.date_from)

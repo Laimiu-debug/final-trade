@@ -751,6 +751,34 @@ class InMemoryStore:
                 f"当前较起爆{current_vs_breakout * 100:.2f}%，"
                 f"{'高点回撤' + format(pullback_from_peak * 100, '.2f') + '%。' if in_pullback else '尚未明显回撤。'}"
             )
+            latest_date = candles[-1].time
+            latest_idx = len(candles) - 1
+            idx_5 = max(0, latest_idx - 5)
+            idx_10 = max(0, latest_idx - 10)
+            base_close_5 = max(0.01, candles[idx_5].close)
+            base_close_10 = max(0.01, candles[idx_10].close)
+            ret_5 = (latest_close - base_close_5) / base_close_5
+            ret_10 = (latest_close - base_close_10) / base_close_10
+            recent_high_20 = max(point.high for point in candles[max(0, latest_idx - 19): latest_idx + 1])
+            recent_low_20 = min(point.low for point in candles[max(0, latest_idx - 19): latest_idx + 1])
+            drawdown_20 = max(0.0, (recent_high_20 - latest_close) / max(recent_high_20, 0.01))
+            ma20_latest = self._safe_mean([point.close for point in candles[max(0, latest_idx - 19): latest_idx + 1]])
+            above_ma20 = latest_close >= ma20_latest
+            if ret_5 >= 0.03 and drawdown_20 <= 0.05:
+                near_status = "短线强势延续"
+            elif ret_5 >= 0 and above_ma20:
+                near_status = "高位震荡偏强"
+            elif above_ma20:
+                near_status = "回踩整理"
+            elif drawdown_20 >= 0.12:
+                near_status = "短线转弱"
+            else:
+                near_status = "震荡观察"
+            quant += (
+                f"近况：截至{latest_date}，近5日{ret_5 * 100:+.2f}%，"
+                f"近10日{ret_10 * 100:+.2f}%，20日高低区间[{recent_low_20:.2f},{recent_high_20:.2f}]，"
+                f"当前状态={near_status}。"
+            )
         if row is not None:
             amount20_yi = row.amount20 / 1e8 if row.amount20 > 0 else 0.0
             liquidity = (
@@ -3367,7 +3395,7 @@ class InMemoryStore:
         *,
         date_from: str | None = None,
         date_to: str | None = None,
-        date_axis: Literal["sell"] = "sell",
+        date_axis: Literal["sell", "buy"] = "sell",
     ) -> ReviewResponse:
         return self._sim_engine.get_review(
             date_from=date_from,

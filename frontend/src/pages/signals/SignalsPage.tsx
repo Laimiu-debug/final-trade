@@ -25,8 +25,9 @@ import type { ColumnsType } from 'antd/es/table'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import wyckoffCycleDiagram from '@/assets/wyckoff-cycle.svg'
 import { ApiError } from '@/shared/api/client'
-import { getLatestScreenerRun, getScreenerRun, getSignals, postSimOrder } from '@/shared/api/endpoints'
+import { getLatestScreenerRun, getScreenerRun, getSignals } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
+import { upsertPendingBuyDraft } from '@/shared/utils/simPendingOrders'
 import { useUIStore } from '@/state/uiStore'
 import type { SignalResult, SignalScanMode, SignalType, TrendPoolStep } from '@/types/contracts'
 
@@ -451,23 +452,6 @@ export function SignalsPage() {
     return parsed.isValid() ? parsed : null
   }, [asOfDate])
 
-  const quickBuyMutation = useMutation({
-    mutationFn: (row: SignalTableRow) =>
-      postSimOrder({
-        symbol: row.symbol,
-        side: 'buy',
-        quantity: quickQuantity,
-        signal_date: row.trigger_date,
-        submit_date: dayjs().format('YYYY-MM-DD'),
-      }),
-    onSuccess: (_data, row) => {
-      message.success(`模拟买入已提交：${row.symbol} x ${quickQuantity}`)
-    },
-    onError: (error) => {
-      message.error(formatSignalError(error))
-    },
-  })
-
   const bindLatestRunMutation = useMutation({
     mutationFn: getLatestScreenerRun,
     onSuccess: (detail) => {
@@ -513,8 +497,8 @@ export function SignalsPage() {
   )
 
   const kpi = useMemo(() => {
-    const valid = allRows.filter((row) => row.days_to_expire >= 0)
-    const expiring = valid.filter((row) => row.days_to_expire <= 1)
+    const valid = allRows.filter((row) => row.days_to_expire > 1)
+    const expiring = allRows.filter((row) => row.days_to_expire >= 0 && row.days_to_expire <= 1)
     const expired = allRows.filter((row) => row.days_to_expire < 0)
     const todayTriggered = allRows.filter((row) => row.is_today_trigger)
     const bSignals = allRows.filter((row) => row.primary_signal === 'B')
@@ -534,7 +518,7 @@ export function SignalsPage() {
       if (signalFilter !== 'all' && row.primary_signal !== signalFilter) {
         return false
       }
-      if (statusFilter === 'active' && row.days_to_expire < 0) {
+      if (statusFilter === 'active' && row.days_to_expire <= 1) {
         return false
       }
       if (statusFilter === 'expiring' && (row.days_to_expire < 0 || row.days_to_expire > 1)) {
@@ -692,10 +676,26 @@ export function SignalsPage() {
               type="link"
               size="small"
               icon={<ShoppingCartOutlined />}
-              loading={quickBuyMutation.isPending}
-              onClick={() => quickBuyMutation.mutate(row)}
+              onClick={() => {
+                try {
+                  const result = upsertPendingBuyDraft({
+                    symbol: row.symbol,
+                    name: row.name,
+                    source: 'signals',
+                    signal_date: row.trigger_date,
+                    default_quantity: quickQuantity,
+                  })
+                  message.success(
+                    result.inserted
+                      ? `已加入待买单：${row.symbol} x ${quickQuantity}`
+                      : `待买单已更新：${row.symbol}`,
+                  )
+                } catch {
+                  message.error('加入待买单失败，请检查信号日期格式。')
+                }
+              }}
             >
-              模拟买入
+              加入待买单
             </Button>
             <Button
               type="link"
@@ -722,7 +722,6 @@ export function SignalsPage() {
       navigate,
       phaseFilters,
       primarySignalFilters,
-      quickBuyMutation,
       quickQuantity,
       requireSequence,
       runId,
@@ -1108,7 +1107,7 @@ export function SignalsPage() {
                 onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}
                 optionType="button"
                 options={[
-                  { label: '有效(含临期)', value: 'active' },
+                  { label: '有效', value: 'active' },
                   { label: '临期', value: 'expiring' },
                   { label: '已失效', value: 'expired' },
                   { label: '全部', value: 'all' },

@@ -32,6 +32,10 @@ function formatApiError(error: unknown) {
   return '请求失败'
 }
 
+function profitColor(value: number) {
+  return value >= 0 ? '#c4473d' : '#19744f'
+}
+
 export function PortfolioPage() {
   const { message } = AntdApp.useApp()
   const queryClient = useQueryClient()
@@ -93,7 +97,7 @@ export function PortfolioPage() {
         dataIndex: 'pnl_amount',
         width: 120,
         render: (value: number) => (
-          <span style={{ color: value >= 0 ? '#19744f' : '#c4473d' }}>{formatMoney(value)}</span>
+          <span style={{ color: profitColor(value) }}>{formatMoney(value)}</span>
         ),
       },
       {
@@ -156,7 +160,7 @@ export function PortfolioPage() {
             <Statistic
               title="已实现盈亏"
               value={data?.realized_pnl ?? 0}
-              styles={{ content: { color: (data?.realized_pnl ?? 0) >= 0 ? '#19744f' : '#c4473d' } }}
+              styles={{ content: { color: profitColor(data?.realized_pnl ?? 0) } }}
               formatter={(val) => formatMoney(Number(val))}
             />
           </Card>
@@ -166,7 +170,7 @@ export function PortfolioPage() {
             <Statistic
               title="未实现盈亏"
               value={data?.unrealized_pnl ?? 0}
-              styles={{ content: { color: (data?.unrealized_pnl ?? 0) >= 0 ? '#19744f' : '#c4473d' } }}
+              styles={{ content: { color: profitColor(data?.unrealized_pnl ?? 0) } }}
               formatter={(val) => formatMoney(Number(val))}
             />
           </Card>

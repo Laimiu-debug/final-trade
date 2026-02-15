@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import dayjs, { Dayjs } from 'dayjs'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -25,6 +25,7 @@ import { useSearchParams } from 'react-router-dom'
 import { ApiError } from '@/shared/api/client'
 import {
   cancelSimOrder,
+  getPortfolio,
   getSimConfig,
   getSimFills,
   getSimOrders,
@@ -34,6 +35,12 @@ import {
   updateSimConfig,
 } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
+import {
+  clearPendingBuyDrafts,
+  type PendingBuyDraft,
+  readPendingBuyDrafts,
+  writePendingBuyDrafts,
+} from '@/shared/utils/simPendingOrders'
 import { formatMoney, formatPct } from '@/shared/utils/format'
 import type { SimTradeFill, SimTradeOrder, SimTradingConfig } from '@/types/contracts'
 
@@ -91,6 +98,26 @@ function renderTruncatedCell(value: string | undefined) {
   )
 }
 
+function normalizeLotQuantity(quantity: number) {
+  if (!Number.isFinite(quantity)) return 0
+  if (quantity < 100) return 0
+  return Math.floor(quantity / 100) * 100
+}
+
+function resolveDraftQuantity(draft: PendingBuyDraft, cashBase: number) {
+  const referencePrice = draft.reference_price ?? 0
+  if (draft.sizing_mode === 'lots') {
+    return normalizeLotQuantity(Math.floor(draft.sizing_value) * 100)
+  }
+  if (referencePrice <= 0) return 0
+  if (draft.sizing_mode === 'amount') {
+    const budget = Math.max(0, draft.sizing_value)
+    return normalizeLotQuantity(Math.floor(budget / referencePrice))
+  }
+  const budget = Math.max(0, cashBase * (draft.sizing_value / 100))
+  return normalizeLotQuantity(Math.floor(budget / referencePrice))
+}
+
 export function TradePage() {
   const { message } = AntdApp.useApp()
   const queryClient = useQueryClient()
@@ -106,10 +133,18 @@ export function TradePage() {
   const [fillSide, setFillSide] = useState<'all' | 'buy' | 'sell'>('all')
   const [fillSymbol, setFillSymbol] = useState('')
   const [fillRange, setFillRange] = useState<[Dayjs, Dayjs] | null>(null)
+  const [pendingDrafts, setPendingDrafts] = useState<PendingBuyDraft[]>([])
+  const [selectedDraftIds, setSelectedDraftIds] = useState<string[]>([])
+  const [draftSubmitting, setDraftSubmitting] = useState(false)
 
   const configQuery = useQuery({
     queryKey: ['sim-config'],
     queryFn: getSimConfig,
+  })
+
+  const portfolioQuery = useQuery({
+    queryKey: ['portfolio'],
+    queryFn: getPortfolio,
   })
 
   useEffect(() => {
@@ -119,6 +154,28 @@ export function TradePage() {
       configForm.setFieldsValue(defaultConfigValues)
     }
   }, [configForm, configQuery.data])
+
+  const updatePendingDrafts = useCallback((updater: (prev: PendingBuyDraft[]) => PendingBuyDraft[]) => {
+    setPendingDrafts((previous) => {
+      const next = updater(previous)
+      writePendingBuyDrafts(next)
+      return next
+    })
+  }, [])
+
+  useEffect(() => {
+    setPendingDrafts(readPendingBuyDrafts())
+    const onStorage = () => {
+      setPendingDrafts(readPendingBuyDrafts())
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
+
+  useEffect(() => {
+    const existingIds = new Set(pendingDrafts.map((item) => item.id))
+    setSelectedDraftIds((previous) => previous.filter((id) => existingIds.has(id)))
+  }, [pendingDrafts])
 
   const orderQuery = useQuery({
     queryKey: [
@@ -264,6 +321,233 @@ export function TradePage() {
     }
   }, [orderForm, searchParams])
 
+  const cashBase = portfolioQuery.data?.cash ?? configQuery.data?.initial_capital ?? defaultConfigValues.initial_capital
+
+  const patchPendingDraft = useCallback(
+    (id: string, patch: Partial<PendingBuyDraft>) => {
+      updatePendingDrafts((previous) =>
+        previous.map((item) => (item.id === id ? { ...item, ...patch } : item)),
+      )
+    },
+    [updatePendingDrafts],
+  )
+
+  const deletePendingDraft = useCallback(
+    (id: string) => {
+      updatePendingDrafts((previous) => previous.filter((item) => item.id !== id))
+      setSelectedDraftIds((previous) => previous.filter((item) => item !== id))
+    },
+    [updatePendingDrafts],
+  )
+
+  const clearAllPendingDrafts = useCallback(() => {
+    clearPendingBuyDrafts()
+    setPendingDrafts([])
+    setSelectedDraftIds([])
+  }, [])
+
+  const submitPendingDrafts = useCallback(
+    async (targetIds?: string[]) => {
+      const ids = (targetIds ?? selectedDraftIds).filter((item) => item.trim().length > 0)
+      if (ids.length === 0) {
+        message.info('请先选择待成交单。')
+        return
+      }
+
+      const draftMap = new Map(pendingDrafts.map((item) => [item.id, item]))
+      const successIds: string[] = []
+      const failedMessages: string[] = []
+      setDraftSubmitting(true)
+      try {
+        for (const id of ids) {
+          const draft = draftMap.get(id)
+          if (!draft) continue
+          const quantity = resolveDraftQuantity(draft, cashBase)
+          if (quantity < 100) {
+            failedMessages.push(`${draft.symbol}: 下单数量不足100股`)
+            continue
+          }
+          try {
+            const response = await postSimOrder({
+              symbol: draft.symbol,
+              side: 'buy',
+              quantity,
+              signal_date: draft.signal_date,
+              submit_date: dayjs().format('YYYY-MM-DD'),
+            })
+            setLatestOrder(response.order)
+            setLatestFill(response.fill ?? null)
+            if (response.order.status === 'rejected') {
+              failedMessages.push(
+                `${draft.symbol}: ${response.order.reject_reason || response.order.status_reason || '订单被拒绝'}`,
+              )
+              continue
+            }
+            successIds.push(id)
+          } catch (error) {
+            failedMessages.push(`${draft.symbol}: ${formatApiError(error)}`)
+          }
+        }
+      } finally {
+        setDraftSubmitting(false)
+      }
+
+      if (successIds.length > 0) {
+        updatePendingDrafts((previous) => previous.filter((item) => !successIds.includes(item.id)))
+        setSelectedDraftIds((previous) => previous.filter((id) => !successIds.includes(id)))
+        message.success(`待成交单已提交 ${successIds.length} 笔。`)
+        void Promise.all([
+          queryClient.invalidateQueries({ queryKey: ['sim-orders'] }),
+          queryClient.invalidateQueries({ queryKey: ['sim-fills'] }),
+          queryClient.invalidateQueries({ queryKey: ['portfolio'] }),
+          queryClient.invalidateQueries({ queryKey: ['review'] }),
+        ])
+      }
+      if (failedMessages.length > 0) {
+        message.warning(`有 ${failedMessages.length} 笔未提交成功，首条原因：${failedMessages[0]}`)
+      }
+    },
+    [cashBase, message, pendingDrafts, queryClient, selectedDraftIds, updatePendingDrafts],
+  )
+
+  const pendingDraftColumns: ColumnsType<PendingBuyDraft> = useMemo(
+    () => [
+      { title: '代码', dataIndex: 'symbol', width: 110 },
+      {
+        title: '名称',
+        key: 'name',
+        width: 120,
+        render: (_, row) => row.name || '-',
+      },
+      {
+        title: '来源',
+        key: 'source',
+        width: 100,
+        render: (_, row) => <Tag>{row.source === 'signals' ? '待买信号' : '选股漏斗'}</Tag>,
+      },
+      { title: '信号日', dataIndex: 'signal_date', width: 112 },
+      {
+        title: '参考价',
+        key: 'reference_price',
+        width: 140,
+        render: (_, row) => (
+          <InputNumber
+            min={0}
+            step={0.01}
+            precision={3}
+            value={row.reference_price}
+            style={{ width: '100%' }}
+            placeholder="用于金额/仓位换算"
+            onChange={(value) => {
+              const normalized = typeof value === 'number' && value > 0 ? value : undefined
+              patchPendingDraft(row.id, { reference_price: normalized })
+            }}
+          />
+        ),
+      },
+      {
+        title: '下单方式',
+        key: 'sizing_mode',
+        width: 130,
+        render: (_, row) => (
+          <Select
+            value={row.sizing_mode}
+            style={{ width: '100%' }}
+            options={[
+              { value: 'lots', label: '按手数' },
+              { value: 'amount', label: '按金额' },
+              { value: 'position', label: '按仓位' },
+            ]}
+            onChange={(nextMode) => {
+              const normalizedMode = nextMode as PendingBuyDraft['sizing_mode']
+              const nextValue = normalizedMode === 'position'
+                ? Math.min(100, Math.max(0, row.sizing_value))
+                : Math.max(0, row.sizing_value)
+              patchPendingDraft(row.id, { sizing_mode: normalizedMode, sizing_value: nextValue })
+            }}
+          />
+        ),
+      },
+      {
+        title: '配置值',
+        key: 'sizing_value',
+        width: 140,
+        render: (_, row) => {
+          const unit = row.sizing_mode === 'lots' ? '手' : row.sizing_mode === 'amount' ? '元' : '%'
+          const min = row.sizing_mode === 'lots' ? 1 : 0
+          const max = row.sizing_mode === 'position' ? 100 : undefined
+          const step = row.sizing_mode === 'lots' ? 1 : row.sizing_mode === 'amount' ? 1000 : 1
+          const precision = row.sizing_mode === 'lots' ? 0 : row.sizing_mode === 'amount' ? 2 : 2
+          return (
+            <InputNumber
+              min={min}
+              max={max}
+              step={step}
+              precision={precision}
+              addonAfter={unit}
+              value={row.sizing_value}
+              style={{ width: '100%' }}
+              onChange={(value) => {
+                const fallback = row.sizing_mode === 'lots' ? 1 : 0
+                const normalized = typeof value === 'number' && Number.isFinite(value)
+                  ? Math.max(min, value)
+                  : fallback
+                patchPendingDraft(row.id, { sizing_value: normalized })
+              }}
+            />
+          )
+        },
+      },
+      {
+        title: '预计数量',
+        key: 'preview_quantity',
+        width: 150,
+        render: (_, row) => {
+          const quantity = resolveDraftQuantity(row, cashBase)
+          const estimatedAmount = quantity > 0 && (row.reference_price ?? 0) > 0
+            ? quantity * (row.reference_price as number)
+            : 0
+          return (
+            <Space direction="vertical" size={0}>
+              <Typography.Text>{quantity > 0 ? `${quantity} 股` : '-'}</Typography.Text>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {estimatedAmount > 0 ? `约 ${formatMoney(estimatedAmount)}` : '缺少参考价或数量不足'}
+              </Typography.Text>
+            </Space>
+          )
+        },
+      },
+      {
+        title: '操作',
+        key: 'actions',
+        width: 150,
+        fixed: 'right',
+        render: (_, row) => {
+          const quantity = resolveDraftQuantity(row, cashBase)
+          return (
+            <Space size={4}>
+              <Button
+                size="small"
+                type="primary"
+                disabled={quantity < 100}
+                loading={draftSubmitting}
+                onClick={() => {
+                  void submitPendingDrafts([row.id])
+                }}
+              >
+                提交
+              </Button>
+              <Button size="small" danger onClick={() => deletePendingDraft(row.id)}>
+                删除
+              </Button>
+            </Space>
+          )
+        },
+      },
+    ],
+    [cashBase, deletePendingDraft, draftSubmitting, patchPendingDraft, submitPendingDrafts],
+  )
+
   const orderColumns: ColumnsType<SimTradeOrder> = useMemo(
     () => [
       { title: '订单号', dataIndex: 'order_id', width: 200, render: (value: string | undefined) => renderTruncatedCell(value) },
@@ -357,6 +641,51 @@ export function TradePage() {
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
       <PageHeader title="模拟交易" subtitle="A股 T+1 交易闭环：下单、撤单、补结、配置持久化与订单成交查询。" />
+
+      <Card className="glass-card" variant="borderless" title={`待成交单 (${pendingDrafts.length})`}>
+        <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+          <Space wrap>
+            <Typography.Text type="secondary">
+              仓位换算基准可用现金：{formatMoney(cashBase)}
+            </Typography.Text>
+            <Button
+              type="primary"
+              disabled={selectedDraftIds.length === 0}
+              loading={draftSubmitting}
+              onClick={() => {
+                void submitPendingDrafts()
+              }}
+            >
+              提交选中
+            </Button>
+            <Button
+              disabled={pendingDrafts.length === 0}
+              onClick={() => setSelectedDraftIds(pendingDrafts.map((item) => item.id))}
+            >
+              全选
+            </Button>
+            <Button
+              danger
+              disabled={pendingDrafts.length === 0}
+              onClick={clearAllPendingDrafts}
+            >
+              清空待成交单
+            </Button>
+          </Space>
+          <Table
+            rowKey="id"
+            columns={pendingDraftColumns}
+            dataSource={pendingDrafts}
+            pagination={false}
+            scroll={{ x: 1320 }}
+            rowSelection={{
+              selectedRowKeys: selectedDraftIds,
+              onChange: (keys) => setSelectedDraftIds(keys.map((item) => String(item))),
+            }}
+            locale={{ emptyText: '暂无待成交单，可从待买信号或选股漏斗加入。' }}
+          />
+        </Space>
+      </Card>
 
       <Card className="glass-card" variant="borderless">
         <Form

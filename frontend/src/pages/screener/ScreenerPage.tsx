@@ -26,7 +26,7 @@ import type { MenuProps } from 'antd'
 import { Controller, useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { CloudDownloadOutlined, DownOutlined, SettingOutlined, UpOutlined } from '@ant-design/icons'
+import { CloudDownloadOutlined, DownOutlined, SettingOutlined, ShoppingCartOutlined, UpOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import { jsPDF } from 'jspdf'
 import autoTable from 'jspdf-autotable'
@@ -35,6 +35,7 @@ import { PageHeader } from '@/shared/components/PageHeader'
 import { ApiError } from '@/shared/api/client'
 import { getScreenerRun, runScreener, syncMarketData } from '@/shared/api/endpoints'
 import { useUIStore } from '@/state/uiStore'
+import { upsertPendingBuyDraft } from '@/shared/utils/simPendingOrders'
 import type {
   ScreenerParams,
   ScreenerPoolKey,
@@ -139,6 +140,7 @@ const defaultFormValues: FormValues = {
 }
 
 const poolOrder: ScreenerPoolKey[] = ['input', 'step1', 'step2', 'step3', 'step4', 'final']
+const defaultPendingOrderQuantity = 1000
 
 const poolStepIndex: Record<ScreenerPoolKey, number> = {
   input: 0,
@@ -1169,10 +1171,18 @@ export function ScreenerPage() {
           degradedReason: detail.degraded_reason,
           asOfDate: detail.as_of_date ?? undefined,
         })
+        const runWindowDays =
+          typeof detail.params?.return_window_days === 'number' && Number.isFinite(detail.params.return_window_days)
+            ? detail.params.return_window_days
+            : getValues('return_window_days')
+        const runAsOfDate =
+          typeof detail.params?.as_of_date === 'string'
+            ? detail.params.as_of_date
+            : (detail.as_of_date ?? getValues('as_of_date'))
         setInputPoolKey(
           buildInputPoolKey({
-            return_window_days: getValues('return_window_days'),
-            as_of_date: detail.as_of_date ?? getValues('as_of_date'),
+            return_window_days: runWindowDays,
+            as_of_date: runAsOfDate,
           }),
         )
         const restoredStep = stepPools.step4?.length
@@ -2176,7 +2186,7 @@ export function ScreenerPage() {
     const actionColumn: ColumnsType<ScreenerResult>[number] = {
       title: '操作',
       key: 'actions',
-      width: 190,
+      width: 260,
       fixed: 'right',
       render: (_, row) => (
         <Space size={4}>
@@ -2190,6 +2200,31 @@ export function ScreenerPage() {
           >
             看图标注
           </Button>
+          <Button
+            type="link"
+            icon={<ShoppingCartOutlined />}
+            onClick={() => {
+              try {
+                const result = upsertPendingBuyDraft({
+                  symbol: row.symbol,
+                  name: row.name,
+                  source: 'screener',
+                  signal_date: runMeta?.asOfDate || dayjs().format('YYYY-MM-DD'),
+                  default_quantity: defaultPendingOrderQuantity,
+                  reference_price: row.latest_price,
+                })
+                message.success(
+                  result.inserted
+                    ? `已加入待买单：${row.symbol} x ${defaultPendingOrderQuantity}`
+                    : `待买单已更新：${row.symbol}`,
+                )
+              } catch {
+                message.error('加入待买单失败，请检查筛选日期。')
+              }
+            }}
+          >
+            加入待买单
+          </Button>
           {nextPoolKey ? (
             <Button
               type="link"
@@ -2202,7 +2237,7 @@ export function ScreenerPage() {
       ),
     }
     return [...visibleDataColumns, actionColumn]
-  }, [addRowToPoolManually, navigate, nextPoolKey, setSelectedSymbol, visibleDataColumns])
+  }, [addRowToPoolManually, message, navigate, nextPoolKey, runMeta?.asOfDate, setSelectedSymbol, visibleDataColumns])
 
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>

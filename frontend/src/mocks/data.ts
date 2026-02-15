@@ -715,12 +715,18 @@ export function getPortfolio(): PortfolioSnapshot {
 export function getReview(params?: {
   date_from?: string
   date_to?: string
+  date_axis?: 'sell' | 'buy'
 }): ReviewResponse {
   settleOrders()
   const now = dayjs()
   const dateFrom = params?.date_from ?? now.subtract(90, 'day').format('YYYY-MM-DD')
   const dateTo = params?.date_to ?? now.format('YYYY-MM-DD')
-  const trades = simClosedTradesStore.filter((item) => item.sell_date >= dateFrom && item.sell_date <= dateTo)
+  const dateAxis = params?.date_axis === 'buy' ? 'buy' : 'sell'
+  const resolveAxisDate = (trade: TradeRecord) => (dateAxis === 'buy' ? trade.buy_date : trade.sell_date)
+  const trades = simClosedTradesStore.filter((item) => {
+    const axisDate = resolveAxisDate(item)
+    return axisDate >= dateFrom && axisDate <= dateTo
+  })
   const tradeCount = trades.length
   const winCount = trades.filter((row) => row.pnl_amount > 0).length
   const lossCount = trades.filter((row) => row.pnl_amount < 0).length
@@ -733,11 +739,11 @@ export function getReview(params?: {
   let runningPnl = 0
   trades
     .slice()
-    .sort((a, b) => a.sell_date.localeCompare(b.sell_date))
+    .sort((a, b) => resolveAxisDate(a).localeCompare(resolveAxisDate(b)))
     .forEach((row) => {
       runningPnl += row.pnl_amount
       equityCurve.push({
-        date: row.sell_date,
+        date: resolveAxisDate(row),
         equity: Number((simConfigStore.initial_capital + runningPnl).toFixed(4)),
         realized_pnl: Number(runningPnl.toFixed(4)),
       })
@@ -762,7 +768,7 @@ export function getReview(params?: {
 
   const monthlyMap = new Map<string, { pnl: number; count: number }>()
   trades.forEach((trade) => {
-    const key = trade.sell_date.slice(0, 7)
+    const key = resolveAxisDate(trade).slice(0, 7)
     const prev = monthlyMap.get(key) ?? { pnl: 0, count: 0 }
     monthlyMap.set(key, { pnl: prev.pnl + trade.pnl_amount, count: prev.count + 1 })
   })
@@ -802,7 +808,7 @@ export function getReview(params?: {
     range: {
       date_from: dateFrom,
       date_to: dateTo,
-      date_axis: 'sell',
+      date_axis: dateAxis,
     },
   }
 }

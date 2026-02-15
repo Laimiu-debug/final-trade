@@ -31,6 +31,7 @@ interface MarkPointDraft extends MarkPointRecord {
 }
 
 type EventCategory = 'accumulation' | 'distributionRisk' | 'other'
+type PhaseLegendType = 'accumulation' | 'distribution' | 'unknown'
 
 interface EventPointRecord {
   value: [string, number]
@@ -88,6 +89,25 @@ const WYCKOFF_EVENT_DISPLAY_MAP: Record<string, string> = {
 const WYCKOFF_EVENT_GUIDE = {
   accumulation: ['PS', 'SC', 'AR', 'ST', 'TSO', 'Spring', 'SOS', 'JOC', 'LPS'],
   risk: ['PSY', 'BC', 'AR(d)', 'ST(d)', 'UTAD', 'SOW', 'LPSY'],
+}
+
+const WYCKOFF_EVENT_CN_MAP: Record<string, string> = {
+  PS: '\u521d\u59cb\u652f\u6491',
+  SC: '\u5356\u51fa\u9ad8\u6f6e',
+  AR: '\u81ea\u52a8\u53cd\u5f39',
+  ST: '\u4e8c\u6b21\u6d4b\u8bd5',
+  TSO: '\u672b\u7aef\u9707\u4ed3',
+  SPRING: '\u5f39\u7c27\u6d4b\u8bd5',
+  SOS: '\u5f3a\u52bf\u4fe1\u53f7',
+  JOC: '\u8dc3\u8fc7\u5c0f\u6eaa',
+  LPS: '\u6700\u540e\u652f\u6491\u70b9',
+  PSY: '\u521d\u59cb\u4f9b\u7ed9',
+  BC: '\u4e70\u5165\u9ad8\u6f6e',
+  'AR(D)': '\u81ea\u52a8\u56de\u843d',
+  'ST(D)': '\u6d3e\u53d1\u4e8c\u6d4b',
+  UTAD: '\u6d3e\u53d1\u540e\u4e0a\u51b2',
+  SOW: '\u5f31\u52bf\u4fe1\u53f7',
+  LPSY: '\u6700\u540e\u4f9b\u7ed9\u70b9',
 }
 
 type LegendSymbol = 'line' | 'bar' | 'triangle' | 'diamond' | 'circle' | 'pill' | 'pin' | 'area'
@@ -150,6 +170,15 @@ function normalizeEventCode(event: string) {
   return event.trim().replace(/\s+/g, '').toUpperCase()
 }
 
+function formatEventGuideWithZh(codes: string[]) {
+  return codes
+    .map((code) => {
+      const label = WYCKOFF_EVENT_CN_MAP[normalizeEventCode(code)]
+      return label ? `${code}(${label})` : code
+    })
+    .join(' / ')
+}
+
 function resolveEventCategory(eventCode: string): EventCategory {
   const normalized = normalizeEventCode(eventCode)
   const accumulationEvents = new Set(['PS', 'SC', 'AR', 'ST', 'TSO', 'SPRING', 'SOS', 'JOC', 'LPS'])
@@ -170,9 +199,17 @@ function resolveEventDisplayName(eventCode: string) {
   return WYCKOFF_EVENT_DISPLAY_MAP[normalized] ?? eventCode
 }
 
+function resolvePhaseLegendType(phase: string): PhaseLegendType {
+  const normalized = phase.toLowerCase()
+  if (phase.includes('\u5438\u7b79') || normalized.includes('accum')) return 'accumulation'
+  if (phase.includes('\u6d3e\u53d1') || normalized.includes('distrib')) return 'distribution'
+  return 'unknown'
+}
+
 function resolvePhaseAreaColor(phase: string) {
-  if (phase.includes('\u5438\u7b79') || phase.toLowerCase().includes('accum')) return 'rgba(22, 119, 255, 0.10)'
-  if (phase.includes('\u6d3e\u53d1') || phase.toLowerCase().includes('distrib')) return 'rgba(245, 34, 45, 0.10)'
+  const phaseType = resolvePhaseLegendType(phase)
+  if (phaseType === 'accumulation') return 'rgba(22, 119, 255, 0.10)'
+  if (phaseType === 'distribution') return 'rgba(245, 34, 45, 0.10)'
   return 'rgba(120, 136, 153, 0.08)'
 }
 
@@ -249,7 +286,7 @@ function toStackedMarkPoints(points: MarkPointDraft[]) {
 function toStackedEventPoints(points: EventPointDraft[]) {
   const grouped = new Map<string, EventPointDraft[]>()
   for (const point of points) {
-    const groupKey = `${point.category}|${point.dateKey}|${point.anchor}`
+    const groupKey = `${point.dateKey}|${point.anchor}`
     const existed = grouped.get(groupKey)
     if (existed) {
       existed.push(point)
@@ -314,6 +351,14 @@ export function KLineChart({
   const stageRangeSet = new Set<string>()
   const stageRangeData: StageRangeItem[] = []
   const signalSummaryByDate = new Map<string, string[]>()
+  const phaseLegendFlags = {
+    accumulation: false,
+    distribution: false,
+    unknown: false,
+    stats: false,
+  }
+  const unknownEventCodeSet = new Set<string>()
+  const unknownPhaseNameSet = new Set<string>()
 
   for (const signal of signals) {
     const triggerIndex = resolveNearestTradingDateIndex(signal.trigger_date, xData)
@@ -405,6 +450,9 @@ export function KLineChart({
           color: resolveEventColor(category),
         },
       })
+      if (category === 'other') {
+        unknownEventCodeSet.add(eventCode)
+      }
 
       const summaryEntry = `${signalType} | ${phase} | \u4e8b\u4ef6:${eventDisplayName}`
       const existedSummary = signalSummaryByDate.get(mappedEventDate)
@@ -444,6 +492,11 @@ export function KLineChart({
     const rangeKey = `${phase}|${rangeStart}|${rangeEnd}`
     if (!stageRangeSet.has(rangeKey)) {
       stageRangeSet.add(rangeKey)
+      const phaseType = resolvePhaseLegendType(phase)
+      phaseLegendFlags[phaseType] = true
+      if (phaseType === 'unknown') {
+        unknownPhaseNameSet.add(phase)
+      }
       stageRangeData.push([
         {
           name: `\u9636\u6bb5:${phase}`,
@@ -469,6 +522,7 @@ export function KLineChart({
     if (rangeStartIndex >= 0 && rangeEndIndex >= 0) {
       const left = Math.min(rangeStartIndex, rangeEndIndex)
       const right = Math.max(rangeStartIndex, rangeEndIndex)
+      phaseLegendFlags.stats = true
       stageRangeData.push([
         {
           name: '\u7edf\u8ba1\u533a\u95f4',
@@ -521,6 +575,8 @@ export function KLineChart({
 
   const allMarkPoints = toStackedMarkPoints(markPointDrafts)
   const eventPointsByCategory = toStackedEventPoints(eventPointDrafts)
+  const unknownEventCodes = Array.from(unknownEventCodeSet).sort((a, b) => a.localeCompare(b, 'zh-CN'))
+  const unknownPhaseNames = Array.from(unknownPhaseNameSet).sort((a, b) => a.localeCompare(b, 'zh-CN'))
 
   const markLineData = [
     resolveDateMarkLine(manualStartDate, xData, '\u4eba\u5de5\u542f\u52a8\u65e5', '#13c2c2'),
@@ -536,17 +592,40 @@ export function KLineChart({
     { label: 'A\u4fe1\u53f7', color: '#1677ff', symbol: 'diamond' },
     { label: 'C\u4fe1\u53f7', color: '#7f8c8d', symbol: 'circle' },
   ]
-  const annotationLegendItems: LegendItem[] = [
-    { label: '\u5438\u7b79\u4e8b\u4ef6', color: '#13c2c2', symbol: 'pill' },
-    { label: '\u6d3e\u53d1/\u98ce\u9669\u4e8b\u4ef6', color: '#f5222d', symbol: 'pill' },
-    { label: '\u5176\u4ed6\u4e8b\u4ef6', color: '#8c8c8c', symbol: 'pill' },
-    { label: '\u4eba\u5de5\u542f\u52a8\u65e5', color: '#13c2c2', symbol: 'pin' },
-    { label: 'AI\u8d77\u7206\u65e5', color: '#fa8c16', symbol: 'pin' },
-    { label: '\u5438\u7b79\u9636\u6bb5\u533a\u95f4', color: 'rgba(22, 119, 255, 0.50)', symbol: 'area' },
-    { label: '\u6d3e\u53d1\u9636\u6bb5\u533a\u95f4', color: 'rgba(245, 34, 45, 0.50)', symbol: 'area' },
-    { label: '\u672a\u660e\u9636\u6bb5\u533a\u95f4', color: 'rgba(120, 136, 153, 0.50)', symbol: 'area' },
-    { label: '\u7edf\u8ba1\u533a\u95f4', color: 'rgba(250, 173, 20, 0.50)', symbol: 'area' },
-  ]
+  const annotationLegendItems: LegendItem[] = []
+  if (eventPointsByCategory.accumulation.length > 0) {
+    annotationLegendItems.push({ label: '\u5438\u7b79\u4e8b\u4ef6', color: '#13c2c2', symbol: 'pill' })
+  }
+  if (eventPointsByCategory.distributionRisk.length > 0) {
+    annotationLegendItems.push({ label: '\u6d3e\u53d1/\u98ce\u9669\u4e8b\u4ef6', color: '#f5222d', symbol: 'pill' })
+  }
+  if (eventPointsByCategory.other.length > 0) {
+    const unknownLabel = unknownEventCodes.length > 0
+      ? `\u672a\u5f52\u7c7b\u4e8b\u4ef6(${unknownEventCodes.slice(0, 4).join('/')}${unknownEventCodes.length > 4 ? '...' : ''})`
+      : '\u672a\u5f52\u7c7b\u4e8b\u4ef6(\u7f3a\u5c11\u4e8b\u4ef6\u4ee3\u7801\u6620\u5c04)'
+    annotationLegendItems.push({ label: unknownLabel, color: '#8c8c8c', symbol: 'pill' })
+  }
+  if (manualPoint) {
+    annotationLegendItems.push({ label: '\u4eba\u5de5\u542f\u52a8\u65e5', color: '#13c2c2', symbol: 'pin' })
+  }
+  if (aiPoint) {
+    annotationLegendItems.push({ label: 'AI\u8d77\u7206\u65e5', color: '#fa8c16', symbol: 'pin' })
+  }
+  if (phaseLegendFlags.accumulation) {
+    annotationLegendItems.push({ label: '\u5438\u7b79\u9636\u6bb5\u533a\u95f4', color: 'rgba(22, 119, 255, 0.50)', symbol: 'area' })
+  }
+  if (phaseLegendFlags.distribution) {
+    annotationLegendItems.push({ label: '\u6d3e\u53d1\u9636\u6bb5\u533a\u95f4', color: 'rgba(245, 34, 45, 0.50)', symbol: 'area' })
+  }
+  if (phaseLegendFlags.unknown) {
+    const unknownPhaseLabel = unknownPhaseNames.length > 0
+      ? `\u9636\u6bb5\u5f85\u5224\u5b9a\u533a\u95f4(${unknownPhaseNames.slice(0, 2).join('/')}${unknownPhaseNames.length > 2 ? '...' : ''})`
+      : '\u9636\u6bb5\u5f85\u5224\u5b9a\u533a\u95f4(\u539f\u59cb\u9636\u6bb5\u503c\u672a\u5f52\u7c7b)'
+    annotationLegendItems.push({ label: unknownPhaseLabel, color: 'rgba(120, 136, 153, 0.50)', symbol: 'area' })
+  }
+  if (phaseLegendFlags.stats) {
+    annotationLegendItems.push({ label: '\u7edf\u8ba1\u533a\u95f4', color: 'rgba(250, 173, 20, 0.50)', symbol: 'area' })
+  }
 
   const option = {
     animation: true,
@@ -723,6 +802,7 @@ export function KLineChart({
       {
         name: '\u5438\u7b79\u4e8b\u4ef6',
         type: 'scatter',
+        clip: false,
         symbol: 'roundRect',
         symbolSize: 12,
         data: eventPointsByCategory.accumulation,
@@ -732,6 +812,7 @@ export function KLineChart({
           color: '#0f5f59',
           formatter: (params: { data?: { eventCode?: string } }) => params.data?.eventCode ?? '',
         },
+        labelLayout: { hideOverlap: false },
         tooltip: {
           formatter: (params: { data?: { tooltipText?: string } }) => params.data?.tooltipText ?? '',
         },
@@ -741,6 +822,7 @@ export function KLineChart({
       {
         name: '\u98ce\u9669\u4e8b\u4ef6',
         type: 'scatter',
+        clip: false,
         symbol: 'roundRect',
         symbolSize: 12,
         data: eventPointsByCategory.distributionRisk,
@@ -750,6 +832,7 @@ export function KLineChart({
           color: '#9f1239',
           formatter: (params: { data?: { eventCode?: string } }) => params.data?.eventCode ?? '',
         },
+        labelLayout: { hideOverlap: false },
         tooltip: {
           formatter: (params: { data?: { tooltipText?: string } }) => params.data?.tooltipText ?? '',
         },
@@ -759,6 +842,7 @@ export function KLineChart({
       {
         name: '\u5176\u4ed6\u4e8b\u4ef6',
         type: 'scatter',
+        clip: false,
         symbol: 'roundRect',
         symbolSize: 12,
         data: eventPointsByCategory.other,
@@ -768,6 +852,7 @@ export function KLineChart({
           color: '#4b5563',
           formatter: (params: { data?: { eventCode?: string } }) => params.data?.eventCode ?? '',
         },
+        labelLayout: { hideOverlap: false },
         tooltip: {
           formatter: (params: { data?: { tooltipText?: string } }) => params.data?.tooltipText ?? '',
         },
@@ -931,8 +1016,14 @@ export function KLineChart({
         <div style={{ fontWeight: 600, marginBottom: 4 }}>
           {'\u5a01\u79d1\u592b\u4e8b\u4ef6\u6807\u6ce8\u6e05\u5355'}
         </div>
-        <div>{'\u5438\u7b79\u4e8b\u4ef6\uff1a'}{WYCKOFF_EVENT_GUIDE.accumulation.join(' / ')}</div>
-        <div>{'\u6d3e\u53d1/\u98ce\u9669\u4e8b\u4ef6\uff1a'}{WYCKOFF_EVENT_GUIDE.risk.join(' / ')}</div>
+        <div>{'\u5438\u7b79\u4e8b\u4ef6\uff1a'}{formatEventGuideWithZh(WYCKOFF_EVENT_GUIDE.accumulation)}</div>
+        <div>{'\u6d3e\u53d1/\u98ce\u9669\u4e8b\u4ef6\uff1a'}{formatEventGuideWithZh(WYCKOFF_EVENT_GUIDE.risk)}</div>
+        {unknownEventCodes.length > 0 ? (
+          <div>{'\u672a\u5f52\u7c7b\u4e8b\u4ef6\u4ee3\u7801\uff1a'}{unknownEventCodes.join(' / ')}</div>
+        ) : null}
+        {unknownPhaseNames.length > 0 ? (
+          <div>{'\u672a\u5f52\u7c7b\u9636\u6bb5\u540d\u79f0\uff1a'}{unknownPhaseNames.join(' / ')}</div>
+        ) : null}
       </div>
     </div>
   )

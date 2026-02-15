@@ -583,3 +583,29 @@ def test_review_default_range_and_curve_fields() -> None:
     assert isinstance(body["drawdown_curve"], list)
     assert isinstance(body["monthly_returns"], list)
     assert "profit_factor" in body["stats"]
+
+
+def test_review_supports_buy_date_axis() -> None:
+    symbol = "sh601899"
+    dates = _load_symbol_dates(symbol)
+    _post_buy(symbol, dates[-8], quantity=100)
+    client.post("/api/sim/settle")
+    _post_sell(symbol, dates[-5], quantity=100)
+    client.post("/api/sim/settle")
+
+    filled_buys = client.get(
+        "/api/sim/orders",
+        params={"status": "filled", "side": "buy", "symbol": symbol},
+    ).json()["items"]
+    assert filled_buys
+    buy_fill_date = min(item["filled_date"] for item in filled_buys if item.get("filled_date"))
+
+    resp = client.get(
+        "/api/review/stats",
+        params={"date_from": buy_fill_date, "date_to": buy_fill_date, "date_axis": "buy"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["range"]["date_axis"] == "buy"
+    assert body["stats"]["trade_count"] >= 1
+    assert all(row["buy_date"] == buy_fill_date for row in body["trades"])

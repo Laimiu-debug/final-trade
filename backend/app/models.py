@@ -328,7 +328,7 @@ class MonthlyReturnPoint(BaseModel):
 class ReviewRange(BaseModel):
     date_from: str
     date_to: str
-    date_axis: Literal["sell"] = "sell"
+    date_axis: Literal["sell", "buy"] = "sell"
 
 
 class ReviewResponse(BaseModel):

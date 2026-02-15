@@ -764,7 +764,7 @@ class SimAccountEngine:
         *,
         date_from: str | None,
         date_to: str | None,
-        date_axis: Literal["sell"] = "sell",
+        date_axis: Literal["sell", "buy"] = "sell",
     ) -> ReviewResponse:
         with self._lock:
             self._auto_settle_locked()
@@ -776,10 +776,15 @@ class SimAccountEngine:
             if start > end:
                 start, end = end, start
 
-            all_trades = [TradeRecord(**item) for item in self._list_closed_raw()]
-            all_trades.sort(key=lambda row: (row.sell_date, row.symbol))
+            axis = "buy" if date_axis == "buy" else "sell"
 
-            filtered = [trade for trade in all_trades if start <= trade.sell_date <= end]
+            def trade_axis_date(row: TradeRecord) -> str:
+                return row.buy_date if axis == "buy" else row.sell_date
+
+            all_trades = [TradeRecord(**item) for item in self._list_closed_raw()]
+            all_trades.sort(key=lambda row: (trade_axis_date(row), row.symbol))
+
+            filtered = [trade for trade in all_trades if start <= trade_axis_date(trade) <= end]
             trade_count = len(filtered)
             win_count = sum(1 for row in filtered if row.pnl_amount > 0)
             loss_count = sum(1 for row in filtered if row.pnl_amount < 0)
@@ -796,12 +801,10 @@ class SimAccountEngine:
             else:
                 profit_factor = 0.0
 
-            cumulative_before_start = sum(
-                row.pnl_amount for row in all_trades if row.sell_date < start
-            )
+            cumulative_before_start = sum(row.pnl_amount for row in all_trades if trade_axis_date(row) < start)
             pnl_by_date: dict[str, float] = defaultdict(float)
             for row in filtered:
-                pnl_by_date[row.sell_date] += row.pnl_amount
+                pnl_by_date[trade_axis_date(row)] += row.pnl_amount
 
             equity_curve: list[EquityPoint] = []
             running_realized = cumulative_before_start
@@ -841,7 +844,7 @@ class SimAccountEngine:
 
             month_agg: dict[str, dict[str, float]] = defaultdict(lambda: {"pnl": 0.0, "count": 0.0})
             for row in filtered:
-                month = row.sell_date[:7]
+                month = trade_axis_date(row)[:7]
                 month_agg[month]["pnl"] += row.pnl_amount
                 month_agg[month]["count"] += 1
             monthly_returns = [

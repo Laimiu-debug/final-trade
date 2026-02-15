@@ -242,7 +242,7 @@ def get_portfolio() -> PortfolioSnapshot:
 def get_review_stats(
     date_from: str | None = Query(default=None, min_length=10, max_length=10),
     date_to: str | None = Query(default=None, min_length=10, max_length=10),
-    date_axis: Literal["sell"] = Query(default="sell"),
+    date_axis: Literal["sell", "buy"] = Query(default="sell"),
 ) -> ReviewResponse:
     return store.get_review(date_from=date_from, date_to=date_to, date_axis=date_axis)
 

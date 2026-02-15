@@ -339,7 +339,7 @@ export interface MonthlyReturnPoint {
 export interface ReviewRange {
   date_from: string
   date_to: string
-  date_axis: 'sell'
+  date_axis: 'sell' | 'buy'
 }
 
 export interface ReviewResponse {

@@ -224,6 +224,7 @@ export const handlers = [
       getReview({
         date_from: url.searchParams.get('date_from') ?? undefined,
         date_to: url.searchParams.get('date_to') ?? undefined,
+        date_axis: (url.searchParams.get('date_axis') as 'sell' | 'buy' | null) ?? undefined,
       }),
     )
   }),

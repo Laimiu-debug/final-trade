@@ -5,7 +5,7 @@ This module implements the Wyckoff methodology for detecting accumulation
 and distribution patterns in stock price movements.
 """
 
-from typing import Optional
+from typing import Callable, Optional
 
 from ..models import CandlePoint, ScreenerResult, Stage, ThemeStage
 
@@ -215,6 +215,71 @@ class SignalAnalyzer:
         """Detect Wyckoff events from price and volume data."""
         event_dates: dict[str, str] = {}
         event_chain: list[dict[str, str]] = []
+        last_idx = len(dates) - 1
+        if last_idx < 0:
+            return event_dates, event_chain
+
+        def ma_at(idx: int, window: int = 20) -> float:
+            start = max(0, idx - window + 1)
+            return cls.safe_mean(closes[start:idx + 1])
+
+        def vol_avg_at(idx: int, window: int = 20) -> float:
+            if idx < 0:
+                return 0.0
+            start = max(0, idx - window + 1)
+            return cls.safe_mean(volumes[start:idx + 1])
+
+        def vol_ratio_at(idx: int, window: int = 20) -> float:
+            base = vol_avg_at(idx, window)
+            return volumes[idx] / max(base, 1.0)
+
+        def ret_at(idx: int, lookback: int = 10) -> float:
+            start = max(0, idx - lookback)
+            return (closes[idx] - closes[start]) / max(closes[start], 0.01)
+
+        def tr_pos_at(idx: int, lookback: int = 40) -> float:
+            start = max(0, idx - lookback + 1)
+            segment_high = max(highs[start:idx + 1])
+            segment_low = min(lows[start:idx + 1])
+            width = max(segment_high - segment_low, 0.01)
+            return (closes[idx] - segment_low) / width
+
+        def prior_high_at(idx: int, lookback: int = 20) -> float:
+            start = max(0, idx - lookback)
+            if start >= idx:
+                return highs[idx]
+            return max(highs[start:idx])
+
+        def prior_low_at(idx: int, lookback: int = 20) -> float:
+            start = max(0, idx - lookback)
+            if start >= idx:
+                return lows[idx]
+            return min(lows[start:idx])
+
+        def upper_shadow_ratio_at(idx: int) -> float:
+            body_high = max(opens[idx], closes[idx])
+            candle_range = max(highs[idx] - lows[idx], 0.01)
+            return (highs[idx] - body_high) / candle_range
+
+        def latest_index_where(start_idx: int, end_idx: int, predicate: Callable[[int], bool]) -> int | None:
+            if end_idx < start_idx:
+                return None
+            left = max(0, start_idx)
+            right = min(last_idx, end_idx)
+            for idx in range(right, left - 1, -1):
+                if predicate(idx):
+                    return idx
+            return None
+
+        def first_index_where(start_idx: int, end_idx: int, predicate: Callable[[int], bool]) -> int | None:
+            if end_idx < start_idx:
+                return None
+            left = max(0, start_idx)
+            right = min(last_idx, end_idx)
+            for idx in range(left, right + 1):
+                if predicate(idx):
+                    return idx
+            return None
 
         def push_event(
             name: str,
@@ -234,121 +299,270 @@ class SignalAnalyzer:
                 "category": category,
             })
 
-        # PS / SC / AR / ST (Accumulation Phase A)
-        push_event("PS", tr_pos <= 0.38 and avg_v5 >= avg_v20 * 1.12)
+        lookback_start = max(0, last_idx - 40)
 
-        look_sc_start = max(0, len(closes) - 30)
-        sc_idx = look_sc_start + max(
-            range(len(volumes[look_sc_start:])),
-            key=lambda idx: volumes[look_sc_start + idx],
+        # SC anchor: prefer high-volume, low-position climax-like bars in the recent window.
+        look_sc_start = max(0, len(closes) - 35)
+        sc_idx = latest_index_where(
+            look_sc_start,
+            last_idx,
+            lambda idx: (
+                tr_pos_at(idx) <= 0.45
+                and closes[idx] <= opens[idx] * 1.02
+                and vol_ratio_at(idx, 20) >= 1.2
+            ),
         )
+        if sc_idx is None:
+            sc_idx = look_sc_start + max(
+                range(len(volumes[look_sc_start:])),
+                key=lambda idx: volumes[look_sc_start + idx],
+            )
         sc_range = max(highs[sc_idx] - lows[sc_idx], 0.01)
         sc_close_near_low = closes[sc_idx] <= lows[sc_idx] + sc_range * 0.38
-        push_event("SC", sc_close_near_low, sc_idx)
+        sc_condition = sc_close_near_low and tr_pos_at(sc_idx) <= 0.55 and vol_ratio_at(sc_idx, 20) >= 1.05
+        push_event("SC", sc_condition, sc_idx)
+
+        # PS / SC / AR / ST (Accumulation Phase A)
+        ps_idx = latest_index_where(
+            max(0, sc_idx - 25),
+            max(0, sc_idx - 1),
+            lambda idx: tr_pos_at(idx) <= 0.42 and vol_ratio_at(idx, 20) >= 1.08 and closes[idx] <= ma_at(idx) * 1.02,
+        )
+        push_event("PS", ps_idx is not None, ps_idx)
 
         ar_idx: int | None = None
-        if "SC" in event_dates and sc_idx < len(closes) - 3:
-            rebound_slice = closes[sc_idx + 1:]
+        if "SC" in event_dates and sc_idx < last_idx - 1:
+            rebound_scan_end = min(last_idx, sc_idx + 18)
+            rebound_slice = closes[sc_idx + 1:rebound_scan_end + 1]
             rebound_max = max(rebound_slice) if rebound_slice else closes[sc_idx]
-            if rebound_max >= closes[sc_idx] * 1.08:
+            if rebound_max >= closes[sc_idx] * 1.05:
                 ar_idx = sc_idx + rebound_slice.index(rebound_max) + 1
                 push_event("AR", True, ar_idx)
 
-        if "SC" in event_dates and len(closes) >= sc_idx + 6:
+        st_idx: int | None = None
+        if "SC" in event_dates and sc_idx < last_idx:
             sc_low = lows[sc_idx]
-            st_idx = None
-            for idx in range(sc_idx + 1, len(closes)):
+            st_start = (ar_idx + 1) if ar_idx is not None else (sc_idx + 2)
+            st_end = min(last_idx, (ar_idx + 12) if ar_idx is not None else (sc_idx + 18))
+            for idx in range(st_start, st_end + 1):
                 near_sc_low = abs(lows[idx] - sc_low) / max(sc_low, 0.01) <= 0.04
                 lower_volume = volumes[idx] <= volumes[sc_idx] * 0.85
                 if near_sc_low and lower_volume:
                     st_idx = idx
+                    break
             push_event("ST", st_idx is not None, st_idx)
 
         # TSO / Spring / SOS / JOC / LPS (Accumulation Phases B-E)
-        support_20 = min(lows[-20:])
-        prior_support = min(lows[-25:-5]) if len(lows) > 25 else support_20
-        push_event(
-            "TSO",
-            lows[-1] < prior_support * 0.99 and closes[-1] > prior_support and avg_v5 >= avg_v20,
+        pattern_seed = max([idx for idx in (st_idx, ar_idx, sc_idx) if idx is not None], default=lookback_start)
+        pattern_start = max(1, pattern_seed + 1)
+        pattern_end = min(last_idx, pattern_start + 28)
+        spring_idx = first_index_where(
+            pattern_start,
+            min(last_idx, pattern_end + 8),
+            lambda idx: (
+                lows[idx] < prior_low_at(idx, 20) * 0.985
+                and closes[idx] > prior_low_at(idx, 20)
+                and vol_ratio_at(idx, 20) >= 1.15
+            ),
+        )
+        tso_end = (spring_idx - 1) if spring_idx is not None else pattern_end
+        tso_idx = first_index_where(
+            pattern_start,
+            tso_end,
+            lambda idx: (
+                lows[idx] < prior_low_at(idx, 20) * 0.99
+                and closes[idx] > prior_low_at(idx, 20)
+                and vol_ratio_at(idx, 20) >= 1.0
+            ),
         )
         push_event(
+            "TSO",
+            tso_idx is not None,
+            tso_idx,
+        )
+
+        push_event(
             "Spring",
-            lows[-1] < support_20 * 0.985 and closes[-1] > support_20 and volumes[-1] >= avg_v20 * 1.15,
+            spring_idx is not None,
+            spring_idx,
+        )
+
+        base_idx = max(
+            [idx for idx in (spring_idx, tso_idx, st_idx, ar_idx, sc_idx) if idx is not None],
+            default=lookback_start,
+        )
+        signal_start = max(lookback_start, base_idx + 1)
+        sos_idx = first_index_where(
+            signal_start,
+            last_idx,
+            lambda idx: (
+                closes[idx] > ma_at(idx) * 1.01
+                and ret_at(idx, 10) > 0.05
+                and vol_ratio_at(idx, 20) >= 1.05
+            ),
         )
         push_event(
             "SOS",
-            closes[-1] > ma20 * 1.01 and ret10 > 0.05 and avg_v5 >= avg_v20 * 1.05,
+            sos_idx is not None,
+            sos_idx,
         )
-        prior_high_20 = max(highs[-21:-1]) if len(highs) > 21 else max(highs[:-1])
+
+        joc_start = max(signal_start, (sos_idx + 1) if sos_idx is not None else signal_start)
+        joc_idx = first_index_where(
+            joc_start,
+            last_idx,
+            lambda idx: idx > 0 and closes[idx] >= prior_high_at(idx, 20) * 1.005 and vol_ratio_at(idx, 20) >= 1.2,
+        )
         push_event(
             "JOC",
-            closes[-1] >= prior_high_20 * 1.005 and volumes[-1] >= avg_v20 * 1.2,
+            joc_idx is not None,
+            joc_idx,
         )
+
+        lps_idx: int | None = None
+        lps_anchor_idx = max([idx for idx in (sos_idx, joc_idx) if idx is not None], default=-1)
+        if lps_anchor_idx >= 0 and lps_anchor_idx < last_idx:
+            lps_end = min(last_idx, lps_anchor_idx + 12)
+            lps_idx = first_index_where(
+                lps_anchor_idx + 1,
+                lps_end,
+                lambda idx: (
+                    closes[idx] > ma_at(idx) * 0.995
+                    and volumes[idx] <= max(vol_avg_at(idx - 1, 5), 1.0) * 0.95
+                    and (idx - lps_anchor_idx) <= 6
+                ),
+            )
         push_event(
             "LPS",
-            (("SOS" in event_dates) or ("JOC" in event_dates))
-            and closes[-1] > ma20
-            and row.pullback_volume_ratio <= 0.95
-            and row.pullback_days <= 4,
+            lps_idx is not None,
+            lps_idx,
         )
 
         # Distribution early events: PSY / BC / AR(d) / ST(d)
-        push_event("PSY", tr_pos >= 0.62 and avg_v5 >= avg_v20 * 1.05, category="distributionRisk")
-
-        look_bc_start = max(0, len(closes) - 30)
-        bc_idx = look_bc_start + max(
-            range(len(volumes[look_bc_start:])),
-            key=lambda idx: volumes[look_bc_start + idx],
+        look_bc_start = max(0, len(closes) - 35)
+        bc_idx = latest_index_where(
+            look_bc_start,
+            last_idx,
+            lambda idx: (
+                tr_pos_at(idx) >= 0.62
+                and closes[idx] >= opens[idx] * 0.98
+                and vol_ratio_at(idx, 20) >= 1.2
+                and highs[idx] >= prior_high_at(idx, 20) * 0.995
+            ),
         )
+        if bc_idx is None:
+            bc_idx = look_bc_start + max(
+                range(len(volumes[look_bc_start:])),
+                key=lambda idx: volumes[look_bc_start + idx],
+            )
         bc_range = max(highs[bc_idx] - lows[bc_idx], 0.01)
         bc_close_near_high = closes[bc_idx] >= highs[bc_idx] - bc_range * 0.32
-        bc_condition = bc_close_near_high and highs[bc_idx] >= max(highs[max(0, bc_idx - 20):bc_idx + 1]) * 0.995
+        bc_condition = (
+            bc_close_near_high
+            and tr_pos_at(bc_idx) >= 0.58
+            and vol_ratio_at(bc_idx, 20) >= 1.05
+            and highs[bc_idx] >= max(highs[max(0, bc_idx - 20):bc_idx + 1]) * 0.995
+        )
+
+        psy_idx = first_index_where(
+            max(0, bc_idx - 20),
+            max(0, bc_idx - 1),
+            lambda idx: tr_pos_at(idx) >= 0.62 and vol_ratio_at(idx, 20) >= 1.05 and closes[idx] >= ma_at(idx) * 0.98,
+        ) if bc_idx > 0 else None
+        push_event("PSY", psy_idx is not None, psy_idx, category="distributionRisk")
+
         push_event("BC", bc_condition, bc_idx, category="distributionRisk")
 
         ar_d_idx: int | None = None
-        if "BC" in event_dates and bc_idx < len(closes) - 2:
-            decline_slice = closes[bc_idx + 1:]
+        if "BC" in event_dates and bc_idx < last_idx - 1:
+            decline_scan_end = min(last_idx, bc_idx + 18)
+            decline_slice = closes[bc_idx + 1:decline_scan_end + 1]
             decline_min = min(decline_slice) if decline_slice else closes[bc_idx]
             if decline_min <= closes[bc_idx] * 0.94:
                 ar_d_idx = bc_idx + decline_slice.index(decline_min) + 1
                 push_event("AR(d)", True, ar_d_idx, category="distributionRisk")
 
-        if "BC" in event_dates and len(closes) >= bc_idx + 4:
+        st_d_idx: int | None = None
+        if "BC" in event_dates and bc_idx < last_idx:
             bc_high = highs[bc_idx]
-            st_d_idx = None
-            for idx in range(bc_idx + 1, len(closes)):
+            st_d_start = (ar_d_idx + 1) if ar_d_idx is not None else (bc_idx + 2)
+            st_d_end = min(last_idx, bc_idx + 24)
+            for idx in range(st_d_start, st_d_end + 1):
                 near_bc_high = abs(highs[idx] - bc_high) / max(bc_high, 0.01) <= 0.04
                 lower_volume = volumes[idx] <= volumes[bc_idx] * 0.9
                 close_weak = closes[idx] <= highs[idx] * 0.985
                 if near_bc_high and lower_volume and close_weak:
                     st_d_idx = idx
+                    break
             push_event("ST(d)", st_d_idx is not None, st_d_idx, category="distributionRisk")
 
         # Risk-side events (Distribution)
-        upper_shadow_ratio = (highs[-1] - max(opens[-1], closes[-1])) / max(highs[-1] - lows[-1], 0.01)
+        utad_start = max(
+            lookback_start,
+            (st_d_idx + 1) if "ST(d)" in event_dates and st_d_idx is not None else (bc_idx + 1),
+        )
+        utad_idx = first_index_where(
+            utad_start,
+            last_idx,
+            lambda idx: (
+                idx > 0
+                and highs[idx] >= prior_high_at(idx, 20) * 1.01
+                and closes[idx] < prior_high_at(idx, 20)
+                and upper_shadow_ratio_at(idx) >= 0.5
+                and vol_ratio_at(idx, 20) >= 1.2
+            ),
+        )
         push_event(
             "UTAD",
-            highs[-1] >= prior_high_20 * 1.01
-            and closes[-1] < prior_high_20
-            and upper_shadow_ratio >= 0.5
-            and volumes[-1] >= avg_v20 * 1.2,
-            category="distributionRisk",
-        )
-        push_event(
-            "SOW",
-            ret10 <= -0.05 and closes[-1] < ma20 and avg_v5 >= avg_v20 * 1.1,
-            category="distributionRisk",
-        )
-        recent_high_5 = max(highs[-5:])
-        prev_high_5 = max(highs[-10:-5]) if len(highs) >= 10 else recent_high_5
-        push_event(
-            "LPSY",
-            ("SOW" in event_dates or "UTAD" in event_dates)
-            and closes[-1] < ma20
-            and recent_high_5 <= prev_high_5 * 0.99,
+            utad_idx is not None,
+            utad_idx,
             category="distributionRisk",
         )
 
+        sow_start = max(
+            lookback_start,
+            (utad_idx + 1) if utad_idx is not None else ((ar_d_idx + 1) if ar_d_idx is not None else (bc_idx + 1)),
+        )
+        sow_idx = first_index_where(
+            sow_start,
+            last_idx,
+            lambda idx: ret_at(idx, 10) <= -0.05 and closes[idx] < ma_at(idx) * 0.995 and vol_ratio_at(idx, 20) >= 1.1,
+        )
+        push_event(
+            "SOW",
+            sow_idx is not None,
+            sow_idx,
+            category="distributionRisk",
+        )
+
+        lpsy_anchor_idx = max([idx for idx in (sow_idx, utad_idx) if idx is not None], default=-1)
+        lpsy_idx: int | None = None
+        if lpsy_anchor_idx >= 0 and lpsy_anchor_idx < last_idx:
+            lpsy_end = min(last_idx, lpsy_anchor_idx + 16)
+            lpsy_idx = first_index_where(
+                lpsy_anchor_idx + 1,
+                lpsy_end,
+                lambda idx: (
+                    closes[idx] < ma_at(idx)
+                    and max(highs[max(0, idx - 4):idx + 1])
+                    <= max(highs[max(0, idx - 9):max(0, idx - 4)] or highs[max(0, idx - 4):idx + 1]) * 0.99
+                ),
+            )
+        push_event(
+            "LPSY",
+            lpsy_idx is not None,
+            lpsy_idx,
+            category="distributionRisk",
+        )
+
+        event_chain.sort(
+            key=lambda item: (
+                str(item.get("date", "")),
+                WYCKOFF_EVENT_ORDER.index(str(item.get("event", "")))
+                if str(item.get("event", "")) in WYCKOFF_EVENT_ORDER
+                else len(WYCKOFF_EVENT_ORDER),
+            )
+        )
         return event_dates, event_chain
 
     @classmethod

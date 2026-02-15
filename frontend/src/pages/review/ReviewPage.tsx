@@ -7,6 +7,7 @@ import {
   Card,
   Col,
   DatePicker,
+  Radio,
   Row,
   Space,
   Statistic,
@@ -83,17 +84,18 @@ function isSameDateRange(prev: [Dayjs, Dayjs], next: [Dayjs, Dayjs]) {
 export function ReviewPage() {
   const { message } = AntdApp.useApp()
   const [range, setRange] = useState<[Dayjs, Dayjs]>([dayjs().subtract(90, 'day'), dayjs()])
+  const [dateAxis, setDateAxis] = useState<'sell' | 'buy'>('sell')
   const equityChartRef = useRef<ReactECharts | null>(null)
   const drawdownChartRef = useRef<ReactECharts | null>(null)
   const monthlyChartRef = useRef<ReactECharts | null>(null)
 
   const reviewQuery = useQuery({
-    queryKey: ['review', range[0].format('YYYY-MM-DD'), range[1].format('YYYY-MM-DD')],
+    queryKey: ['review', range[0].format('YYYY-MM-DD'), range[1].format('YYYY-MM-DD'), dateAxis],
     queryFn: () =>
       getReviewStats({
         date_from: range[0].format('YYYY-MM-DD'),
         date_to: range[1].format('YYYY-MM-DD'),
-        date_axis: 'sell',
+        date_axis: dateAxis,
       }),
   })
 
@@ -396,6 +398,15 @@ export function ReviewPage() {
               const nextRange: [Dayjs, Dayjs] = [value[0], value[1]]
               setRange((prev) => (isSameDateRange(prev, nextRange) ? prev : nextRange))
             }}
+          />
+          <Radio.Group
+            value={dateAxis}
+            optionType="button"
+            options={[
+              { label: '按卖出日', value: 'sell' },
+              { label: '按买入日', value: 'buy' },
+            ]}
+            onChange={(event) => setDateAxis(event.target.value as 'sell' | 'buy')}
           />
           <Button onClick={handleExportExcel}>导出 Excel</Button>
           <Button onClick={handleExportCSV}>导出 CSV</Button>
