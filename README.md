@@ -1,44 +1,74 @@
-# final-trade
+# Final Trade
 
-通达信趋势选股 + 威科夫待买信号 + 模拟交易闭环（前后端一体）项目。
+Integrated stock workflow:
+- Screener funnel
+- Wyckoff-based buy signals
+- Simulated trading loop
+- Portfolio and review analytics
+- AI analysis records
 
-## 功能概览
+Backend: FastAPI  
+Frontend: React + Vite + Ant Design + React Query
 
-### 1) 选股与信号
-- 四步选股漏斗（分步运行、池子查看、导出）
-- 待买信号（威科夫增强）
-  - 趋势池后置 / 全市场扫描双模式
-  - 阶段、事件、评分、风险提示
-  - 与 K 线页、交易页联动
+## Recent Updates (2026-02)
 
-### 2) 模拟交易（MVP）
-- A 股 T+1，仅多头
-- 100 股整手校验
-- 下单、挂单、撤单、自动结算、手动补结
-- 成本模型可配置（佣金、最低佣金、印花税、过户费、滑点）
-- FIFO 卖出批次匹配
+- Replaced direct "simulate buy" on Signals/Screener pages with "Add to Pending Buy List".
+- Added centralized pending order workflow on Trade page.
+- Pending buy sizing now supports:
+  - `lots`
+  - `amount`
+  - `position (%)`
+- Portfolio color convention changed to:
+  - gain = red
+  - loss = green
+- Review stats now support date axis:
+  - `sell` (by sell date)
+  - `buy` (by buy date)
+- Signals filter updated:
+  - `Active` excludes expiring signals
+  - `Expiring` is a separate status
+- Fixed signal expiry logic issue that could mark almost all signals as expiring.
+- Improved AI analysis table UI to avoid text overlap on zoom.
 
-### 3) 持仓与复盘
-- 持仓页：总资产/现金/持仓市值/已实现盈亏/未实现盈亏/挂单数
-- 复盘页：近 90 天默认区间 + 自定义区间（按卖出日）
-- 图表：权益曲线、回撤曲线、月度收益
-- 导出：Excel / CSV / PDF（中文字体已处理）
-
-### 4) 数据与持久化
-- 系统配置 + AI 记录 + 标注：持久化到本地 JSON
-- 模拟交易账户状态：持久化到本地 JSON
-- 行情支持 TDX 日线 + 本地 CSV 行情目录回退
-
-## 项目结构
+## Repository Structure
 
 ```text
-backend/   FastAPI + 本地状态与数据同步
-frontend/  React + Vite + Ant Design + React Query
+backend/    FastAPI services and local state
+frontend/   React application
+docs/       Architecture and usage docs
 ```
 
-## 快速启动
+## One-Click Start
 
-### 后端
+### Windows
+
+```powershell
+.\start.bat
+```
+
+or
+
+```powershell
+.\start-dev.ps1
+```
+
+Default behavior:
+- Stops stale processes on ports `8000` and `4173`
+- Starts backend on `127.0.0.1:8000`
+- Starts frontend on `127.0.0.1:4173`
+- Opens browser automatically
+- Writes logs to `runtime-logs/`
+
+### Linux / macOS
+
+```bash
+chmod +x start.sh
+./start.sh
+```
+
+## Manual Start
+
+### Backend
 
 ```bash
 cd backend
@@ -48,63 +78,69 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-### 前端
+### Frontend
 
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev:host
 ```
 
-## 行情数据更新（推荐 Baostock）
+## Core Features
 
-### 方式 A：首页一键更新（推荐）
-- 在首页（选股漏斗页）点击：`一键增量更新行情（Baostock）`
-- 该按钮调用后端接口：`POST /api/system/sync-market-data`
-- 默认是增量模式，并会回补最近几天，避免“当天有数据但未刷新”的问题
+### Screener and Signals
 
-### 方式 B：命令行同步
+- 4-step screener funnel with per-step pools
+- Trend-pool mode and full-market mode for signals
+- Signal scoring and Wyckoff event context
+- Navigation from signal row to chart and trade page
 
-#### Baostock（推荐）
+### Sim Trading
 
-```bash
-cd backend
-pip install -r requirements-baostock.txt
-python scripts/sync_baostock_daily.py --all-market --limit 300 --mode incremental
-```
+- A-share style T+1 simulation
+- 100-share lot enforcement
+- Place/cancel/settle/reset order flow
+- Configurable cost model:
+  - commission
+  - minimum commission
+  - stamp tax
+  - transfer fee
+  - slippage
+- FIFO lot matching on sell
 
-#### AkShare（可选）
+### Pending Buy Workflow
 
-```bash
-cd backend
-pip install -r requirements-akshare.txt
-python scripts/sync_akshare_daily.py --all-market --limit 300
-```
+- Add candidates from:
+  - Signals page
+  - Screener page
+- Manage and submit drafts on Trade page
+- Per-draft editable sizing mode and value
+- Batch submit selected drafts into real sim orders
 
-CSV 默认目录：
+### Portfolio and Review
 
-`~/.tdx-trend/akshare/daily/*.csv`
+- Portfolio snapshot and positions
+- Realized/unrealized PnL
+- Review stats with buy/sell date axis
+- Charts:
+  - equity curve
+  - drawdown curve
+  - monthly returns
+- Export: Excel / CSV / PDF
 
-## 本地持久化文件
+### AI Records
 
-- 系统配置 / AI记录 / 个股标注：`~/.tdx-trend/app_state.json`
-- 模拟交易 / 持仓 / 复盘状态：`~/.tdx-trend/sim_state.json`
-- 运行时状态检查接口：`GET /api/system/storage`
+- AI analysis record list with filters
+- Link to stock chart annotation page
+- Record deletion and local sync
+- Improved table readability and layout stability
 
-## 前端环境变量
-
-- `VITE_ENABLE_MSW=true`：启用 mock 接口
-- `VITE_ENABLE_MSW=false`：调用真实后端
-- `VITE_API_BASE_URL`：可选，默认走 Vite `/api` 代理
-- `VITE_API_PROXY_TARGET`：开发代理目标（默认 `http://127.0.0.1:8000`）
-
-## 常用接口
+## Common API Endpoints
 
 - `POST /api/screener/run`
 - `GET /api/screener/runs/{run_id}`
+- `GET /api/screener/latest-run`
 - `GET /api/signals`
-- `POST /api/system/sync-market-data`
-- `GET /api/system/storage`
 - `POST /api/sim/orders`
 - `GET /api/sim/orders`
 - `GET /api/sim/fills`
@@ -114,17 +150,31 @@ CSV 默认目录：
 - `GET /api/sim/config`
 - `PUT /api/sim/config`
 - `GET /api/sim/portfolio`
-- `GET /api/review/stats`
+- `GET /api/review/stats` (`date_axis=sell|buy`)
+- `POST /api/system/sync-market-data`
+- `GET /api/system/storage`
 
-## 测试与构建
+## Frontend Environment Variables
 
-### 后端
+- `VITE_ENABLE_MSW=true` enable mock API mode
+- `VITE_ENABLE_MSW=false` use real backend API
+- `VITE_API_BASE_URL` optional API base URL override
+- `VITE_API_PROXY_TARGET` Vite proxy target (default `http://127.0.0.1:8000`)
+
+## Local Persistence
+
+- App state: `~/.tdx-trend/app_state.json`
+- Sim state: `~/.tdx-trend/sim_state.json`
+
+## Build and Test
+
+### Backend
 
 ```bash
 python -m pytest backend/tests/test_api.py -q
 ```
 
-### 前端
+### Frontend
 
 ```bash
 cd frontend
@@ -133,6 +183,9 @@ npm run test
 npm run build
 ```
 
-## PDF 中文字体
+## Additional Docs
 
-已使用 `frontend/public/fonts/LXGWWenKai-Regular.ttf`，避免 PDF 导出中文乱码。
+- `README_GUIDE.md`
+- `docs/QUICKSTART.md`
+- `docs/ARCHITECTURE.md`
+- `docs/VERIFICATION.md`

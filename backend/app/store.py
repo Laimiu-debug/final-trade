@@ -3260,12 +3260,6 @@ class InMemoryStore:
                 trigger_dt = datetime.now()
                 trigger_date = trigger_dt.strftime("%Y-%m-%d")
             expire_dt = trigger_dt + timedelta(days=2)
-            if resolved_as_of_date:
-                try:
-                    as_of_dt = datetime.strptime(resolved_as_of_date, "%Y-%m-%d")
-                    expire_dt = as_of_dt if as_of_dt >= trigger_dt else trigger_dt
-                except ValueError:
-                    pass
             expire_date = expire_dt.strftime("%Y-%m-%d")
             wyckoff_signal = str(snapshot["signal"])
             phase = str(snapshot["phase"])

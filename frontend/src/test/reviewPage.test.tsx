@@ -10,7 +10,7 @@ vi.mock('echarts-for-react', () => ({
 }))
 
 describe('ReviewPage', () => {
-  it('renders stats and trade details from api', async () => {
+  it('renders review, fills and portfolio data', async () => {
     server.use(
       http.get('/api/review/stats', async () => {
         await delay(10)
@@ -88,11 +88,49 @@ describe('ReviewPage', () => {
           },
         })
       }),
+      http.get('/api/sim/fills', async () => {
+        await delay(10)
+        return HttpResponse.json({
+          items: [
+            {
+              order_id: 'ord-1',
+              symbol: 'sz300750',
+              side: 'buy',
+              quantity: 100,
+              fill_date: '2026-01-02',
+              fill_price: 160,
+              price_source: 'vwap',
+              gross_amount: 16_000,
+              net_amount: -16_005,
+              fee_commission: 5,
+              fee_stamp_tax: 0,
+              fee_transfer: 0,
+            },
+          ],
+          total: 1,
+          page: 1,
+          page_size: 500,
+        })
+      }),
+      http.get('/api/sim/portfolio', async () => {
+        await delay(10)
+        return HttpResponse.json({
+          as_of_date: '2026-02-13',
+          total_asset: 1_005_000,
+          cash: 900_000,
+          position_value: 105_000,
+          realized_pnl: 900,
+          unrealized_pnl: 500,
+          pending_order_count: 0,
+          positions: [],
+        })
+      }),
     )
 
     renderWithProviders(<ReviewPage />, '/review')
 
-    expect(await screen.findByText('交易笔数')).toBeInTheDocument()
+    expect(await screen.findByText('已平仓笔数')).toBeInTheDocument()
+    expect(await screen.findByText('买入成交笔数')).toBeInTheDocument()
     expect((await screen.findAllByText('sz300750')).length).toBeGreaterThan(0)
   })
 })

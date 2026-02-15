@@ -8,6 +8,13 @@ import { PageHeader } from '@/shared/components/PageHeader'
 import { useUIStore } from '@/state/uiStore'
 import type { AIAnalysisRecord } from '@/types/contracts'
 
+function confidenceTagColor(confidence: number) {
+  if (confidence >= 0.8) return 'green'
+  if (confidence >= 0.65) return 'gold'
+  if (confidence >= 0.5) return 'orange'
+  return 'default'
+}
+
 export function AiPage() {
   const { message } = AntdApp.useApp()
   const navigate = useNavigate()
@@ -99,47 +106,86 @@ export function AiPage() {
     {
       title: '股票',
       key: 'stock',
-      width: 140,
+      width: 180,
       render: (_, record) => (
-        <Typography.Text strong>{renderTruncated(record.name || record.symbol.toUpperCase())}</Typography.Text>
+        <Space direction="vertical" size={0} style={{ width: '100%' }}>
+          <Typography.Text strong>{renderTruncated(record.name || record.symbol.toUpperCase())}</Typography.Text>
+          <Typography.Text type="secondary">{record.symbol.toUpperCase()}</Typography.Text>
+        </Space>
       ),
     },
-    { title: 'Provider', dataIndex: 'provider', width: 100, render: (value: string | undefined) => renderTruncated(value) },
-    { title: '抓取时间', dataIndex: 'fetched_at', width: 170, render: (value: string | undefined) => renderTruncated(value) },
+    {
+      title: 'Provider',
+      dataIndex: 'provider',
+      width: 120,
+      render: (value: string | undefined) => <Tag>{value || '--'}</Tag>,
+    },
+    {
+      title: '抓取时间',
+      dataIndex: 'fetched_at',
+      width: 170,
+      render: (value: string | undefined) => <Typography.Text type="secondary">{value || '--'}</Typography.Text>,
+    },
     {
       title: '结论',
       dataIndex: 'conclusion',
-      width: 100,
-      render: (value: string) => (
-        <Tag color={value === '发酵中' ? 'green' : value === '高潮' ? 'orange' : 'default'}>{value}</Tag>
-      ),
+      width: 360,
+      render: (value: string | undefined) => {
+        const text = (value ?? '').trim() || '--'
+        return (
+          <div
+            title={text}
+            style={{
+              display: '-webkit-box',
+              WebkitBoxOrient: 'vertical',
+              WebkitLineClamp: 2,
+              overflow: 'hidden',
+              lineHeight: '20px',
+              maxHeight: 40,
+              padding: '4px 10px',
+              borderRadius: 10,
+              background: 'rgba(31,49,48,0.06)',
+            }}
+          >
+            {text}
+          </div>
+        )
+      },
     },
     {
       title: '起爆日期',
       dataIndex: 'breakout_date',
       width: 120,
-      render: (value: string | undefined) => value || '--',
+      render: (value: string | undefined) => <Tag color={value ? 'cyan' : 'default'}>{value || '--'}</Tag>,
     },
     {
       title: '趋势牛类型',
       dataIndex: 'trend_bull_type',
-      width: 140,
+      width: 180,
       render: (value: string | undefined) => renderTruncated(value),
     },
     {
       title: '题材',
       dataIndex: 'theme_name',
-      width: 120,
+      width: 150,
       render: (value: string | undefined) => renderTruncated(value),
     },
-    { title: '置信度', dataIndex: 'confidence', width: 90 },
+    {
+      title: '置信度',
+      dataIndex: 'confidence',
+      width: 100,
+      render: (value: number | undefined) => {
+        const confidence = typeof value === 'number' ? value : 0
+        return <Tag color={confidenceTagColor(confidence)}>{confidence.toFixed(2)}</Tag>
+      },
+    },
     {
       title: '操作',
       key: 'actions',
-      width: 220,
+      width: 200,
       fixed: 'right',
       render: (_, record) => (
-        <Space>
+        <Space wrap size={6}>
           <Button size="small" onClick={() => navigate(`/stocks/${record.symbol}/chart`)}>
             去K线标注
           </Button>
@@ -208,7 +254,8 @@ export function AiPage() {
           loading={query.isLoading}
           dataSource={filteredItems}
           columns={columns}
-          scroll={{ x: 1350 }}
+          tableLayout="fixed"
+          scroll={{ x: 1600 }}
           expandable={{
             expandedRowRender: (record) => (
               <Space orientation="vertical" size={6} style={{ width: '100%' }}>
