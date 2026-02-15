@@ -44,6 +44,7 @@ from .models import (
     SignalScanMode,
     SignalResult,
     SignalsResponse,
+    TrendPoolStep,
     SystemStorageStatus,
     SimFillsResponse,
     SimOrdersResponse,
@@ -2746,14 +2747,67 @@ class InMemoryStore:
         )
         if real_input_pool:
             run_id = f"{int(datetime.now().timestamp() * 1000)}-{uuid4().hex[:6]}"
-            preview = sorted(
-                real_input_pool,
-                key=lambda row: row.score + row.ai_confidence * 20,
-                reverse=True,
-            )[:5]
+            step1_pool = (
+                sorted(
+                    (
+                        row
+                        for row in real_input_pool
+                        if row.turnover20 >= params.turnover_threshold
+                        and row.amount20 >= params.amount_threshold
+                        and row.amplitude20 >= params.amplitude_threshold
+                    ),
+                    key=lambda row: row.ret40,
+                    reverse=True,
+                )[: params.top_n]
+            )
+            if len(step1_pool) > 400:
+                step1_pool = step1_pool[:400]
+
+            loose_padding = 0.02 if params.mode == "loose" else 0.0
+            loose_days = 1 if params.mode == "loose" else 0
+            retrace_min = max(0.0, 0.05 - loose_padding)
+            retrace_max = min(0.8, 0.25 + loose_padding)
+            max_pullback_days = 3 + loose_days
+            min_ma10_days = max(0, 5 - loose_days)
+            min_ma5_days = max(0, 3 - loose_days)
+
+            step2_pool = [
+                row
+                for row in step1_pool
+                if row.retrace20 >= retrace_min
+                and row.retrace20 <= retrace_max
+                and row.pullback_days <= max_pullback_days
+                and row.ma10_above_ma20_days >= min_ma10_days
+                and row.ma5_above_ma10_days >= min_ma5_days
+                and abs(row.price_vs_ma20) <= 0.08
+                and row.price_vs_ma20 >= 0
+                and row.trend_class != "B"
+            ]
+
+            step3_pool = [
+                row
+                for row in step2_pool
+                if row.vol_slope20 >= 0.05
+                and row.up_down_volume_ratio >= 1.3
+                and row.pullback_volume_ratio <= 0.9
+                and not row.has_blowoff_top
+                and not row.has_divergence_5d
+                and not row.has_upper_shadow_risk
+                and not row.degraded
+            ]
+
+            step4_source = [
+                row
+                for row in step3_pool
+                if row.ai_confidence >= 0.55 and row.theme_stage in ("发酵中", "高潮")
+            ]
             step4_pool = [
                 row.model_copy(update={"labels": list({*row.labels, "待买观察"})})
-                for row in preview
+                for row in sorted(
+                    step4_source,
+                    key=lambda row: row.score + row.ai_confidence * 20,
+                    reverse=True,
+                )[:8]
             ]
             has_degraded_rows = any(row.degraded for row in real_input_pool)
 
@@ -2764,16 +2818,16 @@ class InMemoryStore:
                 params=params,
                 step_summary=ScreenerStepSummary(
                     input_count=len(real_input_pool),
-                    step1_count=0,
-                    step2_count=0,
-                    step3_count=0,
+                    step1_count=len(step1_pool),
+                    step2_count=len(step2_pool),
+                    step3_count=len(step3_pool),
                     step4_count=len(step4_pool),
                 ),
                 step_pools=ScreenerStepPools(
                     input=real_input_pool,
-                    step1=[],
-                    step2=[],
-                    step3=[],
+                    step1=step1_pool,
+                    step2=step2_pool,
+                    step3=step3_pool,
                     step4=step4_pool,
                 ),
                 results=step4_pool,
@@ -2781,6 +2835,9 @@ class InMemoryStore:
                 degraded_reason=real_error if has_degraded_rows else None,
             )
             latest_rows = {row.symbol: row for row in real_input_pool}
+            latest_rows.update({row.symbol: row for row in step1_pool})
+            latest_rows.update({row.symbol: row for row in step2_pool})
+            latest_rows.update({row.symbol: row for row in step3_pool})
             latest_rows.update({row.symbol: row for row in step4_pool})
             self._latest_rows = latest_rows
             self._run_store[run_id] = detail
@@ -2854,6 +2911,11 @@ class InMemoryStore:
 
     def get_screener_run(self, run_id: str) -> ScreenerRunDetail | None:
         return self._run_store.get(run_id)
+
+    def get_latest_screener_run(self) -> ScreenerRunDetail | None:
+        if not self._run_store:
+            return None
+        return max(self._run_store.values(), key=lambda run: run.created_at)
 
     def get_candles_payload(self, symbol: str) -> dict[str, object]:
         candles = self._ensure_candles(symbol)
@@ -2969,6 +3031,7 @@ class InMemoryStore:
         *,
         mode: SignalScanMode,
         run_id: str | None,
+        trend_step: TrendPoolStep = "auto",
         as_of_date: str | None = None,
     ) -> tuple[list[ScreenerResult], str | None, str | None, str | None]:
         if mode == "trend_pool":
@@ -2978,9 +3041,22 @@ class InMemoryStore:
             run = self._run_store.get(resolved_run_id)
             if run is None:
                 return [], "TREND_POOL_RUN_NOT_FOUND", resolved_run_id, as_of_date
-            source = run.step_pools.step4 or run.step_pools.step3
+            if trend_step == "step4":
+                source = run.step_pools.step4
+            elif trend_step == "step3":
+                source = run.step_pools.step3
+            elif trend_step == "step2":
+                source = run.step_pools.step2
+            elif trend_step == "step1":
+                source = run.step_pools.step1
+            else:
+                source = run.step_pools.step4 or run.step_pools.step3
             if not source:
-                return [], "TREND_POOL_EMPTY", resolved_run_id, (as_of_date or run.as_of_date)
+                if trend_step == "auto":
+                    reason = "TREND_POOL_EMPTY"
+                else:
+                    reason = f"TREND_POOL_{trend_step.upper()}_EMPTY"
+                return [], reason, resolved_run_id, (as_of_date or run.as_of_date)
             return source, run.degraded_reason if run.degraded else None, resolved_run_id, (as_of_date or run.as_of_date)
 
         source, error = load_input_pool_from_tdx(
@@ -3021,6 +3097,7 @@ class InMemoryStore:
         *,
         mode: SignalScanMode,
         run_id: str | None,
+        trend_step: TrendPoolStep,
         as_of_date: str | None,
         window_days: int,
         min_score: float,
@@ -3030,6 +3107,7 @@ class InMemoryStore:
         payload = {
             "mode": mode,
             "run_id": run_id or "",
+            "trend_step": trend_step,
             "as_of_date": as_of_date or "",
             "window_days": window_days,
             "min_score": round(min_score, 3),
@@ -3043,6 +3121,7 @@ class InMemoryStore:
         *,
         mode: SignalScanMode = "trend_pool",
         run_id: str | None = None,
+        trend_step: TrendPoolStep = "auto",
         as_of_date: str | None = None,
         refresh: bool = False,
         window_days: int = 60,
@@ -3053,12 +3132,14 @@ class InMemoryStore:
         candidates, degraded_reason, resolved_run_id, resolved_as_of_date = self._resolve_signal_candidates(
             mode=mode,
             run_id=run_id,
+            trend_step=trend_step,
             as_of_date=as_of_date,
         )
         source_count = len(candidates)
         cache_key = self._signals_cache_key(
             mode=mode,
             run_id=resolved_run_id if mode == "trend_pool" else run_id,
+            trend_step=trend_step if mode == "trend_pool" else "auto",
             as_of_date=resolved_as_of_date,
             window_days=window_days,
             min_score=min_score,
@@ -3089,10 +3170,42 @@ class InMemoryStore:
             snapshot = self._calc_wyckoff_snapshot(row, window_days=window_days, as_of_date=resolved_as_of_date)
             events = snapshot["events"] if isinstance(snapshot["events"], list) else []
             risk_events = snapshot["risk_events"] if isinstance(snapshot["risk_events"], list) else []
+            raw_event_dates = snapshot.get("event_dates")
+            event_dates: dict[str, str] = {}
+            if isinstance(raw_event_dates, dict):
+                for event_code, event_date in raw_event_dates.items():
+                    code_text = str(event_code).strip()
+                    date_text = str(event_date).strip()
+                    if code_text and date_text:
+                        event_dates[code_text] = date_text
+            raw_event_chain = snapshot.get("event_chain")
+            event_chain: list[dict[str, str]] = []
+            if isinstance(raw_event_chain, list):
+                for node in raw_event_chain:
+                    if not isinstance(node, dict):
+                        continue
+                    code_text = str(node.get("event", "")).strip()
+                    date_text = str(node.get("date", "")).strip()
+                    category_text = str(node.get("category", "")).strip()
+                    if code_text and date_text:
+                        event_chain.append({
+                            "event": code_text,
+                            "date": date_text,
+                            "category": category_text or "other",
+                        })
+            if not event_chain and event_dates:
+                risk_event_set = {str(event).strip() for event in risk_events}
+                for code_text, date_text in sorted(event_dates.items(), key=lambda item: (item[1], item[0])):
+                    event_chain.append({
+                        "event": code_text,
+                        "date": date_text,
+                        "category": "distributionRisk" if code_text in risk_event_set else "accumulation",
+                    })
             sequence_ok = bool(snapshot["sequence_ok"])
             entry_quality_score = float(snapshot["entry_quality_score"])
+            total_event_count = len(event_chain) if event_chain else len(events) + len(risk_events)
 
-            if len(events) < min_event_count:
+            if total_event_count < min_event_count:
                 continue
             if require_sequence and not sequence_ok:
                 continue
@@ -3118,7 +3231,14 @@ class InMemoryStore:
             except ValueError:
                 trigger_dt = datetime.now()
                 trigger_date = trigger_dt.strftime("%Y-%m-%d")
-            expire_date = (trigger_dt + timedelta(days=2)).strftime("%Y-%m-%d")
+            expire_dt = trigger_dt + timedelta(days=2)
+            if resolved_as_of_date:
+                try:
+                    as_of_dt = datetime.strptime(resolved_as_of_date, "%Y-%m-%d")
+                    expire_dt = as_of_dt if as_of_dt >= trigger_dt else trigger_dt
+                except ValueError:
+                    pass
+            expire_date = expire_dt.strftime("%Y-%m-%d")
             wyckoff_signal = str(snapshot["signal"])
             phase = str(snapshot["phase"])
             phase_hint = str(snapshot["phase_hint"])
@@ -3139,11 +3259,13 @@ class InMemoryStore:
                     wyckoff_phase=phase,
                     wyckoff_signal=wyckoff_signal,
                     structure_hhh=str(snapshot["structure_hhh"]),
-                    wy_event_count=len(events),
+                    wy_event_count=total_event_count,
                     wy_sequence_ok=sequence_ok,
                     entry_quality_score=entry_quality_score,
                     wy_events=[str(event) for event in events],
                     wy_risk_events=[str(event) for event in risk_events],
+                    wy_event_dates=event_dates,
+                    wy_event_chain=event_chain,
                     phase_hint=phase_hint,
                     scan_mode=mode,
                     event_strength_score=float(snapshot["event_strength_score"]),

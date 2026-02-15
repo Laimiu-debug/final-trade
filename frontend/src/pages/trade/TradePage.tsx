@@ -72,6 +72,25 @@ function statusColor(status: SimTradeOrder['status']) {
   return 'red'
 }
 
+function renderTruncatedCell(value: string | undefined) {
+  const text = (value ?? '').trim() || '-'
+  return (
+    <span
+      title={text}
+      style={{
+        display: 'inline-block',
+        maxWidth: '100%',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+        verticalAlign: 'bottom',
+      }}
+    >
+      {text}
+    </span>
+  )
+}
+
 export function TradePage() {
   const { message } = AntdApp.useApp()
   const queryClient = useQueryClient()
@@ -247,7 +266,7 @@ export function TradePage() {
 
   const orderColumns: ColumnsType<SimTradeOrder> = useMemo(
     () => [
-      { title: '订单号', dataIndex: 'order_id', width: 200, ellipsis: true },
+      { title: '订单号', dataIndex: 'order_id', width: 200, render: (value: string | undefined) => renderTruncatedCell(value) },
       { title: '代码', dataIndex: 'symbol', width: 120 },
       {
         title: '方向',
@@ -300,7 +319,7 @@ export function TradePage() {
 
   const fillColumns: ColumnsType<SimTradeFill> = useMemo(
     () => [
-      { title: '订单号', dataIndex: 'order_id', width: 200, ellipsis: true },
+      { title: '订单号', dataIndex: 'order_id', width: 200, render: (value: string | undefined) => renderTruncatedCell(value) },
       { title: '代码', dataIndex: 'symbol', width: 120 },
       {
         title: '方向',

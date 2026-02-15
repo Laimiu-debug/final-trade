@@ -14,6 +14,7 @@ import type { ItemType } from 'antd/es/menu/interface'
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom'
 
 const { Header, Content, Sider } = Layout
+const SCREENER_CACHE_KEY = 'tdx-trend-screener-cache-v4'
 
 const navItems: ItemType[] = [
   { key: '/screener', icon: <FilterIcon />, label: '选股漏斗' },
@@ -34,6 +35,26 @@ function resolveSelected(pathname: string) {
   return pathname
 }
 
+function buildSignalsRouteFromScreenerCache(): string {
+  try {
+    const raw = window.localStorage.getItem(SCREENER_CACHE_KEY)
+    if (!raw) return '/signals'
+    const parsed = JSON.parse(raw) as { run_meta?: { runId?: unknown; asOfDate?: unknown } }
+    const runId = typeof parsed?.run_meta?.runId === 'string' ? parsed.run_meta.runId.trim() : ''
+    const asOfDate = typeof parsed?.run_meta?.asOfDate === 'string' ? parsed.run_meta.asOfDate.trim() : ''
+    if (!runId) return '/signals'
+    const params = new URLSearchParams({
+      mode: 'trend_pool',
+      run_id: runId,
+      trend_step: 'auto',
+    })
+    if (asOfDate) params.set('as_of_date', asOfDate)
+    return `/signals?${params.toString()}`
+  } catch {
+    return '/signals'
+  }
+}
+
 export function AppShell() {
   const screens = Grid.useBreakpoint()
   const location = useLocation()
@@ -50,7 +71,8 @@ export function AppShell() {
         selectedKeys={[selectedKey]}
         items={navItems}
         onClick={({ key }) => {
-          navigate(key)
+          const target = key === '/signals' ? buildSignalsRouteFromScreenerCache() : key
+          navigate(target)
           setDrawerOpen(false)
         }}
         style={{ border: 'none', background: 'transparent' }}
@@ -129,4 +151,3 @@ export function AppShell() {
     </Layout>
   )
 }
-

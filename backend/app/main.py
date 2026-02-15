@@ -30,6 +30,7 @@ from .models import (
     SimTradingConfig,
     SystemStorageStatus,
     SignalScanMode,
+    TrendPoolStep,
     ScreenerParams,
     ScreenerRunDetail,
     ScreenerRunResponse,
@@ -103,6 +104,14 @@ def get_screener_run(run_id: str = Path(min_length=6)) -> ScreenerRunDetail | JS
     return run
 
 
+@app.get("/api/screener/latest-run", response_model=ScreenerRunDetail)
+def get_latest_screener_run() -> ScreenerRunDetail | JSONResponse:
+    run = store.get_latest_screener_run()
+    if run is None:
+        return error_response(404, "RUN_NOT_FOUND", "暂无可用筛选任务，请先在选股池执行筛选")
+    return run
+
+
 @app.get("/api/stocks/{symbol}/candles")
 def get_stock_candles(symbol: str) -> dict[str, object]:
     return store.get_candles_payload(symbol)
@@ -133,6 +142,7 @@ def put_stock_annotation(symbol: str, payload: StockAnnotation) -> AnnotationUpd
 def get_signals(
     mode: SignalScanMode = Query(default="trend_pool"),
     run_id: str = Query(default="", min_length=0, max_length=64),
+    trend_step: TrendPoolStep = Query(default="auto"),
     as_of_date: str | None = Query(default=None, min_length=10, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     refresh: bool = Query(default=False),
     window_days: int = Query(default=60, ge=20, le=240),
@@ -143,6 +153,7 @@ def get_signals(
     return store.get_signals(
         mode=mode,
         run_id=run_id.strip() or None,
+        trend_step=trend_step,
         as_of_date=as_of_date,
         refresh=refresh,
         window_days=window_days,

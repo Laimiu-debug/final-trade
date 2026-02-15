@@ -4,6 +4,7 @@ export type TrendClass = 'A' | 'A_B' | 'B' | 'Unknown'
 export type ThemeStage = '发酵中' | '高潮' | '退潮' | 'Unknown'
 export type SignalType = 'A' | 'B' | 'C'
 export type SignalScanMode = 'trend_pool' | 'full_market'
+export type TrendPoolStep = 'auto' | 'step1' | 'step2' | 'step3' | 'step4'
 export type MarketDataSource = 'tdx_only' | 'tdx_then_akshare' | 'akshare_only'
 export type MarketSyncProvider = 'baostock'
 export type MarketSyncMode = 'incremental' | 'full'
@@ -175,6 +176,12 @@ export interface SignalResult {
   entry_quality_score?: number
   wy_events?: string[]
   wy_risk_events?: string[]
+  wy_event_dates?: Record<string, string>
+  wy_event_chain?: Array<{
+    event: string
+    date: string
+    category?: string
+  }>
   phase_hint?: string
   scan_mode?: SignalScanMode
   event_strength_score?: number

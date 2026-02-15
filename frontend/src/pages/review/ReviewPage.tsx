@@ -76,6 +76,10 @@ const tradeColumns: ColumnsType<TradeRecord> = [
   },
 ]
 
+function isSameDateRange(prev: [Dayjs, Dayjs], next: [Dayjs, Dayjs]) {
+  return prev[0].isSame(next[0], 'day') && prev[1].isSame(next[1], 'day')
+}
+
 export function ReviewPage() {
   const { message } = AntdApp.useApp()
   const [range, setRange] = useState<[Dayjs, Dayjs]>([dayjs().subtract(90, 'day'), dayjs()])
@@ -389,7 +393,8 @@ export function ReviewPage() {
             value={range}
             onChange={(value) => {
               if (!value || !value[0] || !value[1]) return
-              setRange([value[0], value[1]])
+              const nextRange: [Dayjs, Dayjs] = [value[0], value[1]]
+              setRange((prev) => (isSameDateRange(prev, nextRange) ? prev : nextRange))
             }}
           />
           <Button onClick={handleExportExcel}>导出 Excel</Button>

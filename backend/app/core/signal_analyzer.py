@@ -12,7 +12,8 @@ from ..models import CandlePoint, ScreenerResult, Stage, ThemeStage
 
 # Wyckoff event constants
 WYCKOFF_ACC_EVENTS = ("PS", "SC", "AR", "ST", "TSO", "Spring", "SOS", "JOC", "LPS")
-WYCKOFF_RISK_EVENTS = ("UTAD", "SOW", "LPSY")
+WYCKOFF_DIST_EVENTS = ("PSY", "BC", "AR(d)", "ST(d)")
+WYCKOFF_RISK_EVENTS = (*WYCKOFF_DIST_EVENTS, "UTAD", "SOW", "LPSY")
 WYCKOFF_EVENT_ORDER = (*WYCKOFF_ACC_EVENTS, *WYCKOFF_RISK_EVENTS)
 
 
@@ -37,20 +38,19 @@ class SignalAnalyzer:
     def phase_hint(phase: str) -> str:
         """Get human-readable hint for a phase."""
         hints = {
-            "吸筹A": "底部支撑,关注反弹",
-            "吸筹B": "二次探底,量能萎缩",
-            "吸筹C": "弹簧探底,蓄势待发",
-            "吸筹D": "强势突破,量价齐升",
-            "吸筹E": "回踩确认,良机入场",
-            "派发A": "高位震荡,警惕风险",
-            "派发B": "上攻乏力,主力派发",
-            "派发C": "破位下行,风险加剧",
-            "派发D": "持续下跌,趋势转弱",
-            "派发E": "恐慌下跌,远离观望",
-            "阶段未明": "信号不足,继续观察",
+            "\u5438\u7b79A": "\u5e95\u90e8\u652f\u6491\uff0c\u5173\u6ce8\u53cd\u5f39",
+            "\u5438\u7b79B": "\u4e8c\u6b21\u63a2\u5e95\uff0c\u91cf\u80fd\u840e\u7f29",
+            "\u5438\u7b79C": "\u5f39\u7c27\u63a2\u5e95\uff0c\u84c4\u52bf\u5f85\u53d1",
+            "\u5438\u7b79D": "\u5f3a\u52bf\u7a81\u7834\uff0c\u91cf\u4ef7\u9f50\u5347",
+            "\u5438\u7b79E": "\u56de\u8e29\u786e\u8ba4\uff0c\u826f\u673a\u5165\u573a",
+            "\u6d3e\u53d1A": "\u9ad8\u4f4d\u9707\u8361\uff0c\u8b66\u60d5\u98ce\u9669",
+            "\u6d3e\u53d1B": "\u4e0a\u653b\u4e4f\u529b\uff0c\u4e3b\u529b\u6d3e\u53d1",
+            "\u6d3e\u53d1C": "\u7834\u4f4d\u4e0b\u884c\uff0c\u98ce\u9669\u52a0\u5267",
+            "\u6d3e\u53d1D": "\u6301\u7eed\u4e0b\u8dcc\uff0c\u8d8b\u52bf\u8f6c\u5f31",
+            "\u6d3e\u53d1E": "\u6050\u614c\u4e0b\u8dcc\uff0c\u8fdc\u79bb\u89c2\u671b",
+            "\u9636\u6bb5\u672a\u660e": "\u4fe1\u53f7\u4e0d\u8db3\uff0c\u7ee7\u7eed\u89c2\u5bdf",
         }
-        return hints.get(phase, "观察为主,控制仓位")
-
+        return hints.get(phase, "\u89c2\u5bdf\u4e3a\u4e3b\uff0c\u63a7\u5236\u4ed3\u4f4d")
     @staticmethod
     def is_subsequence(sequence: list[str], target: tuple[str, ...]) -> bool:
         """
@@ -124,7 +124,7 @@ class SignalAnalyzer:
         ret20 = (latest_close - closes[-21]) / max(closes[-21], 0.01) if len(closes) > 20 else ret10
 
         # Detect events
-        event_dates = cls._detect_wyckoff_events(
+        event_dates, event_chain = cls._detect_wyckoff_events(
             highs, lows, closes, volumes, dates, ma20, avg_v5, avg_v20, row, tr_pos, ret10, opens_list
         )
 
@@ -134,10 +134,15 @@ class SignalAnalyzer:
 
         # Check sequence validity
         ordered_events = sorted(
-            event_dates.items(),
-            key=lambda item: (item[1], WYCKOFF_EVENT_ORDER.index(item[0])),
+            event_chain,
+            key=lambda item: (
+                str(item.get("date", "")),
+                WYCKOFF_EVENT_ORDER.index(str(item.get("event", "")))
+                if str(item.get("event", "")) in WYCKOFF_EVENT_ORDER
+                else len(WYCKOFF_EVENT_ORDER),
+            ),
         )
-        sequence = [event for event, _ in ordered_events if event in WYCKOFF_ACC_EVENTS]
+        sequence = [str(item["event"]) for item in ordered_events if str(item.get("event", "")) in WYCKOFF_ACC_EVENTS]
         sequence_ok = cls.is_subsequence(sequence, WYCKOFF_ACC_EVENTS)
 
         # Analyze structure (HH/HL/HC)
@@ -158,6 +163,8 @@ class SignalAnalyzer:
         return {
             "events": events,
             "risk_events": risk_events,
+            "event_dates": event_dates,
+            "event_chain": event_chain,
             "phase": phase,
             "phase_hint": cls.phase_hint(phase),
             "signal": wyckoff_signal,
@@ -174,8 +181,10 @@ class SignalAnalyzer:
         return {
             "events": [],
             "risk_events": [],
-            "phase": "阶段未明",
-            "phase_hint": cls.phase_hint("阶段未明"),
+            "event_dates": {},
+            "event_chain": [],
+            "phase": "\u9636\u6bb5\u672a\u660e",
+            "phase_hint": cls.phase_hint("\u9636\u6bb5\u672a\u660e"),
             "signal": "",
             "structure_hhh": "-",
             "sequence_ok": False,
@@ -187,7 +196,6 @@ class SignalAnalyzer:
             "entry_quality_score": 0.0,
             "trigger_date": fallback_date,
         }
-
     @classmethod
     def _detect_wyckoff_events(
         cls,
@@ -203,15 +211,28 @@ class SignalAnalyzer:
         tr_pos: float,
         ret10: float,
         opens: list[float],
-    ) -> dict[str, str]:
+    ) -> tuple[dict[str, str], list[dict[str, str]]]:
         """Detect Wyckoff events from price and volume data."""
         event_dates: dict[str, str] = {}
+        event_chain: list[dict[str, str]] = []
 
-        def push_event(name: str, condition: bool, idx: int | None = None) -> None:
+        def push_event(
+            name: str,
+            condition: bool,
+            idx: int | None = None,
+            *,
+            category: str = "accumulation",
+        ) -> None:
             if not condition:
                 return
             target_idx = len(dates) - 1 if idx is None else max(0, min(idx, len(dates) - 1))
-            event_dates[name] = dates[target_idx]
+            event_date = dates[target_idx]
+            event_dates[name] = event_date
+            event_chain.append({
+                "event": name,
+                "date": event_date,
+                "category": category,
+            })
 
         # PS / SC / AR / ST (Accumulation Phase A)
         push_event("PS", tr_pos <= 0.38 and avg_v5 >= avg_v20 * 1.12)
@@ -271,6 +292,38 @@ class SignalAnalyzer:
             and row.pullback_days <= 4,
         )
 
+        # Distribution early events: PSY / BC / AR(d) / ST(d)
+        push_event("PSY", tr_pos >= 0.62 and avg_v5 >= avg_v20 * 1.05, category="distributionRisk")
+
+        look_bc_start = max(0, len(closes) - 30)
+        bc_idx = look_bc_start + max(
+            range(len(volumes[look_bc_start:])),
+            key=lambda idx: volumes[look_bc_start + idx],
+        )
+        bc_range = max(highs[bc_idx] - lows[bc_idx], 0.01)
+        bc_close_near_high = closes[bc_idx] >= highs[bc_idx] - bc_range * 0.32
+        bc_condition = bc_close_near_high and highs[bc_idx] >= max(highs[max(0, bc_idx - 20):bc_idx + 1]) * 0.995
+        push_event("BC", bc_condition, bc_idx, category="distributionRisk")
+
+        ar_d_idx: int | None = None
+        if "BC" in event_dates and bc_idx < len(closes) - 2:
+            decline_slice = closes[bc_idx + 1:]
+            decline_min = min(decline_slice) if decline_slice else closes[bc_idx]
+            if decline_min <= closes[bc_idx] * 0.94:
+                ar_d_idx = bc_idx + decline_slice.index(decline_min) + 1
+                push_event("AR(d)", True, ar_d_idx, category="distributionRisk")
+
+        if "BC" in event_dates and len(closes) >= bc_idx + 4:
+            bc_high = highs[bc_idx]
+            st_d_idx = None
+            for idx in range(bc_idx + 1, len(closes)):
+                near_bc_high = abs(highs[idx] - bc_high) / max(bc_high, 0.01) <= 0.04
+                lower_volume = volumes[idx] <= volumes[bc_idx] * 0.9
+                close_weak = closes[idx] <= highs[idx] * 0.985
+                if near_bc_high and lower_volume and close_weak:
+                    st_d_idx = idx
+            push_event("ST(d)", st_d_idx is not None, st_d_idx, category="distributionRisk")
+
         # Risk-side events (Distribution)
         upper_shadow_ratio = (highs[-1] - max(opens[-1], closes[-1])) / max(highs[-1] - lows[-1], 0.01)
         push_event(
@@ -279,10 +332,12 @@ class SignalAnalyzer:
             and closes[-1] < prior_high_20
             and upper_shadow_ratio >= 0.5
             and volumes[-1] >= avg_v20 * 1.2,
+            category="distributionRisk",
         )
         push_event(
             "SOW",
             ret10 <= -0.05 and closes[-1] < ma20 and avg_v5 >= avg_v20 * 1.1,
+            category="distributionRisk",
         )
         recent_high_5 = max(highs[-5:])
         prev_high_5 = max(highs[-10:-5]) if len(highs) >= 10 else recent_high_5
@@ -291,9 +346,10 @@ class SignalAnalyzer:
             ("SOW" in event_dates or "UTAD" in event_dates)
             and closes[-1] < ma20
             and recent_high_5 <= prev_high_5 * 0.99,
+            category="distributionRisk",
         )
 
-        return event_dates
+        return event_dates, event_chain
 
     @classmethod
     def _analyze_structure(cls, highs: list[float], lows: list[float], closes: list[float]) -> str:
@@ -322,24 +378,27 @@ class SignalAnalyzer:
     ) -> str:
         """Determine the current phase based on events."""
         if risk_events:
-            if "LPSY" in risk_events and ret20 <= -0.12:
-                return "派发D" if ret20 > -0.2 else "派发E"
-            elif "UTAD" in risk_events and "SOW" in risk_events:
-                return "派发B"
-            else:
-                return "派发A" if len(risk_events) == 1 else "派发C"
-        elif "LPS" in events:
-            return "吸筹E"
-        elif "JOC" in events or "SOS" in events:
-            return "吸筹D"
-        elif "Spring" in events:
-            return "吸筹C"
-        elif "ST" in events or "TSO" in events:
-            return "吸筹B"
-        elif {"PS", "SC", "AR"} & set(events):
-            return "吸筹A"
-        else:
-            return "阶段未明"
+            risk_set = set(risk_events)
+            if "LPSY" in risk_set and ret20 <= -0.12:
+                return "\u6d3e\u53d1D" if ret20 > -0.2 else "\u6d3e\u53d1E"
+            if "SOW" in risk_set and "UTAD" in risk_set:
+                return "\u6d3e\u53d1C"
+            if "SOW" in risk_set:
+                return "\u6d3e\u53d1C"
+            if "UTAD" in risk_set or "AR(d)" in risk_set or "ST(d)" in risk_set:
+                return "\u6d3e\u53d1B"
+            return "\u6d3e\u53d1A"
+        if "LPS" in events:
+            return "\u5438\u7b79E"
+        if "JOC" in events or "SOS" in events:
+            return "\u5438\u7b79D"
+        if "Spring" in events:
+            return "\u5438\u7b79C"
+        if "ST" in events or "TSO" in events:
+            return "\u5438\u7b79B"
+        if {"PS", "SC", "AR"} & set(events):
+            return "\u5438\u7b79A"
+        return "\u9636\u6bb5\u672a\u660e"
 
     @classmethod
     def _calculate_scores(
@@ -355,17 +414,17 @@ class SignalAnalyzer:
         """Calculate various analysis scores."""
         # Phase score
         phase_scores: dict[str, float] = {
-            "吸筹A": 58,
-            "吸筹B": 66,
-            "吸筹C": 76,
-            "吸筹D": 86,
-            "吸筹E": 91,
-            "派发A": 36,
-            "派发B": 28,
-            "派发C": 20,
-            "派发D": 14,
-            "派发E": 10,
-            "阶段未明": 45,
+            "\u5438\u7b79A": 58,
+            "\u5438\u7b79B": 66,
+            "\u5438\u7b79C": 76,
+            "\u5438\u7b79D": 86,
+            "\u5438\u7b79E": 91,
+            "\u6d3e\u53d1A": 36,
+            "\u6d3e\u53d1B": 28,
+            "\u6d3e\u53d1C": 20,
+            "\u6d3e\u53d1D": 14,
+            "\u6d3e\u53d1E": 10,
+            "\u9636\u6bb5\u672a\u660e": 45,
         }
         phase_score = phase_scores.get(phase, 45)
 
@@ -374,7 +433,7 @@ class SignalAnalyzer:
             "PS": 5, "SC": 8, "AR": 7, "ST": 6, "TSO": 6,
             "Spring": 10, "SOS": 11, "JOC": 10, "LPS": 10,
         }
-        risk_event_penalty = {"UTAD": -10, "SOW": -9, "LPSY": -8}
+        risk_event_penalty = {"PSY": -4, "BC": -6, "AR(d)": -6, "ST(d)": -6, "UTAD": -10, "SOW": -9, "LPSY": -8}
         event_strength_score = 48.0
         for event in events:
             event_strength_score += positive_event_weights.get(event, 0)
@@ -417,6 +476,9 @@ class SignalAnalyzer:
         """Resolve the primary signal based on priority."""
         signal_priority = [
             "LPS", "JOC", "SOS", "Spring", "TSO", "ST", "AR", "SC", "PS",
-            "LPSY", "SOW", "UTAD",
+            "LPSY", "SOW", "UTAD", "ST(d)", "AR(d)", "BC", "PSY",
         ]
         return next((event for event in signal_priority if event in event_dates), "")
+
+
+

@@ -25,10 +25,10 @@ import type { ColumnsType } from 'antd/es/table'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import wyckoffCycleDiagram from '@/assets/wyckoff-cycle.svg'
 import { ApiError } from '@/shared/api/client'
-import { getScreenerRun, getSignals, postSimOrder } from '@/shared/api/endpoints'
+import { getLatestScreenerRun, getScreenerRun, getSignals, postSimOrder } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { useUIStore } from '@/state/uiStore'
-import type { SignalResult, SignalScanMode, SignalType } from '@/types/contracts'
+import type { SignalResult, SignalScanMode, SignalType, TrendPoolStep } from '@/types/contracts'
 
 type StatusFilter = 'active' | 'expiring' | 'expired' | 'all'
 
@@ -101,8 +101,77 @@ const wyckoffLogicGuide = [
   '示意图已补充派发前段的 PSY/BC/AR/ST，并与 UTAD/SOW/LPSY 衔接成完整派发链。',
 ]
 
+const SIGNAL_MODE_CACHE_KEY = 'tdx-signals-mode-v1'
+const SIGNAL_RUN_CACHE_KEY = 'tdx-signals-run-id-v1'
+const SCREENER_CACHE_KEY = 'tdx-trend-screener-cache-v4'
+const SIGNAL_STEP_CACHE_KEY = 'tdx-signals-trend-step-v1'
+
+function loadCachedSignalMode(): SignalScanMode | null {
+  try {
+    const raw = window.localStorage.getItem(SIGNAL_MODE_CACHE_KEY)
+    if (raw === 'full_market' || raw === 'trend_pool') return raw
+  } catch {
+    // ignore localStorage failures
+  }
+  return null
+}
+
+function loadCachedTrendRunId(): string | null {
+  try {
+    const direct = (window.localStorage.getItem(SIGNAL_RUN_CACHE_KEY) ?? '').trim()
+    if (direct) return direct
+  } catch {
+    // ignore localStorage failures
+  }
+
+  try {
+    const raw = window.localStorage.getItem(SCREENER_CACHE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as { run_meta?: { runId?: unknown } }
+    const runId = typeof parsed?.run_meta?.runId === 'string' ? parsed.run_meta.runId.trim() : ''
+    return runId || null
+  } catch {
+    // ignore parse/localStorage failures
+  }
+  return null
+}
+
+function readScreenerRunMetaFromStorage(): { runId: string; asOfDate?: string } | null {
+  try {
+    const raw = window.localStorage.getItem(SCREENER_CACHE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as { run_meta?: { runId?: unknown; asOfDate?: unknown } }
+    const runId = typeof parsed?.run_meta?.runId === 'string' ? parsed.run_meta.runId.trim() : ''
+    const asOfDate = typeof parsed?.run_meta?.asOfDate === 'string' ? parsed.run_meta.asOfDate.trim() : ''
+    if (!runId) return null
+    return { runId, asOfDate: asOfDate || undefined }
+  } catch {
+    return null
+  }
+}
+
+function normalizeTrendStep(raw: string | null | undefined): TrendPoolStep {
+  if (raw === 'step1' || raw === 'step2' || raw === 'step3' || raw === 'step4') return raw
+  return 'auto'
+}
+
+function loadCachedTrendStep(): TrendPoolStep {
+  try {
+    return normalizeTrendStep(window.localStorage.getItem(SIGNAL_STEP_CACHE_KEY))
+  } catch {
+    return 'auto'
+  }
+}
+
+function isRunNotFoundError(error: unknown) {
+  return error instanceof ApiError && (error.code === 'RUN_NOT_FOUND' || error.code === 'HTTP_404')
+}
+
 function formatSignalError(error: unknown) {
   if (error instanceof ApiError) {
+    if (error.code === 'RUN_NOT_FOUND') {
+      return '筛选任务不存在或已失效，请重新绑定最新筛选任务。'
+    }
     if (error.code === 'REQUEST_TIMEOUT') {
       return '待买信号请求超时，请稍后重试（全市场扫描可能需要更长时间）。'
     }
@@ -173,17 +242,44 @@ export function SignalsPage() {
   const { message } = AntdApp.useApp()
   const navigate = useNavigate()
   const setSelectedSymbol = useUIStore((state) => state.setSelectedSymbol)
-  const [searchParams] = useSearchParams()
-  const runId = searchParams.get('run_id') ?? undefined
+  const [searchParams, setSearchParams] = useSearchParams()
+  const cachedMode = useMemo(() => loadCachedSignalMode(), [])
+  const cachedTrendStep = useMemo(() => loadCachedTrendStep(), [])
+  const [cachedRunId, setCachedRunId] = useState<string | null>(() => loadCachedTrendRunId())
+  const runIdFromQuery = (searchParams.get('run_id') ?? searchParams.get('signal_run_id') ?? '').trim()
+  const runId = runIdFromQuery || cachedRunId || undefined
   const initialAsOfDate = searchParams.get('as_of_date') ?? ''
+  const initialTrendStep = normalizeTrendStep(searchParams.get('trend_step') ?? searchParams.get('signal_trend_step') ?? cachedTrendStep)
+  const initialModeParam = searchParams.get('mode') ?? searchParams.get('signal_mode')
+  const hasModeInQuery = initialModeParam === 'full_market' || initialModeParam === 'trend_pool'
+  const initialMode: SignalScanMode = hasModeInQuery
+    ? (initialModeParam as SignalScanMode)
+    : (cachedMode ?? 'trend_pool')
+  const parsedInitialWindowDays = Number(searchParams.get('window_days') ?? searchParams.get('signal_window_days') ?? 60)
+  const initialWindowDays = Number.isFinite(parsedInitialWindowDays)
+    ? Math.max(20, Math.min(240, Math.round(parsedInitialWindowDays)))
+    : 60
+  const parsedInitialMinScore = Number(searchParams.get('min_score') ?? searchParams.get('signal_min_score') ?? 60)
+  const initialMinScore = Number.isFinite(parsedInitialMinScore)
+    ? Math.max(0, Math.min(100, parsedInitialMinScore))
+    : 60
+  const parsedInitialMinEventCount = Number(
+    searchParams.get('min_event_count') ?? searchParams.get('signal_min_event_count') ?? 1,
+  )
+  const initialMinEventCount = Number.isFinite(parsedInitialMinEventCount)
+    ? Math.max(1, Math.min(12, Math.round(parsedInitialMinEventCount)))
+    : 1
+  const initialRequireSequence =
+    (searchParams.get('require_sequence') ?? searchParams.get('signal_require_sequence')) === 'true'
 
-  const [mode, setMode] = useState<SignalScanMode>('trend_pool')
+  const [mode, setMode] = useState<SignalScanMode>(initialMode)
+  const [trendStep, setTrendStep] = useState<TrendPoolStep>(initialTrendStep)
   const [asOfDate, setAsOfDate] = useState(initialAsOfDate)
   const [asOfDateTouched, setAsOfDateTouched] = useState(initialAsOfDate.length > 0)
-  const [windowDays, setWindowDays] = useState(60)
-  const [minScore, setMinScore] = useState(60)
-  const [minEventCount, setMinEventCount] = useState(1)
-  const [requireSequence, setRequireSequence] = useState(false)
+  const [windowDays, setWindowDays] = useState(initialWindowDays)
+  const [minScore, setMinScore] = useState(initialMinScore)
+  const [minEventCount, setMinEventCount] = useState(initialMinEventCount)
+  const [requireSequence, setRequireSequence] = useState(initialRequireSequence)
   const [keyword, setKeyword] = useState('')
   const [signalFilter, setSignalFilter] = useState<'all' | SignalType>('all')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('active')
@@ -193,13 +289,114 @@ export function SignalsPage() {
   const [guideExpanded, setGuideExpanded] = useState(false)
 
   const refreshTrackerRef = useRef(0)
+  const missingRunHandledRef = useRef('')
+  const searchParamsSnapshot = searchParams.toString()
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIGNAL_MODE_CACHE_KEY, mode)
+    } catch {
+      // ignore localStorage failures
+    }
+  }, [mode])
+
+  useEffect(() => {
+    if (!runId) return
+    try {
+      window.localStorage.setItem(SIGNAL_RUN_CACHE_KEY, runId)
+    } catch {
+      // ignore localStorage failures
+    }
+    setCachedRunId((previous) => (previous === runId ? previous : runId))
+  }, [runId])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIGNAL_STEP_CACHE_KEY, trendStep)
+    } catch {
+      // ignore localStorage failures
+    }
+  }, [trendStep])
+
+  useEffect(() => {
+    const current = new URLSearchParams(searchParamsSnapshot)
+    const next = new URLSearchParams(current)
+
+    next.set('mode', mode)
+    if (mode === 'trend_pool' && runId) {
+      next.set('run_id', runId)
+    } else {
+      next.delete('run_id')
+    }
+    if (mode === 'trend_pool') {
+      next.set('trend_step', trendStep)
+    } else {
+      next.delete('trend_step')
+    }
+    next.delete('signal_run_id')
+    next.delete('signal_trend_step')
+    next.set('window_days', String(windowDays))
+    next.set('min_score', String(minScore))
+    next.set('min_event_count', String(minEventCount))
+    next.set('require_sequence', String(requireSequence))
+
+    const normalizedAsOfDate = asOfDate.trim()
+    if (normalizedAsOfDate) {
+      next.set('as_of_date', normalizedAsOfDate)
+    } else {
+      next.delete('as_of_date')
+    }
+
+    if (next.toString() !== current.toString()) {
+      setSearchParams(next, { replace: true })
+    }
+  }, [
+    asOfDate,
+    minEventCount,
+    minScore,
+    mode,
+    runId,
+    trendStep,
+    requireSequence,
+    searchParamsSnapshot,
+    setSearchParams,
+    windowDays,
+  ])
 
   const runDetailQuery = useQuery({
     queryKey: ['screener-run', runId],
     queryFn: () => getScreenerRun(runId as string),
-    enabled: Boolean(runId),
+    enabled: mode === 'trend_pool' && Boolean(runId),
+    retry: (failureCount, error) => !isRunNotFoundError(error) && failureCount < 2,
     staleTime: 60_000,
   })
+
+  useEffect(() => {
+    if (mode !== 'trend_pool' || !runId) return
+    if (!isRunNotFoundError(runDetailQuery.error)) return
+    if (missingRunHandledRef.current === runId) return
+    missingRunHandledRef.current = runId
+
+    setCachedRunId((previous) => (previous === runId ? null : previous))
+    try {
+      const cached = (window.localStorage.getItem(SIGNAL_RUN_CACHE_KEY) ?? '').trim()
+      if (cached === runId) {
+        window.localStorage.removeItem(SIGNAL_RUN_CACHE_KEY)
+      }
+    } catch {
+      // ignore localStorage failures
+    }
+
+    const next = new URLSearchParams(searchParamsSnapshot)
+    if ((next.get('run_id') ?? '').trim() === runId) {
+      next.delete('run_id')
+    }
+    if ((next.get('signal_run_id') ?? '').trim() === runId) {
+      next.delete('signal_run_id')
+    }
+    setSearchParams(next, { replace: true })
+    message.warning(`筛选任务已失效：${runId}，请重新绑定最新筛选任务。`)
+  }, [message, mode, runDetailQuery.error, runId, searchParamsSnapshot, setSearchParams])
 
   useEffect(() => {
     if (mode !== 'trend_pool') return
@@ -210,8 +407,11 @@ export function SignalsPage() {
     }
   }, [asOfDateTouched, mode, runDetailQuery.data?.as_of_date])
 
+  const trendPoolReady = mode !== 'trend_pool' || Boolean(runId)
+
   const signalQuery = useQuery({
-    queryKey: ['signals', mode, runId, asOfDate, windowDays, minScore, minEventCount, requireSequence, refreshCounter],
+    queryKey: ['signals', mode, runId, trendStep, asOfDate, windowDays, minScore, minEventCount, requireSequence, refreshCounter],
+    enabled: trendPoolReady,
     queryFn: async () => {
       const shouldRefresh = refreshCounter > refreshTrackerRef.current
       if (shouldRefresh) {
@@ -220,7 +420,8 @@ export function SignalsPage() {
       const normalizedAsOfDate = asOfDate.trim()
       return getSignals({
         mode,
-        run_id: runId,
+        run_id: mode === 'trend_pool' ? runId : undefined,
+        trend_step: mode === 'trend_pool' ? trendStep : undefined,
         as_of_date: normalizedAsOfDate || undefined,
         refresh: shouldRefresh,
         window_days: windowDays,
@@ -244,6 +445,11 @@ export function SignalsPage() {
     const parsed = dayjs(raw).startOf('day')
     return parsed.isValid() ? parsed : dayjs().startOf('day')
   }, [asOfDate, signalQuery.data?.as_of_date])
+  const asOfDatePickerValue = useMemo(() => {
+    if (!asOfDate) return null
+    const parsed = dayjs(asOfDate)
+    return parsed.isValid() ? parsed : null
+  }, [asOfDate])
 
   const quickBuyMutation = useMutation({
     mutationFn: (row: SignalTableRow) =>
@@ -262,9 +468,48 @@ export function SignalsPage() {
     },
   })
 
+  const bindLatestRunMutation = useMutation({
+    mutationFn: getLatestScreenerRun,
+    onSuccess: (detail) => {
+      const next = new URLSearchParams(searchParamsSnapshot)
+      next.set('mode', 'trend_pool')
+      next.set('run_id', detail.run_id)
+      if (detail.as_of_date?.trim()) {
+        next.set('as_of_date', detail.as_of_date.trim())
+      }
+      setSearchParams(next, { replace: true })
+      message.success(`已绑定最新筛选任务：${detail.run_id}`)
+    },
+    onError: (error) => {
+      message.error(formatSignalError(error))
+    },
+  })
+
+  const bindRunFromScreenerCache = () => {
+    if (bindLatestRunMutation.isPending) {
+      return
+    }
+    const cached = readScreenerRunMetaFromStorage()
+    if (!cached?.runId) {
+      message.info('当前域名下未找到选股池 run 缓存，正在尝试绑定最新筛选任务。')
+      bindLatestRunMutation.mutate()
+      return
+    }
+    const next = new URLSearchParams(searchParamsSnapshot)
+    next.set('mode', 'trend_pool')
+    next.set('run_id', cached.runId)
+    if (cached.asOfDate) {
+      next.set('as_of_date', cached.asOfDate)
+    }
+    setSearchParams(next, { replace: true })
+    message.success(`已从选股池缓存绑定任务：${cached.runId}`)
+  }
+
+  const effectiveSignalItems = trendPoolReady ? (signalQuery.data?.items ?? []) : []
+
   const allRows = useMemo(
-    () => (signalQuery.data?.items ?? []).map((item) => normalizeSignalRow(item, referenceDate)),
-    [referenceDate, signalQuery.data?.items],
+    () => effectiveSignalItems.map((item) => normalizeSignalRow(item, referenceDate)),
+    [effectiveSignalItems, referenceDate],
   )
 
   const kpi = useMemo(() => {
@@ -279,9 +524,9 @@ export function SignalsPage() {
       expired: expired.length,
       todayTriggered: todayTriggered.length,
       bSignals: bSignals.length,
-      sourceCount: signalQuery.data?.source_count ?? allRows.length,
+      sourceCount: trendPoolReady ? (signalQuery.data?.source_count ?? allRows.length) : 0,
     }
-  }, [allRows, signalQuery.data?.source_count])
+  }, [allRows, signalQuery.data?.source_count, trendPoolReady])
 
   const filteredRows = useMemo(() => {
     const normalizedKeyword = keyword.trim().toLowerCase()
@@ -338,7 +583,6 @@ export function SignalsPage() {
         title: '名称',
         dataIndex: 'name',
         width: 120,
-        ellipsis: true,
         sorter: (a, b) => a.name.localeCompare(b.name, 'zh-CN'),
       },
       {
@@ -354,7 +598,6 @@ export function SignalsPage() {
         title: '阶段',
         key: 'phase_label',
         width: 130,
-        ellipsis: true,
         filters: phaseFilters,
         onFilter: (value, row) => row.phase_label === String(value),
         sorter: (a, b) => a.phase_label.localeCompare(b.phase_label, 'zh-CN'),
@@ -423,11 +666,16 @@ export function SignalsPage() {
               onClick={() => {
                 const params = new URLSearchParams({
                   signal_mode: mode,
+                  signal_trend_step: trendStep,
                   signal_window_days: String(windowDays),
                   signal_min_score: String(minScore),
                   signal_min_event_count: String(minEventCount),
                   signal_require_sequence: String(requireSequence),
                 })
+                const signalAsOfDate = (signalQuery.data?.as_of_date ?? asOfDate).trim()
+                if (signalAsOfDate) {
+                  params.set('signal_as_of_date', signalAsOfDate)
+                }
                 if (runId) {
                   params.set('signal_run_id', runId)
                 }
@@ -466,6 +714,7 @@ export function SignalsPage() {
       },
     ],
     [
+      bindLatestRunMutation.isPending,
       eventFilters,
       minEventCount,
       minScore,
@@ -477,6 +726,9 @@ export function SignalsPage() {
       quickQuantity,
       requireSequence,
       runId,
+      trendStep,
+      asOfDate,
+      signalQuery.data?.as_of_date,
       windowDays,
     ],
   )
@@ -521,7 +773,7 @@ export function SignalsPage() {
     setRefreshCounter((previous) => previous + 1)
   }
 
-  const errorMessage = signalQuery.error ? formatSignalError(signalQuery.error) : ''
+  const errorMessage = trendPoolReady && signalQuery.error ? formatSignalError(signalQuery.error) : ''
 
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
@@ -535,7 +787,7 @@ export function SignalsPage() {
         <Alert
           type="error"
           showIcon
-          message="信号加载失败"
+          title="信号加载失败"
           description={errorMessage}
         />
       ) : null}
@@ -544,8 +796,39 @@ export function SignalsPage() {
         <Alert
           type="warning"
           showIcon
-          message="当前结果处于降级模式"
+          title="当前结果处于降级模式"
           description={signalQuery.data.degraded_reason ?? '数据源部分不可用，已使用降级结果。'}
+        />
+      ) : null}
+
+      {mode === 'trend_pool' && !runId ? (
+        <Alert
+          type="warning"
+          showIcon
+          title="未绑定趋势池筛选任务"
+          description={(
+            <Space wrap>
+              <Typography.Text type="secondary">
+                当前 URL 缺少 run_id（你现在这个链接就是这种情况）。请先绑定筛选任务后再看趋势池后置信号。
+              </Typography.Text>
+              <Typography.Text type="secondary">建议保持同一域名访问（都用 127.0.0.1 或都用 localhost）。</Typography.Text>
+              <Button
+                size="small"
+                loading={bindLatestRunMutation.isPending}
+                onClick={bindRunFromScreenerCache}
+              >
+                从选股池缓存绑定
+              </Button>
+              <Button
+                size="small"
+                loading={bindLatestRunMutation.isPending}
+                onClick={() => bindLatestRunMutation.mutate()}
+              >
+                绑定最新筛选任务
+              </Button>
+              <Button size="small" onClick={() => navigate('/screener')}>去选股池</Button>
+            </Space>
+          )}
         />
       ) : null}
 
@@ -755,17 +1038,43 @@ export function SignalsPage() {
             </Col>
           </Row>
 
+          {mode === 'trend_pool' ? (
+            <Row gutter={[12, 12]}>
+              <Col xs={24} lg={12}>
+                <Typography.Text type="secondary">趋势池来源</Typography.Text>
+                <div>
+                  <Radio.Group
+                    value={trendStep}
+                    onChange={(event) => setTrendStep(event.target.value as TrendPoolStep)}
+                    optionType="button"
+                    options={[
+                      { label: '自动(step4>step3)', value: 'auto' },
+                      { label: '仅Step4', value: 'step4' },
+                      { label: '仅Step3', value: 'step3' },
+                      { label: '仅Step2', value: 'step2' },
+                      { label: '仅Step1', value: 'step1' },
+                    ]}
+                  />
+                </div>
+              </Col>
+            </Row>
+          ) : null}
+
           <Row gutter={[12, 12]}>
             <Col xs={24} md={12} lg={6}>
               <Typography.Text type="secondary">快照日期（留空=最新）</Typography.Text>
               <DatePicker
+                key={`signals-asof-${asOfDate || 'empty'}`}
                 allowClear
-                value={asOfDate && dayjs(asOfDate).isValid() ? dayjs(asOfDate) : null}
+                defaultValue={asOfDatePickerValue ?? undefined}
                 format="YYYY-MM-DD"
                 style={{ width: '100%' }}
                 onChange={(value) => {
-                  setAsOfDateTouched(true)
-                  setAsOfDate(value ? value.format('YYYY-MM-DD') : '')
+                  const nextDate = value ? value.format('YYYY-MM-DD') : ''
+                  if (!asOfDateTouched) {
+                    setAsOfDateTouched(true)
+                  }
+                  setAsOfDate((prev) => (prev === nextDate ? prev : nextDate))
                 }}
               />
             </Col>
@@ -845,7 +1154,7 @@ export function SignalsPage() {
       <Card className="glass-card" variant="borderless">
         <Table
           rowKey="key"
-          loading={signalQuery.isLoading || signalQuery.isFetching}
+          loading={trendPoolReady && (signalQuery.isLoading || signalQuery.isFetching)}
           dataSource={filteredRows}
           columns={columns}
           scroll={{ x: 1480 }}

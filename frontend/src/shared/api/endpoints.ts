@@ -16,6 +16,7 @@ import type {
   ScreenerRunResponse,
   SignalScanMode,
   SignalsResponse,
+  TrendPoolStep,
   SimFillsResponse,
   SimOrdersResponse,
   SimResetResponse,
@@ -39,6 +40,12 @@ export function runScreener(params: ScreenerParams) {
 
 export function getScreenerRun(runId: string) {
   return apiRequest<ScreenerRunDetail>(`/api/screener/runs/${runId}`, {
+    timeoutMs: 60_000,
+  })
+}
+
+export function getLatestScreenerRun() {
+  return apiRequest<ScreenerRunDetail>('/api/screener/latest-run', {
     timeoutMs: 60_000,
   })
 }
@@ -71,6 +78,7 @@ export function updateStockAnnotation(symbol: string, payload: StockAnnotation) 
 export function getSignals(params?: {
   mode?: SignalScanMode
   run_id?: string
+  trend_step?: TrendPoolStep
   as_of_date?: string
   refresh?: boolean
   window_days?: number
@@ -81,6 +89,7 @@ export function getSignals(params?: {
   const query = new URLSearchParams()
   if (params?.mode) query.set('mode', params.mode)
   if (params?.run_id) query.set('run_id', params.run_id)
+  if (params?.trend_step) query.set('trend_step', params.trend_step)
   if (params?.as_of_date) query.set('as_of_date', params.as_of_date)
   if (typeof params?.refresh === 'boolean') query.set('refresh', String(params.refresh))
   if (typeof params?.window_days === 'number') query.set('window_days', String(params.window_days))

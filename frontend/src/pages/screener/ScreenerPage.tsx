@@ -842,7 +842,7 @@ function LabeledNumberInput({ label, style, ...props }: LabeledNumberInputProps)
     <Space.Compact style={{ width: '100%', ...style }}>
       <div
         style={{
-          minWidth: 128,
+          minWidth: 92,
           paddingInline: 12,
           display: 'inline-flex',
           alignItems: 'center',
@@ -852,7 +852,8 @@ function LabeledNumberInput({ label, style, ...props }: LabeledNumberInputProps)
           background: 'rgba(5, 5, 5, 0.04)',
           color: 'rgba(0, 0, 0, 0.72)',
           fontSize: 13,
-          whiteSpace: 'nowrap',
+          lineHeight: 1.2,
+          whiteSpace: 'normal',
         }}
       >
         {label}
@@ -1187,7 +1188,9 @@ export function ScreenerPage() {
         setActivePool(restoredStep === 0 ? 'input' : (`step${restoredStep}` as ScreenerPoolKey))
         message.info('已恢复上次筛选数据')
       } catch {
-        // keep current empty state when run is unavailable
+        if (cancelled) return
+        setRunMeta(undefined)
+        message.warning('上次筛选任务已失效（后端无该 run），请重新加载输入池/运行筛选。')
       }
     })()
 
@@ -2273,13 +2276,17 @@ export function ScreenerPage() {
                     <Space orientation="vertical" size={4} style={{ width: '100%' }}>
                       <Typography.Text type="secondary">筛选日期（留空=最新）</Typography.Text>
                       <DatePicker
+                        key={`screener-asof-${field.value || 'empty'}`}
                         allowClear
-                        value={pickerValue}
+                        defaultValue={pickerValue ?? undefined}
                         format="YYYY-MM-DD"
                         style={{ width: '100%' }}
                         onChange={(next) => {
-                          field.onChange(next ? next.format('YYYY-MM-DD') : '')
-                          invalidateFrom(1)
+                          const nextValue = next ? next.format('YYYY-MM-DD') : ''
+                          if (nextValue !== (field.value ?? '')) {
+                            field.onChange(nextValue)
+                            invalidateFrom(1)
+                          }
                         }}
                       />
                     </Space>
@@ -2370,7 +2377,7 @@ export function ScreenerPage() {
           const canExport = isAvailable && pools[poolKey].length > 0
 
           return (
-            <Col xs={12} md={4} key={poolKey}>
+            <Col xs={24} sm={12} md={8} lg={8} xl={6} xxl={6} key={poolKey}>
               <Card
                 className="glass-card"
                 variant="borderless"
@@ -2396,6 +2403,8 @@ export function ScreenerPage() {
                 }}
                 style={{
                   cursor: 'pointer',
+                  height: '100%',
+                  overflow: 'hidden',
                   border: isDragOver
                     ? '1px dashed rgba(15,139,111,0.85)'
                     : isActive
@@ -2407,8 +2416,13 @@ export function ScreenerPage() {
                       ? '0 0 0 2px rgba(15,139,111,0.18) inset'
                       : undefined,
                 }}
+                styles={{
+                  body: {
+                    overflow: 'hidden',
+                  },
+                }}
               >
-                <Space orientation="vertical" size={6} style={{ width: '100%' }}>
+                <Space orientation="vertical" size={6} style={{ width: '100%', overflow: 'hidden' }}>
                   <Statistic
                     title={
                       poolKey === 'input'
@@ -2420,9 +2434,17 @@ export function ScreenerPage() {
                     value={cardValues[poolKey]}
                   />
                   {poolKey === 'input' ? (
-                    <Space size={6}>
+                    <div
+                      style={{
+                        width: '100%',
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fit, minmax(108px, 1fr))',
+                        gap: 6,
+                      }}
+                    >
                       <Button
                         size="small"
+                        style={{ whiteSpace: 'normal', height: 'auto' }}
                         onClick={(event) => {
                           event.stopPropagation()
                           void handleSubmit(async (values) => {
@@ -2443,14 +2465,22 @@ export function ScreenerPage() {
                       >
                         <Button
                           size="small"
+                          style={{ whiteSpace: 'normal', height: 'auto' }}
                           onClick={(event) => event.stopPropagation()}
                         >
                           导出
                         </Button>
                       </Dropdown>
-                    </Space>
+                    </div>
                   ) : poolKey === 'final' ? (
-                    <Space size={6}>
+                    <div
+                      style={{
+                        width: '100%',
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fit, minmax(108px, 1fr))',
+                        gap: 6,
+                      }}
+                    >
                       <Dropdown
                         trigger={['click']}
                         menu={buildExportMenu(poolKey)}
@@ -2458,6 +2488,7 @@ export function ScreenerPage() {
                       >
                         <Button
                           size="small"
+                          style={{ whiteSpace: 'normal', height: 'auto' }}
                           onClick={(event) => event.stopPropagation()}
                         >
                           导出
@@ -2466,6 +2497,7 @@ export function ScreenerPage() {
                       <Button
                         size="small"
                         danger
+                        style={{ whiteSpace: 'normal', height: 'auto' }}
                         disabled={pools.final.length === 0}
                         onClick={(event) => {
                           event.stopPropagation()
@@ -2480,13 +2512,21 @@ export function ScreenerPage() {
                       >
                         清空终选池
                       </Button>
-                    </Space>
+                    </div>
                   ) : (
-                    <Space size={6}>
+                    <div
+                      style={{
+                        width: '100%',
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fit, minmax(88px, 1fr))',
+                        gap: 6,
+                      }}
+                    >
                       <Button
                         size="small"
                         type={requiredStep === executedStep + 1 ? 'primary' : 'default'}
                         loading={runningStep === requiredStep}
+                        style={{ whiteSpace: 'normal', height: 'auto' }}
                         onClick={(event) => {
                           event.stopPropagation()
                           void executeStep(requiredStep as 1 | 2 | 3 | 4)
@@ -2510,6 +2550,7 @@ export function ScreenerPage() {
                         <Button
                           size="small"
                           icon={<SettingOutlined />}
+                          style={{ whiteSpace: 'normal', height: 'auto' }}
                           onClick={(event) => event.stopPropagation()}
                         />
                       </Popover>
@@ -2520,19 +2561,20 @@ export function ScreenerPage() {
                       >
                         <Button
                           size="small"
+                          style={{ whiteSpace: 'normal', height: 'auto' }}
                           onClick={(event) => event.stopPropagation()}
                         >
                           导出
                         </Button>
                       </Dropdown>
-                    </Space>
+                    </div>
                   )}
                   {poolKey !== 'input' && poolKey !== 'final' ? (
-                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    <Typography.Text type="secondary" style={{ fontSize: 12, wordBreak: 'break-word' }}>
                       {stepConfigHint[poolKey]}
                     </Typography.Text>
                   ) : null}
-                  <Typography.Text type="secondary">
+                  <Typography.Text type="secondary" style={{ wordBreak: 'break-word' }}>
                     {isAvailable
                       ? poolKey === 'final'
                         ? '任意池可手工拖入终选池'
@@ -2540,7 +2582,7 @@ export function ScreenerPage() {
                       : `请先运行到第${requiredStep}步`}
                   </Typography.Text>
                   {isDropTarget ? (
-                    <Typography.Text type="secondary">
+                    <Typography.Text type="secondary" style={{ wordBreak: 'break-word' }}>
                       可拖动股票到此池手工添加
                     </Typography.Text>
                   ) : null}
@@ -2585,7 +2627,7 @@ export function ScreenerPage() {
               </Typography.Text>
             </Col>
             <Col>
-              <Space>
+              <Space wrap size={[8, 8]}>
                 {nextPoolKey ? (
                   <Typography.Text type="secondary">
                     拖动行到任意目标池卡片可手工加票（常用: {poolLabelMap[nextPoolKey]} / 终选池）

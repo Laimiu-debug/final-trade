@@ -1,36 +1,9 @@
 
-> frontend@0.0.0 dev
+> frontend@0.0.0 dev:host
 > vite --host 127.0.0.1 --port 4173
 
 
-  [32m[1mVITE[22m v7.3.1[39m  [2mready in [0m[1m2147[22m[2m[0m ms[22m
+  [32m[1mVITE[22m v7.3.1[39m  [2mready in [0m[1m333[22m[2m[0m ms[22m
 
   [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m4173[22m/[39m
-[2m17:24:43[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/settings/SettingsPage.tsx[22m
-[2m17:38:43[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/ai/AiPage.tsx, /src/pages/portfolio/PortfolioPage.tsx, /src/pages/chart/ChartPage.tsx, /src/pages/settings/SettingsPage.tsx, /src/pages/review/ReviewPage.tsx, /src/pages/trade/TradePage.tsx, /src/pages/signals/SignalsPage.tsx, /src/pages/screener/ScreenerPage.tsx[22m
-[2m17:39:46[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/settings/SettingsPage.tsx[22m
-[2m17:44:08[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/settings/SettingsPage.tsx[22m
-[2m17:54:34[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/settings/SettingsPage.tsx[22m
-[2m18:05:24[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/ai/AiPage.tsx, /src/pages/portfolio/PortfolioPage.tsx, /src/pages/chart/ChartPage.tsx, /src/pages/settings/SettingsPage.tsx, /src/pages/review/ReviewPage.tsx, /src/pages/trade/TradePage.tsx, /src/pages/signals/SignalsPage.tsx, /src/pages/screener/ScreenerPage.tsx[22m
-[2m18:06:58[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
-[2m18:07:12[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/settings/SettingsPage.tsx[22m
-[2m20:11:44[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/ai/AiPage.tsx, /src/pages/portfolio/PortfolioPage.tsx, /src/pages/chart/ChartPage.tsx, /src/pages/settings/SettingsPage.tsx, /src/pages/review/ReviewPage.tsx, /src/pages/trade/TradePage.tsx, /src/pages/signals/SignalsPage.tsx, /src/pages/screener/ScreenerPage.tsx[22m
-[2m20:12:44[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
-[2m20:12:55[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
-[2m20:13:15[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
-[2m20:13:31[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
-[2m20:13:44[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
-[2m20:14:03[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
-[2m20:14:38[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/signals/SignalsPage.tsx[22m
-[2m20:15:01[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/signals/SignalsPage.tsx[22m
-[2m20:15:14[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/signals/SignalsPage.tsx[22m
-[2m20:20:32[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/signals/SignalsPage.tsx[22m
-[2m20:26:05[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/screener/ScreenerPage.tsx[22m
-[2m22:27:02[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/shared/charts/KLineChart.tsx[22m
-[2m22:27:29[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/chart/ChartPage.tsx[22m
-[2m22:28:57[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/chart/ChartPage.tsx[22m
-[2m22:29:27[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/chart/ChartPage.tsx[22m
-[2m22:29:51[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/chart/ChartPage.tsx[22m
-[2m22:30:12[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/chart/ChartPage.tsx[22m
-[2m22:34:43[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/shared/charts/KLineChart.tsx[22m
-[2m22:35:37[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m [32mhmr update [39m[2m/src/pages/chart/ChartPage.tsx[22m
+[2m[32m  ➜[39m[22m[2m  press [22m[1mh + enter[22m[2m to show help[22m

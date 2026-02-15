@@ -250,7 +250,7 @@ export function SettingsPage() {
         <Alert
           type="warning"
           showIcon
-          message="当前启用了 MSW Mock 模式，交易/复盘/AI 记录不会写入真实后端持久化文件。"
+          title="当前启用了 MSW Mock 模式，交易/复盘/AI 记录不会写入真实后端持久化文件。"
         />
       ) : null}
       <Card className="glass-card" variant="borderless">

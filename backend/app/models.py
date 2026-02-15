@@ -10,6 +10,7 @@ TrendClass = Literal["A", "A_B", "B", "Unknown"]
 ThemeStage = Literal["发酵中", "高潮", "退潮", "Unknown"]
 SignalType = Literal["A", "B", "C"]
 SignalScanMode = Literal["trend_pool", "full_market"]
+TrendPoolStep = Literal["auto", "step1", "step2", "step3", "step4"]
 PriceSource = Literal["vwap", "approx"]
 Stage = Literal["Early", "Mid", "Late"]
 MarketDataSource = Literal["tdx_only", "tdx_then_akshare", "akshare_only"]
@@ -183,6 +184,8 @@ class SignalResult(BaseModel):
     entry_quality_score: float = 0.0
     wy_events: list[str] = Field(default_factory=list)
     wy_risk_events: list[str] = Field(default_factory=list)
+    wy_event_dates: dict[str, str] = Field(default_factory=dict)
+    wy_event_chain: list[dict[str, str]] = Field(default_factory=list)
     phase_hint: str = ""
     scan_mode: SignalScanMode = "trend_pool"
     event_strength_score: float = 0.0

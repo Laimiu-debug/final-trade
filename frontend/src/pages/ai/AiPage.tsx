@@ -76,20 +76,36 @@ export function AiPage() {
     },
   })
 
+  const renderTruncated = (value: string | undefined) => {
+    const text = (value ?? '').trim() || '--'
+    return (
+      <span
+        title={text}
+        style={{
+          display: 'inline-block',
+          maxWidth: '100%',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          verticalAlign: 'bottom',
+        }}
+      >
+        {text}
+      </span>
+    )
+  }
+
   const columns: ColumnsType<AIAnalysisRecord> = [
     {
       title: '股票',
       key: 'stock',
       width: 140,
-      ellipsis: true,
       render: (_, record) => (
-        <Typography.Text strong ellipsis={{ tooltip: record.name || record.symbol.toUpperCase() }}>
-          {record.name || record.symbol.toUpperCase()}
-        </Typography.Text>
+        <Typography.Text strong>{renderTruncated(record.name || record.symbol.toUpperCase())}</Typography.Text>
       ),
     },
-    { title: 'Provider', dataIndex: 'provider', width: 100, ellipsis: true },
-    { title: '抓取时间', dataIndex: 'fetched_at', width: 170, ellipsis: true },
+    { title: 'Provider', dataIndex: 'provider', width: 100, render: (value: string | undefined) => renderTruncated(value) },
+    { title: '抓取时间', dataIndex: 'fetched_at', width: 170, render: (value: string | undefined) => renderTruncated(value) },
     {
       title: '结论',
       dataIndex: 'conclusion',
@@ -108,15 +124,13 @@ export function AiPage() {
       title: '趋势牛类型',
       dataIndex: 'trend_bull_type',
       width: 140,
-      ellipsis: true,
-      render: (value: string | undefined) => value || '--',
+      render: (value: string | undefined) => renderTruncated(value),
     },
     {
       title: '题材',
       dataIndex: 'theme_name',
       width: 120,
-      ellipsis: true,
-      render: (value: string | undefined) => value || '--',
+      render: (value: string | undefined) => renderTruncated(value),
     },
     { title: '置信度', dataIndex: 'confidence', width: 90 },
     {

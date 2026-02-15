@@ -35,7 +35,7 @@ import { KLineChart } from '@/shared/charts/KLineChart'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { computeCandleRangeStats } from '@/shared/utils/candleStats'
 import { useUIStore } from '@/state/uiStore'
-import type { AIAnalysisRecord, SignalScanMode, StockAnnotation } from '@/types/contracts'
+import type { AIAnalysisRecord, SignalScanMode, StockAnnotation, TrendPoolStep } from '@/types/contracts'
 
 function defaultAnnotation(symbol: string): StockAnnotation {
   return {
@@ -96,7 +96,17 @@ export function ChartPage() {
   const stockTitle = resolvedName ? `${resolvedName} (${symbolText})` : symbolText
   const signalModeParam = searchParams.get('signal_mode')
   const signalMode: SignalScanMode = signalModeParam === 'full_market' ? 'full_market' : 'trend_pool'
+  const signalTrendStepRaw = searchParams.get('signal_trend_step') ?? searchParams.get('trend_step') ?? 'auto'
+  const signalTrendStep: TrendPoolStep =
+    signalTrendStepRaw === 'step1' ||
+    signalTrendStepRaw === 'step2' ||
+    signalTrendStepRaw === 'step3' ||
+    signalTrendStepRaw === 'step4'
+      ? signalTrendStepRaw
+      : 'auto'
   const signalRunId = searchParams.get('signal_run_id') ?? undefined
+  const signalAsOfDateRaw = (searchParams.get('signal_as_of_date') ?? searchParams.get('as_of_date') ?? '').trim()
+  const signalAsOfDate = /^\d{4}-\d{2}-\d{2}$/.test(signalAsOfDateRaw) ? signalAsOfDateRaw : undefined
   const parsedWindowDays = Number(searchParams.get('signal_window_days') ?? 60)
   const signalWindowDays = Number.isFinite(parsedWindowDays) ? Math.max(20, Math.round(parsedWindowDays)) : 60
   const parsedMinScore = Number(searchParams.get('signal_min_score') ?? 60)
@@ -121,7 +131,9 @@ export function ChartPage() {
     queryKey: [
       'signals',
       signalMode,
+      signalTrendStep,
       signalRunId ?? '',
+      signalAsOfDate ?? '',
       signalWindowDays,
       signalMinScore,
       signalMinEventCount,
@@ -131,6 +143,8 @@ export function ChartPage() {
       getSignals({
         mode: signalMode,
         run_id: signalRunId,
+        trend_step: signalMode === 'trend_pool' ? signalTrendStep : undefined,
+        as_of_date: signalAsOfDate,
         window_days: signalWindowDays,
         min_score: signalMinScore,
         min_event_count: signalMinEventCount,
@@ -238,8 +252,13 @@ export function ChartPage() {
     [candles, statsRange],
   )
 
-  const rangePickerValue: [Dayjs, Dayjs] | null =
-    statsRange[0] && statsRange[1] ? [dayjs(statsRange[0]), dayjs(statsRange[1])] : null
+  const rangePickerValue = useMemo<[Dayjs, Dayjs] | null>(() => {
+    if (!statsRange[0] || !statsRange[1]) return null
+    const start = dayjs(statsRange[0])
+    const end = dayjs(statsRange[1])
+    if (!start.isValid() || !end.isValid()) return null
+    return [start, end]
+  }, [statsRange])
 
   function backToPrev() {
     if (window.history.length > 1) {
@@ -369,10 +388,14 @@ export function ChartPage() {
               value={rangePickerValue}
               onChange={(values) => {
                 if (!values || !values[0] || !values[1]) {
-                  setStatsRange([null, null])
+                  setStatsRange((prev) => (prev[0] === null && prev[1] === null ? prev : [null, null]))
                   return
                 }
-                setStatsRange([values[0].format('YYYY-MM-DD'), values[1].format('YYYY-MM-DD')])
+                const nextRange: [string, string] = [
+                  values[0].format('YYYY-MM-DD'),
+                  values[1].format('YYYY-MM-DD'),
+                ]
+                setStatsRange((prev) => (prev[0] === nextRange[0] && prev[1] === nextRange[1] ? prev : nextRange))
               }}
               allowClear
             />
@@ -444,14 +467,25 @@ export function ChartPage() {
                 <Controller
                   name="start_date"
                   control={control}
-                  render={({ field }) => (
-                    <DatePicker
-                      style={{ width: '100%' }}
-                      value={field.value ? dayjs(field.value) : null}
-                      onChange={(value) => field.onChange(value?.format('YYYY-MM-DD'))}
-                      allowClear={false}
-                    />
-                  )}
+                  render={({ field }) => {
+                    const parsedStartDate = field.value ? dayjs(field.value) : null
+                    const startDatePickerValue =
+                      parsedStartDate && parsedStartDate.isValid() ? parsedStartDate : null
+                    return (
+                      <DatePicker
+                        key={`chart-start-date-${field.value || 'empty'}`}
+                        style={{ width: '100%' }}
+                        defaultValue={startDatePickerValue ?? undefined}
+                        onChange={(value) => {
+                          const nextValue = value ? value.format('YYYY-MM-DD') : ''
+                          if (nextValue !== (field.value ?? '')) {
+                            field.onChange(nextValue)
+                          }
+                        }}
+                        allowClear={false}
+                      />
+                    )
+                  }}
                 />
               </Space>
             </Col>
