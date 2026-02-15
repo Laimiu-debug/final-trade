@@ -72,6 +72,8 @@ from .tdx_loader import (
 from .utils.text_utils import TextProcessor, URLUtils
 from .core.signal_analyzer import SignalAnalyzer, WYCKOFF_ACC_EVENTS, WYCKOFF_RISK_EVENTS, WYCKOFF_EVENT_ORDER
 from .core.ai_analyzer import AIAnalyzer, create_ai_analyzer
+from .core.screener import ScreenerEngine, create_screener_engine, THEME_STAGES
+from .core.candle_analyzer import CandleAnalyzer, create_candle_analyzer
 from .providers.web_provider import RSSWebEvidenceProvider, SearchWebEvidenceProvider
 from .config import ConfigManager, create_config_manager, ConfigValidator
 from .state_manager import StateManager, create_state_manager
@@ -87,7 +89,6 @@ STOCK_POOL: list[dict[str, str]] = [
     {"symbol": "sz002230", "name": "科大讯飞", "trend": "A_B", "stage": "Mid"},
 ]
 
-THEME_STAGES: tuple[ThemeStage, ThemeStage, ThemeStage] = ("发酵中", "高潮", "退潮")
 
 
 class InMemoryStore:
