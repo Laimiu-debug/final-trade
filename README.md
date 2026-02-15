@@ -1,5 +1,9 @@
 # Final Trade
 
+Language:
+- English: `README.md`
+- 中文: `README.zh-CN.md`
+
 Integrated stock workflow:
 - Screener funnel
 - Wyckoff-based buy signals
@@ -183,9 +187,32 @@ npm run test
 npm run build
 ```
 
+## First Run Checklist
+
+1. Start services with `start.bat` (Windows) or `start.sh` (Linux/macOS).
+2. Confirm backend is reachable at `http://127.0.0.1:8000/health`.
+3. Open frontend at `http://127.0.0.1:4173`.
+4. Run one screener pass, then open Signals/Trade/Review pages in sequence.
+
+## Troubleshooting
+
+- Page not loading:
+  - ensure backend is running (`/health` returns 200)
+  - ensure frontend dev server is running on `4173`
+  - hard refresh browser (`Ctrl+F5`)
+- Data load failed:
+  - check `tdx_data_path` and market data source in Settings
+  - trigger `POST /api/system/sync-market-data`
+- Port occupied:
+  - backend: `uvicorn app.main:app --reload --host 127.0.0.1 --port 8001`
+  - frontend: `npm run dev -- --port 4174`
+- Need full reset:
+  - stop services
+  - clear frontend cache (`frontend/node_modules/.vite`)
+  - restart with `start.bat` or `start.sh`
+
 ## Additional Docs
 
-- `README_GUIDE.md`
 - `docs/QUICKSTART.md`
 - `docs/ARCHITECTURE.md`
 - `docs/VERIFICATION.md`
