@@ -68,6 +68,10 @@ from .tdx_loader import (
     load_intraday_for_symbol_date,
 )
 
+# Import refactored modules
+from .utils.text_utils import TextProcessor, URLUtils
+from .core.signal_analyzer import SignalAnalyzer, WYCKOFF_ACC_EVENTS, WYCKOFF_RISK_EVENTS, WYCKOFF_EVENT_ORDER
+
 STOCK_POOL: list[dict[str, str]] = [
     {"symbol": "sh600519", "name": "贵州茅台", "trend": "A", "stage": "Mid"},
     {"symbol": "sz300750", "name": "宁德时代", "trend": "A_B", "stage": "Early"},
@@ -80,10 +84,6 @@ STOCK_POOL: list[dict[str, str]] = [
 ]
 
 THEME_STAGES: tuple[ThemeStage, ThemeStage, ThemeStage] = ("发酵中", "高潮", "退潮")
-
-WYCKOFF_ACC_EVENTS: tuple[str, ...] = ("PS", "SC", "AR", "ST", "TSO", "Spring", "SOS", "JOC", "LPS")
-WYCKOFF_RISK_EVENTS: tuple[str, ...] = ("UTAD", "SOW", "LPSY")
-WYCKOFF_EVENT_ORDER: tuple[str, ...] = (*WYCKOFF_ACC_EVENTS, *WYCKOFF_RISK_EVENTS)
 
 
 class InMemoryStore:
@@ -333,109 +333,29 @@ class InMemoryStore:
         urls = [item.url for item in self._config.ai_sources if item.enabled and item.url.strip()]
         return urls[:limit]
 
-    @staticmethod
-    def _clean_whitespace(text: str) -> str:
-        return re.sub(r"\s+", " ", text).strip()
-
-    @staticmethod
-    def _strip_html_tags(text: str) -> str:
-        return re.sub(r"<[^>]+>", "", text)
-
-    @staticmethod
-    def _extract_domain(raw_url: str) -> str:
-        parsed = urlparse(raw_url.strip())
-        host = parsed.netloc.lower().strip()
-        if host.startswith("www."):
-            host = host[4:]
-        return host
-
-    @staticmethod
-    def _registrable_domain(host: str) -> str:
-        parts = [part for part in host.lower().split(".") if part]
-        if len(parts) <= 2:
-            return ".".join(parts)
-        if len(parts) >= 3 and parts[-2:] == ["com", "cn"]:
-            return ".".join(parts[-3:])
-        if len(parts) >= 3 and parts[-2:] == ["net", "cn"]:
-            return ".".join(parts[-3:])
-        return ".".join(parts[-2:])
-
     def _source_domains(self, source_urls: list[str]) -> set[str]:
-        domains: set[str] = set()
-        for item in source_urls:
-            domain = self._extract_domain(item)
-            if domain:
-                domains.add(domain)
-                root = self._registrable_domain(domain)
-                if root:
-                    domains.add(root)
-        return domains
+        """Extract source domains from URLs using URLUtils."""
+        return URLUtils.source_domains(source_urls)
 
     @staticmethod
     def _url_in_domains(url: str, domains: set[str]) -> bool:
-        if not domains:
-            return True
-        host = urlparse(url).netloc.lower().strip()
-        if host.startswith("www."):
-            host = host[4:]
-        if not host:
-            return False
-        host_root = InMemoryStore._registrable_domain(host)
-        return any(
-            host == domain
-            or host.endswith(f".{domain}")
-            or (host_root and host_root == domain)
-            for domain in domains
-        )
+        """Check if URL is in allowed domains using URLUtils."""
+        return URLUtils.url_in_domains(url, domains)
 
     @staticmethod
     def _is_low_quality_source(source_name: str, source_url: str) -> bool:
-        haystack = f"{source_name} {source_url}".lower()
-        blocked_keywords = (
-            "guba",
-            "mguba",
-            "股吧",
-            "财富号",
-            "caifuhao",
-            "论坛",
-            "社区",
-            "xueqiu",
-            "雪球",
-            "博客",
-            "blog",
-            "tieba",
-        )
-        return any(keyword in haystack for keyword in blocked_keywords)
+        """Check if source is low quality using TextProcessor."""
+        return TextProcessor.is_low_quality_source(source_name, source_url)
 
     @staticmethod
     def _is_low_signal_title(title: str) -> bool:
-        value = title.lower()
-        noisy_keywords = (
-            "早盘",
-            "盘前",
-            "盘后",
-            "复盘",
-            "午评",
-            "收评",
-            "走势",
-            "观察分享",
-            "股吧",
-            "技术分析",
-            "看盘",
-            "点评",
-            "开盘",
-            "龙虎榜复盘",
-            "强势涨停",
-            "果断上车",
-            "牛股",
-            "主升浪",
-            "标杆",
-        )
-        return any(keyword in value for keyword in noisy_keywords)
+        """Check if title has low signal value using TextProcessor."""
+        return TextProcessor.is_low_signal_title(title)
 
     @staticmethod
     def _clean_event_text(text: str) -> str:
-        cleaned = InMemoryStore._clean_whitespace(text)
+        """Clean event text with media filtering."""
+        cleaned = TextProcessor.clean_whitespace(text)
         cleaned = re.sub(r"^\[[^\]]+\]\s*", "", cleaned)
         cleaned = re.sub(r"^(新闻线索|信息源摘要|来源)[:：]\s*", "", cleaned)
         cleaned = re.sub(r"https?://\S+", "", cleaned)
@@ -445,14 +365,20 @@ class InMemoryStore:
         )
         cleaned = re.sub(rf"({media})\s*[|｜]", "", cleaned)
         cleaned = re.sub(rf"[（(]({media})[^)）]*[)）]", "", cleaned)
-        cleaned = InMemoryStore._clean_whitespace(cleaned)
+        cleaned = TextProcessor.clean_whitespace(cleaned)
         cleaned = re.sub(rf"\s*[-|｜]\s*({media})\s*$", "", cleaned)
         cleaned = re.sub(rf"\s*({media})\s*$", "", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" -|｜")
         return cleaned[:96]
 
     @staticmethod
+    def _clean_text(text: str) -> str:
+        """Simple text cleaning without media filtering."""
+        return TextProcessor.clean_whitespace(TextProcessor.strip_html_tags(text))
+
+    @staticmethod
     def _normalize_rise_reasons(reasons: list[str]) -> list[str]:
+        """Normalize and deduplicate rise reasons with keyword prioritization."""
         cleaned: list[str] = []
         seen: set[str] = set()
         high_signal_keywords = (
@@ -508,20 +434,13 @@ class InMemoryStore:
 
     @staticmethod
     def _extract_code_tokens(text: str) -> set[str]:
-        tokens: set[str] = set()
-        for raw in re.findall(r"(?:sh|sz|bj)?\d{6}", text.lower()):
-            if raw.startswith(("sh", "sz", "bj")):
-                tokens.add(raw[2:])
-            else:
-                tokens.add(raw)
-        return tokens
+        """Extract stock code tokens from text."""
+        return TextProcessor.extract_code_tokens(text)
 
     @staticmethod
     def _truncate_reason(text: str, max_len: int = 26) -> str:
-        value = InMemoryStore._clean_whitespace(text).rstrip("。；;，, ")
-        if len(value) <= max_len:
-            return value
-        return value[:max_len].rstrip("。；;，, ")
+        """Truncate text to max length, preserving word boundaries."""
+        return TextProcessor.truncate_reason(text, max_len)
 
     @staticmethod
     def _extract_industry_label(industry_event_candidates: list[str] | None) -> str:
@@ -549,7 +468,7 @@ class InMemoryStore:
         # Remove long quoted headline fragments and trailing source-like tails.
         raw = re.sub(r"[“\"].{8,48}?[”\"]", "", raw)
         raw = re.sub(r"\s*[-|｜:：]\s*(财联社|东方财富|同花顺|新浪|证券时报|每日经济新闻).*$", "", raw)
-        raw = self._clean_whitespace(raw).strip("。；;，, ")
+        raw = TextProcessor.clean_whitespace(raw).strip("。；;，, ")
         if not raw:
             return None
 
@@ -608,7 +527,7 @@ class InMemoryStore:
         industry_hint: str = "",
     ) -> list[str]:
         symbol_code = symbol.lower().replace("sh", "").replace("sz", "").replace("bj", "")
-        industry_label = self._extract_industry_label(industry_event_candidates) or self._clean_whitespace(industry_hint)
+        industry_label = self._extract_industry_label(industry_event_candidates) or TextProcessor.clean_whitespace(industry_hint)
         combined: list[str] = []
         if core_event_candidates:
             combined.extend(core_event_candidates)
@@ -761,7 +680,7 @@ class InMemoryStore:
         evidence: list[dict[str, str]],
         inferred_sector: str,
     ) -> str:
-        value = self._clean_whitespace(theme_name)
+        value = TextProcessor.clean_whitespace(theme_name)
         generic = {"", "Unknown", "未知题材", "潜在热点", "主线热点"}
         if value in generic:
             inferred_theme = self._infer_theme_from_web_evidence(evidence)
@@ -873,7 +792,7 @@ class InMemoryStore:
         industry: str,
         evidence: list[dict[str, str]],
     ) -> list[str]:
-        industry_name = self._clean_whitespace(industry)
+        industry_name = TextProcessor.clean_whitespace(industry)
         if not industry_name:
             return []
         event_keywords = (
@@ -929,7 +848,7 @@ class InMemoryStore:
         industry: str,
         row: ScreenerResult | None,
     ) -> list[str]:
-        industry_name = self._clean_whitespace(industry)
+        industry_name = TextProcessor.clean_whitespace(industry)
         if not industry_name or industry_name == "Unknown":
             return []
         reasons: list[str] = [f"行业驱动：{industry_name}板块近期放量走强，行业资金共振带动个股补涨。"]
@@ -1129,8 +1048,8 @@ class InMemoryStore:
                     continue
                 title_raw = html.unescape((item.findtext("title") or "").strip())
                 desc_raw = html.unescape((item.findtext("description") or "").strip())
-                title = self._clean_whitespace(self._strip_html_tags(title_raw))
-                snippet = self._clean_whitespace(self._strip_html_tags(desc_raw))
+                title = self._clean_text(title_raw)
+                snippet = self._clean_text(desc_raw)
                 if self._is_low_signal_title(title):
                     continue
                 if stock_name and stock_name not in f"{title} {snippet}" and symbol.lower() not in f"{title} {snippet}".lower():
@@ -1188,7 +1107,7 @@ class InMemoryStore:
         focus_date: str | None = None,
         max_items: int = 8,
     ) -> list[dict[str, str]]:
-        industry_name = self._clean_whitespace(industry)
+        industry_name = TextProcessor.clean_whitespace(industry)
         if not industry_name or industry_name == "Unknown":
             return []
         cache_key = f"industry:{industry_name}:{focus_date or ''}:{','.join(source_urls)}"
@@ -1236,8 +1155,8 @@ class InMemoryStore:
                     continue
                 title_raw = html.unescape((item.findtext("title") or "").strip())
                 desc_raw = html.unescape((item.findtext("description") or "").strip())
-                title = self._clean_whitespace(self._strip_html_tags(title_raw))
-                snippet = self._clean_whitespace(self._strip_html_tags(desc_raw))
+                title = self._clean_text(title_raw)
+                snippet = self._clean_text(desc_raw)
                 if self._is_low_signal_title(title):
                     continue
                 if industry_name not in f"{title} {snippet}":
@@ -1977,7 +1896,7 @@ class InMemoryStore:
         evidence: list[dict[str, str]],
     ) -> str:
         profile = self._fetch_quote_profile(symbol)
-        profile_industry = self._clean_whitespace(profile.get("industry", ""))
+        profile_industry = TextProcessor.clean_whitespace(profile.get("industry", ""))
         if profile_industry:
             return profile_industry
         corpus = " ".join(
@@ -3018,10 +2937,6 @@ class InMemoryStore:
         return primary, secondary
 
     @staticmethod
-    def _clamp_score(value: float, lower: float = 0.0, upper: float = 100.0) -> float:
-        return max(lower, min(upper, value))
-
-    @staticmethod
     def _phase_hint(phase: str) -> str:
         mapping = {
             "吸筹A": "疑似筹码吸收初期，重点观察抛压衰减。",
@@ -3037,15 +2952,6 @@ class InMemoryStore:
         }
         return mapping.get(phase, "阶段未明，建议结合结构与量能进一步确认。")
 
-    @staticmethod
-    def _is_subsequence(sequence: list[str], target: tuple[str, ...]) -> bool:
-        if not sequence:
-            return False
-        idx = 0
-        for item in sequence:
-            if idx < len(target) and item == target[idx]:
-                idx += 1
-        return idx >= 5 and any(item in sequence for item in ("SOS", "JOC", "LPS"))
 
     def _latest_run_id(self) -> str | None:
         if not self._run_store:
@@ -3099,255 +3005,11 @@ class InMemoryStore:
         *,
         as_of_date: str | None = None,
     ) -> dict[str, object]:
-        candles, resolved_as_of_date = self._slice_candles_as_of(self._ensure_candles(row.symbol), as_of_date)
-        fallback_trigger_date = candles[-1].time if candles else (resolved_as_of_date or as_of_date or self._now_date())
-        if len(candles) < 25:
-            return {
-                "events": [],
-                "risk_events": [],
-                "phase": "阶段未明",
-                "phase_hint": self._phase_hint("阶段未明"),
-                "signal": "",
-                "structure_hhh": "-",
-                "sequence_ok": False,
-                "event_strength_score": 0.0,
-                "phase_score": 45.0,
-                "structure_score": 0.0,
-                "trend_score": 0.0,
-                "volatility_score": 0.0,
-                "entry_quality_score": 0.0,
-                "trigger_date": fallback_trigger_date,
-            }
-
-        window = max(20, min(window_days, len(candles)))
-        segment = candles[-window:]
-        dates = [point.time for point in segment]
-        opens = [point.open for point in segment]
-        highs = [point.high for point in segment]
-        lows = [point.low for point in segment]
-        closes = [point.close for point in segment]
-        volumes = [max(0, int(point.volume)) for point in segment]
-
-        latest_close = closes[-1]
-        latest_high = highs[-1]
-        latest_low = lows[-1]
-        tr_high = max(highs)
-        tr_low = min(lows)
-        tr_width = max(tr_high - tr_low, 0.01)
-        tr_pos = (latest_close - tr_low) / tr_width
-        avg_v5 = self._safe_mean(volumes[-5:])
-        avg_v10 = self._safe_mean(volumes[-10:])
-        avg_v20 = self._safe_mean(volumes[-20:])
-        ma20 = self._safe_mean(closes[-20:])
-        ret10 = (latest_close - closes[-11]) / max(closes[-11], 0.01) if len(closes) > 10 else 0.0
-        ret20 = (latest_close - closes[-21]) / max(closes[-21], 0.01) if len(closes) > 20 else ret10
-
-        event_dates: dict[str, str] = {}
-
-        def push_event(name: str, condition: bool, idx: int | None = None) -> None:
-            if not condition:
-                return
-            target_idx = len(dates) - 1 if idx is None else max(0, min(idx, len(dates) - 1))
-            event_dates[name] = dates[target_idx]
-
-        # PS / SC / AR / ST
-        push_event("PS", tr_pos <= 0.38 and avg_v5 >= avg_v20 * 1.12)
-        look_sc_start = max(0, len(closes) - 30)
-        sc_idx = look_sc_start + max(
-            range(len(volumes[look_sc_start:])),
-            key=lambda idx: volumes[look_sc_start + idx],
+        """Calculate Wyckoff snapshot using SignalAnalyzer."""
+        candles, resolved_as_of_date = self._slice_candles_as_of(
+            self._ensure_candles(row.symbol), as_of_date
         )
-        sc_range = max(highs[sc_idx] - lows[sc_idx], 0.01)
-        sc_close_near_low = closes[sc_idx] <= lows[sc_idx] + sc_range * 0.38
-        push_event("SC", sc_close_near_low, sc_idx)
-
-        ar_idx: int | None = None
-        if "SC" in event_dates and sc_idx < len(closes) - 3:
-            rebound_slice = closes[sc_idx + 1 :]
-            rebound_max = max(rebound_slice) if rebound_slice else closes[sc_idx]
-            if rebound_max >= closes[sc_idx] * 1.08:
-                ar_idx = sc_idx + rebound_slice.index(rebound_max) + 1
-                push_event("AR", True, ar_idx)
-
-        if "SC" in event_dates and len(closes) >= sc_idx + 6:
-            sc_low = lows[sc_idx]
-            st_idx = None
-            for idx in range(sc_idx + 1, len(closes)):
-                near_sc_low = abs(lows[idx] - sc_low) / max(sc_low, 0.01) <= 0.04
-                lower_volume = volumes[idx] <= volumes[sc_idx] * 0.85
-                if near_sc_low and lower_volume:
-                    st_idx = idx
-            push_event("ST", st_idx is not None, st_idx)
-
-        # TSO / Spring / SOS / JOC / LPS
-        support_20 = min(lows[-20:])
-        prior_support = min(lows[-25:-5]) if len(lows) > 25 else support_20
-        push_event(
-            "TSO",
-            latest_low < prior_support * 0.99 and latest_close > prior_support and avg_v5 >= avg_v20,
-        )
-        push_event(
-            "Spring",
-            latest_low < support_20 * 0.985 and latest_close > support_20 and volumes[-1] >= avg_v20 * 1.15,
-        )
-        push_event(
-            "SOS",
-            latest_close > ma20 * 1.01 and ret10 > 0.05 and avg_v5 >= avg_v20 * 1.05,
-        )
-        prior_high_20 = max(highs[-21:-1]) if len(highs) > 21 else max(highs[:-1])
-        push_event(
-            "JOC",
-            latest_close >= prior_high_20 * 1.005 and volumes[-1] >= avg_v20 * 1.2,
-        )
-        push_event(
-            "LPS",
-            (("SOS" in event_dates) or ("JOC" in event_dates))
-            and latest_close > ma20
-            and row.pullback_volume_ratio <= 0.95
-            and row.pullback_days <= 4,
-        )
-
-        # Risk-side events
-        upper_shadow_ratio = (latest_high - max(opens[-1], closes[-1])) / max(latest_high - latest_low, 0.01)
-        push_event(
-            "UTAD",
-            latest_high >= prior_high_20 * 1.01
-            and latest_close < prior_high_20
-            and upper_shadow_ratio >= 0.5
-            and volumes[-1] >= avg_v20 * 1.2,
-        )
-        push_event(
-            "SOW",
-            ret10 <= -0.05 and latest_close < ma20 and avg_v5 >= avg_v20 * 1.1,
-        )
-        recent_high_5 = max(highs[-5:])
-        prev_high_5 = max(highs[-10:-5]) if len(highs) >= 10 else recent_high_5
-        push_event(
-            "LPSY",
-            ("SOW" in event_dates or "UTAD" in event_dates)
-            and latest_close < ma20
-            and recent_high_5 <= prev_high_5 * 0.99,
-        )
-
-        events = [event for event in WYCKOFF_ACC_EVENTS if event in event_dates]
-        risk_events = [event for event in WYCKOFF_RISK_EVENTS if event in event_dates]
-
-        ordered_events = sorted(
-            event_dates.items(),
-            key=lambda item: (item[1], WYCKOFF_EVENT_ORDER.index(item[0])),
-        )
-        sequence = [event for event, _ in ordered_events if event in WYCKOFF_ACC_EVENTS]
-        sequence_ok = self._is_subsequence(sequence, WYCKOFF_ACC_EVENTS)
-
-        hh = latest_high >= max(highs[-10:-1]) * 1.003 if len(highs) > 10 else False
-        hl = (
-            min(lows[-5:]) >= min(lows[-15:-5]) * 1.01
-            if len(lows) >= 15
-            else latest_low >= min(lows[:-1]) * 1.005
-        )
-        hc = closes[-1] > closes[-5] > closes[-10] if len(closes) >= 10 else closes[-1] > closes[-2]
-        structure_hhh = f"{'HH' if hh else '-'}|{'HL' if hl else '-'}|{'HC' if hc else '-'}"
-
-        if risk_events:
-            if "LPSY" in risk_events and ret20 <= -0.12:
-                phase = "派发D" if ret20 > -0.2 else "派发E"
-            elif "UTAD" in risk_events and "SOW" in risk_events:
-                phase = "派发B"
-            else:
-                phase = "派发A" if len(risk_events) == 1 else "派发C"
-        elif "LPS" in events:
-            phase = "吸筹E"
-        elif "JOC" in events or "SOS" in events:
-            phase = "吸筹D"
-        elif "Spring" in events:
-            phase = "吸筹C"
-        elif "ST" in events or "TSO" in events:
-            phase = "吸筹B"
-        elif {"PS", "SC", "AR"} & set(events):
-            phase = "吸筹A"
-        else:
-            phase = "阶段未明"
-
-        phase_scores: dict[str, float] = {
-            "吸筹A": 58,
-            "吸筹B": 66,
-            "吸筹C": 76,
-            "吸筹D": 86,
-            "吸筹E": 91,
-            "派发A": 36,
-            "派发B": 28,
-            "派发C": 20,
-            "派发D": 14,
-            "派发E": 10,
-            "阶段未明": 45,
-        }
-        phase_score = phase_scores.get(phase, 45)
-
-        positive_event_weights = {
-            "PS": 5,
-            "SC": 8,
-            "AR": 7,
-            "ST": 6,
-            "TSO": 6,
-            "Spring": 10,
-            "SOS": 11,
-            "JOC": 10,
-            "LPS": 10,
-        }
-        risk_event_penalty = {"UTAD": -10, "SOW": -9, "LPSY": -8}
-        event_strength_score = 48.0
-        for event in events:
-            event_strength_score += positive_event_weights.get(event, 0)
-        for event in risk_events:
-            event_strength_score += risk_event_penalty.get(event, 0)
-        event_strength_score = self._clamp_score(event_strength_score)
-
-        structure_score = self._clamp_score(35 + (22 if hh else 0) + (22 if hl else 0) + (21 if hc else 0))
-        trend_score = self._clamp_score(50 + row.ret40 * 110 - row.retrace20 * 35)
-        volatility_score = self._clamp_score(100 - row.amplitude20 * 620)
-        risk_penalty = len(risk_events) * 4.5
-        entry_quality_score = self._clamp_score(
-            phase_score * 0.34
-            + event_strength_score * 0.24
-            + structure_score * 0.20
-            + trend_score * 0.14
-            + volatility_score * 0.08
-            - risk_penalty
-        )
-
-        signal_priority = [
-            "LPS",
-            "JOC",
-            "SOS",
-            "Spring",
-            "TSO",
-            "ST",
-            "AR",
-            "SC",
-            "PS",
-            "LPSY",
-            "SOW",
-            "UTAD",
-        ]
-        wyckoff_signal = next((event for event in signal_priority if event in event_dates), "")
-        trigger_date = event_dates.get(wyckoff_signal, dates[-1] if dates else fallback_trigger_date)
-
-        return {
-            "events": events,
-            "risk_events": risk_events,
-            "phase": phase,
-            "phase_hint": self._phase_hint(phase),
-            "signal": wyckoff_signal,
-            "structure_hhh": structure_hhh,
-            "sequence_ok": sequence_ok,
-            "event_strength_score": round(event_strength_score, 2),
-            "phase_score": round(phase_score, 2),
-            "structure_score": round(structure_score, 2),
-            "trend_score": round(trend_score, 2),
-            "volatility_score": round(volatility_score, 2),
-            "entry_quality_score": round(entry_quality_score, 2),
-            "trigger_date": trigger_date,
-        }
+        return SignalAnalyzer.calculate_wyckoff_snapshot(row, candles, window_days)
 
     def _signals_cache_key(
         self,
