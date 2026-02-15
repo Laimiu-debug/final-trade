@@ -41,7 +41,7 @@ from .models import (
 from .sim_engine import SimEngineError
 from .store import store
 
-app = FastAPI(title="TDX Trend Screener API", version="0.1.0")
+app = FastAPI(title="Final trade API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,

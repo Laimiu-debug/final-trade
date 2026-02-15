@@ -104,9 +104,9 @@ export function AppShell() {
         >
           <div style={{ padding: '20px 16px 12px' }}>
             <Typography.Title level={4} style={{ margin: 0 }}>
-              TDX Trend
+              Final trade
             </Typography.Title>
-            <Typography.Text type="secondary">前端原型版</Typography.Text>
+            <Typography.Text type="secondary">Final trade</Typography.Text>
           </div>
           {menu}
         </Sider>
@@ -132,7 +132,7 @@ export function AppShell() {
                 导航
               </a>
             ) : null}
-            <Typography.Text strong>通达信趋势选股系统</Typography.Text>
+            <Typography.Text strong>Final trade</Typography.Text>
           </Space>
 
           <Space size={18}>
