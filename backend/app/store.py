@@ -31,10 +31,18 @@ from .models import (
     IntradayPoint,
     MarketDataSyncRequest,
     MarketDataSyncResponse,
+    MarketNewsItem,
+    MarketNewsResponse,
     PortfolioPosition,
     PortfolioSnapshot,
     ReviewResponse,
     ReviewStats,
+    ReviewTag,
+    ReviewTagCreateRequest,
+    ReviewTagStatItem,
+    ReviewTagStatsResponse,
+    ReviewTagsPayload,
+    ReviewTagType,
     ScreenerMode,
     ScreenerParams,
     ScreenerResult,
@@ -54,12 +62,20 @@ from .models import (
     SimTradeOrder,
     SimTradingConfig,
     Stage,
+    DailyReviewListResponse,
+    DailyReviewPayload,
+    DailyReviewRecord,
     StockAnalysis,
     StockAnalysisResponse,
     StockAnnotation,
+    TradeFillTagAssignment,
+    TradeFillTagUpdateRequest,
     ThemeStage,
     TradeRecord,
     TrendClass,
+    WeeklyReviewListResponse,
+    WeeklyReviewPayload,
+    WeeklyReviewRecord,
 )
 from .market_data_sync import sync_baostock_daily
 from .sim_engine import SimAccountEngine
@@ -93,7 +109,7 @@ STOCK_POOL: list[dict[str, str]] = [
 
 
 class InMemoryStore:
-    _APP_STATE_SCHEMA_VERSION = 1
+    _APP_STATE_SCHEMA_VERSION = 2
 
     def __init__(self, app_state_path: str | None = None, sim_state_path: str | None = None) -> None:
         self._lock = RLock()
@@ -103,6 +119,10 @@ class InMemoryStore:
         self._config: AppConfig = self._default_config()
         self._latest_rows: dict[str, ScreenerResult] = {}
         self._ai_record_store: list[AIAnalysisRecord] = self._default_ai_records()
+        self._daily_review_store: dict[str, DailyReviewRecord] = {}
+        self._weekly_review_store: dict[str, WeeklyReviewRecord] = {}
+        self._review_tags: dict[ReviewTagType, list[ReviewTag]] = self._default_review_tags()
+        self._fill_tag_store: dict[str, TradeFillTagAssignment] = {}
         self._web_evidence_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
         self._quote_profile_cache: dict[str, tuple[float, dict[str, str]]] = {}
         self._signals_cache: dict[str, tuple[float, SignalsResponse]] = {}
@@ -136,6 +156,13 @@ class InMemoryStore:
             "config": self._config.model_dump(),
             "ai_records": [item.model_dump() for item in self._ai_record_store],
             "annotations": {symbol: item.model_dump() for symbol, item in self._annotation_store.items()},
+            "daily_reviews": {day: item.model_dump() for day, item in self._daily_review_store.items()},
+            "weekly_reviews": {week: item.model_dump() for week, item in self._weekly_review_store.items()},
+            "review_tags": {
+                "emotion": [item.model_dump() for item in self._review_tags.get("emotion", [])],
+                "reason": [item.model_dump() for item in self._review_tags.get("reason", [])],
+            },
+            "fill_tags": {order_id: item.model_dump() for order_id, item in self._fill_tag_store.items()},
             "audit": {
                 "updated_at": self._now_datetime(),
             },
@@ -192,6 +219,57 @@ class InMemoryStore:
                     except Exception:
                         continue
                 self._ai_record_store = restored_records
+            daily_reviews_raw = raw.get("daily_reviews")
+            if isinstance(daily_reviews_raw, dict):
+                restored_daily: dict[str, DailyReviewRecord] = {}
+                for day, item in daily_reviews_raw.items():
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        restored_daily[str(day)] = DailyReviewRecord(**item)
+                    except Exception:
+                        continue
+                self._daily_review_store = restored_daily
+            weekly_reviews_raw = raw.get("weekly_reviews")
+            if isinstance(weekly_reviews_raw, dict):
+                restored_weekly: dict[str, WeeklyReviewRecord] = {}
+                for week, item in weekly_reviews_raw.items():
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        restored_weekly[str(week)] = WeeklyReviewRecord(**item)
+                    except Exception:
+                        continue
+                self._weekly_review_store = restored_weekly
+            review_tags_raw = raw.get("review_tags")
+            if isinstance(review_tags_raw, dict):
+                merged_tags = self._default_review_tags()
+                for tag_type in ("emotion", "reason"):
+                    values = review_tags_raw.get(tag_type)
+                    if not isinstance(values, list):
+                        continue
+                    restored_tags: list[ReviewTag] = []
+                    for item in values:
+                        if not isinstance(item, dict):
+                            continue
+                        try:
+                            restored_tags.append(ReviewTag(**item))
+                        except Exception:
+                            continue
+                    if restored_tags:
+                        merged_tags[tag_type] = restored_tags
+                self._review_tags = merged_tags
+            fill_tags_raw = raw.get("fill_tags")
+            if isinstance(fill_tags_raw, dict):
+                restored_fill_tags: dict[str, TradeFillTagAssignment] = {}
+                for order_id, item in fill_tags_raw.items():
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        restored_fill_tags[str(order_id)] = TradeFillTagAssignment(**item)
+                    except Exception:
+                        continue
+                self._fill_tag_store = restored_fill_tags
             self._persist_app_state()
         except Exception:
             self._persist_app_state()
@@ -290,6 +368,66 @@ class InMemoryStore:
     @staticmethod
     def _days_ago(days: int) -> str:
         return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _default_review_tags() -> dict[ReviewTagType, list[ReviewTag]]:
+        created_at = "2026-01-01 00:00:00"
+        emotion_rows = [
+            ("emotion-01", "冲动追高", "red"),
+            ("emotion-02", "恐慌割肉", "volcano"),
+            ("emotion-03", "理性建仓", "blue"),
+            ("emotion-04", "波段操作", "purple"),
+            ("emotion-05", "止盈离场", "green"),
+            ("emotion-06", "止损离场", "orange"),
+        ]
+        reason_rows = [
+            ("reason-01", "财报利好", "geekblue"),
+            ("reason-02", "政策利好", "magenta"),
+            ("reason-03", "技术突破", "cyan"),
+            ("reason-04", "板块轮动", "gold"),
+            ("reason-05", "资金需求", "lime"),
+            ("reason-06", "止损", "volcano"),
+            ("reason-07", "止盈", "green"),
+        ]
+        return {
+            "emotion": [
+                ReviewTag(id=tag_id, name=name, color=color, created_at=created_at)
+                for tag_id, name, color in emotion_rows
+            ],
+            "reason": [
+                ReviewTag(id=tag_id, name=name, color=color, created_at=created_at)
+                for tag_id, name, color in reason_rows
+            ],
+        }
+
+    @staticmethod
+    def _resolve_week_range(week_label: str) -> tuple[str, str]:
+        match = re.match(r"^(\d{4})-W(\d{2})$", week_label)
+        if not match:
+            raise ValueError("week_label must be YYYY-Www")
+        year = int(match.group(1))
+        week = int(match.group(2))
+        start = datetime.fromisocalendar(year, week, 1).strftime("%Y-%m-%d")
+        end = datetime.fromisocalendar(year, week, 7).strftime("%Y-%m-%d")
+        return start, end
+
+    @staticmethod
+    def _unique_ordered(values: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for value in values:
+            token = str(value).strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            result.append(token)
+        return result
+
+    def _find_review_tag(self, tag_type: ReviewTagType, tag_id: str) -> ReviewTag | None:
+        for item in self._review_tags.get(tag_type, []):
+            if item.id == tag_id:
+                return item
+        return None
 
     @staticmethod
     def _hash_seed(text: str) -> int:
@@ -3395,6 +3533,401 @@ class InMemoryStore:
             date_from=date_from,
             date_to=date_to,
             date_axis=date_axis,
+        )
+
+    def get_daily_review(self, date: str) -> DailyReviewRecord | None:
+        return self._daily_review_store.get(date)
+
+    def list_daily_reviews(
+        self,
+        *,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> DailyReviewListResponse:
+        rows = list(self._daily_review_store.values())
+        if date_from:
+            rows = [row for row in rows if row.date >= date_from]
+        if date_to:
+            rows = [row for row in rows if row.date <= date_to]
+        rows.sort(key=lambda row: row.date, reverse=True)
+        return DailyReviewListResponse(items=rows)
+
+    def upsert_daily_review(self, date: str, payload: DailyReviewPayload) -> DailyReviewRecord:
+        body = payload.model_dump()
+        body["tags"] = self._unique_ordered([str(item) for item in body.get("tags", [])])
+        record = DailyReviewRecord(
+            date=date,
+            updated_at=self._now_datetime(),
+            **body,
+        )
+        self._daily_review_store[date] = record
+        self._persist_app_state()
+        return record
+
+    def delete_daily_review(self, date: str) -> bool:
+        if date not in self._daily_review_store:
+            return False
+        self._daily_review_store.pop(date, None)
+        self._persist_app_state()
+        return True
+
+    def get_weekly_review(self, week_label: str) -> WeeklyReviewRecord | None:
+        return self._weekly_review_store.get(week_label)
+
+    def list_weekly_reviews(self, *, year: int | None = None) -> WeeklyReviewListResponse:
+        rows = list(self._weekly_review_store.values())
+        if year is not None:
+            prefix = f"{year:04d}-W"
+            rows = [row for row in rows if row.week_label.startswith(prefix)]
+        rows.sort(key=lambda row: row.week_label, reverse=True)
+        return WeeklyReviewListResponse(items=rows)
+
+    def upsert_weekly_review(self, week_label: str, payload: WeeklyReviewPayload) -> WeeklyReviewRecord:
+        body = payload.model_dump()
+        start_date = str(body.get("start_date", "")).strip()
+        end_date = str(body.get("end_date", "")).strip()
+        if not start_date or not end_date:
+            start_date, end_date = self._resolve_week_range(week_label)
+        body["start_date"] = start_date
+        body["end_date"] = end_date
+        body["tags"] = self._unique_ordered([str(item) for item in body.get("tags", [])])
+        record = WeeklyReviewRecord(
+            week_label=week_label,
+            updated_at=self._now_datetime(),
+            **body,
+        )
+        self._weekly_review_store[week_label] = record
+        self._persist_app_state()
+        return record
+
+    def delete_weekly_review(self, week_label: str) -> bool:
+        if week_label not in self._weekly_review_store:
+            return False
+        self._weekly_review_store.pop(week_label, None)
+        self._persist_app_state()
+        return True
+
+    def get_market_news(self, *, query: str = "", limit: int = 20) -> MarketNewsResponse:
+        query_text = TextProcessor.clean_whitespace(query) or "A股 热点"
+        max_items = max(1, min(int(limit), 50))
+        source_urls = self._enabled_ai_source_urls(limit=8)
+        allowed_domains = self._source_domains(source_urls)
+        cache_key = f"market_news:{query_text}:{max_items}:{','.join(sorted(allowed_domains))}"
+        now_ts = time.time()
+        cached = self._web_evidence_cache.get(cache_key)
+        if cached and now_ts - cached[0] <= 180:
+            cached_items = [MarketNewsItem(**item) for item in cached[1][:max_items]]
+            return MarketNewsResponse(
+                query=query_text,
+                items=cached_items,
+                fetched_at=self._now_datetime(),
+                degraded=len(cached_items) == 0,
+                degraded_reason="NEWS_EMPTY" if len(cached_items) == 0 else None,
+            )
+
+        timeout = max(5.0, min(float(self._config.ai_timeout_sec), 12.0))
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        }
+
+        query_candidates = [query_text, f"{query_text} 财经", f"{query_text} A股"]
+        queries: list[str] = []
+        for candidate in query_candidates:
+            cleaned = TextProcessor.clean_whitespace(candidate)
+            if cleaned and cleaned not in queries:
+                queries.append(cleaned)
+        token_filters = [token.lower() for token in re.split(r"\s+", query_text) if token]
+
+        results: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+        fetch_error: str | None = None
+
+        def parse_rss(xml_text: str, domain_filter: set[str]) -> list[dict[str, str]]:
+            parsed_items: list[dict[str, str]] = []
+            try:
+                root = ET.fromstring(xml_text)
+            except ET.ParseError:
+                return parsed_items
+            for item in root.findall("./channel/item"):
+                link = (item.findtext("link") or "").strip()
+                source_node = item.find("source")
+                source_name = ""
+                source_url = ""
+                if source_node is not None:
+                    source_name = (source_node.text or "").strip()
+                    source_url = (source_node.attrib.get("url") or "").strip()
+                if self._is_low_quality_source(source_name, source_url):
+                    continue
+                filter_url = source_url or link
+                display_url = source_url or link
+                if display_url in seen_urls and link and link not in seen_urls:
+                    display_url = link
+                if not display_url or display_url in seen_urls:
+                    continue
+                if not self._url_in_domains(filter_url, domain_filter):
+                    continue
+                title_raw = html.unescape((item.findtext("title") or "").strip())
+                desc_raw = html.unescape((item.findtext("description") or "").strip())
+                title = self._clean_text(title_raw)
+                snippet = self._clean_text(desc_raw)
+                if self._is_low_signal_title(title):
+                    continue
+                corpus = f"{title} {snippet} {source_name}".lower()
+                if token_filters and not any(token in corpus for token in token_filters):
+                    continue
+                if not title and not snippet:
+                    continue
+                parsed_items.append(
+                    {
+                        "title": title[:120] if title else "无标题",
+                        "url": display_url,
+                        "snippet": (f"{source_name} | {snippet}" if source_name else snippet)[:260] if snippet else "无摘要",
+                        "pub_date": (item.findtext("pubDate") or "").strip()[:40],
+                        "source_name": source_name[:40],
+                    }
+                )
+                seen_urls.add(display_url)
+                if len(results) + len(parsed_items) >= max_items:
+                    break
+            return parsed_items
+
+        try:
+            with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers) as client:
+                for item_query in queries:
+                    if len(results) >= max_items:
+                        break
+                    response = client.get(
+                        "https://news.google.com/rss/search",
+                        params={
+                            "q": item_query,
+                            "hl": "zh-CN",
+                            "gl": "CN",
+                            "ceid": "CN:zh-Hans",
+                        },
+                    )
+                    response.raise_for_status()
+                    parsed_items = parse_rss(response.text, allowed_domains)
+                    if not parsed_items and allowed_domains:
+                        parsed_items = parse_rss(response.text, set())
+                    results.extend(parsed_items)
+                    if len(results) >= max_items:
+                        break
+        except Exception as exc:
+            fetch_error = str(exc)[:160]
+            results = []
+
+        results = results[:max_items]
+        results.sort(
+            key=lambda item: self._parse_rss_pub_date(item.get("pub_date", "")) or datetime.min,
+            reverse=True,
+        )
+        self._web_evidence_cache[cache_key] = (now_ts, results)
+        result_items = [MarketNewsItem(**item) for item in results]
+
+        return MarketNewsResponse(
+            query=query_text,
+            items=result_items,
+            fetched_at=self._now_datetime(),
+            degraded=len(result_items) == 0,
+            degraded_reason=fetch_error or ("NEWS_EMPTY" if len(result_items) == 0 else None),
+        )
+
+    def get_review_tags(self) -> ReviewTagsPayload:
+        return ReviewTagsPayload(
+            emotion=[item.model_copy() for item in self._review_tags.get("emotion", [])],
+            reason=[item.model_copy() for item in self._review_tags.get("reason", [])],
+        )
+
+    def create_review_tag(self, tag_type: ReviewTagType, payload: ReviewTagCreateRequest) -> ReviewTag:
+        name = payload.name.strip()
+        if not name:
+            raise ValueError("tag name cannot be empty")
+        for item in self._review_tags[tag_type]:
+            if item.name.strip() == name:
+                return item
+        colors = ["blue", "cyan", "green", "gold", "orange", "red", "magenta", "purple", "geekblue", "lime"]
+        color = colors[len(self._review_tags[tag_type]) % len(colors)]
+        created = ReviewTag(
+            id=f"{tag_type}-{uuid4().hex[:8]}",
+            name=name,
+            color=color,
+            created_at=self._now_datetime(),
+        )
+        self._review_tags[tag_type].append(created)
+        self._persist_app_state()
+        return created
+
+    def delete_review_tag(self, tag_type: ReviewTagType, tag_id: str) -> bool:
+        original_count = len(self._review_tags[tag_type])
+        self._review_tags[tag_type] = [item for item in self._review_tags[tag_type] if item.id != tag_id]
+        if len(self._review_tags[tag_type]) == original_count:
+            return False
+
+        updated_at = self._now_datetime()
+        for order_id in list(self._fill_tag_store.keys()):
+            row = self._fill_tag_store[order_id]
+            next_emotion = row.emotion_tag_id
+            next_reasons = list(row.reason_tag_ids)
+            changed = False
+            if tag_type == "emotion" and row.emotion_tag_id == tag_id:
+                next_emotion = None
+                changed = True
+            if tag_type == "reason" and tag_id in row.reason_tag_ids:
+                next_reasons = [item for item in row.reason_tag_ids if item != tag_id]
+                changed = True
+            if not changed:
+                continue
+            if not next_emotion and not next_reasons:
+                self._fill_tag_store.pop(order_id, None)
+                continue
+            self._fill_tag_store[order_id] = TradeFillTagAssignment(
+                order_id=order_id,
+                emotion_tag_id=next_emotion,
+                reason_tag_ids=next_reasons,
+                updated_at=updated_at,
+            )
+        self._persist_app_state()
+        return True
+
+    def get_fill_tag_assignment(self, order_id: str) -> TradeFillTagAssignment | None:
+        return self._fill_tag_store.get(order_id)
+
+    def list_fill_tag_assignments(self) -> list[TradeFillTagAssignment]:
+        rows = list(self._fill_tag_store.values())
+        rows.sort(key=lambda row: row.updated_at, reverse=True)
+        return rows
+
+    def set_fill_tag_assignment(self, order_id: str, payload: TradeFillTagUpdateRequest) -> TradeFillTagAssignment:
+        fill_resp = self._sim_engine.list_fills(
+            symbol=None,
+            side=None,
+            date_from=None,
+            date_to=None,
+            page=1,
+            page_size=200_000,
+        )
+        if not any(item.order_id == order_id for item in fill_resp.items):
+            raise ValueError("order_id not found in fill records")
+
+        emotion_tag_id = (payload.emotion_tag_id or "").strip() or None
+        if emotion_tag_id and self._find_review_tag("emotion", emotion_tag_id) is None:
+            raise ValueError(f"emotion tag not found: {emotion_tag_id}")
+
+        reason_ids = self._unique_ordered([str(item) for item in payload.reason_tag_ids])
+        for item in reason_ids:
+            if self._find_review_tag("reason", item) is None:
+                raise ValueError(f"reason tag not found: {item}")
+
+        if emotion_tag_id is None and not reason_ids:
+            self._fill_tag_store.pop(order_id, None)
+            self._persist_app_state()
+            return TradeFillTagAssignment(
+                order_id=order_id,
+                emotion_tag_id=None,
+                reason_tag_ids=[],
+                updated_at=self._now_datetime(),
+            )
+
+        record = TradeFillTagAssignment(
+            order_id=order_id,
+            emotion_tag_id=emotion_tag_id,
+            reason_tag_ids=reason_ids,
+            updated_at=self._now_datetime(),
+        )
+        self._fill_tag_store[order_id] = record
+        self._persist_app_state()
+        return record
+
+    def get_review_tag_stats(
+        self,
+        *,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> ReviewTagStatsResponse:
+        fills = self._sim_engine.list_fills(
+            symbol=None,
+            side=None,
+            date_from=date_from,
+            date_to=date_to,
+            page=1,
+            page_size=200_000,
+        ).items
+
+        emotion_acc: dict[str, dict[str, float | int | str]] = {}
+        reason_acc: dict[str, dict[str, float | int | str]] = {}
+        for tag in self._review_tags.get("emotion", []):
+            emotion_acc[tag.id] = {
+                "tag_id": tag.id,
+                "name": tag.name,
+                "color": tag.color,
+                "count": 0,
+                "gross_amount": 0.0,
+                "net_amount": 0.0,
+            }
+        for tag in self._review_tags.get("reason", []):
+            reason_acc[tag.id] = {
+                "tag_id": tag.id,
+                "name": tag.name,
+                "color": tag.color,
+                "count": 0,
+                "gross_amount": 0.0,
+                "net_amount": 0.0,
+            }
+
+        for fill in fills:
+            assignment = self._fill_tag_store.get(fill.order_id)
+            if assignment is None:
+                continue
+
+            if assignment.emotion_tag_id and assignment.emotion_tag_id in emotion_acc:
+                item = emotion_acc[assignment.emotion_tag_id]
+                item["count"] = int(item["count"]) + 1
+                item["gross_amount"] = float(item["gross_amount"]) + float(fill.gross_amount)
+                item["net_amount"] = float(item["net_amount"]) + float(fill.net_amount)
+
+            for tag_id in assignment.reason_tag_ids:
+                if tag_id not in reason_acc:
+                    continue
+                item = reason_acc[tag_id]
+                item["count"] = int(item["count"]) + 1
+                item["gross_amount"] = float(item["gross_amount"]) + float(fill.gross_amount)
+                item["net_amount"] = float(item["net_amount"]) + float(fill.net_amount)
+
+        emotion_rows = [
+            ReviewTagStatItem(
+                tag_id=str(item["tag_id"]),
+                name=str(item["name"]),
+                color=str(item["color"]),
+                count=int(item["count"]),
+                gross_amount=float(item["gross_amount"]),
+                net_amount=float(item["net_amount"]),
+            )
+            for item in emotion_acc.values()
+            if int(item["count"]) > 0
+        ]
+        reason_rows = [
+            ReviewTagStatItem(
+                tag_id=str(item["tag_id"]),
+                name=str(item["name"]),
+                color=str(item["color"]),
+                count=int(item["count"]),
+                gross_amount=float(item["gross_amount"]),
+                net_amount=float(item["net_amount"]),
+            )
+            for item in reason_acc.values()
+            if int(item["count"]) > 0
+        ]
+        emotion_rows.sort(key=lambda row: (row.count, row.net_amount), reverse=True)
+        reason_rows.sort(key=lambda row: (row.count, row.net_amount), reverse=True)
+
+        return ReviewTagStatsResponse(
+            date_from=date_from,
+            date_to=date_to,
+            emotion=emotion_rows,
+            reason=reason_rows,
         )
 
     def analyze_stock_with_ai(self, symbol: str) -> AIAnalysisRecord:

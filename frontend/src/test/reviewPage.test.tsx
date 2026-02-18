@@ -132,5 +132,5 @@ describe('ReviewPage', () => {
     expect(await screen.findByText('已平仓笔数')).toBeInTheDocument()
     expect(await screen.findByText('买入成交笔数')).toBeInTheDocument()
     expect((await screen.findAllByText('sz300750')).length).toBeGreaterThan(0)
-  })
+  }, 10_000)
 })

@@ -5,12 +5,21 @@ import type {
   AIProviderTestResponse,
   AppConfig,
   CandlePoint,
+  DailyReviewListResponse,
+  DailyReviewPayload,
+  DailyReviewRecord,
   IntradayPoint,
   MarketDataSyncRequest,
   MarketDataSyncResponse,
+  MarketNewsResponse,
   PortfolioPosition,
   PortfolioSnapshot,
   ReviewResponse,
+  ReviewTag,
+  ReviewTagCreateRequest,
+  ReviewTagStatsResponse,
+  ReviewTagsPayload,
+  ReviewTagType,
   ScreenerMode,
   ScreenerParams,
   ScreenerResult,
@@ -28,6 +37,11 @@ import type {
   StockAnalysis,
   StockAnnotation,
   SystemStorageStatus,
+  TradeFillTagAssignment,
+  TradeFillTagUpdateRequest,
+  WeeklyReviewListResponse,
+  WeeklyReviewPayload,
+  WeeklyReviewRecord,
   ThemeStage,
   TradeRecord,
   TrendClass,
@@ -50,6 +64,52 @@ const THEME_STAGES: ThemeStage[] = ['发酵中' as ThemeStage, '高潮' as Theme
 const candlesMap = new Map<string, CandlePoint[]>()
 const runStore = new Map<string, ScreenerRunDetail>()
 const annotationStore = new Map<string, StockAnnotation>()
+let dailyReviewsStore: DailyReviewRecord[] = []
+let weeklyReviewsStore: WeeklyReviewRecord[] = []
+let fillTagStore: TradeFillTagAssignment[] = []
+let reviewTagsStore: ReviewTagsPayload = {
+  emotion: [
+    { id: 'emotion-01', name: '冲动追高', color: 'red', created_at: '2026-01-01 00:00:00' },
+    { id: 'emotion-02', name: '恐慌割肉', color: 'volcano', created_at: '2026-01-01 00:00:00' },
+    { id: 'emotion-03', name: '理性建仓', color: 'blue', created_at: '2026-01-01 00:00:00' },
+  ],
+  reason: [
+    { id: 'reason-01', name: '财报利好', color: 'geekblue', created_at: '2026-01-01 00:00:00' },
+    { id: 'reason-02', name: '政策利好', color: 'magenta', created_at: '2026-01-01 00:00:00' },
+    { id: 'reason-03', name: '技术突破', color: 'cyan', created_at: '2026-01-01 00:00:00' },
+  ],
+}
+
+const marketNewsSeed: MarketNewsResponse['items'] = [
+  {
+    title: 'AI 算力板块午后拉升，多只核心股放量走强',
+    url: 'https://finance.eastmoney.com/',
+    snippet: '盘中资金回流算力与光模块方向，短线风险偏好明显提升。',
+    pub_date: dayjs().subtract(1, 'hour').format('YYYY-MM-DD HH:mm:ss'),
+    source_name: '东方财富',
+  },
+  {
+    title: '机器人产业链持续活跃，政策催化叠加订单预期',
+    url: 'https://www.cls.cn/',
+    snippet: '多家机构认为机器人板块景气度仍有向上空间，但需关注高位波动。',
+    pub_date: dayjs().subtract(3, 'hour').format('YYYY-MM-DD HH:mm:ss'),
+    source_name: '财联社',
+  },
+  {
+    title: '半导体设备公司披露业绩预告，行业景气延续分化',
+    url: 'https://www.cninfo.com.cn/',
+    snippet: '龙头公司盈利改善较快，二线标的估值修复节奏存在差异。',
+    pub_date: dayjs().subtract(6, 'hour').format('YYYY-MM-DD HH:mm:ss'),
+    source_name: '巨潮资讯',
+  },
+  {
+    title: 'A股三大指数震荡整理，成交额较前一日温和放大',
+    url: 'https://finance.eastmoney.com/',
+    snippet: '市场风格在成长与价值之间来回切换，热点轮动速度仍然较快。',
+    pub_date: dayjs().subtract(10, 'hour').format('YYYY-MM-DD HH:mm:ss'),
+    source_name: '东方财富',
+  },
+]
 
 let aiRecordsStore: AIAnalysisRecord[] = [
   {
@@ -182,6 +242,35 @@ function hashSeed(text: string) {
 function mean(values: number[]) {
   if (values.length === 0) return 0
   return values.reduce((acc, value) => acc + value, 0) / values.length
+}
+
+function uniqueTokens(values: string[]) {
+  const seen = new Set<string>()
+  const result: string[] = []
+  values.forEach((item) => {
+    const token = item.trim()
+    if (!token || seen.has(token)) return
+    seen.add(token)
+    result.push(token)
+  })
+  return result
+}
+
+function getWeekRangeFromLabel(weekLabel: string) {
+  const match = weekLabel.match(/^(\d{4})-W(\d{2})$/)
+  if (!match) {
+    const today = dayjs()
+    return { start_date: today.startOf('week').format('YYYY-MM-DD'), end_date: today.endOf('week').format('YYYY-MM-DD') }
+  }
+  const year = Number(match[1])
+  const week = Number(match[2])
+  const jan4 = dayjs(`${year}-01-04`)
+  const firstMonday = jan4.subtract((jan4.day() + 6) % 7, 'day')
+  const start = firstMonday.add((week - 1) * 7, 'day')
+  return {
+    start_date: start.format('YYYY-MM-DD'),
+    end_date: start.add(6, 'day').format('YYYY-MM-DD'),
+  }
 }
 
 function genCandles(seed: number, startPrice = 40): CandlePoint[] {
@@ -810,6 +899,221 @@ export function getReview(params?: {
       date_to: dateTo,
       date_axis: dateAxis,
     },
+  }
+}
+
+export function getDailyReviewsStore(params?: { date_from?: string; date_to?: string }): DailyReviewListResponse {
+  let rows = dailyReviewsStore.slice()
+  if (params?.date_from) rows = rows.filter((row) => row.date >= params.date_from!)
+  if (params?.date_to) rows = rows.filter((row) => row.date <= params.date_to!)
+  rows.sort((a, b) => b.date.localeCompare(a.date))
+  return { items: rows }
+}
+
+export function getDailyReviewStore(date: string): DailyReviewRecord | null {
+  return dailyReviewsStore.find((row) => row.date === date) ?? null
+}
+
+export function upsertDailyReviewStore(date: string, payload: DailyReviewPayload): DailyReviewRecord {
+  const record: DailyReviewRecord = {
+    ...payload,
+    tags: uniqueTokens(payload.tags || []),
+    date,
+    updated_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+  }
+  const next = dailyReviewsStore.filter((row) => row.date !== date)
+  next.push(record)
+  dailyReviewsStore = next.sort((a, b) => b.date.localeCompare(a.date))
+  return record
+}
+
+export function deleteDailyReviewStore(date: string) {
+  const before = dailyReviewsStore.length
+  dailyReviewsStore = dailyReviewsStore.filter((row) => row.date !== date)
+  return { deleted: dailyReviewsStore.length < before }
+}
+
+export function getWeeklyReviewsStore(params?: { year?: number }): WeeklyReviewListResponse {
+  let rows = weeklyReviewsStore.slice()
+  if (typeof params?.year === 'number') {
+    const prefix = `${params.year}-W`
+    rows = rows.filter((row) => row.week_label.startsWith(prefix))
+  }
+  rows.sort((a, b) => b.week_label.localeCompare(a.week_label))
+  return { items: rows }
+}
+
+export function getWeeklyReviewStore(weekLabel: string): WeeklyReviewRecord | null {
+  return weeklyReviewsStore.find((row) => row.week_label === weekLabel) ?? null
+}
+
+export function upsertWeeklyReviewStore(weekLabel: string, payload: WeeklyReviewPayload): WeeklyReviewRecord {
+  const weekRange = getWeekRangeFromLabel(weekLabel)
+  const record: WeeklyReviewRecord = {
+    ...payload,
+    tags: uniqueTokens(payload.tags || []),
+    week_label: weekLabel,
+    start_date: payload.start_date || weekRange.start_date,
+    end_date: payload.end_date || weekRange.end_date,
+    updated_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+  }
+  const next = weeklyReviewsStore.filter((row) => row.week_label !== weekLabel)
+  next.push(record)
+  weeklyReviewsStore = next.sort((a, b) => b.week_label.localeCompare(a.week_label))
+  return record
+}
+
+export function deleteWeeklyReviewStore(weekLabel: string) {
+  const before = weeklyReviewsStore.length
+  weeklyReviewsStore = weeklyReviewsStore.filter((row) => row.week_label !== weekLabel)
+  return { deleted: weeklyReviewsStore.length < before }
+}
+
+export function getReviewTagsStore(): ReviewTagsPayload {
+  return {
+    emotion: reviewTagsStore.emotion.slice(),
+    reason: reviewTagsStore.reason.slice(),
+  }
+}
+
+export function createReviewTagStore(tagType: ReviewTagType, payload: ReviewTagCreateRequest): ReviewTag {
+  const name = payload.name.trim()
+  const source = reviewTagsStore[tagType]
+  const exists = source.find((item) => item.name === name)
+  if (exists) return exists
+  const palette = ['blue', 'cyan', 'green', 'gold', 'orange', 'red', 'magenta', 'purple', 'geekblue', 'lime']
+  const created: ReviewTag = {
+    id: `${tagType}-${Date.now().toString(36)}`,
+    name,
+    color: palette[source.length % palette.length],
+    created_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+  }
+  reviewTagsStore = {
+    ...reviewTagsStore,
+    [tagType]: [...source, created],
+  }
+  return created
+}
+
+export function deleteReviewTagStore(tagType: ReviewTagType, tagId: string) {
+  const before = reviewTagsStore[tagType].length
+  reviewTagsStore = {
+    ...reviewTagsStore,
+    [tagType]: reviewTagsStore[tagType].filter((item) => item.id !== tagId),
+  }
+  if (tagType === 'emotion') {
+    fillTagStore = fillTagStore.map((row) => ({
+      ...row,
+      emotion_tag_id: row.emotion_tag_id === tagId ? null : row.emotion_tag_id,
+    }))
+  } else {
+    fillTagStore = fillTagStore.map((row) => ({
+      ...row,
+      reason_tag_ids: row.reason_tag_ids.filter((item) => item !== tagId),
+    }))
+  }
+  fillTagStore = fillTagStore.filter((row) => row.emotion_tag_id || row.reason_tag_ids.length > 0)
+  return { deleted: reviewTagsStore[tagType].length < before }
+}
+
+export function getReviewFillTagsStore(): TradeFillTagAssignment[] {
+  return fillTagStore.slice().sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+}
+
+export function getReviewFillTagStore(orderId: string): TradeFillTagAssignment | null {
+  return fillTagStore.find((row) => row.order_id === orderId) ?? null
+}
+
+export function updateReviewFillTagStore(orderId: string, payload: TradeFillTagUpdateRequest): TradeFillTagAssignment | null {
+  const exists = simFillsStore.some((row) => row.order_id === orderId)
+  if (!exists) return null
+  const next: TradeFillTagAssignment = {
+    order_id: orderId,
+    emotion_tag_id: payload.emotion_tag_id ?? null,
+    reason_tag_ids: uniqueTokens(payload.reason_tag_ids || []),
+    updated_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+  }
+  fillTagStore = fillTagStore.filter((row) => row.order_id !== orderId)
+  if (next.emotion_tag_id || next.reason_tag_ids.length > 0) {
+    fillTagStore.unshift(next)
+  }
+  return next
+}
+
+export function getReviewTagStatsStore(params?: { date_from?: string; date_to?: string }): ReviewTagStatsResponse {
+  let fills = simFillsStore.slice()
+  if (params?.date_from) fills = fills.filter((row) => row.fill_date >= params.date_from!)
+  if (params?.date_to) fills = fills.filter((row) => row.fill_date <= params.date_to!)
+
+  const fillMap = new Map<string, SimTradeFill>()
+  fills.forEach((row) => fillMap.set(row.order_id, row))
+
+  const emotionRows = reviewTagsStore.emotion.map((tag) => ({
+    tag_id: tag.id,
+    name: tag.name,
+    color: tag.color,
+    count: 0,
+    gross_amount: 0,
+    net_amount: 0,
+  }))
+  const reasonRows = reviewTagsStore.reason.map((tag) => ({
+    tag_id: tag.id,
+    name: tag.name,
+    color: tag.color,
+    count: 0,
+    gross_amount: 0,
+    net_amount: 0,
+  }))
+
+  const emotionIndex = new Map(emotionRows.map((row) => [row.tag_id, row]))
+  const reasonIndex = new Map(reasonRows.map((row) => [row.tag_id, row]))
+
+  fillTagStore.forEach((assignment) => {
+    const fill = fillMap.get(assignment.order_id)
+    if (!fill) return
+    if (assignment.emotion_tag_id && emotionIndex.has(assignment.emotion_tag_id)) {
+      const row = emotionIndex.get(assignment.emotion_tag_id)!
+      row.count += 1
+      row.gross_amount += fill.gross_amount
+      row.net_amount += fill.net_amount
+    }
+    assignment.reason_tag_ids.forEach((tagId) => {
+      if (!reasonIndex.has(tagId)) return
+      const row = reasonIndex.get(tagId)!
+      row.count += 1
+      row.gross_amount += fill.gross_amount
+      row.net_amount += fill.net_amount
+    })
+  })
+
+  return {
+    date_from: params?.date_from,
+    date_to: params?.date_to,
+    emotion: emotionRows.filter((row) => row.count > 0).sort((a, b) => b.count - a.count),
+    reason: reasonRows.filter((row) => row.count > 0).sort((a, b) => b.count - a.count),
+  }
+}
+
+export function getMarketNewsStore(params?: { query?: string; limit?: number }): MarketNewsResponse {
+  const normalizedQuery = (params?.query || 'A股 热点').trim()
+  const tokens = normalizedQuery.toLowerCase().split(/\s+/).filter(Boolean)
+  const limit = Math.min(Math.max(params?.limit ?? 20, 1), 50)
+
+  let rows = marketNewsSeed.slice()
+  if (tokens.length > 0) {
+    rows = rows.filter((item) => {
+      const corpus = `${item.title} ${item.snippet} ${item.source_name}`.toLowerCase()
+      return tokens.some((token) => corpus.includes(token))
+    })
+  }
+
+  const items = rows.slice(0, limit)
+  return {
+    query: normalizedQuery || 'A股 热点',
+    items,
+    fetched_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    degraded: items.length === 0,
+    degraded_reason: items.length === 0 ? 'MOCK_NEWS_EMPTY' : undefined,
   }
 }
 

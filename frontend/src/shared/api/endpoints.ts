@@ -7,10 +7,19 @@ import type {
   CandlePoint,
   DeleteAIRecordResponse,
   IntradayPayload,
+  MarketNewsResponse,
   MarketDataSyncRequest,
   MarketDataSyncResponse,
   PortfolioSnapshot,
+  DailyReviewListResponse,
+  DailyReviewPayload,
+  DailyReviewRecord,
   ReviewResponse,
+  ReviewTag,
+  ReviewTagCreateRequest,
+  ReviewTagStatsResponse,
+  ReviewTagsPayload,
+  ReviewTagType,
   ScreenerParams,
   ScreenerRunDetail,
   ScreenerRunResponse,
@@ -27,6 +36,11 @@ import type {
   StockAnalysis,
   StockAnnotation,
   SystemStorageStatus,
+  TradeFillTagAssignment,
+  TradeFillTagUpdateRequest,
+  WeeklyReviewListResponse,
+  WeeklyReviewPayload,
+  WeeklyReviewRecord,
 } from '@/types/contracts'
 
 export function runScreener(params: ScreenerParams) {
@@ -216,6 +230,109 @@ export function getReviewStats(params?: {
   const suffix = query.toString()
   return apiRequest<ReviewResponse>(`/api/review/stats${suffix ? `?${suffix}` : ''}`, {
     timeoutMs: 45_000,
+  })
+}
+
+export function getDailyReviews(params?: { date_from?: string; date_to?: string }) {
+  const query = new URLSearchParams()
+  if (params?.date_from) query.set('date_from', params.date_from)
+  if (params?.date_to) query.set('date_to', params.date_to)
+  const suffix = query.toString()
+  return apiRequest<DailyReviewListResponse>(`/api/review/daily${suffix ? `?${suffix}` : ''}`)
+}
+
+export function getDailyReview(date: string) {
+  return apiRequest<DailyReviewRecord>(`/api/review/daily/${date}`)
+}
+
+export function upsertDailyReview(date: string, payload: DailyReviewPayload) {
+  return apiRequest<DailyReviewRecord>(`/api/review/daily/${date}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deleteDailyReview(date: string) {
+  return apiRequest<{ deleted: boolean }>(`/api/review/daily/${date}`, {
+    method: 'DELETE',
+  })
+}
+
+export function getWeeklyReviews(params?: { year?: number }) {
+  const query = new URLSearchParams()
+  if (typeof params?.year === 'number') query.set('year', String(params.year))
+  const suffix = query.toString()
+  return apiRequest<WeeklyReviewListResponse>(`/api/review/weekly${suffix ? `?${suffix}` : ''}`)
+}
+
+export function getWeeklyReview(weekLabel: string) {
+  return apiRequest<WeeklyReviewRecord>(`/api/review/weekly/${weekLabel}`)
+}
+
+export function upsertWeeklyReview(weekLabel: string, payload: WeeklyReviewPayload) {
+  return apiRequest<WeeklyReviewRecord>(`/api/review/weekly/${weekLabel}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deleteWeeklyReview(weekLabel: string) {
+  return apiRequest<{ deleted: boolean }>(`/api/review/weekly/${weekLabel}`, {
+    method: 'DELETE',
+  })
+}
+
+export function getReviewTags() {
+  return apiRequest<ReviewTagsPayload>('/api/review/tags')
+}
+
+export function createReviewTag(tagType: ReviewTagType, payload: ReviewTagCreateRequest) {
+  return apiRequest<ReviewTag>(`/api/review/tags/${tagType}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deleteReviewTag(tagType: ReviewTagType, tagId: string) {
+  return apiRequest<{ deleted: boolean }>(`/api/review/tags/${tagType}/${tagId}`, {
+    method: 'DELETE',
+  })
+}
+
+export function getReviewFillTags() {
+  return apiRequest<TradeFillTagAssignment[]>('/api/review/fill-tags')
+}
+
+export function getReviewFillTag(orderId: string) {
+  return apiRequest<TradeFillTagAssignment>(`/api/review/fill-tags/${orderId}`)
+}
+
+export function updateReviewFillTag(orderId: string, payload: TradeFillTagUpdateRequest) {
+  return apiRequest<TradeFillTagAssignment>(`/api/review/fill-tags/${orderId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export function getReviewTagStats(params?: { date_from?: string; date_to?: string }) {
+  const query = new URLSearchParams()
+  if (params?.date_from) query.set('date_from', params.date_from)
+  if (params?.date_to) query.set('date_to', params.date_to)
+  const suffix = query.toString()
+  return apiRequest<ReviewTagStatsResponse>(`/api/review/tag-stats${suffix ? `?${suffix}` : ''}`)
+}
+
+export function getMarketNews(params?: { query?: string; limit?: number }) {
+  const query = new URLSearchParams()
+  if (params?.query) query.set('query', params.query)
+  if (typeof params?.limit === 'number') query.set('limit', String(params.limit))
+  const suffix = query.toString()
+  return apiRequest<MarketNewsResponse>(`/api/market/news${suffix ? `?${suffix}` : ''}`, {
+    timeoutMs: 20_000,
   })
 }
 

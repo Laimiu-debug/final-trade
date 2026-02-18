@@ -2,22 +2,35 @@ import { delay, http, HttpResponse } from 'msw'
 import {
   analyzeStockWithAI,
   cancelOrder,
+  createReviewTagStore,
   createOrder,
   createScreenerRun,
+  deleteDailyReviewStore,
+  deleteReviewTagStore,
+  deleteWeeklyReviewStore,
   deleteAIRecord,
+  getDailyReviewStore,
+  getDailyReviewsStore,
   getFills,
   getAIRecords,
   getAnalysis,
+  getMarketNewsStore,
   getCandlePayload,
   getIntradayPayload,
   getConfigStore,
   getOrders,
   getPortfolio,
   getReview,
+  getReviewFillTagStore,
+  getReviewFillTagsStore,
+  getReviewTagStatsStore,
+  getReviewTagsStore,
   getSimConfigStore,
   getScreenerRun,
   getSignals,
   getSystemStorageStore,
+  getWeeklyReviewStore,
+  getWeeklyReviewsStore,
   resetAccount,
   saveAnnotation,
   setSimConfigStore,
@@ -25,13 +38,21 @@ import {
   settleOrders,
   setConfigStore,
   testAIProvider,
+  updateReviewFillTagStore,
+  upsertDailyReviewStore,
+  upsertWeeklyReviewStore,
 } from '@/mocks/data'
 import type {
   AIProviderTestRequest,
   AppConfig,
+  DailyReviewPayload,
   MarketDataSyncRequest,
+  ReviewTagCreateRequest,
+  ReviewTagType,
   ScreenerParams,
   StockAnnotation,
+  TradeFillTagUpdateRequest,
+  WeeklyReviewPayload,
 } from '@/types/contracts'
 
 export const handlers = [
@@ -225,6 +246,158 @@ export const handlers = [
         date_from: url.searchParams.get('date_from') ?? undefined,
         date_to: url.searchParams.get('date_to') ?? undefined,
         date_axis: (url.searchParams.get('date_axis') as 'sell' | 'buy' | null) ?? undefined,
+      }),
+    )
+  }),
+
+  http.get('/api/review/daily', async ({ request }) => {
+    await delay(100)
+    const url = new URL(request.url)
+    return HttpResponse.json(
+      getDailyReviewsStore({
+        date_from: url.searchParams.get('date_from') ?? undefined,
+        date_to: url.searchParams.get('date_to') ?? undefined,
+      }),
+    )
+  }),
+
+  http.get('/api/review/daily/:date', async ({ params }) => {
+    await delay(80)
+    const row = getDailyReviewStore(String(params.date))
+    if (!row) {
+      return HttpResponse.json(
+        {
+          code: 'REVIEW_DAILY_NOT_FOUND',
+          message: '日复盘不存在',
+          trace_id: `${Date.now()}`,
+        },
+        { status: 404 },
+      )
+    }
+    return HttpResponse.json(row)
+  }),
+
+  http.put('/api/review/daily/:date', async ({ request, params }) => {
+    await delay(120)
+    const payload = (await request.json()) as DailyReviewPayload
+    return HttpResponse.json(upsertDailyReviewStore(String(params.date), payload))
+  }),
+
+  http.delete('/api/review/daily/:date', async ({ params }) => {
+    await delay(80)
+    return HttpResponse.json(deleteDailyReviewStore(String(params.date)))
+  }),
+
+  http.get('/api/review/weekly', async ({ request }) => {
+    await delay(100)
+    const url = new URL(request.url)
+    const yearRaw = url.searchParams.get('year')
+    const year = yearRaw ? Number(yearRaw) : undefined
+    return HttpResponse.json(getWeeklyReviewsStore({ year: Number.isFinite(year as number) ? year : undefined }))
+  }),
+
+  http.get('/api/review/weekly/:weekLabel', async ({ params }) => {
+    await delay(80)
+    const row = getWeeklyReviewStore(String(params.weekLabel))
+    if (!row) {
+      return HttpResponse.json(
+        {
+          code: 'REVIEW_WEEKLY_NOT_FOUND',
+          message: '周复盘不存在',
+          trace_id: `${Date.now()}`,
+        },
+        { status: 404 },
+      )
+    }
+    return HttpResponse.json(row)
+  }),
+
+  http.put('/api/review/weekly/:weekLabel', async ({ request, params }) => {
+    await delay(120)
+    const payload = (await request.json()) as WeeklyReviewPayload
+    return HttpResponse.json(upsertWeeklyReviewStore(String(params.weekLabel), payload))
+  }),
+
+  http.delete('/api/review/weekly/:weekLabel', async ({ params }) => {
+    await delay(80)
+    return HttpResponse.json(deleteWeeklyReviewStore(String(params.weekLabel)))
+  }),
+
+  http.get('/api/review/tags', async () => {
+    await delay(80)
+    return HttpResponse.json(getReviewTagsStore())
+  }),
+
+  http.post('/api/review/tags/:tagType', async ({ request, params }) => {
+    await delay(100)
+    const payload = (await request.json()) as ReviewTagCreateRequest
+    const tagType = String(params.tagType) as ReviewTagType
+    return HttpResponse.json(createReviewTagStore(tagType, payload))
+  }),
+
+  http.delete('/api/review/tags/:tagType/:tagId', async ({ params }) => {
+    await delay(100)
+    const tagType = String(params.tagType) as ReviewTagType
+    return HttpResponse.json(deleteReviewTagStore(tagType, String(params.tagId)))
+  }),
+
+  http.get('/api/review/fill-tags', async () => {
+    await delay(80)
+    return HttpResponse.json(getReviewFillTagsStore())
+  }),
+
+  http.get('/api/review/fill-tags/:orderId', async ({ params }) => {
+    await delay(80)
+    const row = getReviewFillTagStore(String(params.orderId))
+    if (!row) {
+      return HttpResponse.json(
+        {
+          code: 'REVIEW_FILL_TAG_NOT_FOUND',
+          message: '成交标签不存在',
+          trace_id: `${Date.now()}`,
+        },
+        { status: 404 },
+      )
+    }
+    return HttpResponse.json(row)
+  }),
+
+  http.put('/api/review/fill-tags/:orderId', async ({ request, params }) => {
+    await delay(100)
+    const payload = (await request.json()) as TradeFillTagUpdateRequest
+    const updated = updateReviewFillTagStore(String(params.orderId), payload)
+    if (!updated) {
+      return HttpResponse.json(
+        {
+          code: 'REVIEW_FILL_TAG_INVALID',
+          message: 'order_id not found in fill records',
+          trace_id: `${Date.now()}`,
+        },
+        { status: 400 },
+      )
+    }
+    return HttpResponse.json(updated)
+  }),
+
+  http.get('/api/review/tag-stats', async ({ request }) => {
+    await delay(100)
+    const url = new URL(request.url)
+    return HttpResponse.json(
+      getReviewTagStatsStore({
+        date_from: url.searchParams.get('date_from') ?? undefined,
+        date_to: url.searchParams.get('date_to') ?? undefined,
+      }),
+    )
+  }),
+
+  http.get('/api/market/news', async ({ request }) => {
+    await delay(140)
+    const url = new URL(request.url)
+    const limitRaw = Number(url.searchParams.get('limit') ?? 20)
+    return HttpResponse.json(
+      getMarketNewsStore({
+        query: url.searchParams.get('query') ?? undefined,
+        limit: Number.isFinite(limitRaw) ? limitRaw : 20,
       }),
     )
   }),

@@ -609,3 +609,156 @@ def test_review_supports_buy_date_axis() -> None:
     assert body["range"]["date_axis"] == "buy"
     assert body["stats"]["trade_count"] >= 1
     assert all(row["buy_date"] == buy_fill_date for row in body["trades"])
+
+
+def test_daily_review_crud() -> None:
+    date = "2026-02-17"
+    client.delete(f"/api/review/daily/{date}")
+
+    payload = {
+        "title": "日复盘测试",
+        "market_summary": "指数分化，情绪中性",
+        "operations_summary": "按计划减仓高位票",
+        "reflection": "卖点执行偏慢",
+        "tomorrow_plan": "关注低位补涨",
+        "summary": "控制回撤优先",
+        "tags": ["纪律", "风险控制", "纪律"],
+    }
+    put_resp = client.put(f"/api/review/daily/{date}", json=payload)
+    assert put_resp.status_code == 200
+    body = put_resp.json()
+    assert body["date"] == date
+    assert body["title"] == payload["title"]
+    assert body["tags"] == ["纪律", "风险控制"]
+
+    get_resp = client.get(f"/api/review/daily/{date}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["date"] == date
+
+    list_resp = client.get("/api/review/daily", params={"date_from": "2026-02-01", "date_to": "2026-02-28"})
+    assert list_resp.status_code == 200
+    items = list_resp.json()["items"]
+    assert any(item["date"] == date for item in items)
+
+    delete_resp = client.delete(f"/api/review/daily/{date}")
+    assert delete_resp.status_code == 200
+    assert delete_resp.json()["deleted"] is True
+
+    not_found_resp = client.get(f"/api/review/daily/{date}")
+    assert not_found_resp.status_code == 404
+
+
+def test_weekly_review_crud() -> None:
+    week_label = "2026-W08"
+    client.delete(f"/api/review/weekly/{week_label}")
+
+    payload = {
+        "start_date": "",
+        "end_date": "",
+        "core_goals": "聚焦主线，不追杂毛",
+        "achievements": "执行力提升",
+        "resource_analysis": "仓位集中度提升",
+        "market_rhythm": "主升后分歧",
+        "next_week_strategy": "保守应对，等回踩",
+        "key_insight": "先活下来再追收益",
+        "tags": ["主线", "风控", "主线"],
+    }
+    put_resp = client.put(f"/api/review/weekly/{week_label}", json=payload)
+    assert put_resp.status_code == 200
+    body = put_resp.json()
+    assert body["week_label"] == week_label
+    assert body["start_date"]
+    assert body["end_date"]
+    assert body["tags"] == ["主线", "风控"]
+
+    get_resp = client.get(f"/api/review/weekly/{week_label}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["week_label"] == week_label
+
+    list_resp = client.get("/api/review/weekly", params={"year": 2026})
+    assert list_resp.status_code == 200
+    items = list_resp.json()["items"]
+    assert any(item["week_label"] == week_label for item in items)
+
+    delete_resp = client.delete(f"/api/review/weekly/{week_label}")
+    assert delete_resp.status_code == 200
+    assert delete_resp.json()["deleted"] is True
+
+    not_found_resp = client.get(f"/api/review/weekly/{week_label}")
+    assert not_found_resp.status_code == 404
+
+
+def test_review_tags_fill_assignment_and_stats() -> None:
+    symbol = "sz300750"
+    dates = _load_symbol_dates(symbol)
+    order = _post_buy(symbol, dates[-6], quantity=100)
+    client.post("/api/sim/settle")
+
+    fills_resp = client.get("/api/sim/fills", params={"symbol": symbol})
+    assert fills_resp.status_code == 200
+    fills = fills_resp.json()["items"]
+    fill = next(item for item in fills if item["order_id"] == order["order_id"])
+
+    emotion_resp = client.post("/api/review/tags/emotion", json={"name": f"情绪-{order['order_id'][-4:]}"})
+    reason_resp = client.post("/api/review/tags/reason", json={"name": f"原因-{order['order_id'][-4:]}"})
+    assert emotion_resp.status_code == 200
+    assert reason_resp.status_code == 200
+    emotion_tag = emotion_resp.json()
+    reason_tag = reason_resp.json()
+
+    put_tag_resp = client.put(
+        f"/api/review/fill-tags/{fill['order_id']}",
+        json={
+            "emotion_tag_id": emotion_tag["id"],
+            "reason_tag_ids": [reason_tag["id"]],
+        },
+    )
+    assert put_tag_resp.status_code == 200
+    tagged = put_tag_resp.json()
+    assert tagged["order_id"] == fill["order_id"]
+    assert tagged["emotion_tag_id"] == emotion_tag["id"]
+    assert reason_tag["id"] in tagged["reason_tag_ids"]
+
+    get_tag_resp = client.get(f"/api/review/fill-tags/{fill['order_id']}")
+    assert get_tag_resp.status_code == 200
+    assert get_tag_resp.json()["order_id"] == fill["order_id"]
+
+    stats_resp = client.get(
+        "/api/review/tag-stats",
+        params={"date_from": dates[-10], "date_to": dates[-1]},
+    )
+    assert stats_resp.status_code == 200
+    stats = stats_resp.json()
+    emotion_rows = stats["emotion"]
+    reason_rows = stats["reason"]
+    assert any(row["tag_id"] == emotion_tag["id"] and row["count"] >= 1 for row in emotion_rows)
+    assert any(row["tag_id"] == reason_tag["id"] and row["count"] >= 1 for row in reason_rows)
+
+
+def test_market_news_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_get_market_news(*, query: str = "", limit: int = 20) -> dict[str, object]:
+        assert query == "机器人"
+        assert limit == 5
+        return {
+            "query": query,
+            "items": [
+                {
+                    "title": "机器人板块放量上涨",
+                    "url": "https://example.com/news/robot",
+                    "snippet": "机构认为产业链订单预期改善。",
+                    "pub_date": "2026-02-18 10:00:00",
+                    "source_name": "MockNews",
+                }
+            ],
+            "fetched_at": "2026-02-18 10:00:01",
+            "degraded": False,
+            "degraded_reason": None,
+        }
+
+    monkeypatch.setattr(store, "get_market_news", fake_get_market_news)
+    resp = client.get("/api/market/news", params={"query": "机器人", "limit": 5})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["query"] == "机器人"
+    assert body["degraded"] is False
+    assert len(body["items"]) == 1

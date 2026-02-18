@@ -354,6 +354,108 @@ export interface ReviewResponse {
   range: ReviewRange
 }
 
+export type ReviewTagType = 'emotion' | 'reason'
+
+export interface ReviewTag {
+  id: string
+  name: string
+  color: string
+  created_at: string
+}
+
+export interface ReviewTagsPayload {
+  emotion: ReviewTag[]
+  reason: ReviewTag[]
+}
+
+export interface ReviewTagCreateRequest {
+  name: string
+}
+
+export interface TradeFillTagUpdateRequest {
+  emotion_tag_id?: string | null
+  reason_tag_ids: string[]
+}
+
+export interface TradeFillTagAssignment {
+  order_id: string
+  emotion_tag_id?: string | null
+  reason_tag_ids: string[]
+  updated_at: string
+}
+
+export interface ReviewTagStatItem {
+  tag_id: string
+  name: string
+  color: string
+  count: number
+  gross_amount: number
+  net_amount: number
+}
+
+export interface ReviewTagStatsResponse {
+  date_from?: string
+  date_to?: string
+  emotion: ReviewTagStatItem[]
+  reason: ReviewTagStatItem[]
+}
+
+export interface DailyReviewPayload {
+  title: string
+  market_summary: string
+  operations_summary: string
+  reflection: string
+  tomorrow_plan: string
+  summary: string
+  tags: string[]
+}
+
+export interface DailyReviewRecord extends DailyReviewPayload {
+  date: string
+  updated_at: string
+}
+
+export interface DailyReviewListResponse {
+  items: DailyReviewRecord[]
+}
+
+export interface WeeklyReviewPayload {
+  start_date: string
+  end_date: string
+  core_goals: string
+  achievements: string
+  resource_analysis: string
+  market_rhythm: string
+  next_week_strategy: string
+  key_insight: string
+  tags: string[]
+}
+
+export interface WeeklyReviewRecord extends WeeklyReviewPayload {
+  week_label: string
+  updated_at: string
+}
+
+export interface WeeklyReviewListResponse {
+  items: WeeklyReviewRecord[]
+}
+
+export interface MarketNewsItem {
+  title: string
+  url: string
+  snippet: string
+  pub_date: string
+  source_name: string
+}
+
+export interface MarketNewsResponse {
+  query: string
+  items: MarketNewsItem[]
+  fetched_at: string
+  degraded: boolean
+  degraded_reason?: string
+}
+
 export interface AIAnalysisRecord {
   provider: string
   symbol: string

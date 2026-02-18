@@ -16,6 +16,7 @@ Stage = Literal["Early", "Mid", "Late"]
 MarketDataSource = Literal["tdx_only", "tdx_then_akshare", "akshare_only"]
 MarketSyncProvider = Literal["baostock"]
 MarketSyncMode = Literal["incremental", "full"]
+ReviewTagType = Literal["emotion", "reason"]
 
 
 class ApiErrorPayload(BaseModel):
@@ -341,6 +342,106 @@ class ReviewResponse(BaseModel):
     bottom_trades: list[TradeRecord] = Field(default_factory=list)
     cost_snapshot: SimTradingConfig = Field(default_factory=SimTradingConfig)
     range: ReviewRange
+
+
+class ReviewTag(BaseModel):
+    id: str
+    name: str
+    color: str
+    created_at: str
+
+
+class ReviewTagsPayload(BaseModel):
+    emotion: list[ReviewTag] = Field(default_factory=list)
+    reason: list[ReviewTag] = Field(default_factory=list)
+
+
+class ReviewTagCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=32)
+
+
+class TradeFillTagUpdateRequest(BaseModel):
+    emotion_tag_id: str | None = None
+    reason_tag_ids: list[str] = Field(default_factory=list, max_length=16)
+
+
+class TradeFillTagAssignment(BaseModel):
+    order_id: str
+    emotion_tag_id: str | None = None
+    reason_tag_ids: list[str] = Field(default_factory=list)
+    updated_at: str
+
+
+class ReviewTagStatItem(BaseModel):
+    tag_id: str
+    name: str
+    color: str
+    count: int
+    gross_amount: float
+    net_amount: float
+
+
+class ReviewTagStatsResponse(BaseModel):
+    date_from: str | None = None
+    date_to: str | None = None
+    emotion: list[ReviewTagStatItem] = Field(default_factory=list)
+    reason: list[ReviewTagStatItem] = Field(default_factory=list)
+
+
+class DailyReviewPayload(BaseModel):
+    title: str = ""
+    market_summary: str = ""
+    operations_summary: str = ""
+    reflection: str = ""
+    tomorrow_plan: str = ""
+    summary: str = ""
+    tags: list[str] = Field(default_factory=list)
+
+
+class DailyReviewRecord(DailyReviewPayload):
+    date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    updated_at: str
+
+
+class DailyReviewListResponse(BaseModel):
+    items: list[DailyReviewRecord] = Field(default_factory=list)
+
+
+class WeeklyReviewPayload(BaseModel):
+    start_date: str = ""
+    end_date: str = ""
+    core_goals: str = ""
+    achievements: str = ""
+    resource_analysis: str = ""
+    market_rhythm: str = ""
+    next_week_strategy: str = ""
+    key_insight: str = ""
+    tags: list[str] = Field(default_factory=list)
+
+
+class WeeklyReviewRecord(WeeklyReviewPayload):
+    week_label: str = Field(pattern=r"^\d{4}-W\d{2}$")
+    updated_at: str
+
+
+class WeeklyReviewListResponse(BaseModel):
+    items: list[WeeklyReviewRecord] = Field(default_factory=list)
+
+
+class MarketNewsItem(BaseModel):
+    title: str
+    url: str
+    snippet: str = ""
+    pub_date: str = ""
+    source_name: str = ""
+
+
+class MarketNewsResponse(BaseModel):
+    query: str
+    items: list[MarketNewsItem] = Field(default_factory=list)
+    fetched_at: str
+    degraded: bool = False
+    degraded_reason: str | None = None
 
 
 class SimOrdersResponse(BaseModel):

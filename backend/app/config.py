@@ -135,7 +135,7 @@ class ConfigManager:
         """Create default configuration."""
         return AppConfig(
             tdx_data_path="",
-            market_data_source="tdx",
+            market_data_source="tdx_then_akshare",
             akshare_cache_dir="",
             api_keys_path="",
             sim_trading=self._default_sim_config(),

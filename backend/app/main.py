@@ -21,8 +21,17 @@ from .models import (
     IntradayPayload,
     MarketDataSyncRequest,
     MarketDataSyncResponse,
+    MarketNewsResponse,
     PortfolioSnapshot,
+    DailyReviewListResponse,
+    DailyReviewPayload,
+    DailyReviewRecord,
     ReviewResponse,
+    ReviewTag,
+    ReviewTagCreateRequest,
+    ReviewTagStatsResponse,
+    ReviewTagsPayload,
+    ReviewTagType,
     SimFillsResponse,
     SimOrdersResponse,
     SimResetResponse,
@@ -37,6 +46,11 @@ from .models import (
     SignalsResponse,
     StockAnalysisResponse,
     StockAnnotation,
+    TradeFillTagAssignment,
+    TradeFillTagUpdateRequest,
+    WeeklyReviewListResponse,
+    WeeklyReviewPayload,
+    WeeklyReviewRecord,
 )
 from .sim_engine import SimEngineError
 from .store import store
@@ -245,6 +259,125 @@ def get_review_stats(
     date_axis: Literal["sell", "buy"] = Query(default="sell"),
 ) -> ReviewResponse:
     return store.get_review(date_from=date_from, date_to=date_to, date_axis=date_axis)
+
+
+@app.get("/api/market/news", response_model=MarketNewsResponse)
+def get_market_news(
+    query: str = Query(default="", min_length=0, max_length=120),
+    limit: int = Query(default=20, ge=1, le=50),
+) -> MarketNewsResponse:
+    return store.get_market_news(query=query, limit=limit)
+
+
+@app.get("/api/review/daily", response_model=DailyReviewListResponse)
+def get_daily_reviews(
+    date_from: str | None = Query(default=None, min_length=10, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: str | None = Query(default=None, min_length=10, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+) -> DailyReviewListResponse:
+    return store.list_daily_reviews(date_from=date_from, date_to=date_to)
+
+
+@app.get("/api/review/daily/{date}", response_model=DailyReviewRecord)
+def get_daily_review(date: str = Path(pattern=r"^\d{4}-\d{2}-\d{2}$")) -> DailyReviewRecord | JSONResponse:
+    row = store.get_daily_review(date)
+    if row is None:
+        return error_response(404, "REVIEW_DAILY_NOT_FOUND", "日复盘不存在")
+    return row
+
+
+@app.put("/api/review/daily/{date}", response_model=DailyReviewRecord)
+def put_daily_review(
+    payload: DailyReviewPayload,
+    date: str = Path(pattern=r"^\d{4}-\d{2}-\d{2}$"),
+) -> DailyReviewRecord:
+    return store.upsert_daily_review(date, payload)
+
+
+@app.delete("/api/review/daily/{date}")
+def delete_daily_review(date: str = Path(pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict[str, bool]:
+    return {"deleted": store.delete_daily_review(date)}
+
+
+@app.get("/api/review/weekly", response_model=WeeklyReviewListResponse)
+def get_weekly_reviews(year: int | None = Query(default=None, ge=2000, le=2100)) -> WeeklyReviewListResponse:
+    return store.list_weekly_reviews(year=year)
+
+
+@app.get("/api/review/weekly/{week_label}", response_model=WeeklyReviewRecord)
+def get_weekly_review(week_label: str = Path(pattern=r"^\d{4}-W\d{2}$")) -> WeeklyReviewRecord | JSONResponse:
+    row = store.get_weekly_review(week_label)
+    if row is None:
+        return error_response(404, "REVIEW_WEEKLY_NOT_FOUND", "周复盘不存在")
+    return row
+
+
+@app.put("/api/review/weekly/{week_label}", response_model=WeeklyReviewRecord)
+def put_weekly_review(
+    payload: WeeklyReviewPayload,
+    week_label: str = Path(pattern=r"^\d{4}-W\d{2}$"),
+) -> WeeklyReviewRecord | JSONResponse:
+    try:
+        return store.upsert_weekly_review(week_label, payload)
+    except ValueError as exc:
+        return error_response(400, "REVIEW_WEEKLY_INVALID", str(exc))
+
+
+@app.delete("/api/review/weekly/{week_label}")
+def delete_weekly_review(week_label: str = Path(pattern=r"^\d{4}-W\d{2}$")) -> dict[str, bool]:
+    return {"deleted": store.delete_weekly_review(week_label)}
+
+
+@app.get("/api/review/tags", response_model=ReviewTagsPayload)
+def get_review_tags() -> ReviewTagsPayload:
+    return store.get_review_tags()
+
+
+@app.post("/api/review/tags/{tag_type}", response_model=ReviewTag)
+def post_review_tag(tag_type: ReviewTagType, payload: ReviewTagCreateRequest) -> ReviewTag | JSONResponse:
+    try:
+        return store.create_review_tag(tag_type, payload)
+    except ValueError as exc:
+        return error_response(400, "REVIEW_TAG_INVALID", str(exc))
+
+
+@app.delete("/api/review/tags/{tag_type}/{tag_id}")
+def delete_review_tag(
+    tag_type: ReviewTagType,
+    tag_id: str = Path(min_length=3, max_length=64),
+) -> dict[str, bool]:
+    return {"deleted": store.delete_review_tag(tag_type, tag_id)}
+
+
+@app.get("/api/review/fill-tags", response_model=list[TradeFillTagAssignment])
+def get_fill_tag_assignments() -> list[TradeFillTagAssignment]:
+    return store.list_fill_tag_assignments()
+
+
+@app.get("/api/review/fill-tags/{order_id}", response_model=TradeFillTagAssignment)
+def get_fill_tag_assignment(order_id: str = Path(min_length=8, max_length=64)) -> TradeFillTagAssignment | JSONResponse:
+    row = store.get_fill_tag_assignment(order_id)
+    if row is None:
+        return error_response(404, "REVIEW_FILL_TAG_NOT_FOUND", "成交标签不存在")
+    return row
+
+
+@app.put("/api/review/fill-tags/{order_id}", response_model=TradeFillTagAssignment)
+def put_fill_tag_assignment(
+    payload: TradeFillTagUpdateRequest,
+    order_id: str = Path(min_length=8, max_length=64),
+) -> TradeFillTagAssignment | JSONResponse:
+    try:
+        return store.set_fill_tag_assignment(order_id, payload)
+    except ValueError as exc:
+        return error_response(400, "REVIEW_FILL_TAG_INVALID", str(exc))
+
+
+@app.get("/api/review/tag-stats", response_model=ReviewTagStatsResponse)
+def get_review_tag_stats(
+    date_from: str | None = Query(default=None, min_length=10, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: str | None = Query(default=None, min_length=10, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+) -> ReviewTagStatsResponse:
+    return store.get_review_tag_stats(date_from=date_from, date_to=date_to)
 
 
 @app.get("/api/ai/records", response_model=AIRecordsResponse)
