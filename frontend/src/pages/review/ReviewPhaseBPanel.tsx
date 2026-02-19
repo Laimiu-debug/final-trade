@@ -17,6 +17,7 @@ type ReviewSharePanelState = {
   keyword: string
   selectedTsCode: string
   note: string
+  historyItems: StockSearchResult[]
 }
 
 type PriceSnapshot = {
@@ -34,19 +35,33 @@ const REVIEW_SHARE_PANEL_STORAGE_KEY = 'final-trade-review-share-panel-v1'
 
 function loadReviewSharePanelState(): ReviewSharePanelState {
   if (typeof window === 'undefined') {
-    return { keyword: '', selectedTsCode: '', note: '' }
+    return { keyword: '', selectedTsCode: '', note: '', historyItems: [] }
   }
   try {
     const raw = window.localStorage.getItem(REVIEW_SHARE_PANEL_STORAGE_KEY)
-    if (!raw) return { keyword: '', selectedTsCode: '', note: '' }
+    if (!raw) return { keyword: '', selectedTsCode: '', note: '', historyItems: [] }
     const parsed = JSON.parse(raw) as Partial<ReviewSharePanelState>
+    const historyItems = Array.isArray(parsed.historyItems)
+      ? parsed.historyItems.filter((item): item is StockSearchResult => (
+        Boolean(item)
+        && typeof item.ts_code === 'string'
+        && typeof item.name === 'string'
+        && typeof item.symbol === 'string'
+        && typeof item.industry === 'string'
+        && typeof item.market === 'string'
+        && typeof item.cnspell === 'string'
+        && typeof item.exchange === 'string'
+        && typeof item.list_status === 'string'
+      ))
+      : []
     return {
       keyword: typeof parsed.keyword === 'string' ? parsed.keyword : '',
       selectedTsCode: typeof parsed.selectedTsCode === 'string' ? parsed.selectedTsCode : '',
       note: typeof parsed.note === 'string' ? parsed.note : '',
+      historyItems,
     }
   } catch {
-    return { keyword: '', selectedTsCode: '', note: '' }
+    return { keyword: '', selectedTsCode: '', note: '', historyItems: [] }
   }
 }
 
@@ -203,14 +218,16 @@ function drawWrappedText(
 }
 
 export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) {
+  const persistedState = useMemo(() => loadReviewSharePanelState(), [])
   const { message } = AntdApp.useApp()
   const navigate = useNavigate()
-  const [keyword, setKeyword] = useState(() => loadReviewSharePanelState().keyword)
+  const [keyword, setKeyword] = useState(persistedState.keyword)
   const [rows, setRows] = useState<StockSearchResult[]>([])
   const [loading, setLoading] = useState(false)
   const [selected, setSelected] = useState<StockSearchResult | null>(null)
-  const [note, setNote] = useState(() => loadReviewSharePanelState().note)
-  const [preferredTsCode, setPreferredTsCode] = useState(() => loadReviewSharePanelState().selectedTsCode)
+  const [note, setNote] = useState(persistedState.note)
+  const [preferredTsCode, setPreferredTsCode] = useState(persistedState.selectedTsCode)
+  const [historyItems, setHistoryItems] = useState<StockSearchResult[]>(persistedState.historyItems)
 
   const statsQuery = useQuery({
     queryKey: ['stock-library-stats'],
@@ -262,8 +279,28 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
       keyword,
       selectedTsCode: selected?.ts_code || preferredTsCode || '',
       note,
+      historyItems,
     })
-  }, [keyword, note, preferredTsCode, selected?.ts_code])
+  }, [historyItems, keyword, note, preferredTsCode, selected?.ts_code])
+
+  function updateSelectionHistory(row: StockSearchResult) {
+    setHistoryItems((previous) => {
+      const deduped = previous.filter((item) => item.ts_code !== row.ts_code)
+      return [row, ...deduped].slice(0, 12)
+    })
+  }
+
+  function applySelection(row: StockSearchResult, ensureInRows = false) {
+    setSelected(row)
+    setPreferredTsCode(row.ts_code)
+    updateSelectionHistory(row)
+    if (ensureInRows) {
+      setRows((previous) => {
+        if (previous.some((item) => item.ts_code === row.ts_code)) return previous
+        return [row, ...previous]
+      })
+    }
+  }
 
   const selectedSymbol = useMemo(() => {
     if (!selected) return ''
@@ -465,7 +502,7 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
   }
 
   function handleOpenChart(row: StockSearchResult) {
-    setPreferredTsCode(row.ts_code)
+    applySelection(row, true)
     const prefixedSymbol = tsCodeToPrefixedSymbol(row.ts_code)
     if (!prefixedSymbol) {
       message.warning('该股票缺少行情代码，无法打开K线页')
@@ -520,6 +557,35 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
             value={keyword}
             onChange={(event) => setKeyword(event.target.value)}
           />
+          <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
+            <Space wrap>
+              <Typography.Text type="secondary">历史选择:</Typography.Text>
+              {historyItems.length === 0 ? <Typography.Text type="secondary">暂无</Typography.Text> : null}
+              {historyItems.map((item) => (
+                <Tag.CheckableTag
+                  key={item.ts_code}
+                  checked={selected?.ts_code === item.ts_code}
+                  onChange={() => {
+                    setKeyword(item.ts_code)
+                    applySelection(item, true)
+                  }}
+                >
+                  {item.name} {item.ts_code}
+                </Tag.CheckableTag>
+              ))}
+            </Space>
+            {historyItems.length > 0 ? (
+              <Button
+                size="small"
+                type="link"
+                onClick={() => {
+                  setHistoryItems([])
+                }}
+              >
+                清空历史
+              </Button>
+            ) : null}
+          </Space>
           <Table
             rowKey={(row) => row.ts_code}
             loading={loading}
@@ -533,14 +599,12 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
               onChange: (keys) => {
                 const key = String(keys[0] || '')
                 const row = rows.find((item) => item.ts_code === key) || null
-                setSelected(row)
-                if (row) setPreferredTsCode(row.ts_code)
+                if (row) applySelection(row)
               },
             }}
             onRow={(record) => ({
               onClick: () => {
-                setSelected(record)
-                setPreferredTsCode(record.ts_code)
+                applySelection(record)
               },
             })}
           />
