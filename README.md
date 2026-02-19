@@ -2,7 +2,7 @@
 
 Language:
 - English: `README.md`
-- 中文: `README.zh-CN.md`
+- Chinese: `README.zh-CN.md`
 
 Integrated stock workflow:
 - Screener funnel
@@ -14,32 +14,29 @@ Integrated stock workflow:
 Backend: FastAPI  
 Frontend: React + Vite + Ant Design + React Query
 
-## Recent Updates (2026-02)
+## Recent Updates (2026-02-19)
 
-- Replaced direct "simulate buy" on Signals/Screener pages with "Add to Pending Buy List".
-- Added centralized pending order workflow on Trade page.
-- Pending buy sizing now supports:
-  - `lots`
-  - `amount`
-  - `position (%)`
-- Portfolio color convention changed to:
-  - gain = red
-  - loss = green
-- Review stats now support date axis:
-  - `sell` (by sell date)
-  - `buy` (by buy date)
-- Signals filter updated:
-  - `Active` excludes expiring signals
-  - `Expiring` is a separate status
-- Fixed signal expiry logic issue that could mark almost all signals as expiring.
-- Improved AI analysis table UI to avoid text overlap on zoom.
+- Review workspace upgrades:
+  - Share card panel now persists search keyword, selected stock, notes, and selection history.
+  - Market index panel now persists selected indices, market mood, and mood notes.
+- Pending buy workflow centralization:
+  - Signals/Screener "simulate buy" now goes through Trade-page pending list.
+  - Pending buy sizing supports `lots`, `amount`, and `position (%)`.
+- Review and signals refinements:
+  - Review stats support `date_axis=sell|buy`.
+  - Signals status split between `Active` and `Expiring`.
+  - Fixed signal expiry logic edge case.
+- UI updates:
+  - Portfolio color convention: gain = red, loss = green.
+  - AI analysis table readability improved under browser zoom.
 
 ## Repository Structure
 
 ```text
-backend/    FastAPI services and local state
-frontend/   React application
-docs/       Architecture and usage docs
+backend/        FastAPI services and local persistence
+frontend/       React application
+docs/           Architecture and usage docs
+runtime-logs/   Dev startup logs
 ```
 
 ## One-Click Start
@@ -56,12 +53,19 @@ or
 .\start-dev.ps1
 ```
 
-Default behavior:
-- Stops stale processes on ports `8000` and `4173`
-- Starts backend on `127.0.0.1:8000`
+Default behavior (`start-dev.ps1`):
+- Stops stale processes on ports `8010`, `8000`, and `4173`
+- Starts backend on `127.0.0.1:8010`
 - Starts frontend on `127.0.0.1:4173`
+- Automatically sets `VITE_API_PROXY_TARGET` to current backend URL
 - Opens browser automatically
 - Writes logs to `runtime-logs/`
+
+Optional parameters:
+
+```powershell
+.\start-dev.ps1 -BackendUrl "http://127.0.0.1:8011" -FrontendUrl "http://127.0.0.1:4174" -NoBrowser
+```
 
 ### Linux / macOS
 
@@ -69,6 +73,8 @@ Default behavior:
 chmod +x start.sh
 ./start.sh
 ```
+
+Note: current `start.sh` starts backend on `127.0.0.1:8000`.
 
 ## Manual Start
 
@@ -90,6 +96,13 @@ npm install
 npm run dev:host
 ```
 
+If backend is not `8000`, set proxy target before starting frontend:
+
+```powershell
+$env:VITE_API_PROXY_TARGET="http://127.0.0.1:8010"
+npm run dev:host
+```
+
 ## Core Features
 
 ### Screener and Signals
@@ -104,21 +117,14 @@ npm run dev:host
 - A-share style T+1 simulation
 - 100-share lot enforcement
 - Place/cancel/settle/reset order flow
-- Configurable cost model:
-  - commission
-  - minimum commission
-  - stamp tax
-  - transfer fee
-  - slippage
+- Configurable costs: commission, minimum commission, stamp tax, transfer fee, slippage
 - FIFO lot matching on sell
 
 ### Pending Buy Workflow
 
-- Add candidates from:
-  - Signals page
-  - Screener page
-- Manage and submit drafts on Trade page
-- Per-draft editable sizing mode and value
+- Add candidates from Signals page and Screener page
+- Manage/edit/submit drafts on Trade page
+- Per-draft sizing mode and value
 - Batch submit selected drafts into real sim orders
 
 ### Portfolio and Review
@@ -126,25 +132,35 @@ npm run dev:host
 - Portfolio snapshot and positions
 - Realized/unrealized PnL
 - Review stats with buy/sell date axis
-- Charts:
-  - equity curve
-  - drawdown curve
-  - monthly returns
+- Daily/weekly review records
+- Review tags and per-fill tag assignments
+- Market index watch panel with saved index selection
+- Share card workspace with local state persistence
 - Export: Excel / CSV / PDF
 
 ### AI Records
 
 - AI analysis record list with filters
+- Prompt preview and provider test endpoint
 - Link to stock chart annotation page
 - Record deletion and local sync
-- Improved table readability and layout stability
 
 ## Common API Endpoints
 
+- `GET /health`
 - `POST /api/screener/run`
 - `GET /api/screener/runs/{run_id}`
 - `GET /api/screener/latest-run`
 - `GET /api/signals`
+- `GET /api/stocks/{symbol}/candles`
+- `GET /api/stocks/{symbol}/intraday`
+- `GET /api/stocks/{symbol}/analysis`
+- `PUT /api/stocks/{symbol}/annotations`
+- `POST /api/stocks/{symbol}/ai-analyze`
+- `GET /api/stocks/{symbol}/ai-prompt-preview`
+- `GET /api/ai/records`
+- `DELETE /api/ai/records`
+- `POST /api/ai/providers/test`
 - `POST /api/sim/orders`
 - `GET /api/sim/orders`
 - `GET /api/sim/fills`
@@ -155,6 +171,24 @@ npm run dev:host
 - `PUT /api/sim/config`
 - `GET /api/sim/portfolio`
 - `GET /api/review/stats` (`date_axis=sell|buy`)
+- `GET /api/review/daily`
+- `GET /api/review/daily/{date}`
+- `PUT /api/review/daily/{date}`
+- `DELETE /api/review/daily/{date}`
+- `GET /api/review/weekly`
+- `GET /api/review/weekly/{week_label}`
+- `PUT /api/review/weekly/{week_label}`
+- `DELETE /api/review/weekly/{week_label}`
+- `GET /api/review/tags`
+- `POST /api/review/tags/{tag_type}`
+- `DELETE /api/review/tags/{tag_type}/{tag_id}`
+- `GET /api/review/fill-tags`
+- `GET /api/review/fill-tags/{order_id}`
+- `PUT /api/review/fill-tags/{order_id}`
+- `GET /api/review/tag-stats`
+- `GET /api/market/news`
+- `GET /api/config`
+- `PUT /api/config`
 - `POST /api/system/sync-market-data`
 - `GET /api/system/storage`
 
@@ -190,9 +224,11 @@ npm run build
 ## First Run Checklist
 
 1. Start services with `start.bat` (Windows) or `start.sh` (Linux/macOS).
-2. Confirm backend is reachable at `http://127.0.0.1:8000/health`.
+2. Confirm backend is reachable:
+   - Windows default: `http://127.0.0.1:8010/health`
+   - Linux/macOS `start.sh`: `http://127.0.0.1:8000/health`
 3. Open frontend at `http://127.0.0.1:4173`.
-4. Run one screener pass, then open Signals/Trade/Review pages in sequence.
+4. Run one screener pass, then open Signals, Trade, and Review pages in sequence.
 
 ## Troubleshooting
 
@@ -203,8 +239,11 @@ npm run build
 - Data load failed:
   - check `tdx_data_path` and market data source in Settings
   - trigger `POST /api/system/sync-market-data`
+- Backend started but frontend API requests fail:
+  - check backend port
+  - set `VITE_API_PROXY_TARGET` to your backend URL before `npm run dev:host`
 - Port occupied:
-  - backend: `uvicorn app.main:app --reload --host 127.0.0.1 --port 8001`
+  - backend: `uvicorn app.main:app --reload --host 127.0.0.1 --port 8011`
   - frontend: `npm run dev -- --port 4174`
 - Need full reset:
   - stop services
