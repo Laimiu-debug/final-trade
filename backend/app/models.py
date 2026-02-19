@@ -438,8 +438,14 @@ class MarketNewsItem(BaseModel):
 
 class MarketNewsResponse(BaseModel):
     query: str
+    age_hours: int = 72
+    symbol: str | None = None
+    symbol_name: str | None = None
+    source_domains: list[str] = Field(default_factory=list)
     items: list[MarketNewsItem] = Field(default_factory=list)
     fetched_at: str
+    cache_hit: bool = False
+    fallback_used: bool = False
     degraded: bool = False
     degraded_reason: str | None = None
 

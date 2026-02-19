@@ -264,9 +264,24 @@ def get_review_stats(
 @app.get("/api/market/news", response_model=MarketNewsResponse)
 def get_market_news(
     query: str = Query(default="", min_length=0, max_length=120),
+    symbol: str | None = Query(default=None, min_length=0, max_length=16),
+    source_domains: str | None = Query(default=None, min_length=0, max_length=300),
+    age_hours: int = Query(default=72, ge=1, le=240, description="支持 24/48/72，其他值会回退到 72"),
+    refresh: bool = Query(default=False, description="true 时跳过短缓存，强制拉取最新资讯"),
     limit: int = Query(default=20, ge=1, le=50),
 ) -> MarketNewsResponse:
-    return store.get_market_news(query=query, limit=limit)
+    domains: list[str] = []
+    if source_domains:
+        raw_tokens = source_domains.replace(";", ",").replace("|", ",")
+        domains = [token.strip() for token in raw_tokens.split(",") if token.strip()]
+    return store.get_market_news(
+        query=query,
+        symbol=symbol,
+        source_domains=domains,
+        age_hours=age_hours,
+        refresh=refresh,
+        limit=limit,
+    )
 
 
 @app.get("/api/review/daily", response_model=DailyReviewListResponse)

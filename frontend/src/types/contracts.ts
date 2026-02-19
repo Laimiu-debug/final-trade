@@ -450,8 +450,14 @@ export interface MarketNewsItem {
 
 export interface MarketNewsResponse {
   query: string
+  age_hours: number
+  symbol?: string
+  symbol_name?: string
+  source_domains: string[]
   items: MarketNewsItem[]
   fetched_at: string
+  cache_hit: boolean
+  fallback_used: boolean
   degraded: boolean
   degraded_reason?: string
 }

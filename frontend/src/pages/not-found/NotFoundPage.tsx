@@ -7,7 +7,7 @@ export function NotFoundPage() {
     <Result
       status="404"
       title="页面不存在"
-      subTitle="路由未匹配，请返回主流程页面。"
+      subTitle="路由未匹配，请返回主流程页面继续操作。"
       extra={
         <Button type="primary" onClick={() => navigate('/screener')}>
           返回选股控制台
@@ -16,4 +16,3 @@ export function NotFoundPage() {
     />
   )
 }
-

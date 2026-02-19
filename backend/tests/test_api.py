@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import sys
@@ -139,7 +139,7 @@ def test_run_and_get_screener() -> None:
     body = detail_resp.json()
     assert body["as_of_date"] == as_of_date
     assert body["step_summary"]["input_count"] > 0
-    assert body["step_pools"]["input"][0]["name"] != "科技样本1"
+    assert body["step_pools"]["input"][0]["name"] != "绉戞妧鏍锋湰1"
 
 
 def test_annotation_roundtrip() -> None:
@@ -616,20 +616,20 @@ def test_daily_review_crud() -> None:
     client.delete(f"/api/review/daily/{date}")
 
     payload = {
-        "title": "日复盘测试",
-        "market_summary": "指数分化，情绪中性",
-        "operations_summary": "按计划减仓高位票",
-        "reflection": "卖点执行偏慢",
-        "tomorrow_plan": "关注低位补涨",
-        "summary": "控制回撤优先",
-        "tags": ["纪律", "风险控制", "纪律"],
+        "title": "daily review test",
+        "market_summary": "market was mixed and sentiment neutral",
+        "operations_summary": "reduced high-beta positions",
+        "reflection": "exit timing was slightly slow",
+        "tomorrow_plan": "watch low-risk pullback entries",
+        "summary": "capital protection first",
+        "tags": ["discipline", "risk-control", "discipline"],
     }
     put_resp = client.put(f"/api/review/daily/{date}", json=payload)
     assert put_resp.status_code == 200
     body = put_resp.json()
     assert body["date"] == date
     assert body["title"] == payload["title"]
-    assert body["tags"] == ["纪律", "风险控制"]
+    assert body["tags"] == ["discipline", "risk-control"]
 
     get_resp = client.get(f"/api/review/daily/{date}")
     assert get_resp.status_code == 200
@@ -655,13 +655,13 @@ def test_weekly_review_crud() -> None:
     payload = {
         "start_date": "",
         "end_date": "",
-        "core_goals": "聚焦主线，不追杂毛",
-        "achievements": "执行力提升",
-        "resource_analysis": "仓位集中度提升",
-        "market_rhythm": "主升后分歧",
-        "next_week_strategy": "保守应对，等回踩",
-        "key_insight": "先活下来再追收益",
-        "tags": ["主线", "风控", "主线"],
+        "core_goals": "focus on main trend and avoid noise",
+        "achievements": "execution quality improved",
+        "resource_analysis": "position concentration improved",
+        "market_rhythm": "uptrend with periodic rotations",
+        "next_week_strategy": "defensive and wait for pullbacks",
+        "key_insight": "survival before return maximization",
+        "tags": ["main-trend", "risk-control", "main-trend"],
     }
     put_resp = client.put(f"/api/review/weekly/{week_label}", json=payload)
     assert put_resp.status_code == 200
@@ -669,7 +669,7 @@ def test_weekly_review_crud() -> None:
     assert body["week_label"] == week_label
     assert body["start_date"]
     assert body["end_date"]
-    assert body["tags"] == ["主线", "风控"]
+    assert body["tags"] == ["main-trend", "risk-control"]
 
     get_resp = client.get(f"/api/review/weekly/{week_label}")
     assert get_resp.status_code == 200
@@ -699,8 +699,8 @@ def test_review_tags_fill_assignment_and_stats() -> None:
     fills = fills_resp.json()["items"]
     fill = next(item for item in fills if item["order_id"] == order["order_id"])
 
-    emotion_resp = client.post("/api/review/tags/emotion", json={"name": f"情绪-{order['order_id'][-4:]}"})
-    reason_resp = client.post("/api/review/tags/reason", json={"name": f"原因-{order['order_id'][-4:]}"})
+    emotion_resp = client.post("/api/review/tags/emotion", json={"name": f"鎯呯华-{order['order_id'][-4:]}"})
+    reason_resp = client.post("/api/review/tags/reason", json={"name": f"鍘熷洜-{order['order_id'][-4:]}"})
     assert emotion_resp.status_code == 200
     assert reason_resp.status_code == 200
     emotion_tag = emotion_resp.json()
@@ -736,29 +736,62 @@ def test_review_tags_fill_assignment_and_stats() -> None:
 
 
 def test_market_news_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_get_market_news(*, query: str = "", limit: int = 20) -> dict[str, object]:
-        assert query == "机器人"
+    def fake_get_market_news(
+        *,
+        query: str = "",
+        symbol: str | None = None,
+        source_domains: list[str] | None = None,
+        age_hours: int = 72,
+        refresh: bool = False,
+        limit: int = 20,
+    ) -> dict[str, object]:
+        assert query == "robotics"
+        assert symbol == "sz300750"
+        assert source_domains == ["finance.eastmoney.com", "cls.cn"]
+        assert age_hours == 24
+        assert refresh is False
         assert limit == 5
         return {
             "query": query,
+            "age_hours": age_hours,
+            "symbol": symbol,
+            "symbol_name": "Ningde Times",
+            "source_domains": source_domains or [],
             "items": [
                 {
-                    "title": "机器人板块放量上涨",
+                    "title": "Robotics sector moves higher with rising volume",
                     "url": "https://example.com/news/robot",
-                    "snippet": "机构认为产业链订单预期改善。",
+                    "snippet": "Institutions expect improving upstream orders.",
                     "pub_date": "2026-02-18 10:00:00",
                     "source_name": "MockNews",
                 }
             ],
             "fetched_at": "2026-02-18 10:00:01",
+            "cache_hit": False,
+            "fallback_used": False,
             "degraded": False,
             "degraded_reason": None,
         }
 
     monkeypatch.setattr(store, "get_market_news", fake_get_market_news)
-    resp = client.get("/api/market/news", params={"query": "机器人", "limit": 5})
+    resp = client.get(
+        "/api/market/news",
+        params={
+            "query": "robotics",
+            "symbol": "sz300750",
+            "source_domains": "finance.eastmoney.com,cls.cn",
+            "age_hours": 24,
+            "limit": 5,
+        },
+    )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["query"] == "机器人"
+    assert body["query"] == "robotics"
+    assert body["age_hours"] == 24
+    assert body["symbol"] == "sz300750"
+    assert body["symbol_name"] == "Ningde Times"
+    assert body["source_domains"] == ["finance.eastmoney.com", "cls.cn"]
+    assert body["cache_hit"] is False
+    assert body["fallback_used"] is False
     assert body["degraded"] is False
     assert len(body["items"]) == 1

@@ -6,6 +6,8 @@ import { SignalsPage } from '@/pages/signals/SignalsPage'
 import { TradePage } from '@/pages/trade/TradePage'
 import { PortfolioPage } from '@/pages/portfolio/PortfolioPage'
 import { ReviewPage } from '@/pages/review/ReviewPage'
+import { ReviewSharePage } from '@/pages/review/ReviewSharePage'
+import { ReviewNewsPage } from '@/pages/review/ReviewNewsPage'
 import { AiPage } from '@/pages/ai/AiPage'
 import { SettingsPage } from '@/pages/settings/SettingsPage'
 import { NotFoundPage } from '@/pages/not-found/NotFoundPage'
@@ -21,11 +23,12 @@ export function AppRoutes() {
         <Route path="/trade" element={<TradePage />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
         <Route path="/review" element={<ReviewPage />} />
+        <Route path="/review/share" element={<ReviewSharePage />} />
+        <Route path="/review/news" element={<ReviewNewsPage />} />
         <Route path="/ai" element={<AiPage />} />
         <Route path="/settings" element={<SettingsPage />} />
+        <Route path="*" element={<NotFoundPage />} />
       </Route>
-      <Route path="*" element={<NotFoundPage />} />
     </Routes>
   )
 }
-

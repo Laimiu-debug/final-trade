@@ -25,6 +25,7 @@ import { ApiError } from '@/shared/api/client'
 import { getPortfolio, getReviewStats, getSimFills } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { ReviewWorkspacePanel } from '@/pages/review/ReviewWorkspacePanel'
+import { ReviewMarketIndicesPanel } from '@/pages/review/ReviewMarketIndicesPanel'
 import type { PortfolioPosition, ReviewResponse, SimTradeFill, TradeRecord } from '@/types/contracts'
 import { formatMoney, formatPct } from '@/shared/utils/format'
 
@@ -492,6 +493,7 @@ export function ReviewPage() {
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
       <PageHeader title="交易记录与复盘" subtitle="复盘统计默认展示已平仓交易，同时补充成交与持仓快照，避免空白。支持 Excel/CSV/PDF 导出。" />
+      <ReviewMarketIndicesPanel />
       <ReviewWorkspacePanel dateFrom={dateFrom} dateTo={dateTo} fills={fills} />
 
       <Card className="glass-card" variant="borderless">
@@ -526,7 +528,7 @@ export function ReviewPage() {
         <Alert
           showIcon
           type="info"
-          message="当前仅有买入成交，暂无已平仓交易"
+          title="当前仅有买入成交，暂无已平仓交易"
           description="复盘收益类指标只按已卖出交易计算。你可以先在模拟交易页卖出，或先参考下方成交统计与持仓浮盈亏。"
         />
       ) : null}

@@ -1,6 +1,6 @@
 ﻿param(
   [string]$FrontendUrl = 'http://127.0.0.1:4173',
-  [string]$BackendUrl = 'http://127.0.0.1:8000',
+  [string]$BackendUrl = 'http://127.0.0.1:8010',
   [switch]$NoBrowser
 )
 
@@ -10,6 +10,16 @@ $repoRoot = $PSScriptRoot
 $backendDir = Join-Path $repoRoot 'backend'
 $frontendDir = Join-Path $repoRoot 'frontend'
 $logDir = Join-Path $repoRoot 'runtime-logs'
+$backendPort = 8010
+try {
+  $backendUri = [System.Uri]$BackendUrl
+  if ($backendUri.Port -gt 0) {
+    $backendPort = $backendUri.Port
+  }
+}
+catch {
+  $backendPort = 8010
+}
 
 function Get-ListeningPids {
   param([int]$Port)
@@ -169,6 +179,8 @@ Stop-MatchingProcesses -ImageName 'python.exe' -CommandPattern 'uvicorn\\s+app\\
 Stop-MatchingProcesses -ImageName 'node.exe' -CommandPattern '(vite(\\.js)?\\s+--host\\s+127\\.0\\.0\\.1\\s+--port\\s+4173)|(npm\\s+run\\s+dev:host)' -Label 'frontend'
 Stop-MatchingProcesses -ImageName 'cmd.exe' -CommandPattern 'npm\\s+run\\s+dev:host' -Label 'frontend-wrapper'
 
+Stop-PortProcesses -Port $backendPort
+# Also clear old default backend port to avoid stale process conflicts.
 Stop-PortProcesses -Port 8000
 Stop-PortProcesses -Port 4173
 
@@ -196,8 +208,8 @@ if (-not $npmCmd) {
   throw 'npm not found. Please install Node.js first.'
 }
 
-$backendProc = Start-Process -FilePath $backendPython -ArgumentList @('-m', 'uvicorn', 'app.main:app', '--reload', '--host', '127.0.0.1', '--port', '8000') -WorkingDirectory $backendDir -RedirectStandardOutput $backendOut -RedirectStandardError $backendErr -PassThru
-$frontendProc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', 'npm run dev:host') -WorkingDirectory $frontendDir -RedirectStandardOutput $frontendOut -RedirectStandardError $frontendErr -PassThru
+$backendProc = Start-Process -FilePath $backendPython -ArgumentList @('-m', 'uvicorn', 'app.main:app', '--reload', '--host', '127.0.0.1', '--port', "$backendPort") -WorkingDirectory $backendDir -RedirectStandardOutput $backendOut -RedirectStandardError $backendErr -PassThru
+$frontendProc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', "set VITE_API_PROXY_TARGET=$BackendUrl && npm run dev:host") -WorkingDirectory $frontendDir -RedirectStandardOutput $frontendOut -RedirectStandardError $frontendErr -PassThru
 
 Write-Host "Backend PID: $($backendProc.Id)"
 Write-Host "Frontend PID: $($frontendProc.Id)"
@@ -225,3 +237,9 @@ if (-not $NoBrowser) {
   Start-Process $FrontendUrl
   Write-Host 'Browser opened.'
 }
+
+
+
+
+
+

@@ -48,8 +48,6 @@ import type {
   WeeklyReviewRecord,
 } from '@/types/contracts'
 import { formatMoney } from '@/shared/utils/format'
-import { ReviewPhaseBPanel } from '@/pages/review/ReviewPhaseBPanel'
-import { ReviewPhaseCPanel } from '@/pages/review/ReviewPhaseCPanel'
 
 type WorkspaceProps = {
   dateFrom: string
@@ -331,6 +329,56 @@ export function ReviewWorkspacePanel({ dateFrom, dateTo, fills }: WorkspaceProps
     return weeklyListQuery.data?.items.find((item) => item.week_label === weekLabel) ?? null
   }, [weekLabel, weeklyListQuery.data?.items, weeklyRecordQuery.data])
 
+  async function openDailyRecord(targetDate: Dayjs, silent = false) {
+    const targetDateKey = targetDate.format('YYYY-MM-DD')
+    setDailyDate(targetDate)
+    try {
+      const row = await queryClient.fetchQuery({
+        queryKey: ['review-daily-record', targetDateKey],
+        queryFn: async () => {
+          try {
+            return await getDailyReview(targetDateKey)
+          } catch (error) {
+            if (isNotFoundError(error)) return null
+            throw error
+          }
+        },
+        staleTime: 0,
+      })
+      if (!silent) {
+        if (row) message.success(`已打开: ${row.date}`)
+        else message.warning('当前日期没有日复盘')
+      }
+    } catch (error) {
+      message.error(formatApiError(error))
+    }
+  }
+
+  async function openWeeklyRecord(targetDate: Dayjs, silent = false) {
+    const targetWeekLabel = getWeekLabelFromDate(targetDate)
+    setWeeklyDate(targetDate)
+    try {
+      const row = await queryClient.fetchQuery({
+        queryKey: ['review-weekly-record', targetWeekLabel],
+        queryFn: async () => {
+          try {
+            return await getWeeklyReview(targetWeekLabel)
+          } catch (error) {
+            if (isNotFoundError(error)) return null
+            throw error
+          }
+        },
+        staleTime: 0,
+      })
+      if (!silent) {
+        if (row) message.success(`已打开: ${row.week_label}`)
+        else message.warning('当前周没有周复盘')
+      }
+    } catch (error) {
+      message.error(formatApiError(error))
+    }
+  }
+
   useEffect(() => {
     const value = selectedDaily ?? { ...EMPTY_DAILY, date: dailyDateKey, updated_at: '' }
     dailyForm.setFieldsValue({
@@ -530,7 +578,7 @@ export function ReviewWorkspacePanel({ dateFrom, dateTo, fills }: WorkspaceProps
       key: 'action',
       width: 90,
       render: (_, row) => (
-        <Button type="link" size="small" onClick={() => setDailyDate(dayjs(row.date))}>
+        <Button type="link" size="small" onClick={() => void openDailyRecord(dayjs(row.date))}>
           打开
         </Button>
       ),
@@ -550,7 +598,7 @@ export function ReviewWorkspacePanel({ dateFrom, dateTo, fills }: WorkspaceProps
         <Button
           type="link"
           size="small"
-          onClick={() => setWeeklyDate(dayjs(row.start_date || row.end_date || dateTo))}
+          onClick={() => void openWeeklyRecord(dayjs(row.start_date || row.end_date || dateTo))}
         >
           打开
         </Button>
@@ -662,7 +710,7 @@ export function ReviewWorkspacePanel({ dateFrom, dateTo, fills }: WorkspaceProps
           复盘工作台
         </Typography.Title>
         <Typography.Text type="secondary">
-          支持日复盘、周复盘、交易标签统计，以及 Phase B 分享卡片和 Phase C 资讯面板。
+          支持日复盘、周复盘与交易标签统计。股票搜索分享和资讯面板已独立到左侧导航。
         </Typography.Text>
 
         <Tabs
@@ -676,7 +724,7 @@ export function ReviewWorkspacePanel({ dateFrom, dateTo, fills }: WorkspaceProps
                 <Space orientation="vertical" size={16} style={{ width: '100%' }}>
                   <Space wrap>
                     <DatePicker value={dailyDate} onChange={(value) => value && setDailyDate(value)} />
-                    <Button onClick={() => void dailyRecordQuery.refetch()} loading={dailyRecordQuery.isFetching}>
+                    <Button onClick={() => void openDailyRecord(dailyDate)} loading={dailyRecordQuery.isFetching}>
                       打开当前日期
                     </Button>
                     <Button type="primary" loading={saveDailyMutation.isPending} onClick={() => saveDailyMutation.mutate()}>
@@ -750,7 +798,7 @@ export function ReviewWorkspacePanel({ dateFrom, dateTo, fills }: WorkspaceProps
                     loading={dailyListQuery.isLoading}
                     size="small"
                     pagination={{ pageSize: 8 }}
-                    onRow={(record) => ({ onClick: () => setDailyDate(dayjs(record.date)) })}
+                    onRow={(record) => ({ onClick: () => void openDailyRecord(dayjs(record.date), true) })}
                   />
                 </Space>
               ),
@@ -764,7 +812,7 @@ export function ReviewWorkspacePanel({ dateFrom, dateTo, fills }: WorkspaceProps
                   <Space wrap>
                     <DatePicker value={weeklyDate} onChange={(value) => value && setWeeklyDate(value)} />
                     <Typography.Text>周标识: {weekLabel}</Typography.Text>
-                    <Button onClick={() => void weeklyRecordQuery.refetch()} loading={weeklyRecordQuery.isFetching}>
+                    <Button onClick={() => void openWeeklyRecord(weeklyDate)} loading={weeklyRecordQuery.isFetching}>
                       打开当前周
                     </Button>
                     <Button type="primary" loading={saveWeeklyMutation.isPending} onClick={() => saveWeeklyMutation.mutate()}>
@@ -852,7 +900,7 @@ export function ReviewWorkspacePanel({ dateFrom, dateTo, fills }: WorkspaceProps
                     loading={weeklyListQuery.isLoading}
                     size="small"
                     pagination={{ pageSize: 8 }}
-                    onRow={(record) => ({ onClick: () => setWeeklyDate(dayjs(record.start_date || dateTo)) })}
+                    onRow={(record) => ({ onClick: () => void openWeeklyRecord(dayjs(record.start_date || dateTo), true) })}
                   />
                 </Space>
               ),
@@ -999,16 +1047,6 @@ export function ReviewWorkspacePanel({ dateFrom, dateTo, fills }: WorkspaceProps
                   </Row>
                 </Space>
               ),
-            },
-            {
-              key: 'phase-b',
-              label: 'Phase B：股票搜索+分享',
-              children: <ReviewPhaseBPanel dateFrom={dateFrom} dateTo={dateTo} />,
-            },
-            {
-              key: 'phase-c',
-              label: 'Phase C：资讯面板',
-              children: <ReviewPhaseCPanel dateFrom={dateFrom} dateTo={dateTo} />,
             },
           ]}
         />

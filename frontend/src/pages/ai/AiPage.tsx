@@ -108,7 +108,7 @@ export function AiPage() {
       key: 'stock',
       width: 180,
       render: (_, record) => (
-        <Space direction="vertical" size={0} style={{ width: '100%' }}>
+        <Space orientation="vertical" size={0} style={{ width: '100%' }}>
           <Typography.Text strong>{renderTruncated(record.name || record.symbol.toUpperCase())}</Typography.Text>
           <Typography.Text type="secondary">{record.symbol.toUpperCase()}</Typography.Text>
         </Space>

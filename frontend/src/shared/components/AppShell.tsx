@@ -22,6 +22,8 @@ const navItems: ItemType[] = [
   { key: '/trade', icon: <SwapOutlined />, label: '模拟交易' },
   { key: '/portfolio', icon: <LineChartOutlined />, label: '持仓管理' },
   { key: '/review', icon: <BarChartOutlined />, label: '复盘统计' },
+  { key: '/review/share', icon: <AreaChartOutlined />, label: '股票搜索与分享' },
+  { key: '/review/news', icon: <BarChartOutlined />, label: '资讯面板' },
   { key: '/ai', icon: <RadarChartOutlined />, label: 'AI分析' },
   { key: '/settings', icon: <SettingOutlined />, label: '系统设置' },
 ]
@@ -32,6 +34,8 @@ function FilterIcon() {
 
 function resolveSelected(pathname: string) {
   if (pathname.startsWith('/stocks/')) return '/screener'
+  if (pathname.startsWith('/review/share')) return '/review/share'
+  if (pathname.startsWith('/review/news')) return '/review/news'
   return pathname
 }
 
@@ -125,10 +129,7 @@ export function AppShell() {
         >
           <Space size={12}>
             {isMobile ? (
-              <a
-                onClick={() => setDrawerOpen(true)}
-                style={{ cursor: 'pointer', color: '#0a6b54' }}
-              >
+              <a onClick={() => setDrawerOpen(true)} style={{ cursor: 'pointer', color: '#0a6b54' }}>
                 导航
               </a>
             ) : null}
@@ -137,7 +138,7 @@ export function AppShell() {
 
           <Space size={18}>
             <Link to="/screener">主流程</Link>
-            <Link to="/settings">配置</Link>
+            <Link to="/settings">设置</Link>
             <AreaChartOutlined style={{ color: '#0f8b6f' }} />
           </Space>
         </Header>

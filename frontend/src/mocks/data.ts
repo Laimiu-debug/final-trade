@@ -109,7 +109,16 @@ const marketNewsSeed: MarketNewsResponse['items'] = [
     pub_date: dayjs().subtract(10, 'hour').format('YYYY-MM-DD HH:mm:ss'),
     source_name: '东方财富',
   },
+  {
+    title: '上周市场风格复盘：成长与价值轮动的节奏',
+    url: 'https://finance.eastmoney.com/',
+    snippet: '该文用于验证时效筛选，默认不应出现在 24h/48h 结果中。',
+    pub_date: dayjs().subtract(96, 'hour').format('YYYY-MM-DD HH:mm:ss'),
+    source_name: '东方财富',
+  },
 ]
+let marketNewsCacheStore = new Map<string, { ts: number; items: MarketNewsResponse['items'] }>()
+let marketNewsLastSuccess: MarketNewsResponse['items'] = []
 
 let aiRecordsStore: AIAnalysisRecord[] = [
   {
@@ -1094,26 +1103,110 @@ export function getReviewTagStatsStore(params?: { date_from?: string; date_to?: 
   }
 }
 
-export function getMarketNewsStore(params?: { query?: string; limit?: number }): MarketNewsResponse {
+export function getMarketNewsStore(params?: {
+  query?: string
+  symbol?: string
+  source_domains?: string[]
+  age_hours?: 24 | 48 | 72
+  refresh?: boolean
+  limit?: number
+}): MarketNewsResponse {
   const normalizedQuery = (params?.query || 'A股 热点').trim()
-  const tokens = normalizedQuery.toLowerCase().split(/\s+/).filter(Boolean)
+  const normalizedSymbol = (params?.symbol || '').trim().toLowerCase()
+  const selectedDomains = [...new Set((params?.source_domains || []).map((item) => item.trim().toLowerCase()).filter(Boolean))]
+  const ageHours = params?.age_hours && [24, 48, 72].includes(params.age_hours) ? params.age_hours : 72
+  const defaultQueryTokens = new Set(['a股', '热点', 'a股热点', 'a股 热点'])
+  const normalizedCompact = normalizedQuery.replace(/\s+/g, '').toLowerCase()
+  const queryTokens = defaultQueryTokens.has(normalizedCompact)
+    ? []
+    : normalizedQuery.toLowerCase().split(/\s+/).filter(Boolean)
+  const tokens = [...queryTokens, normalizedSymbol].filter(Boolean)
   const limit = Math.min(Math.max(params?.limit ?? 20, 1), 50)
+  const cacheKey = `${normalizedQuery}|${normalizedSymbol}|${selectedDomains.join(',')}|${ageHours}|${limit}`
+  const nowTs = Date.now()
+  const cached = marketNewsCacheStore.get(cacheKey)
+  if (!params?.refresh && cached && nowTs - cached.ts <= 180_000) {
+    return {
+      query: normalizedQuery || 'A股 热点',
+      age_hours: ageHours,
+      symbol: normalizedSymbol || undefined,
+      symbol_name: normalizedSymbol ? normalizedSymbol.toUpperCase() : undefined,
+      source_domains: selectedDomains,
+      items: cached.items.slice(0, limit),
+      fetched_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+      cache_hit: true,
+      fallback_used: false,
+      degraded: false,
+      degraded_reason: undefined,
+    }
+  }
 
   let rows = marketNewsSeed.slice()
+  rows = rows.filter((item) => dayjs(item.pub_date).isAfter(dayjs().subtract(ageHours, 'hour')))
   if (tokens.length > 0) {
     rows = rows.filter((item) => {
       const corpus = `${item.title} ${item.snippet} ${item.source_name}`.toLowerCase()
       return tokens.some((token) => corpus.includes(token))
     })
   }
+  if (selectedDomains.length > 0) {
+    rows = rows.filter((item) => {
+      try {
+        const host = new URL(item.url).host.toLowerCase().replace(/^www\./, '')
+        return selectedDomains.some((domain) => host === domain || host.endsWith(`.${domain}`))
+      } catch {
+        return false
+      }
+    })
+  }
 
   const items = rows.slice(0, limit)
+  if (items.length > 0) {
+    marketNewsLastSuccess = items
+    marketNewsCacheStore.set(cacheKey, { ts: nowTs, items })
+    return {
+      query: normalizedQuery || 'A股 热点',
+      age_hours: ageHours,
+      symbol: normalizedSymbol || undefined,
+      symbol_name: normalizedSymbol ? normalizedSymbol.toUpperCase() : undefined,
+      source_domains: selectedDomains,
+      items,
+      fetched_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+      cache_hit: false,
+      fallback_used: false,
+      degraded: false,
+      degraded_reason: undefined,
+    }
+  }
+
+  if (marketNewsLastSuccess.length > 0) {
+    return {
+      query: normalizedQuery || 'A股 热点',
+      age_hours: ageHours,
+      symbol: normalizedSymbol || undefined,
+      symbol_name: normalizedSymbol ? normalizedSymbol.toUpperCase() : undefined,
+      source_domains: selectedDomains,
+      items: marketNewsLastSuccess.slice(0, limit),
+      fetched_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+      cache_hit: false,
+      fallback_used: true,
+      degraded: true,
+      degraded_reason: 'MOCK_NEWS_FALLBACK_CACHE',
+    }
+  }
+
   return {
     query: normalizedQuery || 'A股 热点',
-    items,
+    age_hours: ageHours,
+    symbol: normalizedSymbol || undefined,
+    symbol_name: normalizedSymbol ? normalizedSymbol.toUpperCase() : undefined,
+    source_domains: selectedDomains,
+    items: [],
     fetched_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
-    degraded: items.length === 0,
-    degraded_reason: items.length === 0 ? 'MOCK_NEWS_EMPTY' : undefined,
+    cache_hit: false,
+    fallback_used: false,
+    degraded: true,
+    degraded_reason: 'MOCK_NEWS_EMPTY',
   }
 }
 

@@ -1406,7 +1406,7 @@ export function ScreenerPage() {
 
         if (key === 'symbol') {
           column.filterDropdown = ({ confirm, clearFilters }) => (
-            <Space direction="vertical" size={8} style={{ width: 220, padding: 8 }}>
+            <Space orientation="vertical" size={8} style={{ width: 220, padding: 8 }}>
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                 输入代码或名称关键词
               </Typography.Text>

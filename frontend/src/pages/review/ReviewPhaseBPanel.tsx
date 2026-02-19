@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
-import dayjs from 'dayjs'
 import { useQuery } from '@tanstack/react-query'
 import { App as AntdApp, Alert, Button, Card, Col, Input, Row, Space, Table, Tag, Typography } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
-import { getDailyReviews, getStockCandles, getWeeklyReviews } from '@/shared/api/endpoints'
+import { useNavigate } from 'react-router-dom'
+import { getAIRecords, getStockAnalysis, getStockCandles } from '@/shared/api/endpoints'
 import { formatPct } from '@/shared/utils/format'
-import type { CandlePoint, DailyReviewRecord, WeeklyReviewRecord } from '@/types/contracts'
+import type { CandlePoint, StockAnnotation } from '@/types/contracts'
 import { getStockLibraryStats, searchStockLibrary, type StockSearchResult } from '@/shared/services/stockLibrary'
 
 type ReviewPhaseBPanelProps = {
@@ -58,28 +58,6 @@ function formatSignedPct(value: number | null) {
   return value > 0 ? `+${(value * 100).toFixed(2)}%` : `${(value * 100).toFixed(2)}%`
 }
 
-function pickDailyThought(record: DailyReviewRecord | null) {
-  if (!record) return '-'
-  return (
-    record.reflection.trim()
-    || record.summary.trim()
-    || record.operations_summary.trim()
-    || record.market_summary.trim()
-    || '-'
-  )
-}
-
-function pickWeeklyThought(record: WeeklyReviewRecord | null) {
-  if (!record) return '-'
-  return (
-    record.key_insight.trim()
-    || record.next_week_strategy.trim()
-    || record.market_rhythm.trim()
-    || record.achievements.trim()
-    || '-'
-  )
-}
-
 function shortenText(value: string, max = 72) {
   const text = value.trim()
   if (!text) return '-'
@@ -125,6 +103,17 @@ function trendLabel(value: number | null) {
   if (value >= 0.08) return '上升'
   if (value <= -0.08) return '下降'
   return '震荡'
+}
+
+function stageLabel(stage: StockAnnotation['stage']) {
+  if (stage === 'Early') return '发酵中'
+  if (stage === 'Mid') return '高潮'
+  return '退潮'
+}
+
+function formatConfidence(value: number | null | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '--'
+  return `${(value * 100).toFixed(1)}%`
 }
 
 function drawSparkline(ctx: CanvasRenderingContext2D, points: number[], x: number, y: number, width: number, height: number) {
@@ -180,6 +169,7 @@ function drawWrappedText(
 
 export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) {
   const { message } = AntdApp.useApp()
+  const navigate = useNavigate()
   const [keyword, setKeyword] = useState('')
   const [rows, setRows] = useState<StockSearchResult[]>([])
   const [loading, setLoading] = useState(false)
@@ -234,18 +224,15 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
     enabled: Boolean(selectedSymbol),
   })
 
-  const dailyThoughtQuery = useQuery({
-    queryKey: ['phase-b-daily-thought', dateFrom, dateTo],
-    queryFn: () => getDailyReviews({ date_from: dateFrom, date_to: dateTo }),
+  const stockAnalysisQuery = useQuery({
+    queryKey: ['phase-b-share-card-analysis', selectedSymbol],
+    queryFn: () => getStockAnalysis(selectedSymbol),
+    enabled: Boolean(selectedSymbol),
   })
 
-  const weeklyThoughtQuery = useQuery({
-    queryKey: ['phase-b-weekly-thought', dateFrom, dateTo],
-    queryFn: async () => {
-      const years = [...new Set([dayjs(dateFrom).year(), dayjs(dateTo).year()])]
-      const groups = await Promise.all(years.map((year) => getWeeklyReviews({ year })))
-      return groups.flatMap((group) => group.items)
-    },
+  const aiRecordsQuery = useQuery({
+    queryKey: ['phase-b-share-card-ai-records'],
+    queryFn: getAIRecords,
   })
 
   const priceSnapshot = useMemo(
@@ -253,24 +240,65 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
     [candlesQuery.data?.candles],
   )
 
-  const latestDailyThought = useMemo(() => {
-    const items = dailyThoughtQuery.data?.items ?? []
-    return (
-      items.find(
-        (item) => Boolean(item.reflection.trim() || item.summary.trim() || item.operations_summary.trim() || item.market_summary.trim()),
-      ) ?? null
-    )
-  }, [dailyThoughtQuery.data?.items])
+  const klineAnnotation = useMemo(() => {
+    const annotation = stockAnalysisQuery.data?.annotation
+    if (!annotation) return null
+    if (annotation.updated_by === 'manual') return annotation
+    if (annotation.notes.trim().length > 0) return annotation
+    return null
+  }, [stockAnalysisQuery.data?.annotation])
 
-  const latestWeeklyThought = useMemo(() => {
-    const items = weeklyThoughtQuery.data ?? []
-    const sorted = items.slice().sort((a, b) => b.week_label.localeCompare(a.week_label))
+  const latestAiRecord = useMemo(() => {
+    if (!selectedSymbol) return null
     return (
-      sorted.find(
-        (item) => Boolean(item.key_insight.trim() || item.next_week_strategy.trim() || item.market_rhythm.trim() || item.achievements.trim()),
+      (aiRecordsQuery.data?.items ?? []).find(
+        (item) => item.symbol.trim().toLowerCase() === selectedSymbol.trim().toLowerCase(),
       ) ?? null
     )
-  }, [weeklyThoughtQuery.data])
+  }, [aiRecordsQuery.data?.items, selectedSymbol])
+
+  const klineSummary = useMemo(() => {
+    if (!klineAnnotation) return ''
+    return `起始日 ${klineAnnotation.start_date} · 阶段 ${stageLabel(klineAnnotation.stage)} · 趋势 ${klineAnnotation.trend_class} · 决策 ${klineAnnotation.decision}`
+  }, [klineAnnotation])
+
+  const klineNotes = useMemo(() => {
+    if (!klineAnnotation || !klineAnnotation.notes.trim()) return ''
+    return shortenText(klineAnnotation.notes, 120)
+  }, [klineAnnotation])
+
+  const aiSummary = useMemo(() => {
+    if (!latestAiRecord) return ''
+    const parts = [
+      latestAiRecord.provider || '--',
+      latestAiRecord.conclusion || '--',
+      `置信度 ${formatConfidence(latestAiRecord.confidence)}`,
+      `起爆日 ${latestAiRecord.breakout_date || '--'}`,
+    ]
+    return parts.join(' · ')
+  }, [latestAiRecord])
+
+  const aiNotes = useMemo(() => {
+    if (!latestAiRecord) return ''
+    const core = latestAiRecord.summary.trim()
+    if (core) return shortenText(core, 120)
+    const parts = [
+      `题材 ${latestAiRecord.theme_name || '--'}`,
+      `趋势 ${latestAiRecord.trend_bull_type || '--'}`,
+    ]
+    return parts.join(' · ')
+  }, [latestAiRecord])
+
+  const cardInsights = useMemo(
+    () =>
+      [
+        klineSummary ? { title: 'K线分析', content: klineSummary, maxLines: 2 } : null,
+        klineNotes ? { title: 'K线备注', content: klineNotes, maxLines: 3 } : null,
+        aiSummary ? { title: 'AI分析', content: aiSummary, maxLines: 2 } : null,
+        aiNotes ? { title: 'AI摘要', content: aiNotes, maxLines: 3 } : null,
+      ].filter((item): item is { title: string; content: string; maxLines: number } => Boolean(item)),
+    [aiNotes, aiSummary, klineNotes, klineSummary],
+  )
 
   const shareText = useMemo(() => {
     if (!selected) return ''
@@ -282,13 +310,15 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
       `最新价: ${formatPrice(priceSnapshot.latest)} (${formatSignedPrice(priceSnapshot.change)} / ${formatSignedPct(priceSnapshot.changePct)})`,
       `20日走势: ${trendLabel(priceSnapshot.trend20Pct)} (${formatSignedPct(priceSnapshot.trend20Pct)})`,
       `20日区间: ${formatPrice(priceSnapshot.low20)} - ${formatPrice(priceSnapshot.high20)}`,
-      `日复盘思考${latestDailyThought ? `(${latestDailyThought.date})` : ''}: ${shortenText(pickDailyThought(latestDailyThought), 88)}`,
-      `周复盘思考${latestWeeklyThought ? `(${latestWeeklyThought.week_label})` : ''}: ${shortenText(pickWeeklyThought(latestWeeklyThought), 88)}`,
+      klineSummary ? `K线分析: ${klineSummary}` : '',
+      klineNotes ? `K线备注: ${klineNotes}` : '',
+      aiSummary ? `AI分析: ${aiSummary}` : '',
+      aiNotes ? `AI摘要: ${aiNotes}` : '',
       note.trim() ? `补充观点: ${shortenText(note, 88)}` : '',
     ]
       .filter(Boolean)
       .join('\n')
-  }, [dateFrom, dateTo, latestDailyThought, latestWeeklyThought, note, priceSnapshot.change, priceSnapshot.changePct, priceSnapshot.high20, priceSnapshot.latest, priceSnapshot.low20, priceSnapshot.trend20Pct, selected])
+  }, [aiNotes, aiSummary, dateFrom, dateTo, klineNotes, klineSummary, note, priceSnapshot.change, priceSnapshot.changePct, priceSnapshot.high20, priceSnapshot.latest, priceSnapshot.low20, priceSnapshot.trend20Pct, selected])
 
   async function handleCopyText() {
     if (!selected) {
@@ -309,7 +339,7 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
       return
     }
     const width = 1080
-    const height = 1350
+    const height = 1580
     const canvas = document.createElement('canvas')
     canvas.width = width
     canvas.height = height
@@ -347,29 +377,30 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
     ctx.strokeRect(70, 575, 940, 200)
     drawSparkline(ctx, priceSnapshot.sparkline, 98, 610, 885, 130)
 
-    ctx.fillStyle = '#0f172a'
-    ctx.font = 'bold 34px sans-serif'
-    ctx.fillText(`日复盘思考${latestDailyThought ? ` (${latestDailyThought.date})` : ''}`, 70, 858)
-    ctx.font = '30px sans-serif'
-    drawWrappedText(ctx, pickDailyThought(latestDailyThought), 70, 902, 940, 42, 2)
+    let cursorY = 860
 
-    ctx.fillStyle = '#0f172a'
-    ctx.font = 'bold 34px sans-serif'
-    ctx.fillText(`周复盘思考${latestWeeklyThought ? ` (${latestWeeklyThought.week_label})` : ''}`, 70, 1014)
-    ctx.font = '30px sans-serif'
-    drawWrappedText(ctx, pickWeeklyThought(latestWeeklyThought), 70, 1058, 940, 42, 2)
+    cardInsights.forEach((item) => {
+      ctx.fillStyle = '#0f172a'
+      ctx.font = 'bold 30px sans-serif'
+      ctx.fillText(item.title, 70, cursorY)
+      ctx.font = '27px sans-serif'
+      drawWrappedText(ctx, item.content, 70, cursorY + 38, 940, 36, item.maxLines)
+      cursorY += 38 + item.maxLines * 36 + 22
+    })
 
     if (note.trim()) {
       ctx.fillStyle = '#0f172a'
       ctx.font = 'bold 32px sans-serif'
-      ctx.fillText('补充观点', 70, 1170)
+      ctx.fillText('补充观点', 70, cursorY)
       ctx.font = '28px sans-serif'
-      drawWrappedText(ctx, note.trim(), 70, 1208, 940, 38, 2)
+      drawWrappedText(ctx, note.trim(), 70, cursorY + 40, 940, 38, 4)
+      cursorY += 240
     }
 
+    const footerY = Math.min(height - 36, cursorY + 16)
     ctx.fillStyle = '#475569'
     ctx.font = '26px sans-serif'
-    ctx.fillText(`生成时间: ${new Date().toLocaleString()}`, 70, 1280)
+    ctx.fillText(`生成时间: ${new Date().toLocaleString()}`, 70, footerY)
 
     canvas.toBlob((blob) => {
       if (!blob) {
@@ -379,6 +410,15 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
       downloadBlob(`share-card-${selected.symbol}-${Date.now()}.png`, blob)
       message.success('分享卡片已导出')
     }, 'image/png')
+  }
+
+  function handleOpenChart(row: StockSearchResult) {
+    const prefixedSymbol = tsCodeToPrefixedSymbol(row.ts_code)
+    if (!prefixedSymbol) {
+      message.warning('该股票缺少行情代码，无法打开K线页')
+      return
+    }
+    navigate(`/stocks/${prefixedSymbol}/chart`)
   }
 
   const columns: ColumnsType<StockSearchResult> = [
@@ -392,6 +432,23 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
       width: 90,
       render: (value: StockSearchResult['matchType']) => (
         <Tag color={value === 'code' ? 'blue' : value === 'name' ? 'green' : 'purple'}>{value}</Tag>
+      ),
+    },
+    {
+      title: '操作',
+      key: 'actions',
+      width: 110,
+      render: (_, row) => (
+        <Button
+          type="link"
+          size="small"
+          onClick={(event) => {
+            event.stopPropagation()
+            handleOpenChart(row)
+          }}
+        >
+          查看K线
+        </Button>
       ),
     },
   ]
@@ -437,7 +494,7 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
         <Alert
           type="warning"
           showIcon
-          message="行情加载失败"
+          title="行情加载失败"
           description="当前无法获取该股票价格走势，分享卡片将展示可用复盘内容。"
         />
       ) : null}
@@ -469,12 +526,12 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
                 <Typography.Text>
                   20日区间: {formatPrice(priceSnapshot.low20)} - {formatPrice(priceSnapshot.high20)}
                 </Typography.Text>
-                <Typography.Text>
-                  日复盘思考{latestDailyThought ? ` (${latestDailyThought.date})` : ''}: {shortenText(pickDailyThought(latestDailyThought))}
-                </Typography.Text>
-                <Typography.Text>
-                  周复盘思考{latestWeeklyThought ? ` (${latestWeeklyThought.week_label})` : ''}: {shortenText(pickWeeklyThought(latestWeeklyThought))}
-                </Typography.Text>
+                {klineSummary ? <Typography.Text>K线分析: {klineSummary}</Typography.Text> : null}
+                {klineNotes ? <Typography.Text>K线备注: {klineNotes}</Typography.Text> : null}
+                {aiSummary ? <Typography.Text>AI分析: {aiSummary}</Typography.Text> : null}
+                {aiNotes ? <Typography.Text>AI摘要: {aiNotes}</Typography.Text> : null}
+                {stockAnalysisQuery.isFetching ? <Typography.Text type="secondary">正在加载K线分析...</Typography.Text> : null}
+                {aiRecordsQuery.isFetching ? <Typography.Text type="secondary">正在加载AI分析...</Typography.Text> : null}
                 {candlesQuery.isLoading ? <Typography.Text type="secondary">正在加载走势数据...</Typography.Text> : null}
               </Space>
             </Card>

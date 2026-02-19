@@ -124,6 +124,7 @@ class InMemoryStore:
         self._review_tags: dict[ReviewTagType, list[ReviewTag]] = self._default_review_tags()
         self._fill_tag_store: dict[str, TradeFillTagAssignment] = {}
         self._web_evidence_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
+        self._market_news_last_success: tuple[float, list[dict[str, str]], dict[str, str]] | None = None
         self._quote_profile_cache: dict[str, tuple[float, dict[str, str]]] = {}
         self._signals_cache: dict[str, tuple[float, SignalsResponse]] = {}
         self._app_state_path = self._resolve_app_state_path(app_state_path)
@@ -3607,20 +3608,173 @@ class InMemoryStore:
         self._persist_app_state()
         return True
 
-    def get_market_news(self, *, query: str = "", limit: int = 20) -> MarketNewsResponse:
-        query_text = TextProcessor.clean_whitespace(query) or "A股 热点"
+    def get_market_news(
+        self,
+        *,
+        query: str = "",
+        limit: int = 20,
+        symbol: str | None = None,
+        source_domains: list[str] | None = None,
+        age_hours: int = 72,
+        refresh: bool = False,
+    ) -> MarketNewsResponse:
         max_items = max(1, min(int(limit), 50))
-        source_urls = self._enabled_ai_source_urls(limit=8)
-        allowed_domains = self._source_domains(source_urls)
-        cache_key = f"market_news:{query_text}:{max_items}:{','.join(sorted(allowed_domains))}"
+        max_age_hours = age_hours if age_hours in (24, 48, 72) else 72
+        now_dt = datetime.now()
+        cutoff_dt = now_dt - timedelta(hours=max_age_hours)
+
+        symbol_text = TextProcessor.clean_whitespace(str(symbol or "")).lower()
+        symbol_name = ""
+        if symbol_text:
+            profile = self._fetch_quote_profile(symbol_text)
+            symbol_name = TextProcessor.clean_whitespace(profile.get("name", ""))
+            if not query.strip():
+                query = f"{symbol_text} {symbol_name} 新闻".strip()
+
+        query_text = TextProcessor.clean_whitespace(query) or "A股 热点"
+        default_domains = self._source_domains(self._enabled_ai_source_urls(limit=8))
+
+        selected_domains: set[str] = set()
+        for raw_domain in source_domains or []:
+            token = TextProcessor.clean_whitespace(str(raw_domain))
+            if not token:
+                continue
+            normalized = token
+            if "://" in token:
+                normalized = TextProcessor.extract_domain(token)
+            normalized = normalized.lower().strip()
+            if normalized.startswith("www."):
+                normalized = normalized[4:]
+            normalized = normalized.strip("/")
+            if not normalized:
+                continue
+            selected_domains.add(normalized)
+            root = TextProcessor.registrable_domain(normalized)
+            if root:
+                selected_domains.add(root)
+
+        allowed_domains = selected_domains
+        response_domains = sorted(selected_domains or default_domains)
+        domain_key = ",".join(sorted(allowed_domains)) if allowed_domains else "*"
+        cache_key = f"market_news:v3:{query_text}:{symbol_text}:{max_items}:{max_age_hours}:{domain_key}"
         now_ts = time.time()
+
+        def parse_news_datetime(value: str) -> datetime | None:
+            raw = TextProcessor.clean_whitespace(value)
+            if not raw:
+                return None
+            parsed = self._parse_rss_pub_date(raw)
+            if parsed is not None:
+                return parsed
+
+            candidate = raw
+            candidate = candidate.replace("年", "-").replace("月", "-").replace("日", "")
+            candidate = candidate.replace("/", "-").replace("T", " ")
+            candidate = re.sub(r"\s+", " ", candidate).strip()
+
+            patterns = [
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+                "%m-%d %H:%M:%S",
+                "%m-%d %H:%M",
+                "%H:%M:%S",
+                "%H:%M",
+            ]
+            for pattern in patterns:
+                try:
+                    parsed_dt = datetime.strptime(candidate, pattern)
+                    if pattern.startswith("%m"):
+                        parsed_dt = parsed_dt.replace(year=now_dt.year)
+                    elif pattern.startswith("%H"):
+                        parsed_dt = now_dt.replace(
+                            hour=parsed_dt.hour,
+                            minute=parsed_dt.minute,
+                            second=parsed_dt.second,
+                            microsecond=0,
+                        )
+                        if parsed_dt > now_dt + timedelta(minutes=5):
+                            parsed_dt = parsed_dt - timedelta(days=1)
+                    if parsed_dt > now_dt + timedelta(days=2):
+                        parsed_dt = parsed_dt.replace(year=parsed_dt.year - 1)
+                    return parsed_dt
+                except Exception:
+                    continue
+            return None
+
+        def to_pub_date(parsed_dt: datetime | None, raw_text: str) -> str:
+            if parsed_dt is not None:
+                return parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
+            return TextProcessor.clean_whitespace(raw_text)[:40]
+
+        def is_recent(parsed_dt: datetime | None) -> bool:
+            return parsed_dt is not None and parsed_dt >= cutoff_dt
+
+        def filter_recent_items(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+            filtered: list[dict[str, str]] = []
+            for item in rows:
+                parsed_dt = parse_news_datetime(str(item.get("pub_date", "")))
+                if not is_recent(parsed_dt):
+                    continue
+                filtered.append(item)
+            filtered.sort(
+                key=lambda item: parse_news_datetime(str(item.get("pub_date", ""))) or datetime.min,
+                reverse=True,
+            )
+            return filtered[:max_items]
+
+        def filter_relaxed_items(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+            filtered: list[dict[str, str]] = []
+            for item in rows:
+                parsed_dt = parse_news_datetime(str(item.get("pub_date", "")))
+                if parsed_dt is None:
+                    continue
+                filtered.append(item)
+            filtered.sort(
+                key=lambda item: parse_news_datetime(str(item.get("pub_date", ""))) or datetime.min,
+                reverse=True,
+            )
+            return filtered[:max_items]
+
+        symbol_code = re.sub(r"^(sh|sz|bj)", "", symbol_text)
+        default_query_tokens = {"a股", "热点", "a股热点", "a股 热点"}
+        token_filters = [token.lower() for token in re.split(r"\s+", query_text) if token]
+        if query_text.replace(" ", "").lower() in default_query_tokens:
+            token_filters = []
+        if symbol_text:
+            token_filters.extend([symbol_text.lower(), symbol_code.lower()])
+            if symbol_name:
+                token_filters.append(symbol_name.lower())
+        token_filters = [token for token in token_filters if token]
+
         cached = self._web_evidence_cache.get(cache_key)
-        if cached and now_ts - cached[0] <= 180:
-            cached_items = [MarketNewsItem(**item) for item in cached[1][:max_items]]
+        if (not refresh) and cached and now_ts - cached[0] <= 180:
+            cached_items = filter_recent_items(cached[1])
+            if not cached_items:
+                cached_relaxed = filter_relaxed_items(cached[1])
+                if cached_relaxed:
+                    return MarketNewsResponse(
+                        query=query_text,
+                        age_hours=max_age_hours,
+                        symbol=symbol_text or None,
+                        symbol_name=symbol_name or None,
+                        source_domains=response_domains,
+                        items=[MarketNewsItem(**item) for item in cached_relaxed],
+                        fetched_at=self._now_datetime(),
+                        cache_hit=True,
+                        fallback_used=True,
+                        degraded=True,
+                        degraded_reason="NEWS_OUT_OF_WINDOW",
+                    )
             return MarketNewsResponse(
                 query=query_text,
-                items=cached_items,
+                age_hours=max_age_hours,
+                symbol=symbol_text or None,
+                symbol_name=symbol_name or None,
+                source_domains=response_domains,
+                items=[MarketNewsItem(**item) for item in cached_items],
                 fetched_at=self._now_datetime(),
+                cache_hit=True,
+                fallback_used=False,
                 degraded=len(cached_items) == 0,
                 degraded_reason="NEWS_EMPTY" if len(cached_items) == 0 else None,
             )
@@ -3633,69 +3787,186 @@ class InMemoryStore:
             )
         }
 
-        query_candidates = [query_text, f"{query_text} 财经", f"{query_text} A股"]
-        queries: list[str] = []
-        for candidate in query_candidates:
-            cleaned = TextProcessor.clean_whitespace(candidate)
-            if cleaned and cleaned not in queries:
-                queries.append(cleaned)
-        token_filters = [token.lower() for token in re.split(r"\s+", query_text) if token]
+        def fetch_eastmoney_fast_news(client: httpx.Client) -> list[dict[str, str]]:
+            timestamp = int(time.time() * 1000)
+            response = client.get(
+                "https://np-weblist.eastmoney.com/comm/web/getFastNewsList",
+                params={
+                    "client": "web",
+                    "biz": "web_724",
+                    "fastColumn": "102",
+                    "sortEnd": "",
+                    "pageSize": max(50, max_items * 3),
+                    "req_trace": str(timestamp),
+                    "_": str(timestamp),
+                },
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
 
-        results: list[dict[str, str]] = []
-        seen_urls: set[str] = set()
-        fetch_error: str | None = None
+            data = payload.get("data") if isinstance(payload, dict) else None
+            source_rows: list[dict[str, object]] = []
+            if isinstance(data, list):
+                source_rows = [item for item in data if isinstance(item, dict)]
+            elif isinstance(data, dict):
+                news_list = data.get("newsList")
+                if isinstance(news_list, list):
+                    source_rows = [item for item in news_list if isinstance(item, dict)]
+                if not source_rows:
+                    for value in data.values():
+                        if isinstance(value, list) and value and isinstance(value[0], dict):
+                            source_rows = [item for item in value if isinstance(item, dict)]
+                            break
 
-        def parse_rss(xml_text: str, domain_filter: set[str]) -> list[dict[str, str]]:
-            parsed_items: list[dict[str, str]] = []
-            try:
-                root = ET.fromstring(xml_text)
-            except ET.ParseError:
-                return parsed_items
-            for item in root.findall("./channel/item"):
-                link = (item.findtext("link") or "").strip()
-                source_node = item.find("source")
-                source_name = ""
-                source_url = ""
-                if source_node is not None:
-                    source_name = (source_node.text or "").strip()
-                    source_url = (source_node.attrib.get("url") or "").strip()
-                if self._is_low_quality_source(source_name, source_url):
-                    continue
-                filter_url = source_url or link
-                display_url = source_url or link
-                if display_url in seen_urls and link and link not in seen_urls:
-                    display_url = link
-                if not display_url or display_url in seen_urls:
-                    continue
-                if not self._url_in_domains(filter_url, domain_filter):
-                    continue
-                title_raw = html.unescape((item.findtext("title") or "").strip())
-                desc_raw = html.unescape((item.findtext("description") or "").strip())
-                title = self._clean_text(title_raw)
-                snippet = self._clean_text(desc_raw)
+            results: list[dict[str, str]] = []
+            seen_urls: set[str] = set()
+            for idx, item in enumerate(source_rows):
+                title = self._clean_text(html.unescape(str(item.get("title", "")).strip()))
+                snippet = self._clean_text(
+                    html.unescape(
+                        str(
+                            item.get("summary")
+                            or item.get("digest")
+                            or item.get("content")
+                            or item.get("ltext")
+                            or ""
+                        ).strip()
+                    )
+                )
                 if self._is_low_signal_title(title):
                     continue
+                raw_time = str(
+                    item.get("showTime")
+                    or item.get("displayTime")
+                    or item.get("publishTime")
+                    or item.get("time")
+                    or ""
+                )
+                parsed_dt = parse_news_datetime(raw_time)
+                pub_date = to_pub_date(parsed_dt, raw_time)
+
+                raw_unique_id = TextProcessor.clean_whitespace(
+                    str(item.get("id") or item.get("newsid") or item.get("code") or "")
+                )
+                link = TextProcessor.clean_whitespace(str(item.get("url") or ""))
+                if not link:
+                    # Eastmoney fast news often has no URL and uses `code` as unique id.
+                    link = f"https://kuaixun.eastmoney.com/news/{raw_unique_id}" if raw_unique_id else "https://kuaixun.eastmoney.com/"
+                if link.startswith("//"):
+                    link = f"https:{link}"
+                elif link and not link.startswith("http"):
+                    link = f"https://{link.lstrip('/')}"
+                if not self._url_in_domains(link, allowed_domains):
+                    continue
+
+                source_name = self._clean_text(
+                    str(item.get("source") or item.get("mediaName") or item.get("media") or item.get("infoSource") or "东方财富快讯")
+                )[:40]
                 corpus = f"{title} {snippet} {source_name}".lower()
                 if token_filters and not any(token in corpus for token in token_filters):
                     continue
                 if not title and not snippet:
                     continue
-                parsed_items.append(
+
+                dedupe_key = raw_unique_id or link or f"{title}:{pub_date}:{idx}"
+                if dedupe_key in seen_urls:
+                    continue
+                seen_urls.add(dedupe_key)
+                results.append(
                     {
                         "title": title[:120] if title else "无标题",
-                        "url": display_url,
-                        "snippet": (f"{source_name} | {snippet}" if source_name else snippet)[:260] if snippet else "无摘要",
-                        "pub_date": (item.findtext("pubDate") or "").strip()[:40],
-                        "source_name": source_name[:40],
+                        "url": link,
+                        "snippet": (f"{source_name} | {snippet}" if source_name and snippet else (snippet or "无摘要"))[:260],
+                        "pub_date": pub_date,
+                        "source_name": source_name or "东方财富快讯",
                     }
                 )
-                seen_urls.add(display_url)
-                if len(results) + len(parsed_items) >= max_items:
+                if len(results) >= max_items:
                     break
-            return parsed_items
 
-        try:
-            with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers) as client:
+            results.sort(
+                key=lambda row: parse_news_datetime(str(row.get("pub_date", ""))) or datetime.min,
+                reverse=True,
+            )
+            return results[:max_items]
+
+        def fetch_google_rss(client: httpx.Client) -> tuple[list[dict[str, str]], str | None]:
+            if symbol_text:
+                query_candidates = [
+                    f"{symbol_text} {symbol_name} {query_text}".strip(),
+                    f"{symbol_code} {symbol_name} 新闻 公告".strip(),
+                    f"{symbol_name} 板块 热点".strip(),
+                    query_text,
+                ]
+            else:
+                query_candidates = [query_text, f"{query_text} 财经", f"{query_text} A股"]
+
+            queries: list[str] = []
+            for candidate in query_candidates:
+                cleaned = TextProcessor.clean_whitespace(candidate)
+                if cleaned and cleaned not in queries:
+                    queries.append(cleaned)
+
+            seen_urls: set[str] = set()
+            results: list[dict[str, str]] = []
+
+            def parse_rss(xml_text: str, domain_filter: set[str]) -> list[dict[str, str]]:
+                parsed_items: list[dict[str, str]] = []
+                try:
+                    root = ET.fromstring(xml_text)
+                except ET.ParseError:
+                    return parsed_items
+                for item in root.findall("./channel/item"):
+                    link = TextProcessor.clean_whitespace(item.findtext("link") or "")
+                    source_node = item.find("source")
+                    source_name = ""
+                    source_url = ""
+                    if source_node is not None:
+                        source_name = TextProcessor.clean_whitespace(source_node.text or "")
+                        source_url = TextProcessor.clean_whitespace(source_node.attrib.get("url") or "")
+                    if self._is_low_quality_source(source_name, source_url):
+                        continue
+                    filter_url = source_url or link
+                    # Prefer article link so the title can jump to the exact news page.
+                    display_url = link or source_url
+                    if not display_url:
+                        continue
+                    if display_url in seen_urls and source_url and source_url not in seen_urls:
+                        display_url = source_url
+                    if display_url in seen_urls:
+                        continue
+                    if not self._url_in_domains(filter_url, domain_filter):
+                        continue
+                    title_raw = html.unescape(TextProcessor.clean_whitespace(item.findtext("title") or ""))
+                    desc_raw = html.unescape(TextProcessor.clean_whitespace(item.findtext("description") or ""))
+                    title = self._clean_text(title_raw)
+                    snippet = self._clean_text(desc_raw)
+                    if self._is_low_signal_title(title):
+                        continue
+                    parsed_dt = parse_news_datetime(str(item.findtext("pubDate") or ""))
+                    pub_date = to_pub_date(parsed_dt, str(item.findtext("pubDate") or ""))
+                    corpus = f"{title} {snippet} {source_name}".lower()
+                    if token_filters and not any(token in corpus for token in token_filters):
+                        continue
+                    if not title and not snippet:
+                        continue
+                    parsed_items.append(
+                        {
+                            "title": title[:120] if title else "无标题",
+                            "url": display_url,
+                            "snippet": (f"{source_name} | {snippet}" if source_name else snippet)[:260] if snippet else "无摘要",
+                            "pub_date": pub_date,
+                            "source_name": source_name[:40],
+                        }
+                    )
+                    seen_urls.add(display_url)
+                    if len(results) + len(parsed_items) >= max_items:
+                        break
+                return parsed_items
+
+            fetch_error: str | None = None
+            try:
                 for item_query in queries:
                     if len(results) >= max_items:
                         break
@@ -3715,24 +3986,121 @@ class InMemoryStore:
                     results.extend(parsed_items)
                     if len(results) >= max_items:
                         break
+            except Exception as exc:
+                fetch_error = str(exc)[:160]
+                results = []
+
+            results.sort(
+                key=lambda row: parse_news_datetime(str(row.get("pub_date", ""))) or datetime.min,
+                reverse=True,
+            )
+            return results[:max_items], fetch_error
+
+        fresh_items_raw: list[dict[str, str]] = []
+        fetch_error: str | None = None
+        try:
+            with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers) as client:
+                fresh_items_raw = fetch_eastmoney_fast_news(client)
+                if not fresh_items_raw:
+                    fresh_items_raw, fetch_error = fetch_google_rss(client)
         except Exception as exc:
             fetch_error = str(exc)[:160]
-            results = []
+            fresh_items_raw = []
 
-        results = results[:max_items]
-        results.sort(
-            key=lambda item: self._parse_rss_pub_date(item.get("pub_date", "")) or datetime.min,
-            reverse=True,
-        )
-        self._web_evidence_cache[cache_key] = (now_ts, results)
-        result_items = [MarketNewsItem(**item) for item in results]
+        fresh_items = filter_recent_items(fresh_items_raw)
+        if fresh_items:
+            self._web_evidence_cache[cache_key] = (now_ts, fresh_items)
+            self._market_news_last_success = (
+                now_ts,
+                fresh_items,
+                {"query": query_text, "symbol": symbol_text, "source_domains": domain_key},
+            )
+            return MarketNewsResponse(
+                query=query_text,
+                age_hours=max_age_hours,
+                symbol=symbol_text or None,
+                symbol_name=symbol_name or None,
+                source_domains=response_domains,
+                items=[MarketNewsItem(**item) for item in fresh_items],
+                fetched_at=self._now_datetime(),
+                cache_hit=False,
+                fallback_used=False,
+                degraded=False,
+                degraded_reason=None,
+            )
 
+        fresh_relaxed_items = filter_relaxed_items(fresh_items_raw)
+        if fresh_relaxed_items:
+            self._web_evidence_cache[cache_key] = (now_ts, fresh_relaxed_items)
+            self._market_news_last_success = (
+                now_ts,
+                fresh_relaxed_items,
+                {"query": query_text, "symbol": symbol_text, "source_domains": domain_key},
+            )
+            return MarketNewsResponse(
+                query=query_text,
+                age_hours=max_age_hours,
+                symbol=symbol_text or None,
+                symbol_name=symbol_name or None,
+                source_domains=response_domains,
+                items=[MarketNewsItem(**item) for item in fresh_relaxed_items],
+                fetched_at=self._now_datetime(),
+                cache_hit=False,
+                fallback_used=True,
+                degraded=True,
+                degraded_reason="NEWS_OUT_OF_WINDOW",
+            )
+
+        fallback_items: list[dict[str, str]] = []
+        fallback_reason: str | None = None
+        if cached and cached[1]:
+            fallback_items = filter_recent_items(cached[1])
+            if fallback_items:
+                fallback_reason = "NEWS_FALLBACK_STALE_CACHE"
+            else:
+                fallback_items = filter_relaxed_items(cached[1])
+                if fallback_items:
+                    fallback_reason = "NEWS_FALLBACK_STALE_CACHE_OUT_OF_WINDOW"
+        if not fallback_items and self._market_news_last_success and self._market_news_last_success[1]:
+            _, last_rows, last_meta = self._market_news_last_success
+            last_symbol = TextProcessor.clean_whitespace(str(last_meta.get("symbol", ""))).lower()
+            if (symbol_text and last_symbol == symbol_text) or (not symbol_text):
+                fallback_items = filter_recent_items(last_rows)
+                if fallback_items:
+                    fallback_reason = "NEWS_FALLBACK_LAST_SUCCESS"
+                else:
+                    fallback_items = filter_relaxed_items(last_rows)
+                    if fallback_items:
+                        fallback_reason = "NEWS_FALLBACK_LAST_SUCCESS_OUT_OF_WINDOW"
+
+        if fallback_items:
+            return MarketNewsResponse(
+                query=query_text,
+                age_hours=max_age_hours,
+                symbol=symbol_text or None,
+                symbol_name=symbol_name or None,
+                source_domains=response_domains,
+                items=[MarketNewsItem(**item) for item in fallback_items],
+                fetched_at=self._now_datetime(),
+                cache_hit=False,
+                fallback_used=True,
+                degraded=True,
+                degraded_reason=f"{fallback_reason}:{fetch_error or 'NEWS_EMPTY'}",
+            )
+
+        self._web_evidence_cache[cache_key] = (now_ts, [])
         return MarketNewsResponse(
             query=query_text,
-            items=result_items,
+            age_hours=max_age_hours,
+            symbol=symbol_text or None,
+            symbol_name=symbol_name or None,
+            source_domains=response_domains,
+            items=[],
             fetched_at=self._now_datetime(),
-            degraded=len(result_items) == 0,
-            degraded_reason=fetch_error or ("NEWS_EMPTY" if len(result_items) == 0 else None),
+            cache_hit=False,
+            fallback_used=False,
+            degraded=True,
+            degraded_reason=fetch_error or "NEWS_EMPTY",
         )
 
     def get_review_tags(self) -> ReviewTagsPayload:

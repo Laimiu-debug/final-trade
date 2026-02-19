@@ -326,9 +326,22 @@ export function getReviewTagStats(params?: { date_from?: string; date_to?: strin
   return apiRequest<ReviewTagStatsResponse>(`/api/review/tag-stats${suffix ? `?${suffix}` : ''}`)
 }
 
-export function getMarketNews(params?: { query?: string; limit?: number }) {
+export function getMarketNews(params?: {
+  query?: string
+  symbol?: string
+  source_domains?: string[]
+  age_hours?: 24 | 48 | 72
+  refresh?: boolean
+  limit?: number
+}) {
   const query = new URLSearchParams()
   if (params?.query) query.set('query', params.query)
+  if (params?.symbol) query.set('symbol', params.symbol)
+  if (params?.source_domains && params.source_domains.length > 0) {
+    query.set('source_domains', params.source_domains.join(','))
+  }
+  if (typeof params?.age_hours === 'number') query.set('age_hours', String(params.age_hours))
+  if (params?.refresh) query.set('refresh', 'true')
   if (typeof params?.limit === 'number') query.set('limit', String(params.limit))
   const suffix = query.toString()
   return apiRequest<MarketNewsResponse>(`/api/market/news${suffix ? `?${suffix}` : ''}`, {

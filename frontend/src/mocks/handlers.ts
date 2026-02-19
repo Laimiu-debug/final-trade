@@ -394,9 +394,23 @@ export const handlers = [
     await delay(140)
     const url = new URL(request.url)
     const limitRaw = Number(url.searchParams.get('limit') ?? 20)
+    const ageHoursRaw = Number(url.searchParams.get('age_hours') ?? 72)
+    const ageHours = ageHoursRaw === 24 || ageHoursRaw === 48 || ageHoursRaw === 72 ? ageHoursRaw : 72
+    const refresh = (url.searchParams.get('refresh') ?? '').toLowerCase() === 'true'
+    const sourceDomainsRaw = url.searchParams.get('source_domains') ?? ''
+    const sourceDomains = sourceDomainsRaw
+      .replace(/;/g, ',')
+      .replace(/\|/g, ',')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
     return HttpResponse.json(
       getMarketNewsStore({
         query: url.searchParams.get('query') ?? undefined,
+        symbol: url.searchParams.get('symbol') ?? undefined,
+        source_domains: sourceDomains,
+        age_hours: ageHours,
+        refresh,
         limit: Number.isFinite(limitRaw) ? limitRaw : 20,
       }),
     )

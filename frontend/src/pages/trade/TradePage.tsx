@@ -479,22 +479,26 @@ export function TradePage() {
           const step = row.sizing_mode === 'lots' ? 1 : row.sizing_mode === 'amount' ? 1000 : 1
           const precision = row.sizing_mode === 'lots' ? 0 : row.sizing_mode === 'amount' ? 2 : 2
           return (
-            <InputNumber
-              min={min}
-              max={max}
-              step={step}
-              precision={precision}
-              addonAfter={unit}
-              value={row.sizing_value}
-              style={{ width: '100%' }}
-              onChange={(value) => {
-                const fallback = row.sizing_mode === 'lots' ? 1 : 0
-                const normalized = typeof value === 'number' && Number.isFinite(value)
-                  ? Math.max(min, value)
-                  : fallback
-                patchPendingDraft(row.id, { sizing_value: normalized })
-              }}
-            />
+            <Space.Compact style={{ width: '100%' }}>
+              <InputNumber
+                min={min}
+                max={max}
+                step={step}
+                precision={precision}
+                value={row.sizing_value}
+                style={{ width: '100%' }}
+                onChange={(value) => {
+                  const fallback = row.sizing_mode === 'lots' ? 1 : 0
+                  const normalized = typeof value === 'number' && Number.isFinite(value)
+                    ? Math.max(min, value)
+                    : fallback
+                  patchPendingDraft(row.id, { sizing_value: normalized })
+                }}
+              />
+              <Button disabled tabIndex={-1} style={{ width: 42, pointerEvents: 'none' }}>
+                {unit}
+              </Button>
+            </Space.Compact>
           )
         },
       },
@@ -508,7 +512,7 @@ export function TradePage() {
             ? quantity * (row.reference_price as number)
             : 0
           return (
-            <Space direction="vertical" size={0}>
+            <Space orientation="vertical" size={0}>
               <Typography.Text>{quantity > 0 ? `${quantity} 股` : '-'}</Typography.Text>
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                 {estimatedAmount > 0 ? `约 ${formatMoney(estimatedAmount)}` : '缺少参考价或数量不足'}
