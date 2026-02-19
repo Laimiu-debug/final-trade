@@ -13,6 +13,12 @@ type ReviewPhaseBPanelProps = {
   dateTo: string
 }
 
+type ReviewSharePanelState = {
+  keyword: string
+  selectedTsCode: string
+  note: string
+}
+
 type PriceSnapshot = {
   latest: number | null
   prev: number | null
@@ -22,6 +28,35 @@ type PriceSnapshot = {
   high20: number | null
   low20: number | null
   sparkline: number[]
+}
+
+const REVIEW_SHARE_PANEL_STORAGE_KEY = 'final-trade-review-share-panel-v1'
+
+function loadReviewSharePanelState(): ReviewSharePanelState {
+  if (typeof window === 'undefined') {
+    return { keyword: '', selectedTsCode: '', note: '' }
+  }
+  try {
+    const raw = window.localStorage.getItem(REVIEW_SHARE_PANEL_STORAGE_KEY)
+    if (!raw) return { keyword: '', selectedTsCode: '', note: '' }
+    const parsed = JSON.parse(raw) as Partial<ReviewSharePanelState>
+    return {
+      keyword: typeof parsed.keyword === 'string' ? parsed.keyword : '',
+      selectedTsCode: typeof parsed.selectedTsCode === 'string' ? parsed.selectedTsCode : '',
+      note: typeof parsed.note === 'string' ? parsed.note : '',
+    }
+  } catch {
+    return { keyword: '', selectedTsCode: '', note: '' }
+  }
+}
+
+function saveReviewSharePanelState(state: ReviewSharePanelState) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(REVIEW_SHARE_PANEL_STORAGE_KEY, JSON.stringify(state))
+  } catch {
+    // ignore localStorage errors
+  }
 }
 
 function tsCodeToPrefixedSymbol(tsCode: string) {
@@ -170,11 +205,12 @@ function drawWrappedText(
 export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) {
   const { message } = AntdApp.useApp()
   const navigate = useNavigate()
-  const [keyword, setKeyword] = useState('')
+  const [keyword, setKeyword] = useState(() => loadReviewSharePanelState().keyword)
   const [rows, setRows] = useState<StockSearchResult[]>([])
   const [loading, setLoading] = useState(false)
   const [selected, setSelected] = useState<StockSearchResult | null>(null)
-  const [note, setNote] = useState('')
+  const [note, setNote] = useState(() => loadReviewSharePanelState().note)
+  const [preferredTsCode, setPreferredTsCode] = useState(() => loadReviewSharePanelState().selectedTsCode)
 
   const statsQuery = useQuery({
     queryKey: ['stock-library-stats'],
@@ -208,10 +244,26 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
   }, [keyword, message])
 
   useEffect(() => {
+    if (!preferredTsCode || rows.length === 0 || selected?.ts_code === preferredTsCode) return
+    const matched = rows.find((item) => item.ts_code === preferredTsCode)
+    if (matched) {
+      setSelected(matched)
+    }
+  }, [preferredTsCode, rows, selected?.ts_code])
+
+  useEffect(() => {
     if (!selected && rows.length > 0) {
       setSelected(rows[0])
     }
   }, [rows, selected])
+
+  useEffect(() => {
+    saveReviewSharePanelState({
+      keyword,
+      selectedTsCode: selected?.ts_code || preferredTsCode || '',
+      note,
+    })
+  }, [keyword, note, preferredTsCode, selected?.ts_code])
 
   const selectedSymbol = useMemo(() => {
     if (!selected) return ''
@@ -413,6 +465,7 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
   }
 
   function handleOpenChart(row: StockSearchResult) {
+    setPreferredTsCode(row.ts_code)
     const prefixedSymbol = tsCodeToPrefixedSymbol(row.ts_code)
     if (!prefixedSymbol) {
       message.warning('该股票缺少行情代码，无法打开K线页')
@@ -481,10 +534,14 @@ export function ReviewPhaseBPanel({ dateFrom, dateTo }: ReviewPhaseBPanelProps) 
                 const key = String(keys[0] || '')
                 const row = rows.find((item) => item.ts_code === key) || null
                 setSelected(row)
+                if (row) setPreferredTsCode(row.ts_code)
               },
             }}
             onRow={(record) => ({
-              onClick: () => setSelected(record),
+              onClick: () => {
+                setSelected(record)
+                setPreferredTsCode(record.ts_code)
+              },
             })}
           />
         </Space>

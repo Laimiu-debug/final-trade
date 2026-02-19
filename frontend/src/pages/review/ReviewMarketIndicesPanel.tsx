@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ReloadOutlined, SettingOutlined } from '@ant-design/icons'
 import { Alert, Button, Card, Checkbox, Input, Popover, Radio, Row, Col, Space, Typography } from 'antd'
+import { useNavigate } from 'react-router-dom'
 import { getStockCandles } from '@/shared/api/endpoints'
 
 type IndexDefinition = {
@@ -113,6 +114,7 @@ function toSnapshot(definition: IndexDefinition, candles: Array<{ time: string; 
 }
 
 export function ReviewMarketIndicesPanel() {
+  const navigate = useNavigate()
   const [selectedSymbols, setSelectedSymbols] = useState<string[]>(() => loadSelectedSymbols())
   const [configOpen, setConfigOpen] = useState(false)
   const [searchKeyword, setSearchKeyword] = useState('')
@@ -185,6 +187,11 @@ export function ReviewMarketIndicesPanel() {
   function handleMoodNoteChange(nextNote: string) {
     setMoodNote(nextNote)
     saveMoodNote(nextNote)
+  }
+
+  function openIndexTrend(item: IndexSnapshot) {
+    const params = new URLSearchParams({ signal_stock_name: item.name })
+    navigate(`/stocks/${item.symbol}/chart?${params.toString()}`)
   }
 
   return (
@@ -283,7 +290,20 @@ export function ReviewMarketIndicesPanel() {
               const isUp = item.changePct >= 0
               return (
                 <Col key={item.symbol} xs={24} sm={12} lg={6}>
-                  <Card size="small" style={{ borderRadius: 12 }}>
+                  <Card
+                    size="small"
+                    hoverable
+                    style={{ borderRadius: 12 }}
+                    onClick={() => openIndexTrend(item)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        openIndexTrend(item)
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
+                  >
                     <Space orientation="vertical" size={2} style={{ width: '100%' }}>
                       <Typography.Text type="secondary">{item.name}</Typography.Text>
                       <Typography.Text strong style={{ fontSize: 34, lineHeight: '38px' }}>
@@ -296,6 +316,9 @@ export function ReviewMarketIndicesPanel() {
                         <Typography.Text type="secondary">最高: {item.high.toFixed(2)}</Typography.Text>
                         <Typography.Text type="secondary">最低: {item.low.toFixed(2)}</Typography.Text>
                       </Space>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        点击查看走势
+                      </Typography.Text>
                     </Space>
                   </Card>
                 </Col>
