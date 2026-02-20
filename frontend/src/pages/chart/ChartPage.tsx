@@ -35,7 +35,18 @@ import { KLineChart } from '@/shared/charts/KLineChart'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { computeCandleRangeStats } from '@/shared/utils/candleStats'
 import { useUIStore } from '@/state/uiStore'
-import type { AIAnalysisRecord, SignalScanMode, StockAnnotation, TrendPoolStep } from '@/types/contracts'
+import type { AIAnalysisRecord, BoardFilter, SignalScanMode, StockAnnotation, TrendPoolStep } from '@/types/contracts'
+
+const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 'st']
+
+function parseSignalBoardFilters(searchParams: URLSearchParams): BoardFilter[] {
+  const merged = searchParams
+    .getAll('signal_board_filters')
+    .flatMap((item) => item.split(','))
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0 && ALLOWED_BOARD_FILTERS.includes(item as BoardFilter))
+  return Array.from(new Set(merged)) as BoardFilter[]
+}
 
 function defaultAnnotation(symbol: string): StockAnnotation {
   return {
@@ -114,6 +125,7 @@ export function ChartPage() {
   const parsedMinEventCount = Number(searchParams.get('signal_min_event_count') ?? 1)
   const signalMinEventCount = Number.isFinite(parsedMinEventCount) ? Math.max(1, Math.round(parsedMinEventCount)) : 1
   const signalRequireSequence = searchParams.get('signal_require_sequence') === 'true'
+  const signalBoardFilters = parseSignalBoardFilters(searchParams)
 
   const candlesQuery = useQuery({
     queryKey: ['candles', symbol],
@@ -138,12 +150,14 @@ export function ChartPage() {
       signalMinScore,
       signalMinEventCount,
       signalRequireSequence,
+      signalBoardFilters.join(','),
     ],
     queryFn: () =>
       getSignals({
         mode: signalMode,
         run_id: signalRunId,
         trend_step: signalMode === 'trend_pool' ? signalTrendStep : undefined,
+        board_filters: signalMode === 'trend_pool' && signalBoardFilters.length > 0 ? signalBoardFilters : undefined,
         as_of_date: signalAsOfDate,
         window_days: signalWindowDays,
         min_score: signalMinScore,

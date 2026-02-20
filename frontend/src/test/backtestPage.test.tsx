@@ -16,10 +16,46 @@ describe('BacktestPage', () => {
   })
 
   it('runs backtest and renders result summary', async () => {
+    let pollCount = 0
     server.use(
-      http.post('/api/backtest/run', async () => {
+      http.post('/api/backtest/tasks', async () => {
+        await delay(20)
+        return HttpResponse.json({ task_id: 'bt_test_001' })
+      }),
+      http.get('/api/backtest/tasks/:taskId', async () => {
+        pollCount += 1
+        await delay(20)
+        if (pollCount <= 1) {
+          return HttpResponse.json({
+            task_id: 'bt_test_001',
+            status: 'running',
+            progress: {
+              mode: 'daily',
+              current_date: '2026-01-10',
+              processed_dates: 1,
+              total_dates: 3,
+              percent: 33.3,
+              message: '滚动筛选进度 1/3',
+              started_at: '2026-02-20 10:00:00',
+              updated_at: '2026-02-20 10:00:01',
+            },
+          })
+        }
         await delay(20)
         return HttpResponse.json({
+          task_id: 'bt_test_001',
+          status: 'succeeded',
+          progress: {
+            mode: 'daily',
+            current_date: '2026-01-31',
+            processed_dates: 3,
+            total_dates: 3,
+            percent: 100,
+            message: '回测完成。',
+            started_at: '2026-02-20 10:00:00',
+            updated_at: '2026-02-20 10:00:05',
+          },
+          result: {
           stats: {
             win_rate: 0.5,
             total_return: 0.08,
@@ -80,6 +116,7 @@ describe('BacktestPage', () => {
           skipped_count: 2,
           fill_rate: 0.333333,
           max_concurrent_positions: 2,
+          },
         })
       }),
     )
@@ -90,6 +127,8 @@ describe('BacktestPage', () => {
 
     expect(await screen.findByText('候选信号')).toBeInTheDocument()
     expect(await screen.findByText('sz300750')).toBeInTheDocument()
+    const chartLink = await screen.findByRole('link', { name: 'sz300750' })
+    expect(chartLink.getAttribute('href')).toContain('/stocks/sz300750/chart')
     expect(await screen.findByText('mock note')).toBeInTheDocument()
   }, 12_000)
 

@@ -48,6 +48,8 @@ import type {
   AIProviderTestRequest,
   AppConfig,
   BacktestRunRequest,
+  BacktestResponse,
+  BoardFilter,
   DailyReviewPayload,
   MarketDataSyncRequest,
   ReviewTagCreateRequest,
@@ -57,6 +59,14 @@ import type {
   TradeFillTagUpdateRequest,
   WeeklyReviewPayload,
 } from '@/types/contracts'
+
+type MockBacktestTask = {
+  status: 'running' | 'succeeded'
+  poll_count: number
+  result: BacktestResponse
+}
+
+const mockBacktestTaskStore = new Map<string, MockBacktestTask>()
 
 export const handlers = [
   http.post('/api/screener/run', async ({ request }) => {
@@ -132,6 +142,18 @@ export const handlers = [
     await delay(120)
     const url = new URL(request.url)
     const mode = (url.searchParams.get('mode') ?? 'trend_pool') as 'trend_pool' | 'full_market'
+    const boardFilters = Array.from(
+      new Set(
+        url.searchParams
+          .getAll('board_filters')
+          .flatMap((item) => item.split(','))
+          .map((item) => item.trim())
+          .filter(
+            (item): item is BoardFilter =>
+              item === 'main' || item === 'gem' || item === 'star' || item === 'beijing' || item === 'st',
+          ),
+      ),
+    )
     const refresh = url.searchParams.get('refresh') === 'true'
     const windowDays = Number(url.searchParams.get('window_days') ?? 60)
     const minScore = Number(url.searchParams.get('min_score') ?? 60)
@@ -140,6 +162,7 @@ export const handlers = [
     return HttpResponse.json(
       getSignals({
         mode,
+        board_filters: boardFilters,
         window_days: Number.isFinite(windowDays) ? windowDays : 60,
         min_score: Number.isFinite(minScore) ? minScore : 60,
         require_sequence: requireSequence,
@@ -157,6 +180,72 @@ export const handlers = [
     await delay(220)
     const payload = (await request.json()) as BacktestRunRequest
     return HttpResponse.json(runBacktestStore(payload))
+  }),
+
+  http.post('/api/backtest/tasks', async ({ request }) => {
+    await delay(120)
+    const payload = (await request.json()) as BacktestRunRequest
+    const taskId = `bt_mock_${Date.now()}_${Math.floor(Math.random() * 10000)}`
+    mockBacktestTaskStore.set(taskId, {
+      status: 'running',
+      poll_count: 0,
+      result: runBacktestStore(payload),
+    })
+    return HttpResponse.json({ task_id: taskId })
+  }),
+
+  http.get('/api/backtest/tasks/:taskId', async ({ params }) => {
+    await delay(120)
+    const taskId = String(params.taskId)
+    const task = mockBacktestTaskStore.get(taskId)
+    if (!task) {
+      return HttpResponse.json(
+        {
+          code: 'BACKTEST_TASK_NOT_FOUND',
+          message: '回测任务不存在',
+          trace_id: `${Date.now()}`,
+        },
+        { status: 404 },
+      )
+    }
+    task.poll_count += 1
+    if (task.status === 'running' && task.poll_count >= 2) {
+      task.status = 'succeeded'
+    }
+    if (task.status === 'running') {
+      return HttpResponse.json({
+        task_id: taskId,
+        status: 'running',
+        progress: {
+          mode: 'daily',
+          current_date: task.result.range.date_from,
+          processed_dates: 1,
+          total_dates: 2,
+          percent: 50,
+          message: '滚动筛选进度 1/2',
+          warning: null,
+          started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+      })
+    }
+    return HttpResponse.json({
+      task_id: taskId,
+      status: 'succeeded',
+      progress: {
+        mode: 'daily',
+        current_date: task.result.range.date_to,
+        processed_dates: 2,
+        total_dates: 2,
+        percent: 100,
+        message: '回测完成。',
+        warning: null,
+        started_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      result: task.result,
+      error: null,
+    })
   }),
 
   http.post('/api/sim/orders', async ({ request }) => {

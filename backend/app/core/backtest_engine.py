@@ -210,6 +210,7 @@ class BacktestEngine:
         payload: BacktestRunRequest,
         start_date: str,
         end_date: str,
+        allowed_symbols_by_date: dict[str, set[str]] | None = None,
     ) -> tuple[list[CandidateTrade], int]:
         candles = self._get_candles(symbol)
         if len(candles) < 30:
@@ -229,6 +230,10 @@ class BacktestEngine:
 
         for idx in in_range_indexes:
             as_of_date = candles[idx].time
+            if allowed_symbols_by_date is not None:
+                allowed_today = allowed_symbols_by_date.get(as_of_date, set())
+                if symbol not in allowed_today:
+                    continue
             row = self._build_row(symbol, as_of_date)
             if row is None:
                 continue
@@ -329,6 +334,7 @@ class BacktestEngine:
         *,
         payload: BacktestRunRequest,
         symbols: list[str],
+        allowed_symbols_by_date: dict[str, set[str]] | None = None,
     ) -> BacktestResponse:
         start_dt = self._parse_date(payload.date_from)
         end_dt = self._parse_date(payload.date_to)
@@ -343,7 +349,13 @@ class BacktestEngine:
         candidates: list[CandidateTrade] = []
         total_t1_skips = 0
         for symbol in symbols:
-            rows, t1_skips = self._build_candidates_for_symbol(symbol, payload, start_date, end_date)
+            rows, t1_skips = self._build_candidates_for_symbol(
+                symbol,
+                payload,
+                start_date,
+                end_date,
+                allowed_symbols_by_date=allowed_symbols_by_date,
+            )
             candidates.extend(rows)
             total_t1_skips += t1_skips
         if total_t1_skips > 0:
@@ -494,22 +506,67 @@ class BacktestEngine:
         else:
             profit_factor = 0.0
 
-        pnl_by_date: dict[str, float] = defaultdict(float)
-        for row in executed:
-            pnl_by_date[row.exit_date] += row.pnl_amount
+        entries_by_date: dict[str, list[tuple[int, BacktestTrade]]] = defaultdict(list)
+        exits_by_date: dict[str, list[tuple[int, BacktestTrade]]] = defaultdict(list)
+        for idx, trade in enumerate(executed):
+            entries_by_date[trade.entry_date].append((idx, trade))
+            exits_by_date[trade.exit_date].append((idx, trade))
 
-        notes.append("资金曲线按自然日采样；无成交日资金保持不变。")
-        running_pnl = 0.0
+        close_map_by_symbol: dict[str, dict[str, float]] = {}
+        for symbol in {trade.symbol for trade in executed}:
+            day_close: dict[str, float] = {}
+            for bar in self._get_candles(symbol):
+                close_price = float(bar.close)
+                if math.isfinite(close_price) and close_price > 0:
+                    day_close[bar.time] = close_price
+            close_map_by_symbol[symbol] = day_close
+
+        notes.append("资金曲线按自然日盯市：无交易日也按持仓收盘价更新净值。")
+        running_realized_pnl = 0.0
+        cash_mark = float(payload.initial_capital)
+        open_positions: dict[int, dict[str, float | str]] = {}
+        last_close_by_symbol: dict[str, float] = {}
+
         equity_curve: list[EquityPoint] = []
         cursor_dt = start_dt
         while cursor_dt <= end_dt:
             day = cursor_dt.strftime("%Y-%m-%d")
-            running_pnl += pnl_by_date.get(day, 0.0)
+
+            for idx, trade in entries_by_date.get(day, []):
+                entry_exec = float(trade.entry_price) * (1 + fee_rate)
+                invested = float(trade.quantity) * entry_exec
+                cash_mark -= invested
+                open_positions[idx] = {
+                    "symbol": trade.symbol,
+                    "quantity": float(trade.quantity),
+                    "entry_price": float(trade.entry_price),
+                }
+
+            for idx, trade in exits_by_date.get(day, []):
+                exit_exec = float(trade.exit_price) * (1 - fee_rate)
+                exit_amount = float(trade.quantity) * exit_exec
+                cash_mark += exit_amount
+                running_realized_pnl += float(trade.pnl_amount)
+                open_positions.pop(idx, None)
+
+            market_value = 0.0
+            for position in open_positions.values():
+                symbol = str(position.get("symbol", ""))
+                quantity = float(position.get("quantity", 0.0))
+                mark = close_map_by_symbol.get(symbol, {}).get(day)
+                if mark is not None and math.isfinite(mark) and mark > 0:
+                    last_close_by_symbol[symbol] = mark
+                else:
+                    mark = last_close_by_symbol.get(symbol)
+                if mark is None or not math.isfinite(mark) or mark <= 0:
+                    mark = float(position.get("entry_price", 0.0))
+                market_value += quantity * mark
+
             equity_curve.append(
                 EquityPoint(
                     date=day,
-                    equity=round(float(payload.initial_capital) + running_pnl, 4),
-                    realized_pnl=round(running_pnl, 4),
+                    equity=round(cash_mark + market_value, 4),
+                    realized_pnl=round(running_realized_pnl, 4),
                 )
             )
             cursor_dt += timedelta(days=1)

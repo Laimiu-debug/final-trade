@@ -14,6 +14,9 @@ from .models import (
     AIRecordsResponse,
     BacktestResponse,
     BacktestRunRequest,
+    BacktestTaskStartResponse,
+    BacktestTaskStatusResponse,
+    BoardFilter,
     AnnotationUpdateResponse,
     ApiErrorPayload,
     AppConfig,
@@ -159,6 +162,7 @@ def get_signals(
     mode: SignalScanMode = Query(default="trend_pool"),
     run_id: str = Query(default="", min_length=0, max_length=64),
     trend_step: TrendPoolStep = Query(default="auto"),
+    board_filters: list[BoardFilter] | None = Query(default=None),
     as_of_date: str | None = Query(default=None, min_length=10, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     refresh: bool = Query(default=False),
     window_days: int = Query(default=60, ge=20, le=240),
@@ -170,6 +174,7 @@ def get_signals(
         mode=mode,
         run_id=run_id.strip() or None,
         trend_step=trend_step,
+        board_filters=list(dict.fromkeys(board_filters or [])),
         as_of_date=as_of_date,
         refresh=refresh,
         window_days=window_days,
@@ -185,6 +190,23 @@ def post_backtest_run(payload: BacktestRunRequest) -> BacktestResponse | JSONRes
         return store.run_backtest(payload)
     except ValueError as exc:
         return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.post("/api/backtest/tasks", response_model=BacktestTaskStartResponse)
+def post_backtest_task(payload: BacktestRunRequest) -> BacktestTaskStartResponse | JSONResponse:
+    try:
+        task_id = store.start_backtest_task(payload)
+        return BacktestTaskStartResponse(task_id=task_id)
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.get("/api/backtest/tasks/{task_id}", response_model=BacktestTaskStatusResponse)
+def get_backtest_task(task_id: str = Path(min_length=8, max_length=64)) -> BacktestTaskStatusResponse | JSONResponse:
+    task = store.get_backtest_task(task_id)
+    if task is None:
+        return error_response(404, "BACKTEST_TASK_NOT_FOUND", "回测任务不存在")
+    return task
 
 
 @app.post("/api/sim/orders", response_model=CreateOrderResponse)

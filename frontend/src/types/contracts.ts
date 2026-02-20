@@ -6,6 +6,7 @@ export type SignalType = 'A' | 'B' | 'C'
 export type SignalScanMode = 'trend_pool' | 'full_market'
 export type TrendPoolStep = 'auto' | 'step1' | 'step2' | 'step3' | 'step4'
 export type BacktestPriorityMode = 'phase_first' | 'balanced' | 'momentum'
+export type BacktestPoolRollMode = 'daily' | 'weekly' | 'position'
 export type BoardFilter = 'main' | 'gem' | 'star' | 'beijing' | 'st'
 export type MarketDataSource = 'tdx_only' | 'tdx_then_akshare' | 'akshare_only'
 export type MarketSyncProvider = 'baostock'
@@ -360,6 +361,7 @@ export interface BacktestRunRequest {
   mode: SignalScanMode
   run_id?: string
   trend_step: TrendPoolStep
+  pool_roll_mode: BacktestPoolRollMode
   board_filters?: BoardFilter[]
   date_from: string
   date_to: string
@@ -416,6 +418,30 @@ export interface BacktestResponse {
   skipped_count: number
   fill_rate: number
   max_concurrent_positions: number
+}
+
+export interface BacktestTaskStartResponse {
+  task_id: string
+}
+
+export interface BacktestTaskProgress {
+  mode: BacktestPoolRollMode
+  current_date?: string | null
+  processed_dates: number
+  total_dates: number
+  percent: number
+  message: string
+  warning?: string | null
+  started_at: string
+  updated_at: string
+}
+
+export interface BacktestTaskStatusResponse {
+  task_id: string
+  status: 'pending' | 'running' | 'succeeded' | 'failed'
+  progress: BacktestTaskProgress
+  result?: BacktestResponse | null
+  error?: string | null
 }
 
 export type ReviewTagType = 'emotion' | 'reason'

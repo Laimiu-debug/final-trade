@@ -10,8 +10,8 @@ import html
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from threading import RLock
-from typing import Literal
+from threading import RLock, Thread
+from typing import Callable, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
 import xml.etree.ElementTree as ET
@@ -27,6 +27,8 @@ from .models import (
     CandlePoint,
     BacktestRunRequest,
     BacktestResponse,
+    BacktestTaskProgress,
+    BacktestTaskStatusResponse,
     BoardFilter,
     CreateOrderRequest,
     CreateOrderResponse,
@@ -131,6 +133,8 @@ class InMemoryStore:
         self._market_news_last_success: tuple[float, list[dict[str, str]], dict[str, str]] | None = None
         self._quote_profile_cache: dict[str, tuple[float, dict[str, str]]] = {}
         self._signals_cache: dict[str, tuple[float, SignalsResponse]] = {}
+        self._backtest_tasks: dict[str, BacktestTaskStatusResponse] = {}
+        self._backtest_task_lock = RLock()
         self._app_state_path = self._resolve_app_state_path(app_state_path)
         self._load_or_init_app_state()
         self._sim_engine = SimAccountEngine(
@@ -3272,6 +3276,7 @@ class InMemoryStore:
         mode: SignalScanMode,
         run_id: str | None,
         trend_step: TrendPoolStep,
+        board_filters: list[BoardFilter],
         as_of_date: str | None,
         window_days: int,
         min_score: float,
@@ -3282,6 +3287,7 @@ class InMemoryStore:
             "mode": mode,
             "run_id": run_id or "",
             "trend_step": trend_step,
+            "board_filters": board_filters,
             "as_of_date": as_of_date or "",
             "window_days": window_days,
             "min_score": round(min_score, 3),
@@ -3296,6 +3302,7 @@ class InMemoryStore:
         mode: SignalScanMode = "trend_pool",
         run_id: str | None = None,
         trend_step: TrendPoolStep = "auto",
+        board_filters: list[BoardFilter] | None = None,
         as_of_date: str | None = None,
         refresh: bool = False,
         window_days: int = 60,
@@ -3309,11 +3316,18 @@ class InMemoryStore:
             trend_step=trend_step,
             as_of_date=as_of_date,
         )
+        allowed_board_filters = {"main", "gem", "star", "beijing", "st"}
+        normalized_board_filters = list(
+            dict.fromkeys(item for item in (board_filters or []) if item in allowed_board_filters)
+        )
+        if normalized_board_filters:
+            candidates = [row for row in candidates if self._row_matches_board_filters(row, normalized_board_filters)]
         source_count = len(candidates)
         cache_key = self._signals_cache_key(
             mode=mode,
             run_id=resolved_run_id if mode == "trend_pool" else run_id,
             trend_step=trend_step if mode == "trend_pool" else "auto",
+            board_filters=normalized_board_filters,
             as_of_date=resolved_as_of_date,
             window_days=window_days,
             min_score=min_score,
@@ -3515,32 +3529,329 @@ class InMemoryStore:
             return False
         return board in selected_boards
 
-    def run_backtest(self, payload: BacktestRunRequest) -> BacktestResponse:
-        candidates, degraded_reason, resolved_run_id, resolved_as_of_date = self._resolve_signal_candidates(
-            mode=payload.mode,
-            run_id=payload.run_id,
-            trend_step=payload.trend_step,
-            as_of_date=payload.date_to,
-        )
-        board_filters = [item for item in payload.board_filters if item in {"main", "gem", "star", "beijing", "st"}]
-        candidate_count_before_board_filter = len(candidates)
-        if board_filters:
-            candidates = [row for row in candidates if self._row_matches_board_filters(row, board_filters)]
-        candidate_count_after_board_filter = len(candidates)
+    @staticmethod
+    def _select_step_source_for_backtest(
+        *,
+        trend_step: TrendPoolStep,
+        step1_pool: list[ScreenerResult],
+        step2_pool: list[ScreenerResult],
+        step3_pool: list[ScreenerResult],
+        step4_pool: list[ScreenerResult],
+    ) -> list[ScreenerResult]:
+        if trend_step == "step4":
+            return step4_pool
+        if trend_step == "step3":
+            return step3_pool
+        if trend_step == "step2":
+            return step2_pool
+        if trend_step == "step1":
+            return step1_pool
+        return step4_pool or step3_pool
 
+    @staticmethod
+    def _run_screener_filters_for_backtest(
+        rows: list[ScreenerResult],
+        params: ScreenerParams,
+    ) -> tuple[list[ScreenerResult], list[ScreenerResult], list[ScreenerResult], list[ScreenerResult]]:
+        step1_pool = (
+            sorted(
+                (
+                    row
+                    for row in rows
+                    if row.turnover20 >= params.turnover_threshold
+                    and row.amount20 >= params.amount_threshold
+                    and row.amplitude20 >= params.amplitude_threshold
+                ),
+                key=lambda row: row.ret40,
+                reverse=True,
+            )[: params.top_n]
+        )
+        if len(step1_pool) > 400:
+            step1_pool = step1_pool[:400]
+
+        loose_padding = 0.02 if params.mode == "loose" else 0.0
+        loose_days = 1 if params.mode == "loose" else 0
+        retrace_min = max(0.0, 0.05 - loose_padding)
+        retrace_max = min(0.8, 0.25 + loose_padding)
+        max_pullback_days = 3 + loose_days
+        min_ma10_days = max(0, 5 - loose_days)
+        min_ma5_days = max(0, 3 - loose_days)
+
+        step2_pool = [
+            row
+            for row in step1_pool
+            if row.retrace20 >= retrace_min
+            and row.retrace20 <= retrace_max
+            and row.pullback_days <= max_pullback_days
+            and row.ma10_above_ma20_days >= min_ma10_days
+            and row.ma5_above_ma10_days >= min_ma5_days
+            and abs(row.price_vs_ma20) <= 0.08
+            and row.price_vs_ma20 >= 0
+            and row.trend_class != "B"
+        ]
+
+        step3_pool = [
+            row
+            for row in step2_pool
+            if row.vol_slope20 >= 0.05
+            and row.up_down_volume_ratio >= 1.3
+            and row.pullback_volume_ratio <= 0.9
+            and not row.has_blowoff_top
+            and not row.has_divergence_5d
+            and not row.has_upper_shadow_risk
+            and not row.degraded
+        ]
+
+        step4_source = [
+            row
+            for row in step3_pool
+            if row.ai_confidence >= 0.55 and row.theme_stage in ("发酵中", "高潮")
+        ]
+        step4_pool = sorted(
+            step4_source,
+            key=lambda row: row.score + row.ai_confidence * 20,
+            reverse=True,
+        )[:8]
+
+        return step1_pool, step2_pool, step3_pool, step4_pool
+
+    def _build_backtest_scan_dates(self, date_from: str, date_to: str) -> list[str]:
+        start_dt = self._parse_date(date_from)
+        end_dt = self._parse_date(date_to)
+        if start_dt is None or end_dt is None:
+            return []
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+        out: list[str] = []
+        cursor = start_dt
+        while cursor <= end_dt:
+            if cursor.weekday() < 5:
+                out.append(cursor.strftime("%Y-%m-%d"))
+            cursor += timedelta(days=1)
+        return out
+
+    def _build_weekly_refresh_dates(self, scan_dates: list[str]) -> list[str]:
+        out: list[str] = []
+        last_key: tuple[int, int] | None = None
+        for day in scan_dates:
+            parsed = self._parse_date(day)
+            if parsed is None:
+                continue
+            year, week_no, _ = parsed.isocalendar()
+            key = (year, week_no)
+            if key != last_key:
+                out.append(day)
+                last_key = key
+        if not out and scan_dates:
+            out.append(scan_dates[0])
+        return out
+
+    @staticmethod
+    def _next_scan_date(scan_dates: list[str], current_date: str) -> str | None:
+        for day in scan_dates:
+            if day > current_date:
+                return day
+        return None
+
+    def _build_backtest_screener_params_from_config(self) -> ScreenerParams:
+        markets = [item for item in self._config.markets if item in {"sh", "sz", "bj"}]
+        if not markets:
+            markets = ["sh", "sz"]
+        return ScreenerParams(
+            markets=markets,
+            mode="strict",
+            as_of_date=None,
+            return_window_days=max(5, min(120, int(self._config.return_window_days))),
+            top_n=max(100, min(2000, int(self._config.top_n))),
+            turnover_threshold=max(0.01, min(0.2, float(self._config.turnover_threshold))),
+            amount_threshold=max(5e7, min(5e9, float(self._config.amount_threshold))),
+            amplitude_threshold=max(0.01, min(0.15, float(self._config.amplitude_threshold))),
+        )
+
+    def _resolve_backtest_trend_pool_params(
+        self,
+        requested_run_id: str | None,
+    ) -> tuple[ScreenerParams, str | None, str | None, str | None]:
+        run_id = (requested_run_id or "").strip() or None
+        if run_id:
+            run = self._run_store.get(run_id)
+            if run is not None:
+                degraded_reason = run.degraded_reason if run.degraded else None
+                return run.params, run.run_id, degraded_reason, None
+            fallback_note = f"筛选任务 {run_id} 不存在，已改用系统筛选参数重建滚动池。"
+            return self._build_backtest_screener_params_from_config(), None, "TREND_POOL_RUN_NOT_FOUND", fallback_note
+
+        latest_run_id = self._latest_run_id()
+        if latest_run_id:
+            latest_run = self._run_store.get(latest_run_id)
+            if latest_run is not None:
+                degraded_reason = latest_run.degraded_reason if latest_run.degraded else None
+                return latest_run.params, latest_run.run_id, degraded_reason, None
+
+        fallback_note = "未找到可用筛选任务，已改用系统筛选参数重建滚动池。"
+        return self._build_backtest_screener_params_from_config(), None, "TREND_POOL_RUN_NOT_FOUND", fallback_note
+
+    def _build_trend_pool_rolling_universe(
+        self,
+        *,
+        payload: BacktestRunRequest,
+        screener_params: ScreenerParams,
+        board_filters: list[BoardFilter],
+        refresh_dates: list[str] | None = None,
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+    ) -> tuple[list[str], dict[str, set[str]], list[str], list[str], list[str]]:
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        if not scan_dates:
+            return [], {}, ["回测区间内无可扫描交易日。"], [], []
+
+        if refresh_dates is None:
+            if payload.pool_roll_mode == "weekly":
+                refresh_dates_used = self._build_weekly_refresh_dates(scan_dates)
+            elif payload.pool_roll_mode == "position":
+                refresh_dates_used = [scan_dates[0]]
+            else:
+                refresh_dates_used = list(scan_dates)
+        else:
+            scan_date_set = set(scan_dates)
+            refresh_dates_used = [day for day in refresh_dates if day in scan_date_set]
+            if not refresh_dates_used:
+                refresh_dates_used = [scan_dates[0]]
+
+        pool_by_refresh_date: dict[str, set[str]] = {}
+        empty_refresh_days = 0
+        loader_error_counter: dict[str, int] = {}
+        source_rows_total = 0
+        for idx, as_of_date in enumerate(refresh_dates_used, start=1):
+            input_rows, load_error = load_input_pool_from_tdx(
+                tdx_root=self._config.tdx_data_path,
+                markets=screener_params.markets,
+                return_window_days=screener_params.return_window_days,
+                as_of_date=as_of_date,
+            )
+            if load_error:
+                loader_error_counter[load_error] = loader_error_counter.get(load_error, 0) + 1
+            source_rows_total += len(input_rows)
+
+            if not input_rows:
+                pool_by_refresh_date[as_of_date] = set()
+                empty_refresh_days += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        as_of_date,
+                        idx,
+                        len(refresh_dates_used),
+                        f"滚动筛选进度 {idx}/{len(refresh_dates_used)}（当日数据为空）",
+                    )
+                continue
+
+            step1_pool, step2_pool, step3_pool, step4_pool = self._run_screener_filters_for_backtest(
+                input_rows,
+                screener_params,
+            )
+            source = self._select_step_source_for_backtest(
+                trend_step=payload.trend_step,
+                step1_pool=step1_pool,
+                step2_pool=step2_pool,
+                step3_pool=step3_pool,
+                step4_pool=step4_pool,
+            )
+            if board_filters:
+                source = [row for row in source if self._row_matches_board_filters(row, board_filters)]
+
+            day_symbols: list[str] = []
+            seen_symbols: set[str] = set()
+            for row in source:
+                symbol = str(row.symbol).strip().lower()
+                if not symbol or symbol in seen_symbols:
+                    continue
+                seen_symbols.add(symbol)
+                day_symbols.append(symbol)
+                if len(day_symbols) >= payload.max_symbols:
+                    break
+
+            pool_by_refresh_date[as_of_date] = set(day_symbols)
+            if progress_callback is not None:
+                progress_callback(
+                    as_of_date,
+                    idx,
+                    len(refresh_dates_used),
+                    f"滚动筛选进度 {idx}/{len(refresh_dates_used)}",
+                )
+
+        allowed_symbols_by_date: dict[str, set[str]] = {}
+        symbols_union: set[str] = set()
+        empty_days = 0
+        active_pool: set[str] = set()
+        for day in scan_dates:
+            if day in pool_by_refresh_date:
+                active_pool = set(pool_by_refresh_date.get(day, set()))
+            allowed_today = set(active_pool)
+            allowed_symbols_by_date[day] = allowed_today
+            if allowed_today:
+                symbols_union.update(allowed_today)
+            else:
+                empty_days += 1
+
+        mode_label_map = {
+            "daily": "每日滚动",
+            "weekly": "每周滚动",
+            "position": "持仓触发滚动",
+        }
+        mode_label = mode_label_map.get(payload.pool_roll_mode, "每日滚动")
+        avg_source_rows = int(round(source_rows_total / max(1, len(refresh_dates_used))))
+        notes = [
+            (
+                f"候选池构建: {mode_label}（扫描 {len(scan_dates)} 日，刷新 {len(refresh_dates_used)} 次，"
+                f"每次刷新平均加载 {avg_source_rows} 只标的）。"
+            ),
+            f"滚动股票池并集数量: {len(symbols_union)}，单日上限: {payload.max_symbols}。",
+        ]
+        if empty_refresh_days > 0:
+            notes.append(f"有 {empty_refresh_days} 个刷新日当日数据为空。")
+        if loader_error_counter:
+            parts = [f"{reason} x{count}" for reason, count in sorted(loader_error_counter.items())]
+            notes.append(f"刷新日数据加载提示: {'; '.join(parts)}")
+        if empty_days > 0:
+            notes.append(f"有 {empty_days} 个交易日筛选为空，当日不会产生候选信号。")
+        return sorted(symbols_union), allowed_symbols_by_date, notes, scan_dates, refresh_dates_used
+
+    def run_backtest(
+        self,
+        payload: BacktestRunRequest,
+        *,
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+    ) -> BacktestResponse:
+        board_filters = [item for item in payload.board_filters if item in {"main", "gem", "star", "beijing", "st"}]
+        candidates: list[ScreenerResult] = []
+        degraded_reason: str | None = None
+        resolved_run_id: str | None = None
+        resolved_as_of_date: str | None = payload.date_to
+        trend_pool_params: ScreenerParams | None = None
+        trend_pool_fallback_note: str | None = None
+        if payload.mode == "trend_pool":
+            (
+                trend_pool_params,
+                resolved_run_id,
+                degraded_reason,
+                trend_pool_fallback_note,
+            ) = self._resolve_backtest_trend_pool_params(payload.run_id)
+        else:
+            candidates, degraded_reason, resolved_run_id, resolved_as_of_date = self._resolve_signal_candidates(
+                mode=payload.mode,
+                run_id=payload.run_id,
+                trend_step=payload.trend_step,
+                as_of_date=payload.date_to,
+            )
+        candidate_count_before_board_filter = len(candidates)
+        candidate_count_after_board_filter = len(candidates)
+        pool_notes: list[str] = []
+        if trend_pool_fallback_note:
+            pool_notes.append(trend_pool_fallback_note)
         symbols: list[str] = []
         seen_symbols: set[str] = set()
-        for row in candidates:
-            symbol = str(row.symbol).strip().lower()
-            if not symbol or symbol in seen_symbols:
-                continue
-            symbols.append(symbol)
-            seen_symbols.add(symbol)
-            if len(symbols) >= payload.max_symbols:
-                break
-
-        if not symbols:
-            raise ValueError("回测股票池为空，请先执行筛选或调整回测模式")
+        used_rolling_universe = False
+        allowed_symbols_by_date: dict[str, set[str]] | None = None
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
 
         engine = BacktestEngine(
             get_candles=self._ensure_candles,
@@ -3552,18 +3863,110 @@ class InMemoryStore:
             ),
             resolve_symbol_name=self._resolve_symbol_name,
         )
-        result = engine.run(payload=payload, symbols=symbols)
+
+        if payload.mode == "trend_pool" and trend_pool_params is not None:
+            if payload.pool_roll_mode == "position":
+                if not scan_dates:
+                    raise ValueError("回测区间内无可扫描交易日。")
+                seed_refresh_dates = [scan_dates[0]]
+                seed_symbols, seed_allowed_by_date, _, _, _ = self._build_trend_pool_rolling_universe(
+                    payload=payload,
+                    screener_params=trend_pool_params,
+                    board_filters=board_filters,
+                    refresh_dates=seed_refresh_dates,
+                    progress_callback=None,
+                )
+                if not seed_symbols:
+                    raise ValueError("回测股票池为空：持仓触发滚动初始池为空。")
+                probe_result = engine.run(
+                    payload=payload,
+                    symbols=seed_symbols,
+                    allowed_symbols_by_date=seed_allowed_by_date,
+                )
+                refresh_date_set: set[str] = {scan_dates[0]}
+                for trade in probe_result.trades:
+                    next_day = self._next_scan_date(scan_dates, trade.exit_date)
+                    if next_day:
+                        refresh_date_set.add(next_day)
+                if progress_callback is not None:
+                    progress_callback(
+                        scan_dates[0],
+                        0,
+                        max(1, len(refresh_date_set)),
+                        "持仓触发滚动：正在根据卖出日生成刷新计划...",
+                    )
+                rolling_symbols, rolling_allowed_by_date, notes, _, refresh_dates_used = (
+                    self._build_trend_pool_rolling_universe(
+                        payload=payload,
+                        screener_params=trend_pool_params,
+                        board_filters=board_filters,
+                        refresh_dates=sorted(refresh_date_set),
+                        progress_callback=progress_callback,
+                    )
+                )
+                pool_notes = [
+                    *pool_notes,
+                    *notes,
+                    f"持仓触发滚动：首日+卖出后下一交易日刷新，共 {len(refresh_dates_used)} 次。",
+                ]
+            else:
+                rolling_symbols, rolling_allowed_by_date, notes, _, _ = self._build_trend_pool_rolling_universe(
+                    payload=payload,
+                    screener_params=trend_pool_params,
+                    board_filters=board_filters,
+                    refresh_dates=None,
+                    progress_callback=progress_callback,
+                )
+                pool_notes = [*pool_notes, *notes]
+            if not rolling_symbols:
+                reason_text = "；".join(pool_notes) if pool_notes else "滚动筛选结果为空。"
+                raise ValueError(f"回测股票池为空：{reason_text}")
+            used_rolling_universe = True
+            symbols = rolling_symbols
+            allowed_symbols_by_date = rolling_allowed_by_date
+
+        if not symbols and payload.mode != "trend_pool":
+            if board_filters:
+                candidates = [row for row in candidates if self._row_matches_board_filters(row, board_filters)]
+            candidate_count_after_board_filter = len(candidates)
+            for row in candidates:
+                symbol = str(row.symbol).strip().lower()
+                if not symbol or symbol in seen_symbols:
+                    continue
+                symbols.append(symbol)
+                seen_symbols.add(symbol)
+                if len(symbols) >= payload.max_symbols:
+                    break
+
+        if not symbols:
+            raise ValueError("回测股票池为空，请先执行筛选或调整回测模式")
+
+        result = engine.run(
+            payload=payload,
+            symbols=symbols,
+            allowed_symbols_by_date=allowed_symbols_by_date,
+        )
 
         notes = list(result.notes)
+        if pool_notes:
+            notes = [*pool_notes, *notes]
         if board_filters:
-            notes.insert(
-                0,
-                (
-                    "候选池板块过滤: "
-                    f"{','.join(board_filters)} "
-                    f"({candidate_count_after_board_filter}/{candidate_count_before_board_filter})"
-                ),
-            )
+            if used_rolling_universe:
+                roll_mode_label = {
+                    "daily": "每日滚动",
+                    "weekly": "每周滚动",
+                    "position": "持仓触发滚动",
+                }.get(payload.pool_roll_mode, "每日滚动")
+                notes.insert(0, f"候选池板块过滤: {','.join(board_filters)}（{roll_mode_label}生效）")
+            else:
+                notes.insert(
+                    0,
+                    (
+                        "候选池板块过滤: "
+                        f"{','.join(board_filters)} "
+                        f"({candidate_count_after_board_filter}/{candidate_count_before_board_filter})"
+                    ),
+                )
         if payload.mode == "trend_pool" and resolved_run_id:
             notes.insert(0, f"使用筛选任务: {resolved_run_id}")
         if degraded_reason:
@@ -3573,6 +3976,142 @@ class InMemoryStore:
         if notes != result.notes:
             result = result.model_copy(update={"notes": notes})
         return result
+
+    def _estimate_backtest_progress_total_dates(self, payload: BacktestRunRequest) -> int:
+        if payload.mode != "trend_pool":
+            return 1
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        if not scan_dates:
+            return 1
+        if payload.pool_roll_mode == "weekly":
+            return max(1, len(self._build_weekly_refresh_dates(scan_dates)))
+        if payload.pool_roll_mode == "position":
+            return max(1, len(scan_dates))
+        return max(1, len(scan_dates))
+
+    def _upsert_backtest_task(self, task: BacktestTaskStatusResponse) -> None:
+        with self._backtest_task_lock:
+            self._backtest_tasks[task.task_id] = task
+            if len(self._backtest_tasks) > 80:
+                sorted_items = sorted(
+                    self._backtest_tasks.items(),
+                    key=lambda item: item[1].progress.updated_at,
+                )
+                for old_task_id, _ in sorted_items[: max(0, len(sorted_items) - 80)]:
+                    self._backtest_tasks.pop(old_task_id, None)
+
+    def get_backtest_task(self, task_id: str) -> BacktestTaskStatusResponse | None:
+        with self._backtest_task_lock:
+            task = self._backtest_tasks.get(task_id)
+            if task is None:
+                return None
+            return task.model_copy(deep=True)
+
+    def start_backtest_task(self, payload: BacktestRunRequest) -> str:
+        task_id = f"bt_{uuid4().hex[:16]}"
+        now_text = self._now_datetime()
+        total_dates = self._estimate_backtest_progress_total_dates(payload)
+        warning: str | None = None
+        if payload.mode == "trend_pool" and payload.pool_roll_mode in {"daily", "weekly"} and total_dates >= 45:
+            warning = "滚动回测日期较长，耗时可能较久，请耐心等待。"
+
+        initial_progress = BacktestTaskProgress(
+            mode=payload.pool_roll_mode,
+            current_date=None,
+            processed_dates=0,
+            total_dates=total_dates,
+            percent=0.0,
+            message="任务已创建，等待执行。",
+            warning=warning,
+            started_at=now_text,
+            updated_at=now_text,
+        )
+        self._upsert_backtest_task(
+            BacktestTaskStatusResponse(
+                task_id=task_id,
+                status="pending",
+                progress=initial_progress,
+                result=None,
+                error=None,
+            )
+        )
+
+        def _worker() -> None:
+            task = self.get_backtest_task(task_id)
+            if task is None:
+                return
+            running_progress = task.progress.model_copy(
+                update={
+                    "message": "任务执行中...",
+                    "updated_at": self._now_datetime(),
+                }
+            )
+            self._upsert_backtest_task(task.model_copy(update={"status": "running", "progress": running_progress}))
+
+            def _progress(current_date: str, processed_dates: int, total: int, message: str) -> None:
+                current_task = self.get_backtest_task(task_id)
+                if current_task is None:
+                    return
+                total_safe = max(1, int(total))
+                processed_safe = max(0, min(int(processed_dates), total_safe))
+                percent = round((processed_safe / total_safe) * 100.0, 2)
+                next_progress = current_task.progress.model_copy(
+                    update={
+                        "current_date": current_date,
+                        "processed_dates": processed_safe,
+                        "total_dates": total_safe,
+                        "percent": percent,
+                        "message": message,
+                        "updated_at": self._now_datetime(),
+                    }
+                )
+                self._upsert_backtest_task(current_task.model_copy(update={"status": "running", "progress": next_progress}))
+
+            try:
+                result = self.run_backtest(payload, progress_callback=_progress)
+                finished_task = self.get_backtest_task(task_id)
+                if finished_task is None:
+                    return
+                done_progress = finished_task.progress.model_copy(
+                    update={
+                        "percent": 100.0,
+                        "processed_dates": max(finished_task.progress.processed_dates, finished_task.progress.total_dates),
+                        "message": "回测完成。",
+                        "updated_at": self._now_datetime(),
+                    }
+                )
+                self._upsert_backtest_task(
+                    finished_task.model_copy(
+                        update={
+                            "status": "succeeded",
+                            "progress": done_progress,
+                            "result": result,
+                            "error": None,
+                        }
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                failed_task = self.get_backtest_task(task_id)
+                if failed_task is None:
+                    return
+                failed_progress = failed_task.progress.model_copy(
+                    update={
+                        "message": "回测失败。",
+                        "updated_at": self._now_datetime(),
+                    }
+                )
+                self._upsert_backtest_task(
+                    failed_task.model_copy(
+                        update={
+                            "status": "failed",
+                            "progress": failed_progress,
+                            "error": str(exc),
+                        }
+                    )
+                )
+
+        Thread(target=_worker, daemon=True).start()
+        return task_id
 
     def create_order(self, payload: CreateOrderRequest) -> CreateOrderResponse:
         return self._sim_engine.create_order(payload)

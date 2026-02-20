@@ -7,6 +7,7 @@ import type {
   BacktestResponse,
   BacktestRunRequest,
   BacktestTrade,
+  BoardFilter,
   CandlePoint,
   DailyReviewListResponse,
   DailyReviewPayload,
@@ -82,6 +83,8 @@ let reviewTagsStore: ReviewTagsPayload = {
     { id: 'reason-03', name: '技术突破', color: 'cyan', created_at: '2026-01-01 00:00:00' },
   ],
 }
+
+const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 'st']
 
 const marketNewsSeed: MarketNewsResponse['items'] = [
   {
@@ -562,8 +565,36 @@ export function saveAnnotation(annotation: StockAnnotation) {
   return annotation
 }
 
+function detectPrimaryBoardFromSymbol(symbol: string): Exclude<BoardFilter, 'st'> | null {
+  const normalized = String(symbol).trim().toLowerCase()
+  if (normalized.length < 8) return null
+  const market = normalized.slice(0, 2)
+  const code = normalized.slice(2)
+  if (market === 'bj') return 'beijing'
+  if (market === 'sh') return code.startsWith('688') || code.startsWith('689') ? 'star' : 'main'
+  if (market === 'sz') return code.startsWith('300') || code.startsWith('301') ? 'gem' : 'main'
+  return null
+}
+
+function isStStock(name: string) {
+  return String(name).replace(/\s+/g, '').toUpperCase().includes('ST')
+}
+
+function matchesBoardFilters(symbol: string, name: string, boardFilters: BoardFilter[]) {
+  if (!boardFilters.length) return true
+  const selected = new Set(boardFilters)
+  const st = isStStock(name)
+  if (st && !selected.has('st')) return false
+  const selectedBoards = boardFilters.filter((item) => item !== 'st')
+  if (!selectedBoards.length) return st
+  const board = detectPrimaryBoardFromSymbol(symbol)
+  if (!board) return false
+  return selectedBoards.includes(board)
+}
+
 export function getSignals(params?: {
   mode?: SignalScanMode
+  board_filters?: BoardFilter[]
   window_days?: number
   min_score?: number
   require_sequence?: boolean
@@ -575,6 +606,9 @@ export function getSignals(params?: {
     { symbol: 'sh600519', name: '贵州茅台', trigger_reason: 'MA10回踩确认', signals: ['A'] },
   ]
   const mode = params?.mode ?? 'trend_pool'
+  const boardFilters = Array.from(
+    new Set((params?.board_filters ?? []).filter((item): item is BoardFilter => ALLOWED_BOARD_FILTERS.includes(item))),
+  )
   const minScore = params?.min_score ?? 60
   const minEventCount = params?.min_event_count ?? 1
   const requireSequence = params?.require_sequence ?? false
@@ -611,7 +645,8 @@ export function getSignals(params?: {
     }
   })
 
-  const filtered = items.filter((row) => {
+  const boardMatched = items.filter((row) => matchesBoardFilters(row.symbol, row.name, boardFilters))
+  const filtered = boardMatched.filter((row) => {
     if ((row.entry_quality_score ?? 0) < minScore) return false
     if ((row.wy_event_count ?? 0) < minEventCount) return false
     if (requireSequence && !row.wy_sequence_ok) return false
@@ -624,7 +659,7 @@ export function getSignals(params?: {
     generated_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
     cache_hit: false,
     degraded: false,
-    source_count: raw.length,
+    source_count: boardMatched.length,
   }
 }
 

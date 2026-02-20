@@ -4,8 +4,11 @@ import type {
   AIProviderTestRequest,
   AIProviderTestResponse,
   AppConfig,
+  BacktestTaskStartResponse,
+  BacktestTaskStatusResponse,
   BacktestResponse,
   BacktestRunRequest,
+  BoardFilter,
   CandlePoint,
   DeleteAIRecordResponse,
   IntradayPayload,
@@ -95,6 +98,7 @@ export function getSignals(params?: {
   mode?: SignalScanMode
   run_id?: string
   trend_step?: TrendPoolStep
+  board_filters?: BoardFilter[]
   as_of_date?: string
   refresh?: boolean
   window_days?: number
@@ -106,6 +110,9 @@ export function getSignals(params?: {
   if (params?.mode) query.set('mode', params.mode)
   if (params?.run_id) query.set('run_id', params.run_id)
   if (params?.trend_step) query.set('trend_step', params.trend_step)
+  if (params?.board_filters?.length) {
+    params.board_filters.forEach((item) => query.append('board_filters', item))
+  }
   if (params?.as_of_date) query.set('as_of_date', params.as_of_date)
   if (typeof params?.refresh === 'boolean') query.set('refresh', String(params.refresh))
   if (typeof params?.window_days === 'number') query.set('window_days', String(params.window_days))
@@ -242,6 +249,21 @@ export function runBacktest(payload: BacktestRunRequest) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     timeoutMs,
+  })
+}
+
+export function startBacktestTask(payload: BacktestRunRequest) {
+  return apiRequest<BacktestTaskStartResponse>('/api/backtest/tasks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 60_000,
+  })
+}
+
+export function getBacktestTask(taskId: string) {
+  return apiRequest<BacktestTaskStatusResponse>(`/api/backtest/tasks/${taskId}`, {
+    timeoutMs: 60_000,
   })
 }
 

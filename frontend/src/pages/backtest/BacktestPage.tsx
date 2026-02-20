@@ -10,6 +10,7 @@ import {
   DatePicker,
   Input,
   InputNumber,
+  Progress,
   Radio,
   Row,
   Select,
@@ -21,12 +22,15 @@ import {
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import ReactECharts from 'echarts-for-react'
+import { Link } from 'react-router-dom'
 import { ApiError } from '@/shared/api/client'
-import { getLatestScreenerRun, runBacktest } from '@/shared/api/endpoints'
+import { getBacktestTask, getLatestScreenerRun, runBacktest, startBacktestTask } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
 import type {
+  BacktestPoolRollMode,
   BacktestPriorityMode,
   BacktestResponse,
+  BacktestTaskStatusResponse,
   BacktestTrade,
   BoardFilter,
   SignalScanMode,
@@ -37,6 +41,7 @@ import { formatMoney, formatPct } from '@/shared/utils/format'
 const TRADE_BACKTEST_DEFAULTS = {
   mode: 'trend_pool' as SignalScanMode,
   trendStep: 'auto' as TrendPoolStep,
+  poolRollMode: 'daily' as BacktestPoolRollMode,
   windowDays: 60,
   minScore: 55,
   minEventCount: 1,
@@ -67,6 +72,7 @@ const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 
 type BacktestFormDraft = {
   mode: SignalScanMode
   trend_step: TrendPoolStep
+  pool_roll_mode: BacktestPoolRollMode
   run_id: string
   board_filters: BoardFilter[]
   date_from: string
@@ -121,6 +127,7 @@ function buildDefaultDraft(): BacktestFormDraft {
   return {
     mode: TRADE_BACKTEST_DEFAULTS.mode,
     trend_step: TRADE_BACKTEST_DEFAULTS.trendStep,
+    pool_roll_mode: TRADE_BACKTEST_DEFAULTS.poolRollMode,
     run_id: '',
     board_filters: BACKTEST_DEFAULT_BOARD_FILTERS,
     date_from: dateFrom,
@@ -165,6 +172,9 @@ function loadBacktestDraft(): BacktestFormDraft {
     }
     const boardFilters = sanitizeBoardFilters(merged.board_filters)
     merged.board_filters = boardFilters.length > 0 ? boardFilters : defaults.board_filters
+    if (!['daily', 'weekly', 'position'].includes(String(merged.pool_roll_mode))) {
+      merged.pool_roll_mode = defaults.pool_roll_mode
+    }
     if (!Number.isFinite(merged.trades_page_size) || (merged.trades_page_size ?? 0) <= 0) {
       merged.trades_page_size = defaults.trades_page_size
     }
@@ -203,9 +213,40 @@ function parseExitReason(value: string): ExitReasonView {
   return { label: text }
 }
 
+function buildChartPath(symbol: string, name?: string) {
+  const symbolText = String(symbol || '').trim()
+  if (!symbolText) return ''
+  const params = new URLSearchParams()
+  const nameText = String(name || '').trim()
+  if (nameText) params.set('signal_stock_name', nameText)
+  const query = params.toString()
+  return `/stocks/${symbolText}/chart${query ? `?${query}` : ''}`
+}
+
 const tradeColumns: ColumnsType<BacktestTrade> = [
-  { title: '代码', dataIndex: 'symbol', width: 110 },
-  { title: '名称', dataIndex: 'name', width: 120 },
+  {
+    title: '代码',
+    dataIndex: 'symbol',
+    width: 110,
+    render: (value: string, row) => {
+      const symbol = String(value || '').trim()
+      if (!symbol) return '--'
+      const target = buildChartPath(symbol, row.name)
+      return <Link to={target}>{symbol}</Link>
+    },
+  },
+  {
+    title: '名称',
+    dataIndex: 'name',
+    width: 120,
+    render: (value: string, row) => {
+      const symbol = String(row.symbol || '').trim()
+      const name = String(value || '').trim()
+      if (!symbol) return name || '--'
+      const target = buildChartPath(symbol, name || row.name)
+      return <Link to={target}>{name || '--'}</Link>
+    },
+  },
   { title: '信号日', dataIndex: 'signal_date', width: 110 },
   { title: '买入日', dataIndex: 'entry_date', width: 110 },
   { title: '卖出日', dataIndex: 'exit_date', width: 110 },
@@ -257,6 +298,7 @@ export function BacktestPage() {
 
   const [mode, setMode] = useState<SignalScanMode>(initialDraft.mode)
   const [trendStep, setTrendStep] = useState<TrendPoolStep>(initialDraft.trend_step)
+  const [poolRollMode, setPoolRollMode] = useState<BacktestPoolRollMode>(initialDraft.pool_roll_mode)
   const [runId, setRunId] = useState(initialDraft.run_id)
   const [boardFilters, setBoardFilters] = useState<BoardFilter[]>(initialDraft.board_filters)
   const [range, setRange] = useState<[Dayjs, Dayjs]>([
@@ -283,6 +325,10 @@ export function BacktestPage() {
   const [maxSymbols, setMaxSymbols] = useState(initialDraft.max_symbols)
   const [tradePage, setTradePage] = useState(1)
   const [tradePageSize, setTradePageSize] = useState(initialDraft.trades_page_size)
+  const [result, setResult] = useState<BacktestResponse | undefined>(undefined)
+  const [runError, setRunError] = useState<string | null>(null)
+  const [taskId, setTaskId] = useState('')
+  const [taskStatus, setTaskStatus] = useState<BacktestTaskStatusResponse | null>(null)
 
   function applyRunMeta(nextRunId: string, asOfDate?: string) {
     setMode('trend_pool')
@@ -324,6 +370,7 @@ export function BacktestPage() {
     const draft: BacktestFormDraft = {
       mode,
       trend_step: trendStep,
+      pool_roll_mode: poolRollMode,
       run_id: runId,
       board_filters: boardFilters,
       date_from: range[0].format('YYYY-MM-DD'),
@@ -352,6 +399,7 @@ export function BacktestPage() {
   }, [
     mode,
     trendStep,
+    poolRollMode,
     runId,
     boardFilters,
     range,
@@ -378,12 +426,38 @@ export function BacktestPage() {
 
   const mutation = useMutation({
     mutationFn: runBacktest,
+    onSuccess: (data) => {
+      setResult(data)
+      setRunError(null)
+      setTaskId('')
+      setTaskStatus(null)
+    },
     onError: (error) => {
       if (error instanceof ApiError && error.code === 'REQUEST_TIMEOUT' && mode === 'full_market') {
-        message.error('全市场回测超时，请缩短回测区间或降低“最大股票数”后重试。')
+        const text = '全市场回测超时，请缩短回测区间或降低“最大股票数”后重试。'
+        setRunError(text)
+        message.error(text)
         return
       }
-      message.error(formatApiError(error))
+      const text = formatApiError(error)
+      setRunError(text)
+      message.error(text)
+    },
+  })
+
+  const startTaskMutation = useMutation({
+    mutationFn: startBacktestTask,
+    onSuccess: (payload) => {
+      setTaskId(payload.task_id)
+      setTaskStatus(null)
+      setRunError(null)
+      setResult(undefined)
+      message.info('回测任务已提交，正在按日期滚动计算...')
+    },
+    onError: (error) => {
+      const text = formatApiError(error)
+      setRunError(text)
+      message.error(text)
     },
   })
 
@@ -396,11 +470,50 @@ export function BacktestPage() {
     onError: (error) => message.error(formatApiError(error)),
   })
 
-  const result: BacktestResponse | undefined = mutation.data
-
   useEffect(() => {
     setTradePage(1)
   }, [result?.trades])
+
+  useEffect(() => {
+    if (!taskId) return
+    let active = true
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const poll = async () => {
+      try {
+        const status = await getBacktestTask(taskId)
+        if (!active) return
+        setTaskStatus(status)
+        if (status.status === 'succeeded') {
+          setResult(status.result ?? undefined)
+          setRunError(null)
+          setTaskId('')
+          return
+        }
+        if (status.status === 'failed') {
+          const text = status.error?.trim() || '回测任务失败'
+          setRunError(text)
+          message.error(text)
+          setTaskId('')
+          return
+        }
+      } catch (error) {
+        if (!active) return
+        const text = formatApiError(error)
+        setRunError(text)
+        message.error(text)
+        setTaskId('')
+        return
+      }
+      timer = setTimeout(poll, 400)
+    }
+
+    void poll()
+    return () => {
+      active = false
+      if (timer) clearTimeout(timer)
+    }
+  }, [taskId, message])
 
   const equityOption = useMemo(() => {
     const curve = result?.equity_curve ?? []
@@ -444,6 +557,7 @@ export function BacktestPage() {
   }, [result?.drawdown_curve])
 
   function handleRun() {
+    if (runLoading) return
     if (entryEvents.length === 0 || exitEvents.length === 0) {
       message.warning('请至少选择一个入场事件和离场事件')
       return
@@ -458,10 +572,11 @@ export function BacktestPage() {
     if (cached?.boardFilters?.length) {
       setBoardFilters(cached.boardFilters)
     }
-    mutation.mutate({
+    const payload = {
       mode,
       run_id: runId.trim() || undefined,
       trend_step: trendStep,
+      pool_roll_mode: poolRollMode,
       board_filters: shouldApplyBoardFilters ? effectiveBoardFilters : undefined,
       date_from: range[0].format('YYYY-MM-DD'),
       date_to: range[1].format('YYYY-MM-DD'),
@@ -483,7 +598,14 @@ export function BacktestPage() {
       priority_topk_per_day: priorityTopK,
       enforce_t1: enforceT1,
       max_symbols: maxSymbols,
-    })
+    }
+    setRunError(null)
+    const shouldUseTaskApi = mode === 'trend_pool'
+    if (shouldUseTaskApi) {
+      startTaskMutation.mutate(payload)
+      return
+    }
+    mutation.mutate(payload)
   }
 
   function handleBindLatestRunId() {
@@ -500,13 +622,17 @@ export function BacktestPage() {
     bindLatestRunMutation.mutate()
   }
 
+  const taskRunning = Boolean(taskId) || startTaskMutation.isPending
+  const runLoading = mutation.isPending || taskRunning
+  const taskProgress = taskStatus?.progress
+
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
       <PageHeader title="策略回测" subtitle="回放历史信号，评估策略收益、回撤与执行质量。" />
 
       <Card>
         <Row gutter={[12, 12]}>
-          <Col xs={24} md={8}>
+          <Col xs={24} md={6}>
             <Space orientation="vertical" style={{ width: '100%' }}>
               <span>回测范围</span>
               <Radio.Group
@@ -520,7 +646,7 @@ export function BacktestPage() {
               />
             </Space>
           </Col>
-          <Col xs={24} md={8}>
+          <Col xs={24} md={6}>
             <Space orientation="vertical" style={{ width: '100%' }}>
               <span>趋势池阶段</span>
               <Select
@@ -536,7 +662,22 @@ export function BacktestPage() {
               />
             </Space>
           </Col>
-          <Col xs={24} md={8}>
+          <Col xs={24} md={6}>
+            <Space orientation="vertical" style={{ width: '100%' }}>
+              <span>滚动模式</span>
+              <Radio.Group
+                value={poolRollMode}
+                optionType="button"
+                onChange={(event) => setPoolRollMode(event.target.value)}
+                options={[
+                  { label: '每日滚动', value: 'daily' },
+                  { label: '每周滚动', value: 'weekly' },
+                  { label: '持仓触发', value: 'position' },
+                ]}
+              />
+            </Space>
+          </Col>
+          <Col xs={24} md={6}>
             <Space orientation="vertical" style={{ width: '100%' }}>
               <span>筛选任务 run_id（可选）</span>
               <div style={{ display: 'flex', gap: 8 }}>
@@ -558,6 +699,27 @@ export function BacktestPage() {
                 type="warning"
                 showIcon
                 title="全市场模式计算量较大，建议缩短区间或降低“最大股票数”，避免超时。"
+              />
+            </Col>
+          ) : null}
+
+          {mode === 'trend_pool' ? (
+            <Col xs={24}>
+              <Alert
+                type={poolRollMode === 'position' ? 'info' : 'warning'}
+                showIcon
+                title={
+                  poolRollMode === 'daily'
+                    ? '每日滚动：每个交易日重算一次股票池，最严格，耗时最长。'
+                    : poolRollMode === 'weekly'
+                      ? '每周滚动：每周首个交易日重算股票池，速度更快。'
+                      : '持仓触发：首日建池，后续在卖出后的下一交易日重算并补仓。'
+                }
+                description={
+                  poolRollMode === 'daily' || poolRollMode === 'weekly'
+                    ? '该模式使用后台任务执行，页面会按日期显示进度，耗时可能较久。'
+                    : '该模式通过持仓空位触发滚动筛选，适合模拟“卖出后再补仓”的交易节奏。'
+                }
               />
             </Col>
           ) : null}
@@ -804,14 +966,32 @@ export function BacktestPage() {
         </Row>
 
         <Space style={{ marginTop: 14 }}>
-          <Button type="primary" loading={mutation.isPending} onClick={handleRun}>
+          <Button type="primary" loading={runLoading} onClick={handleRun}>
             开始回测
           </Button>
           {result ? <Tag color="green">{`${result.range.date_from} ~ ${result.range.date_to}`}</Tag> : null}
         </Space>
       </Card>
 
-      {mutation.error ? <Alert type="error" title={formatApiError(mutation.error)} showIcon /> : null}
+      {runError ? <Alert type="error" title={runError} showIcon /> : null}
+
+      {taskRunning || taskStatus?.status === 'running' || taskStatus?.status === 'pending' ? (
+        <Card title="回测进度">
+          <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+            <Progress percent={Math.max(0, Math.min(100, Number(taskProgress?.percent ?? 0)))} status="active" />
+            <div>{taskProgress?.message || '任务执行中...'}</div>
+            {taskProgress?.current_date ? (
+              <div>当前日期：{taskProgress.current_date}</div>
+            ) : (
+              <div>当前日期：准备中...</div>
+            )}
+            <div>
+              进度：{taskProgress?.processed_dates ?? 0} / {taskProgress?.total_dates ?? 0}
+            </div>
+            {taskProgress?.warning ? <Alert type="warning" showIcon message={taskProgress.warning} /> : null}
+          </Space>
+        </Card>
+      ) : null}
 
       {result ? (
         <>

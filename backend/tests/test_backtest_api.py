@@ -92,6 +92,7 @@ def test_backtest_run_trend_pool_smoke() -> None:
         "priority_topk_per_day": 0,
         "enforce_t1": True,
         "max_symbols": 120,
+        "pool_roll_mode": "weekly",
     }
 
     resp = client.post("/api/backtest/run", json=payload)
@@ -106,18 +107,24 @@ def test_backtest_run_trend_pool_smoke() -> None:
     assert isinstance(body["equity_curve"], list)
 
 
-def test_backtest_run_returns_400_on_empty_pool() -> None:
+def test_backtest_run_falls_back_when_run_missing() -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-35]
+    date_to = dates[-8]
+
     payload = {
         "mode": "trend_pool",
         "run_id": "missing-run-id",
-        "trend_step": "step4",
-        "date_from": "2026-01-01",
-        "date_to": "2026-01-31",
+        "trend_step": "auto",
+        "pool_roll_mode": "position",
+        "date_from": date_from,
+        "date_to": date_to,
     }
     resp = client.post("/api/backtest/run", json=payload)
-    assert resp.status_code == 400
+    assert resp.status_code == 200
     body = resp.json()
-    assert body["code"] == "BACKTEST_INVALID"
+    assert isinstance(body["trades"], list)
+    assert any("已改用系统筛选参数重建滚动池" in note for note in body["notes"])
 
 
 def test_backtest_run_respects_board_filters() -> None:
@@ -172,6 +179,7 @@ def test_backtest_run_respects_board_filters() -> None:
         "priority_topk_per_day": 0,
         "enforce_t1": True,
         "max_symbols": 120,
+        "pool_roll_mode": "weekly",
     }
 
     resp = client.post("/api/backtest/run", json=payload)

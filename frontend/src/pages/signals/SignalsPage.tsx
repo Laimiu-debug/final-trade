@@ -29,7 +29,7 @@ import { getLatestScreenerRun, getScreenerRun, getSignals } from '@/shared/api/e
 import { PageHeader } from '@/shared/components/PageHeader'
 import { upsertPendingBuyDraft } from '@/shared/utils/simPendingOrders'
 import { useUIStore } from '@/state/uiStore'
-import type { SignalResult, SignalScanMode, SignalType, TrendPoolStep } from '@/types/contracts'
+import type { BoardFilter, SignalResult, SignalScanMode, SignalType, TrendPoolStep } from '@/types/contracts'
 
 type StatusFilter = 'active' | 'expiring' | 'expired' | 'all'
 
@@ -106,6 +106,29 @@ const SIGNAL_MODE_CACHE_KEY = 'tdx-signals-mode-v1'
 const SIGNAL_RUN_CACHE_KEY = 'tdx-signals-run-id-v1'
 const SCREENER_CACHE_KEY = 'tdx-trend-screener-cache-v4'
 const SIGNAL_STEP_CACHE_KEY = 'tdx-signals-trend-step-v1'
+const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 'st']
+
+function sanitizeBoardFilters(raw: unknown): BoardFilter[] {
+  if (!Array.isArray(raw)) return []
+  const normalized = raw
+    .map((item) => String(item).trim())
+    .filter((item): item is BoardFilter => ALLOWED_BOARD_FILTERS.includes(item as BoardFilter))
+  return Array.from(new Set(normalized))
+}
+
+function parseBoardFiltersFromSearchParams(searchParams: URLSearchParams): BoardFilter[] {
+  const merged = searchParams
+    .getAll('board_filters')
+    .flatMap((item) => item.split(','))
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+  return sanitizeBoardFilters(merged)
+}
+
+function isSameBoardFilters(left: BoardFilter[], right: BoardFilter[]) {
+  if (left.length !== right.length) return false
+  return left.join(',') === right.join(',')
+}
 
 function loadCachedSignalMode(): SignalScanMode | null {
   try {
@@ -137,15 +160,19 @@ function loadCachedTrendRunId(): string | null {
   return null
 }
 
-function readScreenerRunMetaFromStorage(): { runId: string; asOfDate?: string } | null {
+function readScreenerRunMetaFromStorage(): { runId: string; asOfDate?: string; boardFilters: BoardFilter[] } | null {
   try {
     const raw = window.localStorage.getItem(SCREENER_CACHE_KEY)
     if (!raw) return null
-    const parsed = JSON.parse(raw) as { run_meta?: { runId?: unknown; asOfDate?: unknown } }
+    const parsed = JSON.parse(raw) as {
+      run_meta?: { runId?: unknown; asOfDate?: unknown }
+      form_values?: { board_filters?: unknown }
+    }
     const runId = typeof parsed?.run_meta?.runId === 'string' ? parsed.run_meta.runId.trim() : ''
     const asOfDate = typeof parsed?.run_meta?.asOfDate === 'string' ? parsed.run_meta.asOfDate.trim() : ''
+    const boardFilters = sanitizeBoardFilters(parsed?.form_values?.board_filters)
     if (!runId) return null
-    return { runId, asOfDate: asOfDate || undefined }
+    return { runId, asOfDate: asOfDate || undefined, boardFilters }
   } catch {
     return null
   }
@@ -246,9 +273,17 @@ export function SignalsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const cachedMode = useMemo(() => loadCachedSignalMode(), [])
   const cachedTrendStep = useMemo(() => loadCachedTrendStep(), [])
+  const cachedRunMeta = useMemo(() => readScreenerRunMetaFromStorage(), [])
   const [cachedRunId, setCachedRunId] = useState<string | null>(() => loadCachedTrendRunId())
   const runIdFromQuery = (searchParams.get('run_id') ?? searchParams.get('signal_run_id') ?? '').trim()
   const runId = runIdFromQuery || cachedRunId || undefined
+  const initialBoardFiltersFromQuery = parseBoardFiltersFromSearchParams(searchParams)
+  const initialBoardFilters =
+    initialBoardFiltersFromQuery.length > 0
+      ? initialBoardFiltersFromQuery
+      : cachedRunMeta && runId && cachedRunMeta.runId === runId
+        ? cachedRunMeta.boardFilters
+        : []
   const initialAsOfDate = searchParams.get('as_of_date') ?? ''
   const initialTrendStep = normalizeTrendStep(searchParams.get('trend_step') ?? searchParams.get('signal_trend_step') ?? cachedTrendStep)
   const initialModeParam = searchParams.get('mode') ?? searchParams.get('signal_mode')
@@ -275,6 +310,7 @@ export function SignalsPage() {
 
   const [mode, setMode] = useState<SignalScanMode>(initialMode)
   const [trendStep, setTrendStep] = useState<TrendPoolStep>(initialTrendStep)
+  const [boardFilters, setBoardFilters] = useState<BoardFilter[]>(initialBoardFilters)
   const [asOfDate, setAsOfDate] = useState(initialAsOfDate)
   const [asOfDateTouched, setAsOfDateTouched] = useState(initialAsOfDate.length > 0)
   const [windowDays, setWindowDays] = useState(initialWindowDays)
@@ -320,6 +356,25 @@ export function SignalsPage() {
   }, [trendStep])
 
   useEffect(() => {
+    if (mode !== 'trend_pool') return
+    const queryBoardFilters = parseBoardFiltersFromSearchParams(new URLSearchParams(searchParamsSnapshot))
+    if (queryBoardFilters.length > 0) {
+      setBoardFilters((previous) => (isSameBoardFilters(previous, queryBoardFilters) ? previous : queryBoardFilters))
+      return
+    }
+    if (!runId) {
+      setBoardFilters((previous) => (previous.length === 0 ? previous : []))
+      return
+    }
+    const cached = readScreenerRunMetaFromStorage()
+    if (!cached || cached.runId !== runId || cached.boardFilters.length === 0) {
+      setBoardFilters((previous) => (previous.length === 0 ? previous : []))
+      return
+    }
+    setBoardFilters((previous) => (isSameBoardFilters(previous, cached.boardFilters) ? previous : cached.boardFilters))
+  }, [mode, runId, searchParamsSnapshot])
+
+  useEffect(() => {
     const current = new URLSearchParams(searchParamsSnapshot)
     const next = new URLSearchParams(current)
 
@@ -333,6 +388,10 @@ export function SignalsPage() {
       next.set('trend_step', trendStep)
     } else {
       next.delete('trend_step')
+    }
+    next.delete('board_filters')
+    if (mode === 'trend_pool' && runId && boardFilters.length > 0) {
+      boardFilters.forEach((item) => next.append('board_filters', item))
     }
     next.delete('signal_run_id')
     next.delete('signal_trend_step')
@@ -356,6 +415,7 @@ export function SignalsPage() {
     minEventCount,
     minScore,
     mode,
+    boardFilters,
     runId,
     trendStep,
     requireSequence,
@@ -395,6 +455,8 @@ export function SignalsPage() {
     if ((next.get('signal_run_id') ?? '').trim() === runId) {
       next.delete('signal_run_id')
     }
+    next.delete('board_filters')
+    setBoardFilters([])
     setSearchParams(next, { replace: true })
     message.warning(`筛选任务已失效：${runId}，请重新绑定最新筛选任务。`)
   }, [message, mode, runDetailQuery.error, runId, searchParamsSnapshot, setSearchParams])
@@ -411,7 +473,19 @@ export function SignalsPage() {
   const trendPoolReady = mode !== 'trend_pool' || Boolean(runId)
 
   const signalQuery = useQuery({
-    queryKey: ['signals', mode, runId, trendStep, asOfDate, windowDays, minScore, minEventCount, requireSequence, refreshCounter],
+    queryKey: [
+      'signals',
+      mode,
+      runId,
+      trendStep,
+      boardFilters.join(','),
+      asOfDate,
+      windowDays,
+      minScore,
+      minEventCount,
+      requireSequence,
+      refreshCounter,
+    ],
     enabled: trendPoolReady,
     queryFn: async () => {
       const shouldRefresh = refreshCounter > refreshTrackerRef.current
@@ -423,6 +497,7 @@ export function SignalsPage() {
         mode,
         run_id: mode === 'trend_pool' ? runId : undefined,
         trend_step: mode === 'trend_pool' ? trendStep : undefined,
+        board_filters: mode === 'trend_pool' && boardFilters.length > 0 ? boardFilters : undefined,
         as_of_date: normalizedAsOfDate || undefined,
         refresh: shouldRefresh,
         window_days: windowDays,
@@ -456,8 +531,14 @@ export function SignalsPage() {
     mutationFn: getLatestScreenerRun,
     onSuccess: (detail) => {
       const next = new URLSearchParams(searchParamsSnapshot)
+      const cached = readScreenerRunMetaFromStorage()
+      const nextBoardFilters =
+        cached && cached.runId === detail.run_id && cached.boardFilters.length > 0 ? cached.boardFilters : []
       next.set('mode', 'trend_pool')
       next.set('run_id', detail.run_id)
+      next.delete('board_filters')
+      nextBoardFilters.forEach((item) => next.append('board_filters', item))
+      setBoardFilters(nextBoardFilters)
       if (detail.as_of_date?.trim()) {
         next.set('as_of_date', detail.as_of_date.trim())
       }
@@ -482,6 +563,9 @@ export function SignalsPage() {
     const next = new URLSearchParams(searchParamsSnapshot)
     next.set('mode', 'trend_pool')
     next.set('run_id', cached.runId)
+    next.delete('board_filters')
+    cached.boardFilters.forEach((item) => next.append('board_filters', item))
+    setBoardFilters(cached.boardFilters)
     if (cached.asOfDate) {
       next.set('as_of_date', cached.asOfDate)
     }
@@ -663,6 +747,7 @@ export function SignalsPage() {
                 if (runId) {
                   params.set('signal_run_id', runId)
                 }
+                boardFilters.forEach((item) => params.append('signal_board_filters', item))
                 if (row.name) {
                   params.set('signal_stock_name', row.name)
                 }
@@ -720,6 +805,7 @@ export function SignalsPage() {
       minScore,
       mode,
       navigate,
+      boardFilters,
       phaseFilters,
       primarySignalFilters,
       quickQuantity,

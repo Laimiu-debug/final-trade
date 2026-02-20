@@ -18,6 +18,7 @@ MarketSyncProvider = Literal["baostock"]
 MarketSyncMode = Literal["incremental", "full"]
 ReviewTagType = Literal["emotion", "reason"]
 BacktestPriorityMode = Literal["phase_first", "balanced", "momentum"]
+BacktestPoolRollMode = Literal["daily", "weekly", "position"]
 BoardFilter = Literal["main", "gem", "star", "beijing", "st"]
 
 
@@ -379,6 +380,7 @@ class BacktestRunRequest(BaseModel):
     priority_topk_per_day: int = Field(default=0, ge=0, le=500)
     enforce_t1: bool = True
     max_symbols: int = Field(default=120, ge=20, le=2000)
+    pool_roll_mode: BacktestPoolRollMode = "daily"
 
 
 class BacktestTrade(BaseModel):
@@ -414,6 +416,30 @@ class BacktestResponse(BaseModel):
     skipped_count: int = 0
     fill_rate: float = 0.0
     max_concurrent_positions: int = 0
+
+
+class BacktestTaskStartResponse(BaseModel):
+    task_id: str
+
+
+class BacktestTaskProgress(BaseModel):
+    mode: BacktestPoolRollMode = "daily"
+    current_date: str | None = None
+    processed_dates: int = 0
+    total_dates: int = 0
+    percent: float = 0.0
+    message: str = ""
+    warning: str | None = None
+    started_at: str = ""
+    updated_at: str = ""
+
+
+class BacktestTaskStatusResponse(BaseModel):
+    task_id: str
+    status: Literal["pending", "running", "succeeded", "failed"]
+    progress: BacktestTaskProgress
+    result: BacktestResponse | None = None
+    error: str | None = None
 
 
 class ReviewTag(BaseModel):
