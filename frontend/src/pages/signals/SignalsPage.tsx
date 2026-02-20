@@ -106,7 +106,15 @@ const SIGNAL_MODE_CACHE_KEY = 'tdx-signals-mode-v1'
 const SIGNAL_RUN_CACHE_KEY = 'tdx-signals-run-id-v1'
 const SCREENER_CACHE_KEY = 'tdx-trend-screener-cache-v4'
 const SIGNAL_STEP_CACHE_KEY = 'tdx-signals-trend-step-v1'
+const SIGNAL_BOARD_FILTERS_CACHE_KEY = 'tdx-signals-board-filters-v1'
 const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 'st']
+const BOARD_FILTER_LABELS: Record<BoardFilter, string> = {
+  main: '主板',
+  gem: '创业板',
+  star: '科创板',
+  beijing: '北交所',
+  st: 'ST',
+}
 
 function sanitizeBoardFilters(raw: unknown): BoardFilter[] {
   if (!Array.isArray(raw)) return []
@@ -188,6 +196,17 @@ function loadCachedTrendStep(): TrendPoolStep {
     return normalizeTrendStep(window.localStorage.getItem(SIGNAL_STEP_CACHE_KEY))
   } catch {
     return 'auto'
+  }
+}
+
+function loadCachedSignalBoardFilters(): BoardFilter[] {
+  try {
+    const raw = window.localStorage.getItem(SIGNAL_BOARD_FILTERS_CACHE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as unknown
+    return sanitizeBoardFilters(parsed)
+  } catch {
+    return []
   }
 }
 
@@ -273,6 +292,7 @@ export function SignalsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const cachedMode = useMemo(() => loadCachedSignalMode(), [])
   const cachedTrendStep = useMemo(() => loadCachedTrendStep(), [])
+  const cachedSignalBoardFilters = useMemo(() => loadCachedSignalBoardFilters(), [])
   const cachedRunMeta = useMemo(() => readScreenerRunMetaFromStorage(), [])
   const [cachedRunId, setCachedRunId] = useState<string | null>(() => loadCachedTrendRunId())
   const runIdFromQuery = (searchParams.get('run_id') ?? searchParams.get('signal_run_id') ?? '').trim()
@@ -283,7 +303,7 @@ export function SignalsPage() {
       ? initialBoardFiltersFromQuery
       : cachedRunMeta?.boardFilters?.length
         ? cachedRunMeta.boardFilters
-        : []
+        : cachedSignalBoardFilters
   const initialAsOfDate = searchParams.get('as_of_date') ?? ''
   const initialTrendStep = normalizeTrendStep(searchParams.get('trend_step') ?? searchParams.get('signal_trend_step') ?? cachedTrendStep)
   const initialModeParam = searchParams.get('mode') ?? searchParams.get('signal_mode')
@@ -356,20 +376,21 @@ export function SignalsPage() {
   }, [trendStep])
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem(SIGNAL_BOARD_FILTERS_CACHE_KEY, JSON.stringify(boardFilters))
+    } catch {
+      // ignore localStorage failures
+    }
+  }, [boardFilters])
+
+  useEffect(() => {
     const queryBoardFilters = parseBoardFiltersFromSearchParams(new URLSearchParams(searchParamsSnapshot))
     if (queryBoardFilters.length > 0) {
       setBoardFilters((previous) => (isSameBoardFilters(previous, queryBoardFilters) ? previous : queryBoardFilters))
       return
     }
     const cached = readScreenerRunMetaFromStorage()
-    if (!cached || cached.boardFilters.length === 0) {
-      setBoardFilters((previous) => (previous.length === 0 ? previous : []))
-      return
-    }
-    if (mode === 'trend_pool' && runId && cached.runId !== runId) {
-      setBoardFilters((previous) => (previous.length === 0 ? previous : []))
-      return
-    }
+    if (!cached || cached.boardFilters.length === 0) return
     setBoardFilters((previous) => (isSameBoardFilters(previous, cached.boardFilters) ? previous : cached.boardFilters))
   }, [mode, runId, searchParamsSnapshot])
 
@@ -455,7 +476,6 @@ export function SignalsPage() {
       next.delete('signal_run_id')
     }
     next.delete('board_filters')
-    setBoardFilters([])
     setSearchParams(next, { replace: true })
     message.warning(`筛选任务已失效：${runId}，请重新绑定最新筛选任务。`)
   }, [message, mode, runDetailQuery.error, runId, searchParamsSnapshot, setSearchParams])
@@ -531,8 +551,7 @@ export function SignalsPage() {
     onSuccess: (detail) => {
       const next = new URLSearchParams(searchParamsSnapshot)
       const cached = readScreenerRunMetaFromStorage()
-      const nextBoardFilters =
-        cached && cached.runId === detail.run_id && cached.boardFilters.length > 0 ? cached.boardFilters : []
+      const nextBoardFilters = cached?.boardFilters?.length ? cached.boardFilters : boardFilters
       next.set('mode', 'trend_pool')
       next.set('run_id', detail.run_id)
       next.delete('board_filters')
@@ -1138,6 +1157,24 @@ export function SignalsPage() {
                       { label: '仅Step2', value: 'step2' },
                       { label: '仅Step1', value: 'step1' },
                     ]}
+                  />
+                </div>
+              </Col>
+              <Col xs={24} lg={12}>
+                <Typography.Text type="secondary">
+                  板块过滤：
+                  {boardFilters.length > 0
+                    ? boardFilters.map((item) => BOARD_FILTER_LABELS[item]).join('、')
+                    : '未设置（等同全板块）'}
+                </Typography.Text>
+                <div style={{ marginTop: 8 }}>
+                  <Checkbox.Group
+                    value={boardFilters}
+                    onChange={(values) => setBoardFilters(sanitizeBoardFilters(values))}
+                    options={ALLOWED_BOARD_FILTERS.map((item) => ({
+                      label: BOARD_FILTER_LABELS[item],
+                      value: item,
+                    }))}
                   />
                 </div>
               </Col>

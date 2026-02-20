@@ -44,16 +44,27 @@ function buildSignalsRouteFromScreenerCache(): string {
   try {
     const raw = window.localStorage.getItem(SCREENER_CACHE_KEY)
     if (!raw) return '/signals'
-    const parsed = JSON.parse(raw) as { run_meta?: { runId?: unknown; asOfDate?: unknown } }
+    const parsed = JSON.parse(raw) as {
+      run_meta?: { runId?: unknown; asOfDate?: unknown }
+      form_values?: { board_filters?: unknown }
+    }
     const runId = typeof parsed?.run_meta?.runId === 'string' ? parsed.run_meta.runId.trim() : ''
     const asOfDate = typeof parsed?.run_meta?.asOfDate === 'string' ? parsed.run_meta.asOfDate.trim() : ''
     if (!runId) return '/signals'
+    const boardFilters = Array.from(
+      new Set(
+        (Array.isArray(parsed?.form_values?.board_filters) ? parsed.form_values.board_filters : [])
+          .map((item) => String(item).trim())
+          .filter((item) => item === 'main' || item === 'gem' || item === 'star' || item === 'beijing' || item === 'st'),
+      ),
+    )
     const params = new URLSearchParams({
       mode: 'trend_pool',
       run_id: runId,
       trend_step: 'auto',
     })
     if (asOfDate) params.set('as_of_date', asOfDate)
+    boardFilters.forEach((item) => params.append('board_filters', item))
     return `/signals?${params.toString()}`
   } catch {
     return '/signals'
