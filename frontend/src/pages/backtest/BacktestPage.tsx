@@ -93,9 +93,9 @@ type BacktestFormDraft = {
 }
 
 function formatApiError(error: unknown) {
-  if (error instanceof ApiError) return error.message || `璇锋眰澶辫触: ${error.code}`
-  if (error instanceof Error) return error.message || '璇锋眰澶辫触'
-  return '璇锋眰澶辫触'
+  if (error instanceof ApiError) return error.message || `请求失败: ${error.code}`
+  if (error instanceof Error) return error.message || '请求失败'
+  return '请求失败'
 }
 
 function toPercent(value: number) {
@@ -193,13 +193,13 @@ function parseExitReason(value: string): ExitReasonView {
   const text = String(value || '').trim()
   if (text.startsWith('event_exit')) {
     const detail = text.includes(':') ? text.split(':').slice(1).join(':').trim() : ''
-    return { label: '浜嬩欢', color: 'blue', detail: detail || undefined }
+    return { label: '事件', color: 'blue', detail: detail || undefined }
   }
-  if (text === 'stop_loss') return { label: '姝㈡崯', color: 'red' }
-  if (text === 'take_profit') return { label: '姝㈢泩', color: 'green' }
-  if (text === 'time_exit') return { label: '瓒呮椂', color: 'gold' }
-  if (text === 'eod_exit') return { label: '鏀剁洏', color: 'purple' }
-  if (!text) return { label: '鏈煡' }
+  if (text === 'stop_loss') return { label: '止损', color: 'red' }
+  if (text === 'take_profit') return { label: '止盈', color: 'green' }
+  if (text === 'time_exit') return { label: '超时', color: 'gold' }
+  if (text === 'eod_exit') return { label: '收盘', color: 'purple' }
+  if (!text) return { label: '未知' }
   return { label: text }
 }
 
@@ -391,7 +391,7 @@ export function BacktestPage() {
     mutationFn: getLatestScreenerRun,
     onSuccess: (detail) => {
       applyRunMeta(detail.run_id, detail.as_of_date?.trim() || undefined)
-      message.success(`宸插甫鍏ユ渶鏂扮瓫閫変换鍔★細${detail.run_id}`)
+      message.success(`已带入最新筛选任务：${detail.run_id}`)
     },
     onError: (error) => message.error(formatApiError(error)),
   })
@@ -445,7 +445,7 @@ export function BacktestPage() {
 
   function handleRun() {
     if (entryEvents.length === 0 || exitEvents.length === 0) {
-      message.warning('璇疯嚦灏戦€夋嫨涓€涓叆鍦轰簨浠跺拰绂诲満浜嬩欢')
+      message.warning('请至少选择一个入场事件和离场事件')
       return
     }
     const cached = readScreenerRunMetaFromStorage()
@@ -494,7 +494,7 @@ export function BacktestPage() {
       if (cached.boardFilters?.length) {
         setBoardFilters(cached.boardFilters)
       }
-      message.success(`宸蹭粠鏈湴绛涢€夌紦瀛樺甫鍏ヤ换鍔★細${cached.runId}`)
+      message.success(`已从本地筛选缓存带入任务：${cached.runId}`)
       return
     }
     bindLatestRunMutation.mutate()
@@ -508,7 +508,7 @@ export function BacktestPage() {
         <Row gutter={[12, 12]}>
           <Col xs={24} md={8}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>鍥炴祴鑼冨洿</span>
+              <span>回测范围</span>
               <Radio.Group
                 value={mode}
                 optionType="button"
@@ -527,7 +527,7 @@ export function BacktestPage() {
                 value={trendStep}
                 onChange={(value) => setTrendStep(value)}
                 options={[
-                  { value: 'auto', label: 'auto锛堣嚜鍔級' },
+                  { value: 'auto', label: 'auto（自动）' },
                   { value: 'step1', label: 'step1' },
                   { value: 'step2', label: 'step2' },
                   { value: 'step3', label: 'step3' },
@@ -538,12 +538,12 @@ export function BacktestPage() {
           </Col>
           <Col xs={24} md={8}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>绛涢€変换鍔?run_id锛堝彲閫夛級</span>
+              <span>筛选任务 run_id（可选）</span>
               <div style={{ display: 'flex', gap: 8 }}>
                 <Input
                   value={runId}
                   onChange={(event) => setRunId(event.target.value)}
-                  placeholder="璇疯緭鍏ョ瓫閫変换鍔?run_id"
+                  placeholder="请输入筛选任务 run_id"
                 />
                 <Button loading={bindLatestRunMutation.isPending} onClick={handleBindLatestRunId}>
                   带入最新筛选
@@ -564,7 +564,7 @@ export function BacktestPage() {
 
           <Col xs={24} md={12}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>鍥炴祴鍖洪棿</span>
+              <span>回测区间</span>
               <DatePicker.RangePicker
                 style={{ width: '100%' }}
                 value={range}
@@ -576,7 +576,7 @@ export function BacktestPage() {
           </Col>
           <Col xs={24} md={6}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>淇″彿绐楀彛澶╂暟</span>
+              <span>信号窗口天数</span>
               <InputNumber
                 min={20}
                 max={240}
@@ -601,7 +601,7 @@ export function BacktestPage() {
 
           <Col xs={24} md={12}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>鍏ュ満浜嬩欢</span>
+              <span>入场事件</span>
               <Select
                 mode="multiple"
                 value={entryEvents}
@@ -612,7 +612,7 @@ export function BacktestPage() {
           </Col>
           <Col xs={24} md={12}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>绂诲満浜嬩欢</span>
+              <span>离场事件</span>
               <Select
                 mode="multiple"
                 value={exitEvents}
@@ -624,7 +624,7 @@ export function BacktestPage() {
 
           <Col xs={24} md={6}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>鍒濆璧勯噾</span>
+              <span>初始资金</span>
               <InputNumber
                 min={10_000}
                 max={100_000_000}
@@ -637,7 +637,7 @@ export function BacktestPage() {
           </Col>
           <Col xs={24} md={6}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>鍗曠瑪浠撲綅鍗犳瘮(%)</span>
+              <span>单笔仓位占比(%)</span>
               <InputNumber
                 min={1}
                 max={100}
@@ -663,7 +663,7 @@ export function BacktestPage() {
           </Col>
           <Col xs={24} md={6}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>鏈€澶ц偂绁ㄦ暟</span>
+              <span>最大股票数</span>
               <InputNumber
                 min={20}
                 max={2000}
@@ -677,7 +677,7 @@ export function BacktestPage() {
 
           <Col xs={24} md={6}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>姝㈡崯姣斾緥(%)</span>
+              <span>止损比例(%)</span>
               <InputNumber
                 min={0}
                 max={50}
@@ -691,7 +691,7 @@ export function BacktestPage() {
           </Col>
           <Col xs={24} md={6}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>姝㈢泩姣斾緥(%)</span>
+              <span>止盈比例(%)</span>
               <InputNumber
                 min={0}
                 max={150}
@@ -717,7 +717,7 @@ export function BacktestPage() {
           </Col>
           <Col xs={24} md={6}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>鍗曡竟璐圭巼(bps)</span>
+              <span>单边费率(bps)</span>
               <InputNumber
                 min={0}
                 max={500}
@@ -731,13 +731,13 @@ export function BacktestPage() {
 
           <Col xs={24} md={6}>
             <Space orientation="vertical">
-              <span>瑕佹眰浜嬩欢椤哄簭</span>
+              <span>要求事件顺序</span>
               <Switch checked={requireSequence} onChange={setRequireSequence} />
             </Space>
           </Col>
           <Col xs={24} md={6}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>鏈€灏戜簨浠舵暟</span>
+              <span>最少事件数</span>
               <InputNumber
                 min={0}
                 max={12}
@@ -755,7 +755,7 @@ export function BacktestPage() {
           </Col>
           <Col xs={24} md={6}>
             <Space orientation="vertical">
-              <span>鍚敤 T+1</span>
+              <span>启用 T+1</span>
               <Switch checked={enforceT1} onChange={setEnforceT1} />
             </Space>
           </Col>
@@ -768,16 +768,16 @@ export function BacktestPage() {
                 optionType="button"
                 onChange={(event) => setPriorityMode(event.target.value)}
                 options={[
-                  { label: '闃舵浼樺厛', value: 'phase_first' },
-                  { label: '鍧囪　', value: 'balanced' },
-                  { label: '鍔ㄩ噺浼樺厛', value: 'momentum' },
+                  { label: '阶段优先', value: 'phase_first' },
+                  { label: '均衡', value: 'balanced' },
+                  { label: '动量优先', value: 'momentum' },
                 ]}
               />
             </Space>
           </Col>
           <Col xs={24} md={12}>
             <Space orientation="vertical" style={{ width: '100%' }}>
-              <span>鍚屾棩 TopK锛? = 涓嶉檺鍒讹級</span>
+              <span>同日 TopK（0 = 不限制）</span>
               <InputNumber
                 min={0}
                 max={500}
