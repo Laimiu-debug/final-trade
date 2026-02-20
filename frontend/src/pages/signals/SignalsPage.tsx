@@ -281,7 +281,7 @@ export function SignalsPage() {
   const initialBoardFilters =
     initialBoardFiltersFromQuery.length > 0
       ? initialBoardFiltersFromQuery
-      : cachedRunMeta && runId && cachedRunMeta.runId === runId
+      : cachedRunMeta?.boardFilters?.length
         ? cachedRunMeta.boardFilters
         : []
   const initialAsOfDate = searchParams.get('as_of_date') ?? ''
@@ -356,18 +356,17 @@ export function SignalsPage() {
   }, [trendStep])
 
   useEffect(() => {
-    if (mode !== 'trend_pool') return
     const queryBoardFilters = parseBoardFiltersFromSearchParams(new URLSearchParams(searchParamsSnapshot))
     if (queryBoardFilters.length > 0) {
       setBoardFilters((previous) => (isSameBoardFilters(previous, queryBoardFilters) ? previous : queryBoardFilters))
       return
     }
-    if (!runId) {
+    const cached = readScreenerRunMetaFromStorage()
+    if (!cached || cached.boardFilters.length === 0) {
       setBoardFilters((previous) => (previous.length === 0 ? previous : []))
       return
     }
-    const cached = readScreenerRunMetaFromStorage()
-    if (!cached || cached.runId !== runId || cached.boardFilters.length === 0) {
+    if (mode === 'trend_pool' && runId && cached.runId !== runId) {
       setBoardFilters((previous) => (previous.length === 0 ? previous : []))
       return
     }
@@ -390,7 +389,7 @@ export function SignalsPage() {
       next.delete('trend_step')
     }
     next.delete('board_filters')
-    if (mode === 'trend_pool' && runId && boardFilters.length > 0) {
+    if (boardFilters.length > 0) {
       boardFilters.forEach((item) => next.append('board_filters', item))
     }
     next.delete('signal_run_id')
@@ -497,7 +496,7 @@ export function SignalsPage() {
         mode,
         run_id: mode === 'trend_pool' ? runId : undefined,
         trend_step: mode === 'trend_pool' ? trendStep : undefined,
-        board_filters: mode === 'trend_pool' && boardFilters.length > 0 ? boardFilters : undefined,
+        board_filters: boardFilters.length > 0 ? boardFilters : undefined,
         as_of_date: normalizedAsOfDate || undefined,
         refresh: shouldRefresh,
         window_days: windowDays,

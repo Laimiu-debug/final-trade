@@ -157,7 +157,7 @@ export function ChartPage() {
         mode: signalMode,
         run_id: signalRunId,
         trend_step: signalMode === 'trend_pool' ? signalTrendStep : undefined,
-        board_filters: signalMode === 'trend_pool' && signalBoardFilters.length > 0 ? signalBoardFilters : undefined,
+        board_filters: signalBoardFilters.length > 0 ? signalBoardFilters : undefined,
         as_of_date: signalAsOfDate,
         window_days: signalWindowDays,
         min_score: signalMinScore,
