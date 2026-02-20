@@ -18,3 +18,8 @@ node_modules/
 venv/
 backend/.test-state/
 runtime-logs/
+
+# Packaging temp artifacts
+backend/build/
+backend/dist/
+backend/*.spec
