@@ -24,7 +24,7 @@ import type { ColumnsType } from 'antd/es/table'
 import ReactECharts from 'echarts-for-react'
 import { Link } from 'react-router-dom'
 import { ApiError } from '@/shared/api/client'
-import { getBacktestTask, getLatestScreenerRun, runBacktest, startBacktestTask } from '@/shared/api/endpoints'
+import { getBacktestTask, getLatestScreenerRun, startBacktestTask } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
 import type {
   BacktestPoolRollMode,
@@ -424,27 +424,6 @@ export function BacktestPage() {
     tradePageSize,
   ])
 
-  const mutation = useMutation({
-    mutationFn: runBacktest,
-    onSuccess: (data) => {
-      setResult(data)
-      setRunError(null)
-      setTaskId('')
-      setTaskStatus(null)
-    },
-    onError: (error) => {
-      if (error instanceof ApiError && error.code === 'REQUEST_TIMEOUT' && mode === 'full_market') {
-        const text = '全市场回测超时，请缩短回测区间或降低“最大股票数”后重试。'
-        setRunError(text)
-        message.error(text)
-        return
-      }
-      const text = formatApiError(error)
-      setRunError(text)
-      message.error(text)
-    },
-  })
-
   const startTaskMutation = useMutation({
     mutationFn: startBacktestTask,
     onSuccess: (payload) => {
@@ -600,12 +579,7 @@ export function BacktestPage() {
       max_symbols: maxSymbols,
     }
     setRunError(null)
-    const shouldUseTaskApi = mode === 'trend_pool'
-    if (shouldUseTaskApi) {
-      startTaskMutation.mutate(payload)
-      return
-    }
-    mutation.mutate(payload)
+    startTaskMutation.mutate(payload)
   }
 
   function handleBindLatestRunId() {
@@ -623,7 +597,7 @@ export function BacktestPage() {
   }
 
   const taskRunning = Boolean(taskId) || startTaskMutation.isPending
-  const runLoading = mutation.isPending || taskRunning
+  const runLoading = taskRunning
   const taskProgress = taskStatus?.progress
 
   return (
@@ -698,7 +672,18 @@ export function BacktestPage() {
               <Alert
                 type="warning"
                 showIcon
-                title="全市场模式计算量较大，建议缩短区间或降低“最大股票数”，避免超时。"
+                title={
+                  poolRollMode === 'daily'
+                    ? '全市场-每日滚动：每个交易日全量重算候选池，结果最严格，耗时最高。'
+                    : poolRollMode === 'weekly'
+                      ? '全市场-每周滚动：每周首个交易日重算候选池，其余交易日沿用。'
+                      : '全市场-持仓触发：首日建池，卖出后下一交易日重算并补仓。'
+                }
+                description={
+                  poolRollMode === 'position'
+                    ? '该模式更贴近“卖出后再补仓”的实盘节奏；仍建议控制回测区间与最大股票数。'
+                    : '该模式计算量较大，建议缩短区间或降低“最大股票数”，并通过任务进度面板观察执行状态。'
+                }
               />
             </Col>
           ) : null}

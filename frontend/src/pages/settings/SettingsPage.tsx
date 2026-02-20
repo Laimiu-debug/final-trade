@@ -1,5 +1,6 @@
 ﻿import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import dayjs from 'dayjs'
 import {
   Alert,
   App as AntdApp,
@@ -21,9 +22,16 @@ import { DeleteOutlined, PlusOutlined } from '@ant-design/icons'
 import { Controller, useFieldArray, useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { getConfig, getSystemStorage, testAIProvider, updateConfig } from '@/shared/api/endpoints'
+import {
+  backfillWyckoffEventStore,
+  getConfig,
+  getSystemStorage,
+  getWyckoffEventStoreStats,
+  testAIProvider,
+  updateConfig,
+} from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
-import type { AppConfig } from '@/types/contracts'
+import type { AppConfig, Market } from '@/types/contracts'
 
 const providerSchema = z
   .object({
@@ -131,6 +139,16 @@ export function SettingsPage() {
     queryKey: ['system-storage'],
     queryFn: getSystemStorage,
   })
+  const wyckoffStatsQuery = useQuery({
+    queryKey: ['wyckoff-event-store-stats'],
+    queryFn: getWyckoffEventStoreStats,
+  })
+  const [backfillDateFrom, setBackfillDateFrom] = useState(dayjs().subtract(20, 'day').format('YYYY-MM-DD'))
+  const [backfillDateTo, setBackfillDateTo] = useState(dayjs().subtract(1, 'day').format('YYYY-MM-DD'))
+  const [backfillMarkets, setBackfillMarkets] = useState<Market[]>(['sh', 'sz'])
+  const [backfillWindowsText, setBackfillWindowsText] = useState('60')
+  const [backfillMaxSymbols, setBackfillMaxSymbols] = useState(300)
+  const [backfillForceRebuild, setBackfillForceRebuild] = useState(false)
 
   const { control, getValues, handleSubmit, reset, setValue } = useForm<FormValues>({
     resolver: zodResolver(schema),
@@ -175,6 +193,17 @@ export function SettingsPage() {
       message.success('配置已保存')
       void queryClient.invalidateQueries({ queryKey: ['config'] })
       void queryClient.invalidateQueries({ queryKey: ['system-storage'] })
+    },
+  })
+  const wyckoffBackfillMutation = useMutation({
+    mutationFn: backfillWyckoffEventStore,
+    onSuccess: (data) => {
+      message.success(data.message)
+      void queryClient.invalidateQueries({ queryKey: ['wyckoff-event-store-stats'] })
+      void queryClient.invalidateQueries({ queryKey: ['system-storage'] })
+    },
+    onError: () => {
+      message.error('事件库回填失败，请检查日期范围与数据源配置。')
     },
   })
 
@@ -243,6 +272,37 @@ export function SettingsPage() {
     } finally {
       setTestingProviderId(null)
     }
+  }
+
+  function handleWyckoffBackfill() {
+    if (wyckoffBackfillMutation.isPending) return
+    const datePattern = /^\d{4}-\d{2}-\d{2}$/
+    const dateFrom = backfillDateFrom.trim()
+    const dateTo = backfillDateTo.trim()
+    if (!datePattern.test(dateFrom) || !datePattern.test(dateTo)) {
+      message.error('回填日期格式需为 YYYY-MM-DD')
+      return
+    }
+    const windowDaysList = Array.from(
+      new Set(
+        backfillWindowsText
+          .split(/[,\s]+/)
+          .map((item) => Number(item))
+          .filter((item) => Number.isFinite(item) && item >= 20 && item <= 240),
+      ),
+    )
+    if (windowDaysList.length === 0) {
+      message.error('请至少输入一个有效窗口（20~240）')
+      return
+    }
+    wyckoffBackfillMutation.mutate({
+      date_from: dateFrom,
+      date_to: dateTo,
+      markets: backfillMarkets,
+      window_days_list: windowDaysList,
+      max_symbols_per_day: backfillMaxSymbols,
+      force_rebuild: backfillForceRebuild,
+    })
   }
 
   return (
@@ -439,8 +499,95 @@ export function SettingsPage() {
               <Typography.Text type="secondary">
                 本地状态: 配置{storageQuery.data?.app_state_exists ? '已持久化' : '未持久化'}，
                 模拟账户{storageQuery.data?.sim_state_exists ? '已持久化' : '未持久化'}，
-                本地行情文件数 {storageQuery.data?.akshare_cache_file_count ?? 0}。
+                本地行情文件数 {storageQuery.data?.akshare_cache_file_count ?? 0}，
+                威科夫事件库{storageQuery.data?.wyckoff_event_store_exists ? '已就绪' : '未创建'}。
               </Typography.Text>
+              <br />
+              <Typography.Text type="secondary">
+                事件库统计: 记录 {wyckoffStatsQuery.data?.db_record_count ?? 0}，命中{' '}
+                {wyckoffStatsQuery.data?.cache_hits ?? 0}，未命中 {wyckoffStatsQuery.data?.cache_misses ?? 0}，
+                lazy-fill 写入 {wyckoffStatsQuery.data?.lazy_fill_writes ?? 0}，回填写入{' '}
+                {wyckoffStatsQuery.data?.backfill_writes ?? 0}。
+              </Typography.Text>
+              <br />
+              <Typography.Text type="secondary">
+                命中率 {(Number(wyckoffStatsQuery.data?.cache_hit_rate ?? 0) * 100).toFixed(2)}%，缺失率{' '}
+                {(Number(wyckoffStatsQuery.data?.cache_miss_rate ?? 0) * 100).toFixed(2)}%，质量告警（累计）:
+                空事件 {wyckoffStatsQuery.data?.quality_empty_events ?? 0}、异常分值{' '}
+                {wyckoffStatsQuery.data?.quality_score_outliers ?? 0}、日期错位{' '}
+                {wyckoffStatsQuery.data?.quality_date_misaligned ?? 0}；读取次数{' '}
+                {wyckoffStatsQuery.data?.snapshot_reads ?? 0}，平均读取耗时{' '}
+                {Number(wyckoffStatsQuery.data?.avg_snapshot_read_ms ?? 0).toFixed(3)} ms。
+              </Typography.Text>
+              <br />
+              <Typography.Text type="secondary">
+                最近一次回填质量告警: 空事件 {wyckoffStatsQuery.data?.last_backfill_quality_empty_events ?? 0}、
+                异常分值 {wyckoffStatsQuery.data?.last_backfill_quality_score_outliers ?? 0}、日期错位{' '}
+                {wyckoffStatsQuery.data?.last_backfill_quality_date_misaligned ?? 0}。
+              </Typography.Text>
+              <br />
+              <Typography.Text type="secondary">
+                回填参数：日期区间 + 市场 + 窗口列表（逗号分隔），用于批量补齐缺失事件记录。
+              </Typography.Text>
+              <Space wrap style={{ marginTop: 8 }}>
+                <Input
+                  style={{ width: 130 }}
+                  placeholder="date_from"
+                  value={backfillDateFrom}
+                  onChange={(event) => setBackfillDateFrom(event.target.value)}
+                />
+                <Input
+                  style={{ width: 130 }}
+                  placeholder="date_to"
+                  value={backfillDateTo}
+                  onChange={(event) => setBackfillDateTo(event.target.value)}
+                />
+                <Select
+                  mode="multiple"
+                  style={{ minWidth: 180 }}
+                  value={backfillMarkets}
+                  onChange={(value) => setBackfillMarkets(value as Market[])}
+                  options={[
+                    { label: '沪市', value: 'sh' },
+                    { label: '深市', value: 'sz' },
+                    { label: '北交所', value: 'bj' },
+                  ]}
+                />
+                <Input
+                  style={{ width: 140 }}
+                  placeholder="窗口: 60,90"
+                  value={backfillWindowsText}
+                  onChange={(event) => setBackfillWindowsText(event.target.value)}
+                />
+                <InputNumber
+                  min={20}
+                  max={6000}
+                  value={backfillMaxSymbols}
+                  onChange={(value) => setBackfillMaxSymbols(Number(value || 300))}
+                />
+                <Switch
+                  checked={backfillForceRebuild}
+                  onChange={setBackfillForceRebuild}
+                  checkedChildren="强制重算"
+                  unCheckedChildren="仅补缺失"
+                />
+                <Button
+                  loading={wyckoffBackfillMutation.isPending}
+                  disabled={wyckoffStatsQuery.data?.enabled === false}
+                  onClick={handleWyckoffBackfill}
+                >
+                  回填事件库
+                </Button>
+              </Space>
+              {Array.isArray(wyckoffBackfillMutation.data?.warnings) &&
+              (wyckoffBackfillMutation.data?.warnings?.length ?? 0) > 0 ? (
+                <Alert
+                  style={{ marginTop: 8 }}
+                  type="warning"
+                  showIcon
+                  message={wyckoffBackfillMutation.data?.warnings.join('；')}
+                />
+              ) : null}
             </Col>
           </Row>
 

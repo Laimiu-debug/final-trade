@@ -512,26 +512,57 @@ class BacktestEngine:
             entries_by_date[trade.entry_date].append((idx, trade))
             exits_by_date[trade.exit_date].append((idx, trade))
 
+        executed_symbols = {trade.symbol for trade in executed}
+        input_symbols = {str(symbol).strip().lower() for symbol in symbols if str(symbol).strip()}
+        calendar_dates_set: set[str] = set()
         close_map_by_symbol: dict[str, dict[str, float]] = {}
-        for symbol in {trade.symbol for trade in executed}:
+        for symbol in input_symbols:
             day_close: dict[str, float] = {}
             for bar in self._get_candles(symbol):
+                if bar.time < start_date or bar.time > end_date:
+                    continue
+                calendar_dates_set.add(bar.time)
+                if symbol not in executed_symbols:
+                    continue
+                close_price = float(bar.close)
+                if math.isfinite(close_price) and close_price > 0:
+                    day_close[bar.time] = close_price
+            if symbol in executed_symbols:
+                close_map_by_symbol[symbol] = day_close
+
+        for symbol in executed_symbols:
+            if symbol in close_map_by_symbol:
+                continue
+            day_close: dict[str, float] = {}
+            for bar in self._get_candles(symbol):
+                if bar.time < start_date or bar.time > end_date:
+                    continue
+                calendar_dates_set.add(bar.time)
                 close_price = float(bar.close)
                 if math.isfinite(close_price) and close_price > 0:
                     day_close[bar.time] = close_price
             close_map_by_symbol[symbol] = day_close
 
-        notes.append("资金曲线按自然日盯市：无交易日也按持仓收盘价更新净值。")
+        if not calendar_dates_set:
+            calendar_dates_set.update(day for day in entries_by_date if start_date <= day <= end_date)
+            calendar_dates_set.update(day for day in exits_by_date if start_date <= day <= end_date)
+
+        if not calendar_dates_set:
+            cursor_dt = start_dt
+            while cursor_dt <= end_dt:
+                if cursor_dt.weekday() < 5:
+                    calendar_dates_set.add(cursor_dt.strftime("%Y-%m-%d"))
+                cursor_dt += timedelta(days=1)
+
+        trading_dates = sorted(calendar_dates_set) if calendar_dates_set else [start_date]
+        notes.append("资金曲线按交易日盯市：周末及节假日不生成净值点。")
         running_realized_pnl = 0.0
         cash_mark = float(payload.initial_capital)
         open_positions: dict[int, dict[str, float | str]] = {}
         last_close_by_symbol: dict[str, float] = {}
 
         equity_curve: list[EquityPoint] = []
-        cursor_dt = start_dt
-        while cursor_dt <= end_dt:
-            day = cursor_dt.strftime("%Y-%m-%d")
-
+        for day in trading_dates:
             for idx, trade in entries_by_date.get(day, []):
                 entry_exec = float(trade.entry_price) * (1 + fee_rate)
                 invested = float(trade.quantity) * entry_exec
@@ -569,7 +600,6 @@ class BacktestEngine:
                     realized_pnl=round(running_realized_pnl, 4),
                 )
             )
-            cursor_dt += timedelta(days=1)
 
         if not equity_curve:
             equity_curve.append(

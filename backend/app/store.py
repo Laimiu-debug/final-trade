@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import math
+import hashlib
 import json
 import os
 import random
@@ -26,6 +27,7 @@ from .models import (
     AppConfig,
     CandlePoint,
     BacktestRunRequest,
+    BacktestPoolRollMode,
     BacktestResponse,
     BacktestTaskProgress,
     BacktestTaskStatusResponse,
@@ -82,6 +84,9 @@ from .models import (
     WeeklyReviewListResponse,
     WeeklyReviewPayload,
     WeeklyReviewRecord,
+    WyckoffEventStoreBackfillRequest,
+    WyckoffEventStoreBackfillResponse,
+    WyckoffEventStoreStatsResponse,
 )
 from .market_data_sync import sync_baostock_daily
 from .sim_engine import SimAccountEngine
@@ -96,6 +101,7 @@ from .utils.text_utils import TextProcessor, URLUtils
 from .core.signal_analyzer import SignalAnalyzer, WYCKOFF_ACC_EVENTS, WYCKOFF_RISK_EVENTS, WYCKOFF_EVENT_ORDER
 from .core.ai_analyzer import AIAnalyzer, create_ai_analyzer
 from .core.backtest_engine import BacktestEngine
+from .core.wyckoff_event_store import WyckoffEventStore, build_wyckoff_params_hash
 from .core.screener import ScreenerEngine, create_screener_engine, THEME_STAGES
 from .core.candle_analyzer import CandleAnalyzer, create_candle_analyzer
 from .providers.web_provider import RSSWebEvidenceProvider, SearchWebEvidenceProvider
@@ -117,6 +123,7 @@ STOCK_POOL: list[dict[str, str]] = [
 
 class InMemoryStore:
     _APP_STATE_SCHEMA_VERSION = 2
+    _FULL_MARKET_SYSTEM_PROTECT_LIMIT = 6000
 
     def __init__(self, app_state_path: str | None = None, sim_state_path: str | None = None) -> None:
         self._lock = RLock()
@@ -136,6 +143,36 @@ class InMemoryStore:
         self._signals_cache: dict[str, tuple[float, SignalsResponse]] = {}
         self._backtest_tasks: dict[str, BacktestTaskStatusResponse] = {}
         self._backtest_task_lock = RLock()
+        self._wyckoff_event_store_enabled = self._env_flag("TDX_TREND_WYCKOFF_STORE_ENABLED", True)
+        self._wyckoff_event_store_read_only = self._env_flag("TDX_TREND_WYCKOFF_STORE_READ_ONLY", False)
+        self._wyckoff_event_algo_version = os.getenv("TDX_TREND_WYCKOFF_ALGO_VERSION", "").strip() or "wyckoff-v1"
+        self._wyckoff_event_data_version = os.getenv("TDX_TREND_WYCKOFF_DATA_VERSION", "").strip() or "default"
+        self._wyckoff_event_store = WyckoffEventStore(
+            self._resolve_wyckoff_event_store_path(),
+            enabled=self._wyckoff_event_store_enabled,
+            read_only=self._wyckoff_event_store_read_only,
+        )
+        self._wyckoff_metrics_lock = RLock()
+        self._wyckoff_metrics: dict[str, object] = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "snapshot_reads": 0,
+            "snapshot_read_ms_total": 0.0,
+            "lazy_fill_writes": 0,
+            "backfill_runs": 0,
+            "backfill_writes": 0,
+            "quality_empty_events": 0,
+            "quality_score_outliers": 0,
+            "quality_date_misaligned": 0,
+            "last_backfill_started_at": None,
+            "last_backfill_finished_at": None,
+            "last_backfill_duration_sec": None,
+            "last_backfill_scan_dates": 0,
+            "last_backfill_symbols": 0,
+            "last_backfill_quality_empty_events": 0,
+            "last_backfill_quality_score_outliers": 0,
+            "last_backfill_quality_date_misaligned": 0,
+        }
         self._app_state_path = self._resolve_app_state_path(app_state_path)
         self._load_or_init_app_state()
         self._sim_engine = SimAccountEngine(
@@ -151,6 +188,17 @@ class InMemoryStore:
         expanded = os.path.expandvars(os.path.expanduser(str(value).strip()))
         return Path(expanded)
 
+    @staticmethod
+    def _env_flag(name: str, default: bool) -> bool:
+        raw = os.getenv(name, "").strip().lower()
+        if not raw:
+            return default
+        if raw in {"1", "true", "yes", "y", "on"}:
+            return True
+        if raw in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
+
     @classmethod
     def _resolve_app_state_path(cls, app_state_path: str | None = None) -> Path:
         if app_state_path and str(app_state_path).strip():
@@ -159,6 +207,13 @@ class InMemoryStore:
         if env_value:
             return cls._resolve_user_path(env_value)
         return Path.home() / ".tdx-trend" / "app_state.json"
+
+    @classmethod
+    def _resolve_wyckoff_event_store_path(cls) -> Path:
+        env_value = os.getenv("TDX_TREND_WYCKOFF_STORE_PATH", "").strip()
+        if env_value:
+            return cls._resolve_user_path(env_value)
+        return Path.home() / ".tdx-trend" / "wyckoff_events.sqlite"
 
     def _build_app_state_payload(self) -> dict[str, object]:
         return {
@@ -375,6 +430,128 @@ class InMemoryStore:
     @staticmethod
     def _now_datetime() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _bump_wyckoff_metric(self, key: str, delta: int = 1) -> None:
+        with self._wyckoff_metrics_lock:
+            current = int(self._wyckoff_metrics.get(key, 0) or 0)
+            self._wyckoff_metrics[key] = current + int(delta)
+
+    def _set_wyckoff_metric(self, key: str, value: object) -> None:
+        with self._wyckoff_metrics_lock:
+            self._wyckoff_metrics[key] = value
+
+    def _snapshot_wyckoff_metrics(self) -> dict[str, object]:
+        with self._wyckoff_metrics_lock:
+            return dict(self._wyckoff_metrics)
+
+    def _record_wyckoff_snapshot_read_latency(self, duration_ms: float) -> None:
+        if not math.isfinite(duration_ms):
+            return
+        with self._wyckoff_metrics_lock:
+            current_reads = int(self._wyckoff_metrics.get("snapshot_reads", 0) or 0)
+            current_total = float(self._wyckoff_metrics.get("snapshot_read_ms_total", 0.0) or 0.0)
+            self._wyckoff_metrics["snapshot_reads"] = current_reads + 1
+            self._wyckoff_metrics["snapshot_read_ms_total"] = current_total + max(0.0, float(duration_ms))
+
+    @staticmethod
+    def _is_snapshot_score_outlier(raw: object) -> bool:
+        try:
+            value = float(raw)
+        except Exception:
+            return True
+        if not math.isfinite(value):
+            return True
+        return (value < 0.0) or (value > 100.0)
+
+    def _inspect_wyckoff_snapshot_quality(
+        self,
+        snapshot: dict[str, object],
+        *,
+        trade_date: str,
+    ) -> dict[str, int]:
+        has_event_rows = False
+        has_chain_rows = False
+        date_misaligned = 0
+
+        events = snapshot.get("events")
+        if isinstance(events, list):
+            for item in events:
+                if str(item).strip():
+                    has_event_rows = True
+                    break
+
+        risk_events = snapshot.get("risk_events")
+        if isinstance(risk_events, list):
+            for item in risk_events:
+                if str(item).strip():
+                    has_event_rows = True
+                    break
+
+        event_chain = snapshot.get("event_chain")
+        if isinstance(event_chain, list):
+            for row in event_chain:
+                if not isinstance(row, dict):
+                    continue
+                code_text = str(row.get("event", "")).strip()
+                date_text = str(row.get("date", "")).strip()
+                if not code_text:
+                    continue
+                has_chain_rows = True
+                if not date_text:
+                    date_misaligned = 1
+                    break
+                parsed = self._parse_date(date_text)
+                if parsed is None:
+                    date_misaligned = 1
+                    break
+                if trade_date and date_text > trade_date:
+                    date_misaligned = 1
+                    break
+
+        event_dates = snapshot.get("event_dates")
+        if isinstance(event_dates, dict):
+            for raw_date in event_dates.values():
+                date_text = str(raw_date).strip()
+                if not date_text:
+                    continue
+                parsed = self._parse_date(date_text)
+                if parsed is None:
+                    date_misaligned = 1
+                    break
+                if trade_date and date_text > trade_date:
+                    date_misaligned = 1
+                    break
+
+        score_fields = (
+            "entry_quality_score",
+            "event_strength_score",
+            "phase_score",
+            "structure_score",
+            "trend_score",
+            "volatility_score",
+        )
+        score_outlier = 0
+        for field in score_fields:
+            if self._is_snapshot_score_outlier(snapshot.get(field, 0.0)):
+                score_outlier = 1
+                break
+
+        return {
+            "empty_events": 0 if (has_event_rows or has_chain_rows) else 1,
+            "score_outliers": score_outlier,
+            "date_misaligned": date_misaligned,
+        }
+
+    def _record_wyckoff_snapshot_quality(self, quality_flags: dict[str, int]) -> None:
+        empty_events = int(max(0, quality_flags.get("empty_events", 0)))
+        score_outliers = int(max(0, quality_flags.get("score_outliers", 0)))
+        date_misaligned = int(max(0, quality_flags.get("date_misaligned", 0)))
+        if empty_events > 0:
+            self._bump_wyckoff_metric("quality_empty_events", empty_events)
+        if score_outliers > 0:
+            self._bump_wyckoff_metric("quality_score_outliers", score_outliers)
+        if date_misaligned > 0:
+            self._bump_wyckoff_metric("quality_date_misaligned", date_misaligned)
 
     @staticmethod
     def _days_ago(days: int) -> str:
@@ -3254,9 +3431,28 @@ class InMemoryStore:
                 return fallback_rows, error or "FULL_MARKET_TDX_UNAVAILABLE_FALLBACK_CANDLES", None, as_of_date
             return [], error or "FULL_MARKET_SCAN_EMPTY", None, as_of_date
 
-        source.sort(key=lambda row: row.score + row.ai_confidence * 20, reverse=True)
-        max_candidates = 1500
-        return source[:max_candidates], error, None, as_of_date
+        ordered_rows = sorted(source, key=lambda row: str(row.symbol).strip().lower())
+        deduped_rows: list[ScreenerResult] = []
+        seen_symbols: set[str] = set()
+        for row in ordered_rows:
+            symbol = str(row.symbol).strip().lower()
+            if not symbol or symbol in seen_symbols:
+                continue
+            seen_symbols.add(symbol)
+            deduped_rows.append(row)
+
+        protect_limit = max(1000, int(self._FULL_MARKET_SYSTEM_PROTECT_LIMIT))
+        protect_hit = len(deduped_rows) > protect_limit
+        if protect_hit:
+            deduped_rows = deduped_rows[:protect_limit]
+
+        reasons: list[str] = []
+        if error:
+            reasons.append(str(error))
+        if protect_hit:
+            reasons.append("FULL_MARKET_SYSTEM_LIMIT_HIT")
+        degraded_reason = ";".join(reasons) if reasons else None
+        return deduped_rows, degraded_reason, None, as_of_date
 
     def _calc_wyckoff_snapshot(
         self,
@@ -3265,11 +3461,50 @@ class InMemoryStore:
         *,
         as_of_date: str | None = None,
     ) -> dict[str, object]:
-        """Calculate Wyckoff snapshot using SignalAnalyzer."""
+        """Calculate Wyckoff snapshot with lazy persisted daily event cache."""
         candles, resolved_as_of_date = self._slice_candles_as_of(
             self._ensure_candles(row.symbol), as_of_date
         )
-        return SignalAnalyzer.calculate_wyckoff_snapshot(row, candles, window_days)
+        symbol = str(row.symbol).strip().lower()
+        trade_date = str(resolved_as_of_date or "").strip()
+        data_source = str(self._config.market_data_source).strip() or "unknown"
+        params_hash = build_wyckoff_params_hash(window_days)
+
+        if symbol and trade_date:
+            read_started = time.perf_counter()
+            cached = self._wyckoff_event_store.get_snapshot(
+                symbol=symbol,
+                trade_date=trade_date,
+                window_days=window_days,
+                algo_version=self._wyckoff_event_algo_version,
+                data_source=data_source,
+                data_version=self._wyckoff_event_data_version,
+                params_hash=params_hash,
+            )
+            read_duration_ms = (time.perf_counter() - read_started) * 1000.0
+            self._record_wyckoff_snapshot_read_latency(read_duration_ms)
+            if cached is not None:
+                self._bump_wyckoff_metric("cache_hits", 1)
+                return cached
+
+        self._bump_wyckoff_metric("cache_misses", 1)
+        snapshot = SignalAnalyzer.calculate_wyckoff_snapshot(row, candles, window_days)
+        quality_flags = self._inspect_wyckoff_snapshot_quality(snapshot, trade_date=trade_date)
+        self._record_wyckoff_snapshot_quality(quality_flags)
+        if symbol and trade_date:
+            write_ok = self._wyckoff_event_store.upsert_snapshot(
+                symbol=symbol,
+                trade_date=trade_date,
+                window_days=window_days,
+                algo_version=self._wyckoff_event_algo_version,
+                data_source=data_source,
+                data_version=self._wyckoff_event_data_version,
+                params_hash=params_hash,
+                snapshot=snapshot,
+            )
+            if write_ok:
+                self._bump_wyckoff_metric("lazy_fill_writes", 1)
+        return snapshot
 
     def _signals_cache_key(
         self,
@@ -3674,6 +3909,49 @@ class InMemoryStore:
                 return day
         return None
 
+    def _resolve_backtest_refresh_dates(
+        self,
+        *,
+        scan_dates: list[str],
+        pool_roll_mode: BacktestPoolRollMode,
+        refresh_dates: list[str] | None = None,
+    ) -> list[str]:
+        if not scan_dates:
+            return []
+        if refresh_dates is None:
+            if pool_roll_mode == "weekly":
+                refresh_dates_used = self._build_weekly_refresh_dates(scan_dates)
+            elif pool_roll_mode == "position":
+                refresh_dates_used = [scan_dates[0]]
+            else:
+                refresh_dates_used = list(scan_dates)
+            return refresh_dates_used or [scan_dates[0]]
+
+        scan_date_set = set(scan_dates)
+        refresh_dates_used = [day for day in refresh_dates if day in scan_date_set]
+        return refresh_dates_used or [scan_dates[0]]
+
+    @staticmethod
+    def _build_allowed_symbols_by_date(
+        *,
+        scan_dates: list[str],
+        pool_by_refresh_date: dict[str, set[str]],
+    ) -> tuple[dict[str, set[str]], set[str], int]:
+        allowed_symbols_by_date: dict[str, set[str]] = {}
+        symbols_union: set[str] = set()
+        empty_days = 0
+        active_pool: set[str] = set()
+        for day in scan_dates:
+            if day in pool_by_refresh_date:
+                active_pool = set(pool_by_refresh_date.get(day, set()))
+            allowed_today = set(active_pool)
+            allowed_symbols_by_date[day] = allowed_today
+            if allowed_today:
+                symbols_union.update(allowed_today)
+            else:
+                empty_days += 1
+        return allowed_symbols_by_date, symbols_union, empty_days
+
     def _build_backtest_screener_params_from_config(self) -> ScreenerParams:
         markets = [item for item in self._config.markets if item in {"sh", "sz", "bj"}]
         if not markets:
@@ -3687,6 +3965,42 @@ class InMemoryStore:
             turnover_threshold=max(0.01, min(0.2, float(self._config.turnover_threshold))),
             amount_threshold=max(5e7, min(5e9, float(self._config.amount_threshold))),
             amplitude_threshold=max(0.01, min(0.15, float(self._config.amplitude_threshold))),
+        )
+
+    @staticmethod
+    def _build_backtest_param_snapshot_note(
+        payload: BacktestRunRequest,
+        *,
+        resolved_run_id: str | None,
+        board_filters: list[BoardFilter],
+    ) -> str:
+        snapshot_payload = {
+            "mode": payload.mode,
+            "run_id": (resolved_run_id or payload.run_id or "").strip(),
+            "trend_step": payload.trend_step,
+            "pool_roll_mode": payload.pool_roll_mode,
+            "board_filters": sorted(board_filters),
+            "date_from": payload.date_from,
+            "date_to": payload.date_to,
+            "window_days": int(payload.window_days),
+            "min_score": round(float(payload.min_score), 3),
+            "require_sequence": bool(payload.require_sequence),
+            "min_event_count": int(payload.min_event_count),
+            "entry_events": list(payload.entry_events),
+            "exit_events": list(payload.exit_events),
+            "max_symbols": int(payload.max_symbols),
+            "max_positions": int(payload.max_positions),
+            "priority_mode": payload.priority_mode,
+            "priority_topk_per_day": int(payload.priority_topk_per_day),
+            "enforce_t1": bool(payload.enforce_t1),
+        }
+        raw = json.dumps(snapshot_payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+        return (
+            f"参数快照摘要: {digest} "
+            f"(mode={payload.mode}, roll={payload.pool_roll_mode}, window={payload.window_days}, "
+            f"min_score={payload.min_score}, min_event_count={payload.min_event_count}, "
+            f"max_symbols={payload.max_symbols}, run_id={(resolved_run_id or payload.run_id or 'none')})"
         )
 
     def _resolve_backtest_trend_pool_params(
@@ -3725,18 +4039,11 @@ class InMemoryStore:
         if not scan_dates:
             return [], {}, ["回测区间内无可扫描交易日。"], [], []
 
-        if refresh_dates is None:
-            if payload.pool_roll_mode == "weekly":
-                refresh_dates_used = self._build_weekly_refresh_dates(scan_dates)
-            elif payload.pool_roll_mode == "position":
-                refresh_dates_used = [scan_dates[0]]
-            else:
-                refresh_dates_used = list(scan_dates)
-        else:
-            scan_date_set = set(scan_dates)
-            refresh_dates_used = [day for day in refresh_dates if day in scan_date_set]
-            if not refresh_dates_used:
-                refresh_dates_used = [scan_dates[0]]
+        refresh_dates_used = self._resolve_backtest_refresh_dates(
+            scan_dates=scan_dates,
+            pool_roll_mode=payload.pool_roll_mode,
+            refresh_dates=refresh_dates,
+        )
 
         pool_by_refresh_date: dict[str, set[str]] = {}
         empty_refresh_days = 0
@@ -3799,19 +4106,10 @@ class InMemoryStore:
                     f"滚动筛选进度 {idx}/{len(refresh_dates_used)}",
                 )
 
-        allowed_symbols_by_date: dict[str, set[str]] = {}
-        symbols_union: set[str] = set()
-        empty_days = 0
-        active_pool: set[str] = set()
-        for day in scan_dates:
-            if day in pool_by_refresh_date:
-                active_pool = set(pool_by_refresh_date.get(day, set()))
-            allowed_today = set(active_pool)
-            allowed_symbols_by_date[day] = allowed_today
-            if allowed_today:
-                symbols_union.update(allowed_today)
-            else:
-                empty_days += 1
+        allowed_symbols_by_date, symbols_union, empty_days = self._build_allowed_symbols_by_date(
+            scan_dates=scan_dates,
+            pool_by_refresh_date=pool_by_refresh_date,
+        )
 
         mode_label_map = {
             "daily": "每日滚动",
@@ -3836,6 +4134,113 @@ class InMemoryStore:
             notes.append(f"有 {empty_days} 个交易日筛选为空，当日不会产生候选信号。")
         return sorted(symbols_union), allowed_symbols_by_date, notes, scan_dates, refresh_dates_used
 
+    def _build_full_market_rolling_universe(
+        self,
+        *,
+        payload: BacktestRunRequest,
+        board_filters: list[BoardFilter],
+        refresh_dates: list[str] | None = None,
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+    ) -> tuple[list[str], dict[str, set[str]], list[str], list[str], list[str]]:
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        if not scan_dates:
+            return [], {}, ["回测区间内无可扫描交易日。"], [], []
+
+        refresh_dates_used = self._resolve_backtest_refresh_dates(
+            scan_dates=scan_dates,
+            pool_roll_mode=payload.pool_roll_mode,
+            refresh_dates=refresh_dates,
+        )
+
+        markets = [item for item in self._config.markets if item in {"sh", "sz", "bj"}]
+        if not markets:
+            markets = ["sh", "sz"]
+
+        pool_by_refresh_date: dict[str, set[str]] = {}
+        empty_refresh_days = 0
+        loader_error_counter: dict[str, int] = {}
+        source_rows_total = 0
+        protect_limit = max(1000, int(self._FULL_MARKET_SYSTEM_PROTECT_LIMIT))
+        system_limit_hit_days = 0
+
+        for idx, as_of_date in enumerate(refresh_dates_used, start=1):
+            input_rows, load_error = load_input_pool_from_tdx(
+                tdx_root=self._config.tdx_data_path,
+                markets=markets,
+                return_window_days=max(5, min(120, int(self._config.return_window_days))),
+                as_of_date=as_of_date,
+            )
+            if load_error:
+                loader_error_counter[load_error] = loader_error_counter.get(load_error, 0) + 1
+            source_rows_total += len(input_rows)
+
+            source = input_rows
+            if board_filters:
+                source = [row for row in source if self._row_matches_board_filters(row, board_filters)]
+
+            day_symbols: list[str] = []
+            seen_symbols: set[str] = set()
+            for row in source:
+                symbol = str(row.symbol).strip().lower()
+                if not symbol or symbol in seen_symbols:
+                    continue
+                seen_symbols.add(symbol)
+                day_symbols.append(symbol)
+
+            day_symbols.sort()
+            if len(day_symbols) > protect_limit:
+                day_symbols = day_symbols[:protect_limit]
+                system_limit_hit_days += 1
+            if len(day_symbols) > payload.max_symbols:
+                day_symbols = day_symbols[: payload.max_symbols]
+
+            pool_by_refresh_date[as_of_date] = set(day_symbols)
+            if not day_symbols:
+                empty_refresh_days += 1
+
+            if progress_callback is not None:
+                progress_text = f"滚动筛选进度 {idx}/{len(refresh_dates_used)}"
+                if not day_symbols:
+                    progress_text = f"{progress_text}（当日候选为空）"
+                progress_callback(
+                    as_of_date,
+                    idx,
+                    len(refresh_dates_used),
+                    progress_text,
+                )
+
+        allowed_symbols_by_date, symbols_union, empty_days = self._build_allowed_symbols_by_date(
+            scan_dates=scan_dates,
+            pool_by_refresh_date=pool_by_refresh_date,
+        )
+
+        mode_label_map = {
+            "daily": "每日滚动",
+            "weekly": "每周滚动",
+            "position": "持仓触发滚动",
+        }
+        mode_label = mode_label_map.get(payload.pool_roll_mode, "每日滚动")
+        avg_source_rows = int(round(source_rows_total / max(1, len(refresh_dates_used))))
+        notes = [
+            (
+                f"全市场候选池构建: {mode_label}（扫描 {len(scan_dates)} 日，刷新 {len(refresh_dates_used)} 次，"
+                f"每次刷新平均加载 {avg_source_rows} 只标的）。"
+            ),
+            f"滚动股票池并集数量: {len(symbols_union)}，单日上限: {payload.max_symbols}。",
+        ]
+        if system_limit_hit_days > 0:
+            notes.append(
+                f"触发系统保护上限: {protect_limit}（共 {system_limit_hit_days} 个刷新日被截断，仅用于资源保护）。"
+            )
+        if empty_refresh_days > 0:
+            notes.append(f"有 {empty_refresh_days} 个刷新日当日候选为空。")
+        if loader_error_counter:
+            parts = [f"{reason} x{count}" for reason, count in sorted(loader_error_counter.items())]
+            notes.append(f"刷新日数据加载提示: {'; '.join(parts)}")
+        if empty_days > 0:
+            notes.append(f"有 {empty_days} 个交易日筛选为空，当日不会产生候选信号。")
+        return sorted(symbols_union), allowed_symbols_by_date, notes, scan_dates, refresh_dates_used
+
     def run_backtest(
         self,
         payload: BacktestRunRequest,
@@ -3843,10 +4248,8 @@ class InMemoryStore:
         progress_callback: Callable[[str, int, int, str], None] | None = None,
     ) -> BacktestResponse:
         board_filters = [item for item in payload.board_filters if item in {"main", "gem", "star", "beijing", "st"}]
-        candidates: list[ScreenerResult] = []
         degraded_reason: str | None = None
         resolved_run_id: str | None = None
-        resolved_as_of_date: str | None = payload.date_to
         trend_pool_params: ScreenerParams | None = None
         trend_pool_fallback_note: str | None = None
         if payload.mode == "trend_pool":
@@ -3856,21 +4259,12 @@ class InMemoryStore:
                 degraded_reason,
                 trend_pool_fallback_note,
             ) = self._resolve_backtest_trend_pool_params(payload.run_id)
-        else:
-            candidates, degraded_reason, resolved_run_id, resolved_as_of_date = self._resolve_signal_candidates(
-                mode=payload.mode,
-                run_id=payload.run_id,
-                trend_step=payload.trend_step,
-                as_of_date=payload.date_to,
-            )
-        candidate_count_before_board_filter = len(candidates)
-        candidate_count_after_board_filter = len(candidates)
+
         pool_notes: list[str] = []
         if trend_pool_fallback_note:
             pool_notes.append(trend_pool_fallback_note)
+
         symbols: list[str] = []
-        seen_symbols: set[str] = set()
-        used_rolling_universe = False
         allowed_symbols_by_date: dict[str, set[str]] | None = None
         scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
 
@@ -3885,7 +4279,9 @@ class InMemoryStore:
             resolve_symbol_name=self._resolve_symbol_name,
         )
 
-        if payload.mode == "trend_pool" and trend_pool_params is not None:
+        if payload.mode == "trend_pool":
+            if trend_pool_params is None:
+                raise ValueError("趋势池筛选参数不可用。")
             if payload.pool_roll_mode == "position":
                 if not scan_dates:
                     raise ValueError("回测区间内无可扫描交易日。")
@@ -3942,22 +4338,66 @@ class InMemoryStore:
             if not rolling_symbols:
                 reason_text = "；".join(pool_notes) if pool_notes else "滚动筛选结果为空。"
                 raise ValueError(f"回测股票池为空：{reason_text}")
-            used_rolling_universe = True
             symbols = rolling_symbols
             allowed_symbols_by_date = rolling_allowed_by_date
-
-        if not symbols and payload.mode != "trend_pool":
-            if board_filters:
-                candidates = [row for row in candidates if self._row_matches_board_filters(row, board_filters)]
-            candidate_count_after_board_filter = len(candidates)
-            for row in candidates:
-                symbol = str(row.symbol).strip().lower()
-                if not symbol or symbol in seen_symbols:
-                    continue
-                symbols.append(symbol)
-                seen_symbols.add(symbol)
-                if len(symbols) >= payload.max_symbols:
-                    break
+        elif payload.mode == "full_market":
+            if payload.pool_roll_mode == "position":
+                if not scan_dates:
+                    raise ValueError("回测区间内无可扫描交易日。")
+                seed_refresh_dates = [scan_dates[0]]
+                seed_symbols, seed_allowed_by_date, _, _, _ = self._build_full_market_rolling_universe(
+                    payload=payload,
+                    board_filters=board_filters,
+                    refresh_dates=seed_refresh_dates,
+                    progress_callback=None,
+                )
+                if not seed_symbols:
+                    raise ValueError("回测股票池为空：持仓触发滚动初始池为空。")
+                probe_result = engine.run(
+                    payload=payload,
+                    symbols=seed_symbols,
+                    allowed_symbols_by_date=seed_allowed_by_date,
+                )
+                refresh_date_set: set[str] = {scan_dates[0]}
+                for trade in probe_result.trades:
+                    next_day = self._next_scan_date(scan_dates, trade.exit_date)
+                    if next_day:
+                        refresh_date_set.add(next_day)
+                if progress_callback is not None:
+                    progress_callback(
+                        scan_dates[0],
+                        0,
+                        max(1, len(refresh_date_set)),
+                        "持仓触发滚动：正在根据卖出日生成刷新计划...",
+                    )
+                rolling_symbols, rolling_allowed_by_date, notes, _, refresh_dates_used = (
+                    self._build_full_market_rolling_universe(
+                        payload=payload,
+                        board_filters=board_filters,
+                        refresh_dates=sorted(refresh_date_set),
+                        progress_callback=progress_callback,
+                    )
+                )
+                pool_notes = [
+                    *pool_notes,
+                    *notes,
+                    f"持仓触发滚动：首日+卖出后下一交易日刷新，共 {len(refresh_dates_used)} 次。",
+                ]
+            else:
+                rolling_symbols, rolling_allowed_by_date, notes, _, _ = self._build_full_market_rolling_universe(
+                    payload=payload,
+                    board_filters=board_filters,
+                    refresh_dates=None,
+                    progress_callback=progress_callback,
+                )
+                pool_notes = [*pool_notes, *notes]
+            if not rolling_symbols:
+                reason_text = "；".join(pool_notes) if pool_notes else "滚动筛选结果为空。"
+                raise ValueError(f"回测股票池为空：{reason_text}")
+            symbols = rolling_symbols
+            allowed_symbols_by_date = rolling_allowed_by_date
+        else:
+            raise ValueError(f"不支持的回测模式: {payload.mode}")
 
         if not symbols:
             raise ValueError("回测股票池为空，请先执行筛选或调整回测模式")
@@ -3972,35 +4412,29 @@ class InMemoryStore:
         if pool_notes:
             notes = [*pool_notes, *notes]
         if board_filters:
-            if used_rolling_universe:
-                roll_mode_label = {
-                    "daily": "每日滚动",
-                    "weekly": "每周滚动",
-                    "position": "持仓触发滚动",
-                }.get(payload.pool_roll_mode, "每日滚动")
-                notes.insert(0, f"候选池板块过滤: {','.join(board_filters)}（{roll_mode_label}生效）")
-            else:
-                notes.insert(
-                    0,
-                    (
-                        "候选池板块过滤: "
-                        f"{','.join(board_filters)} "
-                        f"({candidate_count_after_board_filter}/{candidate_count_before_board_filter})"
-                    ),
-                )
+            roll_mode_label = {
+                "daily": "每日滚动",
+                "weekly": "每周滚动",
+                "position": "持仓触发滚动",
+            }.get(payload.pool_roll_mode, "每日滚动")
+            notes.insert(0, f"候选池板块过滤: {','.join(board_filters)}（{roll_mode_label}生效）")
         if payload.mode == "trend_pool" and resolved_run_id:
             notes.insert(0, f"使用筛选任务: {resolved_run_id}")
+        notes.insert(
+            0,
+            self._build_backtest_param_snapshot_note(
+                payload,
+                resolved_run_id=resolved_run_id,
+                board_filters=board_filters,
+            ),
+        )
         if degraded_reason:
             notes.append(f"候选池降级原因: {degraded_reason}")
-        if resolved_as_of_date and resolved_as_of_date != payload.date_to:
-            notes.append(f"候选池按 {resolved_as_of_date} 对齐")
         if notes != result.notes:
             result = result.model_copy(update={"notes": notes})
         return result
 
     def _estimate_backtest_progress_total_dates(self, payload: BacktestRunRequest) -> int:
-        if payload.mode != "trend_pool":
-            return 1
         scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
         if not scan_dates:
             return 1
@@ -4033,7 +4467,7 @@ class InMemoryStore:
         now_text = self._now_datetime()
         total_dates = self._estimate_backtest_progress_total_dates(payload)
         warning: str | None = None
-        if payload.mode == "trend_pool" and payload.pool_roll_mode in {"daily", "weekly"} and total_dates >= 45:
+        if payload.pool_roll_mode in {"daily", "weekly"} and total_dates >= 45:
             warning = "滚动回测日期较长，耗时可能较久，请耐心等待。"
 
         initial_progress = BacktestTaskProgress(
@@ -5146,6 +5580,238 @@ class InMemoryStore:
         self._persist_app_state()
         return self._config
 
+    def get_wyckoff_event_store_stats(self) -> WyckoffEventStoreStatsResponse:
+        metrics = self._snapshot_wyckoff_metrics()
+        cache_hits = int(metrics.get("cache_hits", 0) or 0)
+        cache_misses = int(metrics.get("cache_misses", 0) or 0)
+        cache_total = cache_hits + cache_misses
+        cache_hit_rate = round(cache_hits / cache_total, 6) if cache_total > 0 else 0.0
+        cache_miss_rate = round(cache_misses / cache_total, 6) if cache_total > 0 else 0.0
+        snapshot_reads = int(metrics.get("snapshot_reads", 0) or 0)
+        snapshot_read_ms_total = float(metrics.get("snapshot_read_ms_total", 0.0) or 0.0)
+        avg_snapshot_read_ms = round(snapshot_read_ms_total / snapshot_reads, 6) if snapshot_reads > 0 else 0.0
+        return WyckoffEventStoreStatsResponse(
+            enabled=self._wyckoff_event_store.enabled,
+            read_only=self._wyckoff_event_store.read_only,
+            db_path=str(self._wyckoff_event_store.db_path),
+            db_exists=self._wyckoff_event_store.db_path.exists(),
+            db_record_count=self._wyckoff_event_store.count_records(),
+            runtime_cache_size=self._wyckoff_event_store.runtime_cache_size,
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+            cache_hit_rate=cache_hit_rate,
+            cache_miss_rate=cache_miss_rate,
+            snapshot_reads=snapshot_reads,
+            avg_snapshot_read_ms=avg_snapshot_read_ms,
+            lazy_fill_writes=int(metrics.get("lazy_fill_writes", 0) or 0),
+            backfill_runs=int(metrics.get("backfill_runs", 0) or 0),
+            backfill_writes=int(metrics.get("backfill_writes", 0) or 0),
+            quality_empty_events=int(metrics.get("quality_empty_events", 0) or 0),
+            quality_score_outliers=int(metrics.get("quality_score_outliers", 0) or 0),
+            quality_date_misaligned=int(metrics.get("quality_date_misaligned", 0) or 0),
+            last_backfill_started_at=(
+                str(metrics.get("last_backfill_started_at"))
+                if metrics.get("last_backfill_started_at") is not None
+                else None
+            ),
+            last_backfill_finished_at=(
+                str(metrics.get("last_backfill_finished_at"))
+                if metrics.get("last_backfill_finished_at") is not None
+                else None
+            ),
+            last_backfill_duration_sec=(
+                float(metrics.get("last_backfill_duration_sec"))
+                if metrics.get("last_backfill_duration_sec") is not None
+                else None
+            ),
+            last_backfill_scan_dates=int(metrics.get("last_backfill_scan_dates", 0) or 0),
+            last_backfill_symbols=int(metrics.get("last_backfill_symbols", 0) or 0),
+            last_backfill_quality_empty_events=int(metrics.get("last_backfill_quality_empty_events", 0) or 0),
+            last_backfill_quality_score_outliers=int(
+                metrics.get("last_backfill_quality_score_outliers", 0) or 0
+            ),
+            last_backfill_quality_date_misaligned=int(
+                metrics.get("last_backfill_quality_date_misaligned", 0) or 0
+            ),
+        )
+
+    def backfill_wyckoff_event_store(
+        self,
+        payload: WyckoffEventStoreBackfillRequest,
+    ) -> WyckoffEventStoreBackfillResponse:
+        if not self._wyckoff_event_store.enabled:
+            raise ValueError("威科夫事件库未启用，请先开启 TDX_TREND_WYCKOFF_STORE_ENABLED。")
+        if self._wyckoff_event_store.read_only:
+            raise ValueError("威科夫事件库当前为只读模式，无法执行回填。")
+
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        if not scan_dates:
+            raise ValueError("回填区间内无可扫描交易日。")
+
+        valid_markets = [item for item in payload.markets if item in {"sh", "sz", "bj"}]
+        if not valid_markets:
+            valid_markets = [item for item in self._config.markets if item in {"sh", "sz", "bj"}]
+        if not valid_markets:
+            valid_markets = ["sh", "sz"]
+        markets = list(dict.fromkeys(valid_markets))
+
+        raw_windows = [int(item) for item in payload.window_days_list]
+        window_days_list = sorted(
+            list(
+                dict.fromkeys(
+                    item for item in raw_windows if 20 <= item <= 240
+                )
+            )
+        )
+        if not window_days_list:
+            raise ValueError("window_days_list 必须至少包含一个 [20,240] 内的窗口。")
+
+        started_at = self._now_datetime()
+        started_ts = time.perf_counter()
+        self._bump_wyckoff_metric("backfill_runs", 1)
+        self._set_wyckoff_metric("last_backfill_started_at", started_at)
+
+        loaded_rows_total = 0
+        symbols_scanned = 0
+        cache_hits = 0
+        cache_misses = 0
+        computed_count = 0
+        write_count = 0
+        quality_empty_events = 0
+        quality_score_outliers = 0
+        quality_date_misaligned = 0
+        loader_error_counter: dict[str, int] = {}
+
+        for as_of_date in scan_dates:
+            input_rows, load_error = load_input_pool_from_tdx(
+                tdx_root=self._config.tdx_data_path,
+                markets=markets,
+                return_window_days=max(5, min(120, int(self._config.return_window_days))),
+                as_of_date=as_of_date,
+            )
+            if load_error:
+                loader_error_counter[load_error] = loader_error_counter.get(load_error, 0) + 1
+            loaded_rows_total += len(input_rows)
+
+            unique_rows: list[ScreenerResult] = []
+            seen_symbols: set[str] = set()
+            for row in input_rows:
+                symbol = str(row.symbol).strip().lower()
+                if not symbol or symbol in seen_symbols:
+                    continue
+                seen_symbols.add(symbol)
+                unique_rows.append(row)
+                if len(unique_rows) >= payload.max_symbols_per_day:
+                    break
+
+            for row in unique_rows:
+                symbol = str(row.symbol).strip().lower()
+                if not symbol:
+                    continue
+                symbols_scanned += 1
+                data_source = str(self._config.market_data_source).strip() or "unknown"
+                for window_days in window_days_list:
+                    params_hash = build_wyckoff_params_hash(window_days)
+                    if not payload.force_rebuild:
+                        read_started = time.perf_counter()
+                        cached = self._wyckoff_event_store.get_snapshot(
+                            symbol=symbol,
+                            trade_date=as_of_date,
+                            window_days=window_days,
+                            algo_version=self._wyckoff_event_algo_version,
+                            data_source=data_source,
+                            data_version=self._wyckoff_event_data_version,
+                            params_hash=params_hash,
+                        )
+                        read_duration_ms = (time.perf_counter() - read_started) * 1000.0
+                        self._record_wyckoff_snapshot_read_latency(read_duration_ms)
+                        if cached is not None:
+                            cache_hits += 1
+                            self._bump_wyckoff_metric("cache_hits", 1)
+                            continue
+
+                    cache_misses += 1
+                    self._bump_wyckoff_metric("cache_misses", 1)
+                    candles, resolved_as_of_date = self._slice_candles_as_of(
+                        self._ensure_candles(symbol),
+                        as_of_date,
+                    )
+                    if not candles or not resolved_as_of_date:
+                        continue
+                    snapshot = SignalAnalyzer.calculate_wyckoff_snapshot(row, candles, window_days)
+                    quality_flags = self._inspect_wyckoff_snapshot_quality(
+                        snapshot,
+                        trade_date=resolved_as_of_date,
+                    )
+                    self._record_wyckoff_snapshot_quality(quality_flags)
+                    quality_empty_events += int(max(0, quality_flags.get("empty_events", 0)))
+                    quality_score_outliers += int(max(0, quality_flags.get("score_outliers", 0)))
+                    quality_date_misaligned += int(max(0, quality_flags.get("date_misaligned", 0)))
+                    computed_count += 1
+                    write_ok = self._wyckoff_event_store.upsert_snapshot(
+                        symbol=symbol,
+                        trade_date=resolved_as_of_date,
+                        window_days=window_days,
+                        algo_version=self._wyckoff_event_algo_version,
+                        data_source=data_source,
+                        data_version=self._wyckoff_event_data_version,
+                        params_hash=params_hash,
+                        snapshot=snapshot,
+                    )
+                    if write_ok:
+                        write_count += 1
+                        self._bump_wyckoff_metric("backfill_writes", 1)
+
+        finished_at = self._now_datetime()
+        duration_sec = round(max(0.0, time.perf_counter() - started_ts), 4)
+        self._set_wyckoff_metric("last_backfill_finished_at", finished_at)
+        self._set_wyckoff_metric("last_backfill_duration_sec", duration_sec)
+        self._set_wyckoff_metric("last_backfill_scan_dates", len(scan_dates))
+        self._set_wyckoff_metric("last_backfill_symbols", symbols_scanned)
+        self._set_wyckoff_metric("last_backfill_quality_empty_events", quality_empty_events)
+        self._set_wyckoff_metric("last_backfill_quality_score_outliers", quality_score_outliers)
+        self._set_wyckoff_metric("last_backfill_quality_date_misaligned", quality_date_misaligned)
+
+        warnings: list[str] = []
+        if loader_error_counter:
+            for reason, count in sorted(loader_error_counter.items()):
+                warnings.append(f"{reason} x{count}")
+        if payload.force_rebuild:
+            warnings.append("已开启 force_rebuild：命中记录也会重算并覆盖写入。")
+        if quality_empty_events > 0:
+            warnings.append(f"检测到空事件快照 {quality_empty_events} 条。")
+        if quality_score_outliers > 0:
+            warnings.append(f"检测到异常分值快照 {quality_score_outliers} 条。")
+        if quality_date_misaligned > 0:
+            warnings.append(f"检测到事件日期错位快照 {quality_date_misaligned} 条。")
+
+        message = (
+            f"事件库回填完成：扫描 {len(scan_dates)} 日，标的 {symbols_scanned}，"
+            f"命中 {cache_hits}，重算 {computed_count}，写入 {write_count}。"
+        )
+        return WyckoffEventStoreBackfillResponse(
+            ok=True,
+            message=message,
+            date_from=scan_dates[0],
+            date_to=scan_dates[-1],
+            markets=markets,
+            window_days_list=window_days_list,
+            scan_dates=len(scan_dates),
+            loaded_rows_total=loaded_rows_total,
+            symbols_scanned=symbols_scanned,
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+            computed_count=computed_count,
+            write_count=write_count,
+            quality_empty_events=quality_empty_events,
+            quality_score_outliers=quality_score_outliers,
+            quality_date_misaligned=quality_date_misaligned,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_sec=duration_sec,
+            warnings=warnings,
+        )
+
     def get_system_storage_status(self) -> SystemStorageStatus:
         configured = (self._config.akshare_cache_dir or "").strip()
         if configured:
@@ -5183,6 +5849,9 @@ class InMemoryStore:
             akshare_cache_dir_exists=cache_exists,
             akshare_cache_file_count=cache_file_count,
             akshare_cache_candidates=ordered_candidates,
+            wyckoff_event_store_path=str(self._wyckoff_event_store.db_path),
+            wyckoff_event_store_exists=self._wyckoff_event_store.db_path.exists(),
+            wyckoff_event_store_read_only=self._wyckoff_event_store.read_only,
         )
 
     def sync_market_data(self, payload: MarketDataSyncRequest) -> MarketDataSyncResponse:

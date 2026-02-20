@@ -177,4 +177,78 @@ describe('BacktestPage', () => {
 
     expect(await screen.findByDisplayValue('latest-run-20260220')).toBeInTheDocument()
   })
+
+  it('submits full_market via task api instead of sync api', async () => {
+    let syncRunCalled = false
+    server.use(
+      http.post('/api/backtest/run', async () => {
+        syncRunCalled = true
+        return HttpResponse.json({ error: 'should not be called' }, { status: 500 })
+      }),
+      http.post('/api/backtest/tasks', async () => {
+        await delay(20)
+        return HttpResponse.json({ task_id: 'bt_test_full_001' })
+      }),
+      http.get('/api/backtest/tasks/:taskId', async () => {
+        await delay(20)
+        return HttpResponse.json({
+          task_id: 'bt_test_full_001',
+          status: 'succeeded',
+          progress: {
+            mode: 'weekly',
+            current_date: '2026-01-31',
+            processed_dates: 2,
+            total_dates: 2,
+            percent: 100,
+            message: '回测完成。',
+            started_at: '2026-02-20 10:00:00',
+            updated_at: '2026-02-20 10:00:05',
+          },
+          result: {
+            stats: {
+              win_rate: 0.5,
+              total_return: 0.08,
+              max_drawdown: 0.05,
+              avg_pnl_ratio: 0.02,
+              trade_count: 2,
+              win_count: 1,
+              loss_count: 1,
+              profit_factor: 1.4,
+            },
+            trades: [],
+            equity_curve: [],
+            drawdown_curve: [],
+            monthly_returns: [],
+            top_trades: [],
+            bottom_trades: [],
+            cost_snapshot: {
+              initial_capital: 1_000_000,
+              commission_rate: 0.0008,
+              min_commission: 0,
+              stamp_tax_rate: 0,
+              transfer_fee_rate: 0,
+              slippage_rate: 0,
+            },
+            range: {
+              date_from: '2026-01-01',
+              date_to: '2026-01-31',
+              date_axis: 'sell',
+            },
+            notes: ['full market task'],
+            candidate_count: 0,
+            skipped_count: 0,
+            fill_rate: 0,
+            max_concurrent_positions: 0,
+          },
+        })
+      }),
+    )
+
+    renderWithProviders(<BacktestPage />, '/backtest')
+    await userEvent.click(await screen.findByText('全市场'))
+    await userEvent.click(await screen.findByRole('button', { name: '开始回测' }))
+
+    expect(await screen.findByText('full market task')).toBeInTheDocument()
+    expect(syncRunCalled).toBe(false)
+  }, 12_000)
 })

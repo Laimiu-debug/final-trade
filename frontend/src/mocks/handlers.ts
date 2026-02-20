@@ -567,6 +567,73 @@ export const handlers = [
     return HttpResponse.json(getSystemStorageStore())
   }),
 
+  http.get('/api/system/wyckoff-event-store/stats', async () => {
+    await delay(120)
+    return HttpResponse.json({
+      enabled: true,
+      read_only: false,
+      db_path: 'C:/Users/mock/.tdx-trend/wyckoff_events.sqlite',
+      db_exists: true,
+      db_record_count: 1280,
+      runtime_cache_size: 320,
+      cache_hits: 5600,
+      cache_misses: 1200,
+      cache_hit_rate: 0.823529,
+      cache_miss_rate: 0.176471,
+      snapshot_reads: 6800,
+      avg_snapshot_read_ms: 1.842105,
+      lazy_fill_writes: 1200,
+      backfill_runs: 3,
+      backfill_writes: 980,
+      quality_empty_events: 12,
+      quality_score_outliers: 0,
+      quality_date_misaligned: 3,
+      last_backfill_started_at: '2026-02-20 09:30:00',
+      last_backfill_finished_at: '2026-02-20 09:33:20',
+      last_backfill_duration_sec: 200.0,
+      last_backfill_scan_dates: 20,
+      last_backfill_symbols: 580,
+      last_backfill_quality_empty_events: 2,
+      last_backfill_quality_score_outliers: 0,
+      last_backfill_quality_date_misaligned: 1,
+    })
+  }),
+
+  http.post('/api/system/wyckoff-event-store/backfill', async ({ request }) => {
+    const payload = (await request.json()) as {
+      date_from?: string
+      date_to?: string
+      markets?: string[]
+      window_days_list?: number[]
+      max_symbols_per_day?: number
+      force_rebuild?: boolean
+    }
+    await delay(450)
+    return HttpResponse.json({
+      ok: true,
+      message: '事件库回填完成：扫描 10 日，标的 260，命中 320，重算 180，写入 180。',
+      date_from: payload.date_from || '2026-01-01',
+      date_to: payload.date_to || '2026-01-15',
+      markets: Array.isArray(payload.markets) && payload.markets.length > 0 ? payload.markets : ['sh', 'sz'],
+      window_days_list:
+        Array.isArray(payload.window_days_list) && payload.window_days_list.length > 0 ? payload.window_days_list : [60],
+      scan_dates: 10,
+      loaded_rows_total: 2600,
+      symbols_scanned: 260,
+      cache_hits: 320,
+      cache_misses: 180,
+      computed_count: 180,
+      write_count: 180,
+      quality_empty_events: 4,
+      quality_score_outliers: 0,
+      quality_date_misaligned: 1,
+      started_at: '2026-02-20 09:30:00',
+      finished_at: '2026-02-20 09:33:20',
+      duration_sec: 200.0,
+      warnings: payload.force_rebuild ? ['已开启 force_rebuild：命中记录也会重算并覆盖写入。'] : [],
+    })
+  }),
+
   http.post('/api/system/sync-market-data', async ({ request }) => {
     const payload = (await request.json()) as MarketDataSyncRequest
     await delay(400)

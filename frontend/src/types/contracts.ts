@@ -636,6 +636,70 @@ export interface SystemStorageStatus {
   akshare_cache_dir_exists: boolean
   akshare_cache_file_count: number
   akshare_cache_candidates: string[]
+  wyckoff_event_store_path?: string
+  wyckoff_event_store_exists?: boolean
+  wyckoff_event_store_read_only?: boolean
+}
+
+export interface WyckoffEventStoreStatsResponse {
+  enabled: boolean
+  read_only: boolean
+  db_path: string
+  db_exists: boolean
+  db_record_count: number
+  runtime_cache_size: number
+  cache_hits: number
+  cache_misses: number
+  cache_hit_rate: number
+  cache_miss_rate: number
+  snapshot_reads: number
+  avg_snapshot_read_ms: number
+  lazy_fill_writes: number
+  backfill_runs: number
+  backfill_writes: number
+  quality_empty_events: number
+  quality_score_outliers: number
+  quality_date_misaligned: number
+  last_backfill_started_at?: string | null
+  last_backfill_finished_at?: string | null
+  last_backfill_duration_sec?: number | null
+  last_backfill_scan_dates: number
+  last_backfill_symbols: number
+  last_backfill_quality_empty_events: number
+  last_backfill_quality_score_outliers: number
+  last_backfill_quality_date_misaligned: number
+}
+
+export interface WyckoffEventStoreBackfillRequest {
+  date_from: string
+  date_to: string
+  markets?: Market[]
+  window_days_list?: number[]
+  max_symbols_per_day?: number
+  force_rebuild?: boolean
+}
+
+export interface WyckoffEventStoreBackfillResponse {
+  ok: boolean
+  message: string
+  date_from: string
+  date_to: string
+  markets: Market[]
+  window_days_list: number[]
+  scan_dates: number
+  loaded_rows_total: number
+  symbols_scanned: number
+  cache_hits: number
+  cache_misses: number
+  computed_count: number
+  write_count: number
+  quality_empty_events: number
+  quality_score_outliers: number
+  quality_date_misaligned: number
+  started_at: string
+  finished_at: string
+  duration_sec: number
+  warnings: string[]
 }
 
 export interface MarketDataSyncRequest {

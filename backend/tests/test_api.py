@@ -1,7 +1,9 @@
 ﻿from __future__ import annotations
 
 import os
+import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,9 @@ TEST_STATE_ROOT = ROOT / ".test-state"
 TEST_STATE_ROOT.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("TDX_TREND_APP_STATE_PATH", str(TEST_STATE_ROOT / "app_state.json"))
 os.environ.setdefault("TDX_TREND_SIM_STATE_PATH", str(TEST_STATE_ROOT / "sim_state.json"))
+os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_PATH", str(TEST_STATE_ROOT / "wyckoff_events.sqlite"))
+os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_ENABLED", "1")
+os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_READ_ONLY", "0")
 
 from app.main import app
 from app.store import store
@@ -215,6 +220,48 @@ def test_system_storage_endpoint() -> None:
     assert isinstance(body["akshare_cache_candidates"], list)
 
 
+def test_wyckoff_event_store_stats_endpoint() -> None:
+    resp = client.get("/api/system/wyckoff-event-store/stats")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "enabled" in body
+    assert "db_record_count" in body
+    assert "cache_hits" in body
+    assert "cache_misses" in body
+    assert "cache_hit_rate" in body
+    assert "cache_miss_rate" in body
+    assert "snapshot_reads" in body
+    assert "avg_snapshot_read_ms" in body
+    assert "quality_empty_events" in body
+    assert "quality_score_outliers" in body
+    assert "quality_date_misaligned" in body
+
+
+def test_wyckoff_event_store_backfill_endpoint() -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-12]
+    date_to = dates[-10]
+    payload = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "markets": ["sz"],
+        "window_days_list": [60],
+        "max_symbols_per_day": 40,
+        "force_rebuild": False,
+    }
+    resp = client.post("/api/system/wyckoff-event-store/backfill", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["scan_dates"] >= 1
+    assert body["symbols_scanned"] >= 0
+    assert body["computed_count"] >= 0
+    assert body["write_count"] >= 0
+    assert body["quality_empty_events"] >= 0
+    assert body["quality_score_outliers"] >= 0
+    assert body["quality_date_misaligned"] >= 0
+
+
 def test_market_data_sync_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_sync_market_data(_payload):
         return {
@@ -388,6 +435,79 @@ def test_signals_endpoint_trend_pool_mode() -> None:
     assert body["source_count"] >= 0
     assert isinstance(body["items"], list)
     assert all(item["trigger_date"] <= as_of_date for item in body["items"])
+
+
+def test_wyckoff_event_store_lazy_fill_and_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = Path(os.environ["TDX_TREND_WYCKOFF_STORE_PATH"])
+    if db_path.exists():
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("DELETE FROM wyckoff_daily_events")
+            conn.commit()
+
+    dates = _load_symbol_dates("sz300750")
+    as_of_date = dates[-8]
+    row_a = store._build_row_from_candles("sh600519", as_of_date=as_of_date)
+    row_b = store._build_row_from_candles("sz300750", as_of_date=as_of_date)
+    assert row_a is not None
+    assert row_b is not None
+
+    def fake_resolve_signal_candidates(
+        *,
+        mode: str,
+        run_id: str | None,
+        trend_step: str = "auto",
+        as_of_date: str | None = None,
+    ):
+        return [row_a, row_b], None, run_id, as_of_date or dates[-8]
+
+    monkeypatch.setattr(store, "_resolve_signal_candidates", fake_resolve_signal_candidates)
+    store._signals_cache.clear()
+
+    query = {
+        "mode": "full_market",
+        "as_of_date": as_of_date,
+        "refresh": "true",
+        "window_days": 60,
+        "min_score": 0,
+        "min_event_count": 0,
+    }
+    first_resp = client.get("/api/signals", params=query)
+    assert first_resp.status_code == 200
+    assert db_path.exists()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        first_row = conn.execute(
+            """
+            SELECT symbol, trade_date, window_days, created_at, updated_at
+            FROM wyckoff_daily_events
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    assert first_row is not None
+    symbol, trade_date, window_days, created_at, updated_at = first_row
+    assert symbol
+    assert trade_date
+    assert int(window_days) == 60
+
+    # Ensure rewritten rows would produce a different second-level timestamp.
+    time.sleep(1.2)
+    second_resp = client.get("/api/signals", params=query)
+    assert second_resp.status_code == 200
+
+    with sqlite3.connect(str(db_path)) as conn:
+        second_row = conn.execute(
+            """
+            SELECT created_at, updated_at
+            FROM wyckoff_daily_events
+            WHERE symbol=? AND trade_date=? AND window_days=?
+            LIMIT 1
+            """,
+            (symbol, trade_date, window_days),
+        ).fetchone()
+    assert second_row is not None
+    assert second_row[0] == created_at
+    assert second_row[1] == updated_at
 
 
 def test_signals_endpoint_board_filters(monkeypatch: pytest.MonkeyPatch) -> None:

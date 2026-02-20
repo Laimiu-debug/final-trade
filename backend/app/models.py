@@ -649,6 +649,70 @@ class SystemStorageStatus(BaseModel):
     akshare_cache_dir_exists: bool
     akshare_cache_file_count: int
     akshare_cache_candidates: list[str] = Field(default_factory=list)
+    wyckoff_event_store_path: str = ""
+    wyckoff_event_store_exists: bool = False
+    wyckoff_event_store_read_only: bool = False
+
+
+class WyckoffEventStoreStatsResponse(BaseModel):
+    enabled: bool
+    read_only: bool
+    db_path: str
+    db_exists: bool
+    db_record_count: int
+    runtime_cache_size: int
+    cache_hits: int
+    cache_misses: int
+    cache_hit_rate: float = 0.0
+    cache_miss_rate: float = 0.0
+    snapshot_reads: int = 0
+    avg_snapshot_read_ms: float = 0.0
+    lazy_fill_writes: int
+    backfill_runs: int
+    backfill_writes: int
+    quality_empty_events: int = 0
+    quality_score_outliers: int = 0
+    quality_date_misaligned: int = 0
+    last_backfill_started_at: str | None = None
+    last_backfill_finished_at: str | None = None
+    last_backfill_duration_sec: float | None = None
+    last_backfill_scan_dates: int = 0
+    last_backfill_symbols: int = 0
+    last_backfill_quality_empty_events: int = 0
+    last_backfill_quality_score_outliers: int = 0
+    last_backfill_quality_date_misaligned: int = 0
+
+
+class WyckoffEventStoreBackfillRequest(BaseModel):
+    date_from: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    date_to: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    markets: list[Market] = Field(default_factory=list)
+    window_days_list: list[int] = Field(default_factory=lambda: [60], min_length=1, max_length=6)
+    max_symbols_per_day: int = Field(default=300, ge=20, le=6000)
+    force_rebuild: bool = False
+
+
+class WyckoffEventStoreBackfillResponse(BaseModel):
+    ok: bool
+    message: str
+    date_from: str
+    date_to: str
+    markets: list[Market]
+    window_days_list: list[int]
+    scan_dates: int
+    loaded_rows_total: int
+    symbols_scanned: int
+    cache_hits: int
+    cache_misses: int
+    computed_count: int
+    write_count: int
+    quality_empty_events: int = 0
+    quality_score_outliers: int = 0
+    quality_date_misaligned: int = 0
+    started_at: str
+    finished_at: str
+    duration_sec: float
+    warnings: list[str] = Field(default_factory=list)
 
 
 class MarketDataSyncRequest(BaseModel):

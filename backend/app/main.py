@@ -50,6 +50,9 @@ from .models import (
     ScreenerRunDetail,
     ScreenerRunResponse,
     SignalsResponse,
+    WyckoffEventStoreBackfillRequest,
+    WyckoffEventStoreBackfillResponse,
+    WyckoffEventStoreStatsResponse,
     StockAnalysisResponse,
     StockAnnotation,
     TradeFillTagAssignment,
@@ -478,6 +481,21 @@ def put_config(payload: AppConfig) -> AppConfig:
 @app.get("/api/system/storage", response_model=SystemStorageStatus)
 def get_system_storage() -> SystemStorageStatus:
     return store.get_system_storage_status()
+
+
+@app.get("/api/system/wyckoff-event-store/stats", response_model=WyckoffEventStoreStatsResponse)
+def get_wyckoff_event_store_stats() -> WyckoffEventStoreStatsResponse:
+    return store.get_wyckoff_event_store_stats()
+
+
+@app.post("/api/system/wyckoff-event-store/backfill", response_model=WyckoffEventStoreBackfillResponse)
+def post_wyckoff_event_store_backfill(
+    payload: WyckoffEventStoreBackfillRequest,
+) -> WyckoffEventStoreBackfillResponse | JSONResponse:
+    try:
+        return store.backfill_wyckoff_event_store(payload)
+    except ValueError as exc:
+        return error_response(400, "WYCKOFF_BACKFILL_INVALID", str(exc))
 
 
 @app.post("/api/system/sync-market-data", response_model=MarketDataSyncResponse)

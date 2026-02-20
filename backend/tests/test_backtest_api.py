@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,10 +15,29 @@ if str(ROOT) not in sys.path:
 TEST_STATE_ROOT = Path(tempfile.mkdtemp(prefix="backtest-api-state-"))
 os.environ.setdefault("TDX_TREND_APP_STATE_PATH", str(TEST_STATE_ROOT / "app_state.json"))
 os.environ.setdefault("TDX_TREND_SIM_STATE_PATH", str(TEST_STATE_ROOT / "sim_state.json"))
+os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_PATH", str(TEST_STATE_ROOT / "wyckoff_events.sqlite"))
+os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_ENABLED", "1")
+os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_READ_ONLY", "0")
 
 from app.main import app
+from app.store import store
 
 client = TestClient(app)
+
+
+def _wait_backtest_task(task_id: str, timeout_sec: float = 180.0) -> dict:
+    deadline = time.time() + timeout_sec
+    last_payload: dict | None = None
+    while time.time() < deadline:
+        resp = client.get(f"/api/backtest/tasks/{task_id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert isinstance(body, dict)
+        last_payload = body
+        if body.get("status") in {"succeeded", "failed"}:
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"回测任务超时未结束: task_id={task_id}, last={last_payload}")
 
 
 def _load_symbol_dates(symbol: str) -> list[str]:
@@ -188,3 +209,109 @@ def test_backtest_run_respects_board_filters() -> None:
     assert any("候选池板块过滤" in note for note in body["notes"])
     for row in body["trades"]:
         assert _detect_board(row["symbol"]) == selected_board
+
+
+def test_backtest_task_full_market_daily_smoke() -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-18]
+    date_to = dates[-14]
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "daily",
+        "date_from": date_from,
+        "date_to": date_to,
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+        "priority_topk_per_day": 0,
+    }
+
+    start_resp = client.post("/api/backtest/tasks", json=payload)
+    assert start_resp.status_code == 200
+    task_id = str(start_resp.json()["task_id"])
+    assert task_id.startswith("bt_")
+
+    task = _wait_backtest_task(task_id)
+    assert task["status"] == "succeeded"
+    progress = task["progress"]
+    assert progress["total_dates"] >= 1
+    assert progress["processed_dates"] >= progress["total_dates"]
+    result = task["result"]
+    assert result["range"]["date_from"] == date_from
+    assert result["range"]["date_to"] == date_to
+    assert any("全市场候选池构建" in note for note in result["notes"])
+
+
+def test_backtest_task_full_market_weekly_smoke() -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-28]
+    date_to = dates[-12]
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "weekly",
+        "date_from": date_from,
+        "date_to": date_to,
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+    }
+
+    start_resp = client.post("/api/backtest/tasks", json=payload)
+    assert start_resp.status_code == 200
+    task_id = str(start_resp.json()["task_id"])
+
+    task = _wait_backtest_task(task_id)
+    assert task["status"] == "succeeded"
+    progress = task["progress"]
+    assert progress["mode"] == "weekly"
+    assert progress["processed_dates"] >= 1
+    result = task["result"]
+    assert result["range"]["date_from"] == date_from
+    assert result["range"]["date_to"] == date_to
+    assert any("全市场候选池构建: 每周滚动" in note for note in result["notes"])
+
+
+def test_backtest_run_full_market_reports_system_limit_hit(monkeypatch: pytest.MonkeyPatch) -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-16]
+    date_to = dates[-14]
+
+    monkeypatch.setattr(store, "_FULL_MARKET_SYSTEM_PROTECT_LIMIT", 5)
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "daily",
+        "date_from": date_from,
+        "date_to": date_to,
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 120,
+    }
+    resp = client.post("/api/backtest/run", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert any("触发系统保护上限" in note for note in body["notes"])
+
+
+def test_backtest_run_full_market_position_mode() -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-20]
+    date_to = dates[-14]
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "position",
+        "date_from": date_from,
+        "date_to": date_to,
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+    }
+
+    resp = client.post("/api/backtest/run", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["range"]["date_from"] == date_from
+    assert body["range"]["date_to"] == date_to
+    assert any("持仓触发滚动" in note for note in body["notes"])

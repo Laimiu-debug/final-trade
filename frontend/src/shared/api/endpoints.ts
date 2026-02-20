@@ -47,6 +47,9 @@ import type {
   WeeklyReviewListResponse,
   WeeklyReviewPayload,
   WeeklyReviewRecord,
+  WyckoffEventStoreBackfillRequest,
+  WyckoffEventStoreBackfillResponse,
+  WyckoffEventStoreStatsResponse,
 } from '@/types/contracts'
 
 export function runScreener(params: ScreenerParams) {
@@ -432,6 +435,19 @@ export function updateConfig(payload: AppConfig) {
 
 export function getSystemStorage() {
   return apiRequest<SystemStorageStatus>('/api/system/storage')
+}
+
+export function getWyckoffEventStoreStats() {
+  return apiRequest<WyckoffEventStoreStatsResponse>('/api/system/wyckoff-event-store/stats')
+}
+
+export function backfillWyckoffEventStore(payload: WyckoffEventStoreBackfillRequest) {
+  return apiRequest<WyckoffEventStoreBackfillResponse>('/api/system/wyckoff-event-store/backfill', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 180_000,
+  })
 }
 
 export function syncMarketData(payload: MarketDataSyncRequest) {
