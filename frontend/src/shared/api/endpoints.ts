@@ -15,6 +15,7 @@ import type {
   MarketNewsResponse,
   MarketDataSyncRequest,
   MarketDataSyncResponse,
+  Market,
   PortfolioSnapshot,
   DailyReviewListResponse,
   DailyReviewPayload,
@@ -98,6 +99,7 @@ export function getSignals(params?: {
   mode?: SignalScanMode
   run_id?: string
   trend_step?: TrendPoolStep
+  market_filters?: Market[]
   board_filters?: BoardFilter[]
   as_of_date?: string
   refresh?: boolean
@@ -110,6 +112,9 @@ export function getSignals(params?: {
   if (params?.mode) query.set('mode', params.mode)
   if (params?.run_id) query.set('run_id', params.run_id)
   if (params?.trend_step) query.set('trend_step', params.trend_step)
+  if (params?.market_filters?.length) {
+    params.market_filters.forEach((item) => query.append('market_filters', item))
+  }
   if (params?.board_filters?.length) {
     params.board_filters.forEach((item) => query.append('board_filters', item))
   }

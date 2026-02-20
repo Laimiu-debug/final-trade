@@ -13,6 +13,7 @@ import type {
   DailyReviewPayload,
   DailyReviewRecord,
   IntradayPoint,
+  Market,
   MarketDataSyncRequest,
   MarketDataSyncResponse,
   MarketNewsResponse,
@@ -85,6 +86,7 @@ let reviewTagsStore: ReviewTagsPayload = {
 }
 
 const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 'st']
+const ALLOWED_MARKET_FILTERS: Market[] = ['sh', 'sz', 'bj']
 
 const marketNewsSeed: MarketNewsResponse['items'] = [
   {
@@ -592,8 +594,17 @@ function matchesBoardFilters(symbol: string, name: string, boardFilters: BoardFi
   return selectedBoards.includes(board)
 }
 
+function matchesMarketFilters(symbol: string, marketFilters: Market[]) {
+  if (!marketFilters.length) return true
+  const normalized = String(symbol).trim().toLowerCase()
+  if (normalized.length < 2) return false
+  const market = normalized.slice(0, 2)
+  return marketFilters.includes(market as Market)
+}
+
 export function getSignals(params?: {
   mode?: SignalScanMode
+  market_filters?: Market[]
   board_filters?: BoardFilter[]
   window_days?: number
   min_score?: number
@@ -606,6 +617,9 @@ export function getSignals(params?: {
     { symbol: 'sh600519', name: '贵州茅台', trigger_reason: 'MA10回踩确认', signals: ['A'] },
   ]
   const mode = params?.mode ?? 'trend_pool'
+  const marketFilters = Array.from(
+    new Set((params?.market_filters ?? []).filter((item): item is Market => ALLOWED_MARKET_FILTERS.includes(item))),
+  )
   const boardFilters = Array.from(
     new Set((params?.board_filters ?? []).filter((item): item is BoardFilter => ALLOWED_BOARD_FILTERS.includes(item))),
   )
@@ -645,7 +659,8 @@ export function getSignals(params?: {
     }
   })
 
-  const boardMatched = items.filter((row) => matchesBoardFilters(row.symbol, row.name, boardFilters))
+  const marketMatched = items.filter((row) => matchesMarketFilters(row.symbol, marketFilters))
+  const boardMatched = marketMatched.filter((row) => matchesBoardFilters(row.symbol, row.name, boardFilters))
   const filtered = boardMatched.filter((row) => {
     if ((row.entry_quality_score ?? 0) < minScore) return false
     if ((row.wy_event_count ?? 0) < minEventCount) return false

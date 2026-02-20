@@ -35,9 +35,10 @@ import { KLineChart } from '@/shared/charts/KLineChart'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { computeCandleRangeStats } from '@/shared/utils/candleStats'
 import { useUIStore } from '@/state/uiStore'
-import type { AIAnalysisRecord, BoardFilter, SignalScanMode, StockAnnotation, TrendPoolStep } from '@/types/contracts'
+import type { AIAnalysisRecord, BoardFilter, Market, SignalScanMode, StockAnnotation, TrendPoolStep } from '@/types/contracts'
 
 const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 'st']
+const ALLOWED_MARKET_FILTERS: Market[] = ['sh', 'sz', 'bj']
 
 function parseSignalBoardFilters(searchParams: URLSearchParams): BoardFilter[] {
   const merged = searchParams
@@ -46,6 +47,15 @@ function parseSignalBoardFilters(searchParams: URLSearchParams): BoardFilter[] {
     .map((item) => item.trim())
     .filter((item) => item.length > 0 && ALLOWED_BOARD_FILTERS.includes(item as BoardFilter))
   return Array.from(new Set(merged)) as BoardFilter[]
+}
+
+function parseSignalMarketFilters(searchParams: URLSearchParams): Market[] {
+  const merged = searchParams
+    .getAll('signal_market_filters')
+    .flatMap((item) => item.split(','))
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0 && ALLOWED_MARKET_FILTERS.includes(item as Market))
+  return Array.from(new Set(merged)) as Market[]
 }
 
 function defaultAnnotation(symbol: string): StockAnnotation {
@@ -125,6 +135,7 @@ export function ChartPage() {
   const parsedMinEventCount = Number(searchParams.get('signal_min_event_count') ?? 1)
   const signalMinEventCount = Number.isFinite(parsedMinEventCount) ? Math.max(1, Math.round(parsedMinEventCount)) : 1
   const signalRequireSequence = searchParams.get('signal_require_sequence') === 'true'
+  const signalMarketFilters = parseSignalMarketFilters(searchParams)
   const signalBoardFilters = parseSignalBoardFilters(searchParams)
 
   const candlesQuery = useQuery({
@@ -150,6 +161,7 @@ export function ChartPage() {
       signalMinScore,
       signalMinEventCount,
       signalRequireSequence,
+      signalMarketFilters.join(','),
       signalBoardFilters.join(','),
     ],
     queryFn: () =>
@@ -157,6 +169,7 @@ export function ChartPage() {
         mode: signalMode,
         run_id: signalRunId,
         trend_step: signalMode === 'trend_pool' ? signalTrendStep : undefined,
+        market_filters: signalMode === 'full_market' && signalMarketFilters.length > 0 ? signalMarketFilters : undefined,
         board_filters: signalBoardFilters.length > 0 ? signalBoardFilters : undefined,
         as_of_date: signalAsOfDate,
         window_days: signalWindowDays,

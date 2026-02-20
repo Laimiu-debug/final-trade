@@ -50,6 +50,7 @@ import type {
   BacktestRunRequest,
   BacktestResponse,
   BoardFilter,
+  Market,
   DailyReviewPayload,
   MarketDataSyncRequest,
   ReviewTagCreateRequest,
@@ -142,6 +143,15 @@ export const handlers = [
     await delay(120)
     const url = new URL(request.url)
     const mode = (url.searchParams.get('mode') ?? 'trend_pool') as 'trend_pool' | 'full_market'
+    const marketFilters = Array.from(
+      new Set(
+        url.searchParams
+          .getAll('market_filters')
+          .flatMap((item) => item.split(','))
+          .map((item) => item.trim())
+          .filter((item): item is Market => item === 'sh' || item === 'sz' || item === 'bj'),
+      ),
+    )
     const boardFilters = Array.from(
       new Set(
         url.searchParams
@@ -162,6 +172,7 @@ export const handlers = [
     return HttpResponse.json(
       getSignals({
         mode,
+        market_filters: marketFilters,
         board_filters: boardFilters,
         window_days: Number.isFinite(windowDays) ? windowDays : 60,
         min_score: Number.isFinite(minScore) ? minScore : 60,

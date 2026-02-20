@@ -29,7 +29,7 @@ import { getLatestScreenerRun, getScreenerRun, getSignals } from '@/shared/api/e
 import { PageHeader } from '@/shared/components/PageHeader'
 import { upsertPendingBuyDraft } from '@/shared/utils/simPendingOrders'
 import { useUIStore } from '@/state/uiStore'
-import type { BoardFilter, SignalResult, SignalScanMode, SignalType, TrendPoolStep } from '@/types/contracts'
+import type { BoardFilter, Market, SignalResult, SignalScanMode, SignalType, TrendPoolStep } from '@/types/contracts'
 
 type StatusFilter = 'active' | 'expiring' | 'expired' | 'all'
 
@@ -107,13 +107,43 @@ const SIGNAL_RUN_CACHE_KEY = 'tdx-signals-run-id-v1'
 const SCREENER_CACHE_KEY = 'tdx-trend-screener-cache-v4'
 const SIGNAL_STEP_CACHE_KEY = 'tdx-signals-trend-step-v1'
 const SIGNAL_BOARD_FILTERS_CACHE_KEY = 'tdx-signals-board-filters-v1'
+const SIGNAL_MARKET_FILTERS_CACHE_KEY = 'tdx-signals-market-filters-v1'
+const SIGNAL_TABLE_PAGE_SIZE_CACHE_KEY = 'tdx-signals-table-page-size-v1'
+const ALLOWED_MARKET_FILTERS: Market[] = ['sh', 'sz', 'bj']
 const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 'st']
+const MARKET_FILTER_LABELS: Record<Market, string> = {
+  sh: '沪市',
+  sz: '深市',
+  bj: '北交所',
+}
 const BOARD_FILTER_LABELS: Record<BoardFilter, string> = {
   main: '主板',
   gem: '创业板',
   star: '科创板',
   beijing: '北交所',
   st: 'ST',
+}
+
+function sanitizeMarketFilters(raw: unknown): Market[] {
+  if (!Array.isArray(raw)) return []
+  const normalized = raw
+    .map((item) => String(item).trim())
+    .filter((item): item is Market => ALLOWED_MARKET_FILTERS.includes(item as Market))
+  return Array.from(new Set(normalized))
+}
+
+function parseMarketFiltersFromSearchParams(searchParams: URLSearchParams): Market[] {
+  const merged = searchParams
+    .getAll('market_filters')
+    .flatMap((item) => item.split(','))
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+  return sanitizeMarketFilters(merged)
+}
+
+function isSameMarketFilters(left: Market[], right: Market[]) {
+  if (left.length !== right.length) return false
+  return left.join(',') === right.join(',')
 }
 
 function sanitizeBoardFilters(raw: unknown): BoardFilter[] {
@@ -210,6 +240,27 @@ function loadCachedSignalBoardFilters(): BoardFilter[] {
   }
 }
 
+function loadCachedSignalMarketFilters(): Market[] {
+  try {
+    const raw = window.localStorage.getItem(SIGNAL_MARKET_FILTERS_CACHE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as unknown
+    return sanitizeMarketFilters(parsed)
+  } catch {
+    return []
+  }
+}
+
+function loadCachedSignalTablePageSize() {
+  try {
+    const raw = Number(window.localStorage.getItem(SIGNAL_TABLE_PAGE_SIZE_CACHE_KEY) ?? '')
+    if (raw === 20 || raw === 50 || raw === 100) return raw
+  } catch {
+    // ignore localStorage failures
+  }
+  return 20
+}
+
 function isRunNotFoundError(error: unknown) {
   return error instanceof ApiError && (error.code === 'RUN_NOT_FOUND' || error.code === 'HTTP_404')
 }
@@ -293,10 +344,15 @@ export function SignalsPage() {
   const cachedMode = useMemo(() => loadCachedSignalMode(), [])
   const cachedTrendStep = useMemo(() => loadCachedTrendStep(), [])
   const cachedSignalBoardFilters = useMemo(() => loadCachedSignalBoardFilters(), [])
+  const cachedSignalMarketFilters = useMemo(() => loadCachedSignalMarketFilters(), [])
+  const cachedSignalTablePageSize = useMemo(() => loadCachedSignalTablePageSize(), [])
   const cachedRunMeta = useMemo(() => readScreenerRunMetaFromStorage(), [])
   const [cachedRunId, setCachedRunId] = useState<string | null>(() => loadCachedTrendRunId())
   const runIdFromQuery = (searchParams.get('run_id') ?? searchParams.get('signal_run_id') ?? '').trim()
   const runId = runIdFromQuery || cachedRunId || undefined
+  const initialMarketFiltersFromQuery = parseMarketFiltersFromSearchParams(searchParams)
+  const initialMarketFilters =
+    initialMarketFiltersFromQuery.length > 0 ? initialMarketFiltersFromQuery : cachedSignalMarketFilters
   const initialBoardFiltersFromQuery = parseBoardFiltersFromSearchParams(searchParams)
   const initialBoardFilters =
     initialBoardFiltersFromQuery.length > 0
@@ -330,6 +386,7 @@ export function SignalsPage() {
 
   const [mode, setMode] = useState<SignalScanMode>(initialMode)
   const [trendStep, setTrendStep] = useState<TrendPoolStep>(initialTrendStep)
+  const [marketFilters, setMarketFilters] = useState<Market[]>(initialMarketFilters)
   const [boardFilters, setBoardFilters] = useState<BoardFilter[]>(initialBoardFilters)
   const [asOfDate, setAsOfDate] = useState(initialAsOfDate)
   const [asOfDateTouched, setAsOfDateTouched] = useState(initialAsOfDate.length > 0)
@@ -344,6 +401,8 @@ export function SignalsPage() {
   const [refreshCounter, setRefreshCounter] = useState(0)
   const [manualRefreshing, setManualRefreshing] = useState(false)
   const [guideExpanded, setGuideExpanded] = useState(false)
+  const [tablePage, setTablePage] = useState(1)
+  const [tablePageSize, setTablePageSize] = useState(cachedSignalTablePageSize)
 
   const refreshTrackerRef = useRef(0)
   const missingRunHandledRef = useRef('')
@@ -377,6 +436,14 @@ export function SignalsPage() {
 
   useEffect(() => {
     try {
+      window.localStorage.setItem(SIGNAL_MARKET_FILTERS_CACHE_KEY, JSON.stringify(marketFilters))
+    } catch {
+      // ignore localStorage failures
+    }
+  }, [marketFilters])
+
+  useEffect(() => {
+    try {
       window.localStorage.setItem(SIGNAL_BOARD_FILTERS_CACHE_KEY, JSON.stringify(boardFilters))
     } catch {
       // ignore localStorage failures
@@ -384,6 +451,19 @@ export function SignalsPage() {
   }, [boardFilters])
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem(SIGNAL_TABLE_PAGE_SIZE_CACHE_KEY, String(tablePageSize))
+    } catch {
+      // ignore localStorage failures
+    }
+  }, [tablePageSize])
+
+  useEffect(() => {
+    const queryMarketFilters = parseMarketFiltersFromSearchParams(new URLSearchParams(searchParamsSnapshot))
+    if (queryMarketFilters.length > 0) {
+      setMarketFilters((previous) => (isSameMarketFilters(previous, queryMarketFilters) ? previous : queryMarketFilters))
+    }
+
     const queryBoardFilters = parseBoardFiltersFromSearchParams(new URLSearchParams(searchParamsSnapshot))
     if (queryBoardFilters.length > 0) {
       setBoardFilters((previous) => (isSameBoardFilters(previous, queryBoardFilters) ? previous : queryBoardFilters))
@@ -408,6 +488,10 @@ export function SignalsPage() {
       next.set('trend_step', trendStep)
     } else {
       next.delete('trend_step')
+    }
+    next.delete('market_filters')
+    if (mode === 'full_market' && marketFilters.length > 0) {
+      marketFilters.forEach((item) => next.append('market_filters', item))
     }
     next.delete('board_filters')
     if (boardFilters.length > 0) {
@@ -435,6 +519,7 @@ export function SignalsPage() {
     minEventCount,
     minScore,
     mode,
+    marketFilters,
     boardFilters,
     runId,
     trendStep,
@@ -497,6 +582,7 @@ export function SignalsPage() {
       mode,
       runId,
       trendStep,
+      marketFilters.join(','),
       boardFilters.join(','),
       asOfDate,
       windowDays,
@@ -516,6 +602,7 @@ export function SignalsPage() {
         mode,
         run_id: mode === 'trend_pool' ? runId : undefined,
         trend_step: mode === 'trend_pool' ? trendStep : undefined,
+        market_filters: mode === 'full_market' && marketFilters.length > 0 ? marketFilters : undefined,
         board_filters: boardFilters.length > 0 ? boardFilters : undefined,
         as_of_date: normalizedAsOfDate || undefined,
         refresh: shouldRefresh,
@@ -645,6 +732,13 @@ export function SignalsPage() {
     })
   }, [allRows, keyword, signalFilter, statusFilter])
 
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(filteredRows.length / tablePageSize))
+    if (tablePage > maxPage) {
+      setTablePage(maxPage)
+    }
+  }, [filteredRows.length, tablePage, tablePageSize])
+
   const primarySignalFilters = useMemo(
     () =>
       (['B', 'A', 'C'] as SignalType[])
@@ -765,6 +859,7 @@ export function SignalsPage() {
                 if (runId) {
                   params.set('signal_run_id', runId)
                 }
+                marketFilters.forEach((item) => params.append('signal_market_filters', item))
                 boardFilters.forEach((item) => params.append('signal_board_filters', item))
                 if (row.name) {
                   params.set('signal_stock_name', row.name)
@@ -822,6 +917,7 @@ export function SignalsPage() {
       minEventCount,
       minScore,
       mode,
+      marketFilters,
       navigate,
       boardFilters,
       phaseFilters,
@@ -1181,6 +1277,47 @@ export function SignalsPage() {
             </Row>
           ) : null}
 
+          {mode === 'full_market' ? (
+            <Row gutter={[12, 12]}>
+              <Col xs={24} lg={12}>
+                <Typography.Text type="secondary">
+                  市场过滤：
+                  {marketFilters.length > 0
+                    ? marketFilters.map((item) => MARKET_FILTER_LABELS[item]).join('、')
+                    : '未设置（等同全市场）'}
+                </Typography.Text>
+                <div style={{ marginTop: 8 }}>
+                  <Checkbox.Group
+                    value={marketFilters}
+                    onChange={(values) => setMarketFilters(sanitizeMarketFilters(values))}
+                    options={ALLOWED_MARKET_FILTERS.map((item) => ({
+                      label: MARKET_FILTER_LABELS[item],
+                      value: item,
+                    }))}
+                  />
+                </div>
+              </Col>
+              <Col xs={24} lg={12}>
+                <Typography.Text type="secondary">
+                  板块过滤：
+                  {boardFilters.length > 0
+                    ? boardFilters.map((item) => BOARD_FILTER_LABELS[item]).join('、')
+                    : '未设置（等同全板块）'}
+                </Typography.Text>
+                <div style={{ marginTop: 8 }}>
+                  <Checkbox.Group
+                    value={boardFilters}
+                    onChange={(values) => setBoardFilters(sanitizeBoardFilters(values))}
+                    options={ALLOWED_BOARD_FILTERS.map((item) => ({
+                      label: BOARD_FILTER_LABELS[item],
+                      value: item,
+                    }))}
+                  />
+                </div>
+              </Col>
+            </Row>
+          ) : null}
+
           <Row gutter={[12, 12]}>
             <Col xs={24} md={12} lg={6}>
               <Typography.Text type="secondary">快照日期（留空=最新）</Typography.Text>
@@ -1279,7 +1416,17 @@ export function SignalsPage() {
           dataSource={filteredRows}
           columns={columns}
           scroll={{ x: 1480 }}
-          pagination={{ pageSize: 20, showSizeChanger: true, showTotal: (total) => `共 ${total} 条` }}
+          pagination={{
+            current: tablePage,
+            pageSize: tablePageSize,
+            pageSizeOptions: ['20', '50', '100'],
+            showSizeChanger: true,
+            showTotal: (total) => `共 ${total} 条`,
+            onChange: (page, pageSize) => {
+              setTablePage(page)
+              setTablePageSize(pageSize)
+            },
+          }}
           expandable={{ expandedRowRender }}
           locale={{
             emptyText: signalQuery.isLoading ? '信号计算中...' : <Empty description="没有匹配的待买信号" />,

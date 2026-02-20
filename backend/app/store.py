@@ -30,6 +30,7 @@ from .models import (
     BacktestTaskProgress,
     BacktestTaskStatusResponse,
     BoardFilter,
+    Market,
     CreateOrderRequest,
     CreateOrderResponse,
     IntradayPayload,
@@ -3276,6 +3277,7 @@ class InMemoryStore:
         mode: SignalScanMode,
         run_id: str | None,
         trend_step: TrendPoolStep,
+        market_filters: list[Market],
         board_filters: list[BoardFilter],
         as_of_date: str | None,
         window_days: int,
@@ -3287,6 +3289,7 @@ class InMemoryStore:
             "mode": mode,
             "run_id": run_id or "",
             "trend_step": trend_step,
+            "market_filters": market_filters,
             "board_filters": board_filters,
             "as_of_date": as_of_date or "",
             "window_days": window_days,
@@ -3302,6 +3305,7 @@ class InMemoryStore:
         mode: SignalScanMode = "trend_pool",
         run_id: str | None = None,
         trend_step: TrendPoolStep = "auto",
+        market_filters: list[Market] | None = None,
         board_filters: list[BoardFilter] | None = None,
         as_of_date: str | None = None,
         refresh: bool = False,
@@ -3316,6 +3320,10 @@ class InMemoryStore:
             trend_step=trend_step,
             as_of_date=as_of_date,
         )
+        allowed_markets = {"sh", "sz", "bj"}
+        normalized_market_filters = list(dict.fromkeys(item for item in (market_filters or []) if item in allowed_markets))
+        if normalized_market_filters:
+            candidates = [row for row in candidates if self._row_matches_market_filters(row, normalized_market_filters)]
         allowed_board_filters = {"main", "gem", "star", "beijing", "st"}
         normalized_board_filters = list(
             dict.fromkeys(item for item in (board_filters or []) if item in allowed_board_filters)
@@ -3327,6 +3335,7 @@ class InMemoryStore:
             mode=mode,
             run_id=resolved_run_id if mode == "trend_pool" else run_id,
             trend_step=trend_step if mode == "trend_pool" else "auto",
+            market_filters=normalized_market_filters,
             board_filters=normalized_board_filters,
             as_of_date=resolved_as_of_date,
             window_days=window_days,
@@ -3506,6 +3515,18 @@ class InMemoryStore:
     def _is_st_stock(name: str) -> bool:
         normalized_name = re.sub(r"\s+", "", str(name).upper())
         return "ST" in normalized_name
+
+    @staticmethod
+    def _row_matches_market_filters(
+        row: ScreenerResult,
+        market_filters: list[Market],
+    ) -> bool:
+        if not market_filters:
+            return True
+        symbol = str(row.symbol).strip().lower()
+        if len(symbol) < 2:
+            return False
+        return symbol[:2] in set(market_filters)
 
     @classmethod
     def _row_matches_board_filters(

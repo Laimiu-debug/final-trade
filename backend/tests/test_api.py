@@ -455,6 +455,70 @@ def test_signals_endpoint_board_filters(monkeypatch: pytest.MonkeyPatch) -> None
     assert {item["symbol"] for item in body_main["items"]} == {"sh600519"}
 
 
+def test_signals_endpoint_market_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    row_sh = store._build_row_from_candles("sh600519")
+    row_sz = store._build_row_from_candles("sz300750")
+    assert row_sh is not None
+    assert row_sz is not None
+
+    def fake_resolve_signal_candidates(
+        *,
+        mode: str,
+        run_id: str | None,
+        trend_step: str = "auto",
+        as_of_date: str | None = None,
+    ):
+        return [row_sh, row_sz], None, run_id, as_of_date or "2026-02-10"
+
+    def fake_calc_wyckoff_snapshot(
+        row, window_days: int, *, as_of_date: str | None = None
+    ) -> dict[str, object]:
+        trigger_date = as_of_date or "2026-02-10"
+        return {
+            "events": ["SC", "AR", "ST", "SOS"],
+            "risk_events": [],
+            "event_dates": {"SC": trigger_date, "AR": trigger_date, "ST": trigger_date, "SOS": trigger_date},
+            "event_chain": [],
+            "sequence_ok": True,
+            "entry_quality_score": 80.0,
+            "phase": "吸筹D",
+            "signal": "SOS",
+            "trigger_date": trigger_date,
+            "phase_hint": "测试信号",
+            "structure_hhh": "HH|HL|HC",
+            "event_strength_score": 70.0,
+            "phase_score": 72.0,
+            "structure_score": 68.0,
+            "trend_score": 66.0,
+            "volatility_score": 64.0,
+        }
+
+    monkeypatch.setattr(store, "_resolve_signal_candidates", fake_resolve_signal_candidates)
+    monkeypatch.setattr(store, "_calc_wyckoff_snapshot", fake_calc_wyckoff_snapshot)
+    store._signals_cache.clear()
+
+    base_params = [
+        ("mode", "full_market"),
+        ("refresh", "true"),
+        ("window_days", "60"),
+        ("min_score", "0"),
+        ("require_sequence", "false"),
+        ("min_event_count", "0"),
+    ]
+
+    resp_all = client.get("/api/signals", params=base_params)
+    assert resp_all.status_code == 200
+    body_all = resp_all.json()
+    assert body_all["source_count"] == 2
+    assert {item["symbol"] for item in body_all["items"]} == {"sh600519", "sz300750"}
+
+    resp_sh = client.get("/api/signals", params=base_params + [("market_filters", "sh")])
+    assert resp_sh.status_code == 200
+    body_sh = resp_sh.json()
+    assert body_sh["source_count"] == 1
+    assert {item["symbol"] for item in body_sh["items"]} == {"sh600519"}
+
+
 def test_sim_order_buy_pending_then_settle_filled() -> None:
     dates = _load_symbol_dates("sz300750")
     submit_date = dates[-6]
