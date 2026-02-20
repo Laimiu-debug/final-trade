@@ -6,6 +6,7 @@ import { SignalsPage } from '@/pages/signals/SignalsPage'
 import { TradePage } from '@/pages/trade/TradePage'
 import { PortfolioPage } from '@/pages/portfolio/PortfolioPage'
 import { ReviewPage } from '@/pages/review/ReviewPage'
+import { BacktestPage } from '@/pages/backtest/BacktestPage'
 import { ReviewSharePage } from '@/pages/review/ReviewSharePage'
 import { ReviewNewsPage } from '@/pages/review/ReviewNewsPage'
 import { AiPage } from '@/pages/ai/AiPage'
@@ -21,6 +22,7 @@ export function AppRoutes() {
         <Route path="/stocks/:symbol/chart" element={<ChartPage />} />
         <Route path="/signals" element={<SignalsPage />} />
         <Route path="/trade" element={<TradePage />} />
+        <Route path="/backtest" element={<BacktestPage />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
         <Route path="/review" element={<ReviewPage />} />
         <Route path="/review/share" element={<ReviewSharePage />} />

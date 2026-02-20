@@ -4,6 +4,8 @@ import type {
   AIProviderTestRequest,
   AIProviderTestResponse,
   AppConfig,
+  BacktestResponse,
+  BacktestRunRequest,
   CandlePoint,
   DeleteAIRecordResponse,
   IntradayPayload,
@@ -230,6 +232,16 @@ export function getReviewStats(params?: {
   const suffix = query.toString()
   return apiRequest<ReviewResponse>(`/api/review/stats${suffix ? `?${suffix}` : ''}`, {
     timeoutMs: 45_000,
+  })
+}
+
+export function runBacktest(payload: BacktestRunRequest) {
+  const timeoutMs = payload.mode === 'full_market' ? 240_000 : 60_000
+  return apiRequest<BacktestResponse>('/api/backtest/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs,
   })
 }
 

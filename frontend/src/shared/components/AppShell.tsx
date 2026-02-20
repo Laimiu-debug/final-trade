@@ -20,6 +20,7 @@ const navItems: ItemType[] = [
   { key: '/screener', icon: <FilterIcon />, label: '选股漏斗' },
   { key: '/signals', icon: <AimOutlined />, label: '待买信号' },
   { key: '/trade', icon: <SwapOutlined />, label: '模拟交易' },
+  { key: '/backtest', icon: <LineChartOutlined />, label: '策略回测' },
   { key: '/portfolio', icon: <LineChartOutlined />, label: '持仓管理' },
   { key: '/review', icon: <BarChartOutlined />, label: '复盘统计' },
   { key: '/review/share', icon: <AreaChartOutlined />, label: '股票搜索与分享' },

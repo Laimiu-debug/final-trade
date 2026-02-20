@@ -60,6 +60,7 @@ const schema = z.object({
   akshare_cache_dir: z.string(),
   markets: z.array(z.enum(['sh', 'sz', 'bj'])).min(1),
   return_window_days: z.number().min(5).max(120),
+  candles_window_bars: z.number().int().min(120).max(5000),
   top_n: z.number().min(100).max(2000),
   turnover_threshold: z.number().min(0.01).max(0.2),
   amount_threshold: z.number().min(5e7).max(5e9),
@@ -103,6 +104,7 @@ const DEFAULT_FORM_VALUES: FormValues = {
   akshare_cache_dir: '%USERPROFILE%\\.tdx-trend\\akshare\\daily',
   markets: ['sh', 'sz'],
   return_window_days: 40,
+  candles_window_bars: 120,
   top_n: 500,
   turnover_threshold: 0.05,
   amount_threshold: 5e8,
@@ -405,6 +407,24 @@ export function SettingsPage() {
                       step={10_000}
                       value={field.value}
                       onChange={(v) => field.onChange(v ?? 1_000_000)}
+                      style={{ width: '100%' }}
+                    />
+                  )}
+                />
+              </Form.Item>
+            </Col>
+            <Col xs={12} md={6}>
+              <Form.Item label="K线读取窗口(根)">
+                <Controller
+                  name="candles_window_bars"
+                  control={control}
+                  render={({ field }) => (
+                    <InputNumber
+                      min={120}
+                      max={5000}
+                      step={60}
+                      value={field.value}
+                      onChange={(v) => field.onChange(v ?? 120)}
                       style={{ width: '100%' }}
                     />
                   )}

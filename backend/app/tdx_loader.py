@@ -663,7 +663,7 @@ def load_candles_for_symbol(
             return _load_candles_from_akshare_cache(symbol, window, akshare_cache_dir)
         return None
 
-    parsed = _parse_day_file(file_path, symbol)
+    parsed = _parse_day_file(file_path, symbol, max_bars=max(60, int(window)))
     if not parsed:
         if use_akshare:
             return _load_candles_from_akshare_cache(symbol, window, akshare_cache_dir)

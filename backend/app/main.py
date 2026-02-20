@@ -12,6 +12,8 @@ from .models import (
     AIProviderTestRequest,
     AIProviderTestResponse,
     AIRecordsResponse,
+    BacktestResponse,
+    BacktestRunRequest,
     AnnotationUpdateResponse,
     ApiErrorPayload,
     AppConfig,
@@ -175,6 +177,14 @@ def get_signals(
         require_sequence=require_sequence,
         min_event_count=min_event_count,
     )
+
+
+@app.post("/api/backtest/run", response_model=BacktestResponse)
+def post_backtest_run(payload: BacktestRunRequest) -> BacktestResponse | JSONResponse:
+    try:
+        return store.run_backtest(payload)
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
 
 
 @app.post("/api/sim/orders", response_model=CreateOrderResponse)

@@ -4,6 +4,9 @@ import type {
   AIProviderTestRequest,
   AIProviderTestResponse,
   AppConfig,
+  BacktestResponse,
+  BacktestRunRequest,
+  BacktestTrade,
   CandlePoint,
   DailyReviewListResponse,
   DailyReviewPayload,
@@ -157,6 +160,7 @@ let configStore: AppConfig = {
   akshare_cache_dir: '%USERPROFILE%\\.tdx-trend\\akshare\\daily',
   markets: ['sh', 'sz'],
   return_window_days: 40,
+  candles_window_bars: 120,
   top_n: 500,
   turnover_threshold: 0.05,
   amount_threshold: 5e8,
@@ -251,6 +255,10 @@ function hashSeed(text: string) {
 function mean(values: number[]) {
   if (values.length === 0) return 0
   return values.reduce((acc, value) => acc + value, 0) / values.length
+}
+
+function clamp(value: number, lower: number, upper: number) {
+  return Math.max(lower, Math.min(upper, value))
 }
 
 function uniqueTokens(values: string[]) {
@@ -477,6 +485,28 @@ export function createScreenerRun(params: ScreenerParams) {
 
 export function getScreenerRun(runId: string) {
   return runStore.get(runId)
+}
+
+export function getLatestScreenerRunStore() {
+  let latest: ScreenerRunDetail | undefined
+  for (const detail of runStore.values()) {
+    latest = detail
+  }
+  if (latest) {
+    return latest
+  }
+
+  const seeded = createScreenerRun({
+    markets: configStore.markets,
+    mode: 'strict',
+    as_of_date: dayjs().subtract(1, 'day').format('YYYY-MM-DD'),
+    return_window_days: configStore.return_window_days,
+    top_n: configStore.top_n,
+    turnover_threshold: configStore.turnover_threshold,
+    amount_threshold: configStore.amount_threshold,
+    amplitude_threshold: configStore.amplitude_threshold,
+  })
+  return seeded
 }
 
 export function getCandlePayload(symbol: string) {
@@ -908,6 +938,387 @@ export function getReview(params?: {
       date_to: dateTo,
       date_axis: dateAxis,
     },
+  }
+}
+
+export function runBacktestStore(payload: BacktestRunRequest): BacktestResponse {
+  let dateFrom = dayjs(payload.date_from)
+  let dateTo = dayjs(payload.date_to)
+  if (!dateFrom.isValid()) dateFrom = dayjs().subtract(180, 'day')
+  if (!dateTo.isValid()) dateTo = dayjs()
+  if (dateFrom.isAfter(dateTo)) {
+    const swap = dateFrom
+    dateFrom = dateTo
+    dateTo = swap
+  }
+  const rangeFrom = dateFrom.format('YYYY-MM-DD')
+  const rangeTo = dateTo.format('YYYY-MM-DD')
+
+  const notes: string[] = []
+  if (payload.mode === 'trend_pool' && !payload.run_id?.trim()) {
+    notes.push('Mock 模式未传 run_id，已按当前信号池模拟趋势池回测。')
+  }
+  if (payload.priority_topk_per_day > 0 && !payload.prioritize_signals) {
+    notes.push('未启用优先排序，priority_topk_per_day 配置未生效。')
+  }
+
+  const signalRows = getSignals({
+    mode: payload.mode,
+    window_days: payload.window_days,
+    min_score: payload.min_score,
+    require_sequence: payload.require_sequence,
+    min_event_count: payload.min_event_count,
+  }).items
+  const candidatesRaw = signalRows.slice(0, Math.max(0, payload.max_symbols))
+
+  type Candidate = {
+    symbol: string
+    name: string
+    signal_date: string
+    entry_date: string
+    exit_date: string
+    entry_signal: string
+    entry_phase: string
+    entry_quality_score: number
+    entry_phase_score: number
+    entry_events_weight: number
+    entry_trend_score: number
+    entry_structure_score: number
+    exit_reason: string
+    entry_price: number
+    exit_price: number
+    holding_days: number
+  }
+
+  const candidateRows: Candidate[] = candidatesRaw
+    .map((row, index) => {
+      const candles = ensureCandles(row.symbol)
+      if (candles.length < 10) return null
+
+      const entrySignal = row.wyckoff_signal && payload.entry_events.includes(row.wyckoff_signal)
+        ? row.wyckoff_signal
+        : payload.entry_events[0] || row.wyckoff_signal || 'Signal'
+
+      let signalDay = dayjs(row.trigger_date)
+      if (!signalDay.isValid()) signalDay = dateFrom.add(index % 10, 'day')
+      if (signalDay.isBefore(dateFrom)) signalDay = dateFrom
+      if (signalDay.isAfter(dateTo)) signalDay = dateTo
+
+      let entryDay = signalDay.add(1, 'day')
+      if (entryDay.isBefore(dateFrom)) entryDay = dateFrom
+      if (entryDay.isAfter(dateTo)) return null
+
+      const proposedHoldDays = Math.max(2, Math.min(payload.max_hold_days, 3 + (index % 18)))
+      let exitDay = entryDay.add(proposedHoldDays, 'day')
+      if (exitDay.isAfter(dateTo)) exitDay = dateTo
+      if (payload.enforce_t1 && !exitDay.isAfter(entryDay)) {
+        const forced = entryDay.add(1, 'day')
+        if (forced.isAfter(dateTo)) return null
+        exitDay = forced
+      }
+
+      const resolvePrice = (targetDate: dayjs.Dayjs) => {
+        const target = targetDate.format('YYYY-MM-DD')
+        let chosen = candles[0]?.close ?? 20
+        for (const candle of candles) {
+          if (candle.time <= target) {
+            chosen = candle.close
+          } else {
+            break
+          }
+        }
+        return Math.max(0.01, chosen)
+      }
+
+      const entryPrice = resolvePrice(entryDay)
+      const quality = row.entry_quality_score ?? 60
+      const rawReturn = ((index % 11) - 5) / 100 + (quality - 60) / 500
+      const lossCap = payload.stop_loss > 0 ? -payload.stop_loss * 0.95 : -0.12
+      const profitCap = payload.take_profit > 0 ? payload.take_profit * 0.95 : 0.2
+      const pnlRatio = clamp(rawReturn, lossCap, profitCap)
+      const exitPrice = Math.max(0.01, entryPrice * (1 + pnlRatio))
+
+      const pickedExitEvent = payload.exit_events[index % Math.max(1, payload.exit_events.length)] || 'EVENT'
+      let exitReason = `event_exit:${pickedExitEvent}`
+      if (payload.stop_loss > 0 && pnlRatio <= -payload.stop_loss * 0.9) {
+        exitReason = 'stop_loss'
+      } else if (payload.take_profit > 0 && pnlRatio >= payload.take_profit * 0.85) {
+        exitReason = 'take_profit'
+      } else if (index % 3 !== 0) {
+        exitReason = index % 2 === 0 ? `event_exit:${pickedExitEvent}` : 'time_exit'
+      }
+
+      const phase = row.wyckoff_phase || '阶段未明'
+      const entryEventsWeight = (row.wy_events || [])
+        .filter((event) => payload.entry_events.includes(event))
+        .reduce((sum, event) => sum + ({ PS: 1.0, SC: 1.2, AR: 1.4, ST: 1.6, TSO: 2.5, Spring: 3.0, SOS: 3.4, JOC: 4.0, LPS: 2.8, UTAD: 1.5, SOW: 1.5, LPSY: 1.3 }[event] ?? 1.0), 0)
+      const phaseScore = phase.startsWith('吸筹') ? 2.0 : phase.startsWith('派发') ? -1.5 : 0
+      const structureScore = String(row.structure_hhh || '-')
+        .split('|')
+        .reduce((sum, token) => sum + (token && token !== '-' ? 1 : 0), 0)
+
+      return {
+        symbol: row.symbol,
+        name: row.name,
+        signal_date: signalDay.format('YYYY-MM-DD'),
+        entry_date: entryDay.format('YYYY-MM-DD'),
+        exit_date: exitDay.format('YYYY-MM-DD'),
+        entry_signal: entrySignal,
+        entry_phase: phase,
+        entry_quality_score: quality,
+        entry_phase_score: phaseScore,
+        entry_events_weight: entryEventsWeight,
+        entry_trend_score: row.trend_score ?? 50,
+        entry_structure_score: structureScore,
+        exit_reason: exitReason,
+        entry_price: Number(entryPrice.toFixed(4)),
+        exit_price: Number(exitPrice.toFixed(4)),
+        holding_days: Math.max(1, exitDay.diff(entryDay, 'day')),
+      } satisfies Candidate
+    })
+    .filter((row): row is Candidate => Boolean(row))
+
+  if (payload.prioritize_signals) {
+    candidateRows.sort((a, b) => {
+      if (a.entry_date !== b.entry_date) return a.entry_date.localeCompare(b.entry_date)
+      if (payload.priority_mode === 'phase_first') {
+        if (b.entry_phase_score !== a.entry_phase_score) return b.entry_phase_score - a.entry_phase_score
+      } else if (payload.priority_mode === 'momentum') {
+        if (b.entry_trend_score !== a.entry_trend_score) return b.entry_trend_score - a.entry_trend_score
+      } else if (b.entry_quality_score !== a.entry_quality_score) {
+        return b.entry_quality_score - a.entry_quality_score
+      }
+      if (b.entry_events_weight !== a.entry_events_weight) return b.entry_events_weight - a.entry_events_weight
+      return a.symbol.localeCompare(b.symbol)
+    })
+    notes.push(`同日信号按优先级执行（模式: ${payload.priority_mode}）。`)
+  } else {
+    candidateRows.sort((a, b) => (a.entry_date === b.entry_date ? a.symbol.localeCompare(b.symbol) : a.entry_date.localeCompare(b.entry_date)))
+  }
+
+  if (payload.prioritize_signals && payload.priority_topk_per_day > 0) {
+    const beforeCount = candidateRows.length
+    const counter = new Map<string, number>()
+    const kept = candidateRows.filter((row) => {
+      const used = counter.get(row.signal_date) ?? 0
+      if (used >= payload.priority_topk_per_day) return false
+      counter.set(row.signal_date, used + 1)
+      return true
+    })
+    candidateRows.length = 0
+    candidateRows.push(...kept)
+    const dropped = beforeCount - kept.length
+    if (dropped > 0) {
+      notes.push(`同日 TopK 限流已生效：每日保留前 ${payload.priority_topk_per_day} 笔候选，共过滤 ${dropped} 笔。`)
+    }
+  }
+
+  const feeRate = clamp(payload.fee_bps / 10000, 0, 0.05)
+  let cash = payload.initial_capital
+  let equity = payload.initial_capital
+  let maxConcurrentPositions = 0
+  const activePositions: Array<{ exit_date: string; exit_amount: number; pnl_amount: number }> = []
+  const trades: BacktestTrade[] = []
+  const skipReasons = {
+    max_positions: 0,
+    insufficient_cash: 0,
+    invalid_price: 0,
+  }
+
+  const releaseUntil = (entryDate: string) => {
+    const remaining: typeof activePositions = []
+    activePositions.forEach((row) => {
+      if (row.exit_date < entryDate) {
+        cash += row.exit_amount
+        equity += row.pnl_amount
+      } else {
+        remaining.push(row)
+      }
+    })
+    activePositions.length = 0
+    activePositions.push(...remaining)
+  }
+
+  candidateRows.forEach((row) => {
+    releaseUntil(row.entry_date)
+    if (activePositions.length >= payload.max_positions) {
+      skipReasons.max_positions += 1
+      return
+    }
+
+    const entryExec = row.entry_price * (1 + feeRate)
+    const exitExec = row.exit_price * (1 - feeRate)
+    if (!Number.isFinite(entryExec) || !Number.isFinite(exitExec) || entryExec <= 0) {
+      skipReasons.invalid_price += 1
+      return
+    }
+
+    const allocation = Math.min(cash, Math.max(0, equity * payload.position_pct))
+    const quantity = Math.floor(allocation / entryExec / 100) * 100
+    if (quantity <= 0) {
+      skipReasons.insufficient_cash += 1
+      return
+    }
+
+    const invested = quantity * entryExec
+    if (invested <= 0 || invested > cash + 1e-9) {
+      skipReasons.insufficient_cash += 1
+      return
+    }
+
+    const exitAmount = quantity * exitExec
+    const pnlAmount = exitAmount - invested
+    const pnlRatio = invested > 0 ? pnlAmount / invested : 0
+    cash -= invested
+
+    activePositions.push({
+      exit_date: row.exit_date,
+      exit_amount: exitAmount,
+      pnl_amount: pnlAmount,
+    })
+    maxConcurrentPositions = Math.max(maxConcurrentPositions, activePositions.length)
+
+    trades.push({
+      symbol: row.symbol,
+      name: row.name,
+      signal_date: row.signal_date,
+      entry_date: row.entry_date,
+      exit_date: row.exit_date,
+      entry_signal: row.entry_signal,
+      entry_phase: row.entry_phase,
+      entry_quality_score: Number(row.entry_quality_score.toFixed(2)),
+      exit_reason: row.exit_reason,
+      quantity,
+      entry_price: row.entry_price,
+      exit_price: row.exit_price,
+      holding_days: row.holding_days,
+      pnl_amount: Number(pnlAmount.toFixed(4)),
+      pnl_ratio: Number(pnlRatio.toFixed(6)),
+    })
+  })
+
+  activePositions
+    .slice()
+    .sort((a, b) => a.exit_date.localeCompare(b.exit_date))
+    .forEach((row) => {
+      cash += row.exit_amount
+      equity += row.pnl_amount
+    })
+
+  const candidateCount = candidateRows.length
+  const skippedCount = Object.values(skipReasons).reduce((sum, value) => sum + value, 0)
+  const fillRate = candidateCount > 0 ? trades.length / candidateCount : 0
+  if (skippedCount > 0) {
+    const detail = Object.entries(skipReasons)
+      .filter(([, value]) => value > 0)
+      .map(([key, value]) => `${key}:${value}`)
+      .join(', ')
+    notes.push(`组合约束跳过 ${skippedCount} 笔信号（${detail}）。`)
+  }
+
+  const tradeCount = trades.length
+  const winCount = trades.filter((row) => row.pnl_amount > 0).length
+  const lossCount = trades.filter((row) => row.pnl_amount < 0).length
+  const grossProfit = trades.filter((row) => row.pnl_amount > 0).reduce((sum, row) => sum + row.pnl_amount, 0)
+  const grossLoss = trades.filter((row) => row.pnl_amount < 0).reduce((sum, row) => sum + row.pnl_amount, 0)
+  const totalPnl = trades.reduce((sum, row) => sum + row.pnl_amount, 0)
+  const avgPnlRatio = tradeCount > 0 ? trades.reduce((sum, row) => sum + row.pnl_ratio, 0) / tradeCount : 0
+
+  const pnlByDate = new Map<string, number>()
+  trades.forEach((row) => {
+    pnlByDate.set(row.exit_date, (pnlByDate.get(row.exit_date) ?? 0) + row.pnl_amount)
+  })
+
+  const equityCurve: BacktestResponse['equity_curve'] = [
+    {
+      date: rangeFrom,
+      equity: Number(payload.initial_capital.toFixed(4)),
+      realized_pnl: 0,
+    },
+  ]
+  let runningPnl = 0
+  Array.from(pnlByDate.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .forEach(([date, pnl]) => {
+      runningPnl += pnl
+      equityCurve.push({
+        date,
+        equity: Number((payload.initial_capital + runningPnl).toFixed(4)),
+        realized_pnl: Number(runningPnl.toFixed(4)),
+      })
+    })
+  if (equityCurve[equityCurve.length - 1]?.date !== rangeTo) {
+    equityCurve.push({
+      date: rangeTo,
+      equity: equityCurve[equityCurve.length - 1]?.equity ?? payload.initial_capital,
+      realized_pnl: equityCurve[equityCurve.length - 1]?.realized_pnl ?? runningPnl,
+    })
+  }
+
+  let peak = equityCurve[0]?.equity ?? payload.initial_capital
+  const drawdownCurve = equityCurve.map((point) => {
+    peak = Math.max(peak, point.equity)
+    return {
+      date: point.date,
+      drawdown: peak > 0 ? Number(((point.equity - peak) / peak).toFixed(6)) : 0,
+    }
+  })
+  const maxDrawdown = Math.max(0, ...drawdownCurve.map((row) => Math.abs(row.drawdown)))
+
+  const monthlyMap = new Map<string, { pnl: number; count: number }>()
+  trades.forEach((row) => {
+    const month = row.exit_date.slice(0, 7)
+    const prev = monthlyMap.get(month) ?? { pnl: 0, count: 0 }
+    monthlyMap.set(month, { pnl: prev.pnl + row.pnl_amount, count: prev.count + 1 })
+  })
+  const monthlyReturns = Array.from(monthlyMap.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([month, value]) => ({
+      month,
+      return_ratio: payload.initial_capital > 0 ? Number((value.pnl / payload.initial_capital).toFixed(6)) : 0,
+      pnl_amount: Number(value.pnl.toFixed(4)),
+      trade_count: value.count,
+    }))
+
+  const sortedTrades = trades.slice().sort((a, b) => b.pnl_amount - a.pnl_amount)
+  const topTrades = sortedTrades.slice(0, 10)
+  const bottomTrades = sortedTrades.slice(-10).reverse()
+
+  return {
+    stats: {
+      win_rate: tradeCount > 0 ? winCount / tradeCount : 0,
+      total_return: payload.initial_capital > 0 ? totalPnl / payload.initial_capital : 0,
+      max_drawdown: maxDrawdown,
+      avg_pnl_ratio: Number(avgPnlRatio.toFixed(6)),
+      trade_count: tradeCount,
+      win_count: winCount,
+      loss_count: lossCount,
+      profit_factor: grossLoss < 0 ? Number((grossProfit / Math.abs(grossLoss)).toFixed(6)) : grossProfit > 0 ? 999 : 0,
+    },
+    trades,
+    equity_curve: equityCurve,
+    drawdown_curve: drawdownCurve,
+    monthly_returns: monthlyReturns,
+    top_trades: topTrades,
+    bottom_trades: bottomTrades,
+    cost_snapshot: {
+      initial_capital: payload.initial_capital,
+      commission_rate: Number(clamp(payload.fee_bps / 10000, 0, 0.01).toFixed(6)),
+      min_commission: 0,
+      stamp_tax_rate: 0,
+      transfer_fee_rate: 0,
+      slippage_rate: 0,
+    },
+    range: {
+      date_from: rangeFrom,
+      date_to: rangeTo,
+      date_axis: 'sell',
+    },
+    notes,
+    candidate_count: candidateCount,
+    skipped_count: skippedCount,
+    fill_rate: Number(fillRate.toFixed(6)),
+    max_concurrent_positions: maxConcurrentPositions,
   }
 }
 

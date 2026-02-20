@@ -17,6 +17,8 @@ MarketDataSource = Literal["tdx_only", "tdx_then_akshare", "akshare_only"]
 MarketSyncProvider = Literal["baostock"]
 MarketSyncMode = Literal["incremental", "full"]
 ReviewTagType = Literal["emotion", "reason"]
+BacktestPriorityMode = Literal["phase_first", "balanced", "momentum"]
+BoardFilter = Literal["main", "gem", "star", "beijing", "st"]
 
 
 class ApiErrorPayload(BaseModel):
@@ -344,6 +346,76 @@ class ReviewResponse(BaseModel):
     range: ReviewRange
 
 
+class BacktestRunRequest(BaseModel):
+    mode: SignalScanMode = "trend_pool"
+    run_id: str | None = None
+    trend_step: TrendPoolStep = "auto"
+    board_filters: list[BoardFilter] = Field(default_factory=list, max_length=5)
+    date_from: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    date_to: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    window_days: int = Field(default=60, ge=20, le=240)
+    min_score: float = Field(default=55.0, ge=0.0, le=100.0)
+    require_sequence: bool = False
+    min_event_count: int = Field(default=1, ge=0, le=12)
+    entry_events: list[str] = Field(
+        default_factory=lambda: ["Spring", "SOS", "JOC", "LPS"],
+        min_length=1,
+        max_length=12,
+    )
+    exit_events: list[str] = Field(
+        default_factory=lambda: ["UTAD", "SOW", "LPSY"],
+        min_length=1,
+        max_length=12,
+    )
+    initial_capital: float = Field(default=1_000_000.0, gt=0)
+    position_pct: float = Field(default=0.2, gt=0, le=1)
+    max_positions: int = Field(default=5, ge=1, le=100)
+    stop_loss: float = Field(default=0.05, ge=0, le=0.5)
+    take_profit: float = Field(default=0.15, ge=0, le=1.5)
+    max_hold_days: int = Field(default=60, ge=1, le=365)
+    fee_bps: float = Field(default=10.0, ge=0.0, le=500.0)
+    prioritize_signals: bool = True
+    priority_mode: BacktestPriorityMode = "balanced"
+    priority_topk_per_day: int = Field(default=0, ge=0, le=500)
+    enforce_t1: bool = True
+    max_symbols: int = Field(default=120, ge=20, le=2000)
+
+
+class BacktestTrade(BaseModel):
+    symbol: str
+    name: str
+    signal_date: str
+    entry_date: str
+    exit_date: str
+    entry_signal: str
+    entry_phase: str = "阶段未明"
+    entry_quality_score: float = 0.0
+    exit_reason: str
+    quantity: int
+    entry_price: float
+    exit_price: float
+    holding_days: int
+    pnl_amount: float
+    pnl_ratio: float
+
+
+class BacktestResponse(BaseModel):
+    stats: ReviewStats
+    trades: list[BacktestTrade]
+    equity_curve: list[EquityPoint] = Field(default_factory=list)
+    drawdown_curve: list[DrawdownPoint] = Field(default_factory=list)
+    monthly_returns: list[MonthlyReturnPoint] = Field(default_factory=list)
+    top_trades: list[BacktestTrade] = Field(default_factory=list)
+    bottom_trades: list[BacktestTrade] = Field(default_factory=list)
+    cost_snapshot: SimTradingConfig = Field(default_factory=SimTradingConfig)
+    range: ReviewRange
+    notes: list[str] = Field(default_factory=list)
+    candidate_count: int = 0
+    skipped_count: int = 0
+    fill_rate: float = 0.0
+    max_concurrent_positions: int = 0
+
+
 class ReviewTag(BaseModel):
     id: str
     name: str
@@ -526,6 +598,7 @@ class AppConfig(BaseModel):
     akshare_cache_dir: str = ""
     markets: list[Market]
     return_window_days: int
+    candles_window_bars: int = Field(default=120, ge=120, le=5000)
     top_n: int
     turnover_threshold: float
     amount_threshold: float

@@ -5,6 +5,8 @@ export type ThemeStage = '发酵中' | '高潮' | '退潮' | 'Unknown'
 export type SignalType = 'A' | 'B' | 'C'
 export type SignalScanMode = 'trend_pool' | 'full_market'
 export type TrendPoolStep = 'auto' | 'step1' | 'step2' | 'step3' | 'step4'
+export type BacktestPriorityMode = 'phase_first' | 'balanced' | 'momentum'
+export type BoardFilter = 'main' | 'gem' | 'star' | 'beijing' | 'st'
 export type MarketDataSource = 'tdx_only' | 'tdx_then_akshare' | 'akshare_only'
 export type MarketSyncProvider = 'baostock'
 export type MarketSyncMode = 'incremental' | 'full'
@@ -354,6 +356,68 @@ export interface ReviewResponse {
   range: ReviewRange
 }
 
+export interface BacktestRunRequest {
+  mode: SignalScanMode
+  run_id?: string
+  trend_step: TrendPoolStep
+  board_filters?: BoardFilter[]
+  date_from: string
+  date_to: string
+  window_days: number
+  min_score: number
+  require_sequence: boolean
+  min_event_count: number
+  entry_events: string[]
+  exit_events: string[]
+  initial_capital: number
+  position_pct: number
+  max_positions: number
+  stop_loss: number
+  take_profit: number
+  max_hold_days: number
+  fee_bps: number
+  prioritize_signals: boolean
+  priority_mode: BacktestPriorityMode
+  priority_topk_per_day: number
+  enforce_t1: boolean
+  max_symbols: number
+}
+
+export interface BacktestTrade {
+  symbol: string
+  name: string
+  signal_date: string
+  entry_date: string
+  exit_date: string
+  entry_signal: string
+  entry_phase: string
+  entry_quality_score: number
+  exit_reason: string
+  quantity: number
+  entry_price: number
+  exit_price: number
+  holding_days: number
+  pnl_amount: number
+  pnl_ratio: number
+}
+
+export interface BacktestResponse {
+  stats: ReviewStats
+  trades: BacktestTrade[]
+  equity_curve: EquityPoint[]
+  drawdown_curve: DrawdownPoint[]
+  monthly_returns: MonthlyReturnPoint[]
+  top_trades: BacktestTrade[]
+  bottom_trades: BacktestTrade[]
+  cost_snapshot: SimTradingConfig
+  range: ReviewRange
+  notes: string[]
+  candidate_count: number
+  skipped_count: number
+  fill_rate: number
+  max_concurrent_positions: number
+}
+
 export type ReviewTagType = 'emotion' | 'reason'
 
 export interface ReviewTag {
@@ -521,6 +585,7 @@ export interface AppConfig {
   akshare_cache_dir: string
   markets: Market[]
   return_window_days: number
+  candles_window_bars: number
   top_n: number
   turnover_threshold: number
   amount_threshold: number

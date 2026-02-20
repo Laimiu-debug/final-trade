@@ -25,6 +25,9 @@ from .models import (
     AIProviderConfig,
     AppConfig,
     CandlePoint,
+    BacktestRunRequest,
+    BacktestResponse,
+    BoardFilter,
     CreateOrderRequest,
     CreateOrderResponse,
     IntradayPayload,
@@ -89,6 +92,7 @@ from .tdx_loader import (
 from .utils.text_utils import TextProcessor, URLUtils
 from .core.signal_analyzer import SignalAnalyzer, WYCKOFF_ACC_EVENTS, WYCKOFF_RISK_EVENTS, WYCKOFF_EVENT_ORDER
 from .core.ai_analyzer import AIAnalyzer, create_ai_analyzer
+from .core.backtest_engine import BacktestEngine
 from .core.screener import ScreenerEngine, create_screener_engine, THEME_STAGES
 from .core.candle_analyzer import CandleAnalyzer, create_candle_analyzer
 from .providers.web_provider import RSSWebEvidenceProvider, SearchWebEvidenceProvider
@@ -283,6 +287,7 @@ class InMemoryStore:
             akshare_cache_dir=str(Path.home() / ".tdx-trend" / "akshare" / "daily"),
             markets=["sh", "sz"],
             return_window_days=40,
+            candles_window_bars=120,
             top_n=500,
             turnover_threshold=0.05,
             amount_threshold=5e8,
@@ -2736,9 +2741,11 @@ class InMemoryStore:
 
     def _ensure_candles(self, symbol: str) -> list[CandlePoint]:
         if symbol not in self._candles_map:
+            window_bars = max(120, int(self._config.candles_window_bars))
             real_candles = load_candles_for_symbol(
                 self._config.tdx_data_path,
                 symbol,
+                window=window_bars,
                 market_data_source=self._config.market_data_source,
                 akshare_cache_dir=self._config.akshare_cache_dir,
             )
@@ -3461,6 +3468,111 @@ class InMemoryStore:
         )
         self._signals_cache[cache_key] = (now_ts, payload)
         return payload
+
+    @staticmethod
+    def _detect_primary_board_from_symbol(symbol: str) -> str | None:
+        normalized = str(symbol).strip().lower()
+        if len(normalized) < 8:
+            return None
+        market = normalized[:2]
+        code = normalized[2:]
+        if market == "bj":
+            return "beijing"
+        if market == "sh":
+            if code.startswith("688") or code.startswith("689"):
+                return "star"
+            return "main"
+        if market == "sz":
+            if code.startswith("300") or code.startswith("301"):
+                return "gem"
+            return "main"
+        return None
+
+    @staticmethod
+    def _is_st_stock(name: str) -> bool:
+        normalized_name = re.sub(r"\s+", "", str(name).upper())
+        return "ST" in normalized_name
+
+    @classmethod
+    def _row_matches_board_filters(
+        cls,
+        row: ScreenerResult,
+        board_filters: list[BoardFilter],
+    ) -> bool:
+        if not board_filters:
+            return True
+        selected = set(board_filters)
+        is_st = cls._is_st_stock(row.name)
+        if is_st and "st" not in selected:
+            return False
+
+        selected_boards = [item for item in board_filters if item != "st"]
+        if not selected_boards:
+            return is_st
+
+        board = cls._detect_primary_board_from_symbol(row.symbol)
+        if board is None:
+            return False
+        return board in selected_boards
+
+    def run_backtest(self, payload: BacktestRunRequest) -> BacktestResponse:
+        candidates, degraded_reason, resolved_run_id, resolved_as_of_date = self._resolve_signal_candidates(
+            mode=payload.mode,
+            run_id=payload.run_id,
+            trend_step=payload.trend_step,
+            as_of_date=payload.date_to,
+        )
+        board_filters = [item for item in payload.board_filters if item in {"main", "gem", "star", "beijing", "st"}]
+        candidate_count_before_board_filter = len(candidates)
+        if board_filters:
+            candidates = [row for row in candidates if self._row_matches_board_filters(row, board_filters)]
+        candidate_count_after_board_filter = len(candidates)
+
+        symbols: list[str] = []
+        seen_symbols: set[str] = set()
+        for row in candidates:
+            symbol = str(row.symbol).strip().lower()
+            if not symbol or symbol in seen_symbols:
+                continue
+            symbols.append(symbol)
+            seen_symbols.add(symbol)
+            if len(symbols) >= payload.max_symbols:
+                break
+
+        if not symbols:
+            raise ValueError("回测股票池为空，请先执行筛选或调整回测模式")
+
+        engine = BacktestEngine(
+            get_candles=self._ensure_candles,
+            build_row=self._build_row_from_candles,
+            calc_snapshot=lambda row, window_days, as_of_date: self._calc_wyckoff_snapshot(
+                row,
+                window_days=window_days,
+                as_of_date=as_of_date,
+            ),
+            resolve_symbol_name=self._resolve_symbol_name,
+        )
+        result = engine.run(payload=payload, symbols=symbols)
+
+        notes = list(result.notes)
+        if board_filters:
+            notes.insert(
+                0,
+                (
+                    "候选池板块过滤: "
+                    f"{','.join(board_filters)} "
+                    f"({candidate_count_after_board_filter}/{candidate_count_before_board_filter})"
+                ),
+            )
+        if payload.mode == "trend_pool" and resolved_run_id:
+            notes.insert(0, f"使用筛选任务: {resolved_run_id}")
+        if degraded_reason:
+            notes.append(f"候选池降级原因: {degraded_reason}")
+        if resolved_as_of_date and resolved_as_of_date != payload.date_to:
+            notes.append(f"候选池按 {resolved_as_of_date} 对齐")
+        if notes != result.notes:
+            result = result.model_copy(update={"notes": notes})
+        return result
 
     def create_order(self, payload: CreateOrderRequest) -> CreateOrderResponse:
         return self._sim_engine.create_order(payload)

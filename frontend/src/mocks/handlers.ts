@@ -26,6 +26,7 @@ import {
   getReviewTagStatsStore,
   getReviewTagsStore,
   getSimConfigStore,
+  getLatestScreenerRunStore,
   getScreenerRun,
   getSignals,
   getSystemStorageStore,
@@ -38,6 +39,7 @@ import {
   settleOrders,
   setConfigStore,
   testAIProvider,
+  runBacktestStore,
   updateReviewFillTagStore,
   upsertDailyReviewStore,
   upsertWeeklyReviewStore,
@@ -45,6 +47,7 @@ import {
 import type {
   AIProviderTestRequest,
   AppConfig,
+  BacktestRunRequest,
   DailyReviewPayload,
   MarketDataSyncRequest,
   ReviewTagCreateRequest,
@@ -76,6 +79,12 @@ export const handlers = [
         { status: 404 },
       )
     }
+    return HttpResponse.json(run)
+  }),
+
+  http.get('/api/screener/latest-run', async () => {
+    await delay(220)
+    const run = getLatestScreenerRunStore()
     return HttpResponse.json(run)
   }),
 
@@ -142,6 +151,12 @@ export const handlers = [
         },
       },
     )
+  }),
+
+  http.post('/api/backtest/run', async ({ request }) => {
+    await delay(220)
+    const payload = (await request.json()) as BacktestRunRequest
+    return HttpResponse.json(runBacktestStore(payload))
   }),
 
   http.post('/api/sim/orders', async ({ request }) => {
