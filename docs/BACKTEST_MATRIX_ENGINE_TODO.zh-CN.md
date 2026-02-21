@@ -1,6 +1,6 @@
 ﻿# 回测矩阵引擎改造 TODO（Matrix Engine）
 
-> 状态：Phase A 已落地（执行中）
+> 状态：Phase A/B 已落地（执行中）
 > 更新时间：2026-02-21
 > 目标：在不破坏旧路径的前提下，引入矩阵化信号计算，优先解决 `full_market` 回测速度。
 
@@ -22,9 +22,9 @@
 - [x] 输出 `S1~S9`、`in_pool`、`buy_signal`、`sell_signal`、`score`（shape=(T,N)）
 - [x] 缺失值/停牌安全处理（统一通过 `valid_mask`）
 
-### A3. 接入 store（灰度只开 full_market + daily）
+### A3. 接入 store（灰度起步）
 - [x] `store.py` 增加开关 `TDX_TREND_BACKTEST_MATRIX_ENGINE`
-- [x] 仅在 `mode=full_market && pool_roll_mode=daily` 接矩阵路径
+- [x] Phase A：先在 `mode=full_market && pool_roll_mode=daily` 接矩阵路径
 - [x] 开关关闭时 100% 走旧路径
 - [x] 矩阵路径失败时可回落旧路径并记录 `notes`
 
@@ -34,10 +34,10 @@
 - [x] 维持旧执行语义（T+1、止损止盈、最大持仓等）
 
 ## 3. Phase B（扩展）
-- [ ] 扩展到 `full_market + weekly/position`
-- [ ] weekly 预生成刷新日 mask
-- [ ] position 只做矩阵切片，不重跑 rolling
-- [ ] 迁移 `trend_pool` 到同一矩阵信号实现
+- [x] 扩展到 `full_market + weekly/position`
+- [x] weekly 预生成刷新日 mask
+- [x] position 只做矩阵切片，不重跑 rolling
+- [x] 迁移 `trend_pool` 到同一矩阵信号实现
 
 ## 4. Phase C（验证与收敛）
 
@@ -52,5 +52,5 @@
 
 ## 5. 回滚策略
 - [x] 开关默认关闭。
-- [x] 灰度顺序：先 `full_market + daily`。
+- [x] 失败自动回退旧路径并记录回退原因（`notes`）。
 - [ ] 出现偏差超阈值时，自动回退旧路径并告警。

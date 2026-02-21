@@ -4267,35 +4267,44 @@ class InMemoryStore:
     def _is_backtest_matrix_engine_enabled(self) -> bool:
         return self._env_flag("TDX_TREND_BACKTEST_MATRIX_ENGINE", False)
 
-    def _run_backtest_matrix_full_market_daily(
+    @staticmethod
+    def _build_backtest_matrix_windows(payload: BacktestRunRequest) -> tuple[int, ...]:
+        return tuple(sorted(set([10, 20, 40, 60, max(20, int(payload.window_days))])))
+
+    def _build_backtest_engine(self) -> BacktestEngine:
+        return BacktestEngine(
+            get_candles=self._ensure_candles,
+            build_row=self._build_row_from_candles,
+            calc_snapshot=lambda row, window_days, as_of_date: self._calc_wyckoff_snapshot(
+                row,
+                window_days=window_days,
+                as_of_date=as_of_date,
+            ),
+            resolve_symbol_name=self._resolve_symbol_name,
+        )
+
+    def _run_matrix_execution(
         self,
         *,
         payload: BacktestRunRequest,
-        board_filters: list[BoardFilter],
+        symbols: list[str],
+        allowed_symbols_by_date: dict[str, set[str]] | None,
         progress_callback: Callable[[str, int, int, str], None] | None = None,
-    ) -> BacktestResponse:
-        rolling_symbols, rolling_allowed_by_date, pool_notes, scan_dates, _ = self._build_full_market_rolling_universe(
-            payload=payload,
-            board_filters=board_filters,
-            refresh_dates=None,
-            progress_callback=progress_callback,
-        )
-        if not rolling_symbols:
-            reason_text = "；".join(pool_notes) if pool_notes else "滚动筛选结果为空。"
-            raise ValueError(f"回测股票池为空：{reason_text}")
+        progress_total_dates: int | None = None,
+    ) -> tuple[BacktestResponse, str]:
         self._validate_backtest_data_coverage(
             payload,
-            rolling_symbols,
+            symbols,
             scope_label="滚动池并集",
         )
 
-        matrix_windows = tuple(sorted(set([10, 20, 40, 60, max(20, int(payload.window_days))])))
+        matrix_windows = self._build_backtest_matrix_windows(payload)
         data_version = (
             f"{self._config.market_data_source}|bars={int(self._config.candles_window_bars)}|"
-            f"wy={self._wyckoff_event_data_version}"
+            f"wy={self._wyckoff_event_data_version}|mode={payload.mode}|roll={payload.pool_roll_mode}"
         )
         cache_key = self._backtest_matrix_engine.build_cache_key(
-            symbols=rolling_symbols,
+            symbols=symbols,
             date_from=payload.date_from,
             date_to=payload.date_to,
             data_version=data_version,
@@ -4303,7 +4312,7 @@ class InMemoryStore:
             algo_version=self._backtest_matrix_algo_version,
         )
         bundle, cache_hit = self._backtest_matrix_engine.build_bundle(
-            symbols=rolling_symbols,
+            symbols=symbols,
             get_candles=self._ensure_candles,
             date_from=payload.date_from,
             date_to=payload.date_to,
@@ -4318,52 +4327,176 @@ class InMemoryStore:
             bundle,
             top_n=max(50, min(2000, int(self._config.top_n))),
         )
-        if progress_callback is not None:
+        if progress_callback is not None and progress_total_dates is not None:
+            total_safe = max(1, int(progress_total_dates))
             progress_callback(
                 payload.date_to,
-                max(1, len(scan_dates)),
-                max(1, len(scan_dates)),
+                total_safe,
+                total_safe,
                 "矩阵信号计算完成，开始执行回测撮合...",
             )
 
-        engine = BacktestEngine(
-            get_candles=self._ensure_candles,
-            build_row=self._build_row_from_candles,
-            calc_snapshot=lambda row, window_days, as_of_date: self._calc_wyckoff_snapshot(
-                row,
-                window_days=window_days,
-                as_of_date=as_of_date,
-            ),
-            resolve_symbol_name=self._resolve_symbol_name,
-        )
+        engine = self._build_backtest_engine()
         result = engine.run(
             payload=payload,
-            symbols=rolling_symbols,
-            allowed_symbols_by_date=rolling_allowed_by_date,
+            symbols=symbols,
+            allowed_symbols_by_date=allowed_symbols_by_date,
             matrix_bundle=bundle,
             matrix_signals=signal_matrix,
         )
 
         shape_t, shape_n = bundle.shape()
-        matrix_notes = [
-            (
-                "矩阵引擎已启用："
-                f"shape={shape_t}x{shape_n}，windows={list(matrix_windows)}，"
-                f"cache={'hit' if cache_hit else 'miss'}，key={cache_key[:12]}..."
-            ),
-        ]
+        matrix_note = (
+            "矩阵引擎已启用："
+            f"shape={shape_t}x{shape_n}，windows={list(matrix_windows)}，"
+            f"cache={'hit' if cache_hit else 'miss'}，key={cache_key[:12]}..."
+        )
+        return result, matrix_note
 
-        notes = [*matrix_notes, *pool_notes, *list(result.notes)]
+    def _resolve_matrix_rolling_universe(
+        self,
+        *,
+        payload: BacktestRunRequest,
+        board_filters: list[BoardFilter],
+        trend_pool_params: ScreenerParams | None,
+        progress_callback: Callable[[str, int, int, str], None] | None,
+    ) -> tuple[list[str], dict[str, set[str]], list[str], list[str]]:
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        if not scan_dates:
+            raise ValueError("回测区间内无可扫描交易日。")
+
+        if payload.mode == "trend_pool":
+            if trend_pool_params is None:
+                raise ValueError("趋势池筛选参数不可用。")
+
+            def _build(
+                refresh_dates: list[str] | None,
+                cb: Callable[[str, int, int, str], None] | None,
+            ) -> tuple[list[str], dict[str, set[str]], list[str], list[str], list[str]]:
+                return self._build_trend_pool_rolling_universe(
+                    payload=payload,
+                    screener_params=trend_pool_params,
+                    board_filters=board_filters,
+                    refresh_dates=refresh_dates,
+                    progress_callback=cb,
+                )
+
+        elif payload.mode == "full_market":
+
+            def _build(
+                refresh_dates: list[str] | None,
+                cb: Callable[[str, int, int, str], None] | None,
+            ) -> tuple[list[str], dict[str, set[str]], list[str], list[str], list[str]]:
+                return self._build_full_market_rolling_universe(
+                    payload=payload,
+                    board_filters=board_filters,
+                    refresh_dates=refresh_dates,
+                    progress_callback=cb,
+                )
+
+        else:
+            raise ValueError(f"不支持的回测模式: {payload.mode}")
+
+        if payload.pool_roll_mode == "position":
+            seed_refresh_dates = [scan_dates[0]]
+            seed_symbols, seed_allowed_by_date, _, _, _ = _build(seed_refresh_dates, None)
+            if not seed_symbols:
+                raise ValueError("回测股票池为空：持仓触发滚动初始池为空。")
+            probe_result, probe_matrix_note = self._run_matrix_execution(
+                payload=payload,
+                symbols=seed_symbols,
+                allowed_symbols_by_date=seed_allowed_by_date,
+                progress_callback=None,
+                progress_total_dates=None,
+            )
+            refresh_date_set: set[str] = {scan_dates[0]}
+            for trade in probe_result.trades:
+                next_day = self._next_scan_date(scan_dates, trade.exit_date)
+                if next_day:
+                    refresh_date_set.add(next_day)
+            if progress_callback is not None:
+                progress_callback(
+                    scan_dates[0],
+                    0,
+                    max(1, len(refresh_date_set)),
+                    "持仓触发滚动：正在根据卖出日生成刷新计划...",
+                )
+            rolling_symbols, rolling_allowed_by_date, notes, _, refresh_dates_used = _build(
+                sorted(refresh_date_set),
+                progress_callback,
+            )
+            merged_notes = [
+                *notes,
+                f"持仓触发滚动：首日+卖出后下一交易日刷新，共 {len(refresh_dates_used)} 次。",
+                f"持仓触发滚动预演: {probe_matrix_note}",
+            ]
+            return rolling_symbols, rolling_allowed_by_date, merged_notes, scan_dates
+
+        rolling_symbols, rolling_allowed_by_date, notes, _, _ = _build(None, progress_callback)
+        return rolling_symbols, rolling_allowed_by_date, list(notes), scan_dates
+
+    def _run_backtest_matrix(
+        self,
+        *,
+        payload: BacktestRunRequest,
+        board_filters: list[BoardFilter],
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+    ) -> BacktestResponse:
+        degraded_reason: str | None = None
+        resolved_run_id: str | None = None
+        trend_pool_params: ScreenerParams | None = None
+        trend_pool_fallback_note: str | None = None
+        if payload.mode == "trend_pool":
+            (
+                trend_pool_params,
+                resolved_run_id,
+                degraded_reason,
+                trend_pool_fallback_note,
+            ) = self._resolve_backtest_trend_pool_params(payload.run_id)
+
+        pool_notes: list[str] = []
+        if trend_pool_fallback_note:
+            pool_notes.append(trend_pool_fallback_note)
+
+        rolling_symbols, rolling_allowed_by_date, rolling_notes, scan_dates = self._resolve_matrix_rolling_universe(
+            payload=payload,
+            board_filters=board_filters,
+            trend_pool_params=trend_pool_params,
+            progress_callback=progress_callback,
+        )
+        pool_notes = [*pool_notes, *rolling_notes]
+        if not rolling_symbols:
+            reason_text = "；".join(pool_notes) if pool_notes else "滚动筛选结果为空。"
+            raise ValueError(f"回测股票池为空：{reason_text}")
+
+        result, matrix_note = self._run_matrix_execution(
+            payload=payload,
+            symbols=rolling_symbols,
+            allowed_symbols_by_date=rolling_allowed_by_date,
+            progress_callback=progress_callback,
+            progress_total_dates=max(1, len(scan_dates)),
+        )
+
+        notes = [matrix_note, *pool_notes, *list(result.notes)]
         if board_filters:
-            notes.insert(0, f"候选池板块过滤: {','.join(board_filters)}（每日滚动生效）")
+            roll_mode_label = {
+                "daily": "每日滚动",
+                "weekly": "每周滚动",
+                "position": "持仓触发滚动",
+            }.get(payload.pool_roll_mode, "每日滚动")
+            notes.insert(0, f"候选池板块过滤: {','.join(board_filters)}（{roll_mode_label}生效）")
+        if payload.mode == "trend_pool" and resolved_run_id:
+            notes.insert(0, f"使用筛选任务: {resolved_run_id}")
         notes.insert(
             0,
             self._build_backtest_param_snapshot_note(
                 payload,
-                resolved_run_id=None,
+                resolved_run_id=resolved_run_id,
                 board_filters=board_filters,
             ),
         )
+        if degraded_reason:
+            notes.append(f"候选池降级原因: {degraded_reason}")
         if notes != result.notes:
             result = result.model_copy(update={"notes": notes})
         return result
@@ -4496,13 +4629,13 @@ class InMemoryStore:
     ) -> BacktestResponse:
         board_filters = [item for item in payload.board_filters if item in {"main", "gem", "star", "beijing", "st"}]
         matrix_fallback_note: str | None = None
-        if (
-            self._is_backtest_matrix_engine_enabled()
-            and payload.mode == "full_market"
-            and payload.pool_roll_mode == "daily"
-        ):
+        matrix_supported = (
+            payload.mode in {"full_market", "trend_pool"}
+            and payload.pool_roll_mode in {"daily", "weekly", "position"}
+        )
+        if self._is_backtest_matrix_engine_enabled() and matrix_supported:
             try:
-                return self._run_backtest_matrix_full_market_daily(
+                return self._run_backtest_matrix(
                     payload=payload,
                     board_filters=board_filters,
                     progress_callback=progress_callback,

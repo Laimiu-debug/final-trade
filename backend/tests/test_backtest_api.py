@@ -21,6 +21,7 @@ os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_ENABLED", "1")
 os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_READ_ONLY", "0")
 
 from app.main import app
+from app.models import ScreenerParams
 from app.store import store
 
 client = TestClient(app)
@@ -382,3 +383,121 @@ def test_backtest_run_full_market_daily_matrix_path(monkeypatch: pytest.MonkeyPa
     assert body["range"]["date_from"] == date_from
     assert body["range"]["date_to"] == date_to
     assert any("矩阵引擎已启用" in note for note in body["notes"])
+
+
+def test_backtest_run_full_market_position_matrix_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-20]
+    date_to = dates[-12]
+
+    def _fake_universe(*args, **kwargs):  # noqa: ANN002, ANN003
+        scan_dates = store._build_backtest_scan_dates(date_from, date_to)
+        allowed = {day: {"sz300750"} for day in scan_dates}
+        refresh_dates = kwargs.get("refresh_dates")
+        refresh_used = list(refresh_dates) if refresh_dates else [scan_dates[0]]
+        return ["sz300750"], allowed, ["mock position matrix universe"], scan_dates, refresh_used
+
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_ENGINE", "1")
+    monkeypatch.setattr(store, "_build_full_market_rolling_universe", _fake_universe)
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "position",
+        "date_from": date_from,
+        "date_to": date_to,
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+    }
+
+    resp = client.post("/api/backtest/run", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["range"]["date_from"] == date_from
+    assert body["range"]["date_to"] == date_to
+    assert any("矩阵引擎已启用" in note for note in body["notes"])
+
+
+def test_backtest_run_full_market_weekly_matrix_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-20]
+    date_to = dates[-12]
+
+    def _fake_universe(*args, **kwargs):  # noqa: ANN002, ANN003
+        scan_dates = store._build_backtest_scan_dates(date_from, date_to)
+        allowed = {day: {"sz300750"} for day in scan_dates}
+        refresh_dates = kwargs.get("refresh_dates")
+        refresh_used = list(refresh_dates) if refresh_dates else store._build_weekly_refresh_dates(scan_dates)
+        return ["sz300750"], allowed, ["mock weekly matrix universe"], scan_dates, refresh_used
+
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_ENGINE", "1")
+    monkeypatch.setattr(store, "_build_full_market_rolling_universe", _fake_universe)
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "weekly",
+        "date_from": date_from,
+        "date_to": date_to,
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+    }
+
+    resp = client.post("/api/backtest/run", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["range"]["date_from"] == date_from
+    assert body["range"]["date_to"] == date_to
+    assert any("矩阵引擎已启用" in note for note in body["notes"])
+
+
+def test_backtest_run_trend_pool_weekly_matrix_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-20]
+    date_to = dates[-12]
+
+    def _fake_resolve(run_id: str):  # noqa: ANN001
+        params = ScreenerParams(
+            markets=["sh", "sz"],
+            mode="strict",
+            as_of_date=date_to,
+            return_window_days=40,
+            top_n=500,
+            turnover_threshold=0.05,
+            amount_threshold=500000000,
+            amplitude_threshold=0.03,
+        )
+        return params, run_id, None, None
+
+    def _fake_build(*args, **kwargs):  # noqa: ANN002, ANN003
+        scan_dates = store._build_backtest_scan_dates(date_from, date_to)
+        allowed = {day: {"sz300750"} for day in scan_dates}
+        refresh_dates = kwargs.get("refresh_dates")
+        if refresh_dates:
+            refresh_used = list(refresh_dates)
+        else:
+            refresh_used = store._build_weekly_refresh_dates(scan_dates)
+        return ["sz300750"], allowed, ["mock trend_pool matrix universe"], scan_dates, refresh_used
+
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_ENGINE", "1")
+    monkeypatch.setattr(store, "_resolve_backtest_trend_pool_params", _fake_resolve)
+    monkeypatch.setattr(store, "_build_trend_pool_rolling_universe", _fake_build)
+
+    payload = {
+        "mode": "trend_pool",
+        "run_id": "mock-run",
+        "pool_roll_mode": "weekly",
+        "date_from": date_from,
+        "date_to": date_to,
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+    }
+
+    resp = client.post("/api/backtest/run", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["range"]["date_from"] == date_from
+    assert body["range"]["date_to"] == date_to
+    assert any("矩阵引擎已启用" in note for note in body["notes"])
+    assert any("使用筛选任务: mock-run" in note for note in body["notes"])
