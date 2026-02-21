@@ -1,0 +1,169 @@
+﻿from __future__ import annotations
+
+from pathlib import Path
+import sys
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.core.backtest_matrix_engine import BacktestMatrixEngine, MatrixBundle
+from app.core.backtest_signal_matrix import compute_backtest_signal_matrix
+from app.models import CandlePoint
+
+
+def _candle(day: str, close: float, volume: int = 1000) -> CandlePoint:
+    return CandlePoint(
+        time=day,
+        open=close * 0.99,
+        high=close * 1.02,
+        low=close * 0.98,
+        close=close,
+        volume=volume,
+        amount=float(close * volume),
+        price_source='vwap',
+    )
+
+
+def test_matrix_bundle_shape_and_valid_mask(tmp_path: Path) -> None:
+    engine = BacktestMatrixEngine(cache_dir=tmp_path)
+
+    candles_map = {
+        'sh600000': [
+            _candle('2025-12-29', 10.0),
+            _candle('2025-12-30', 10.2),
+            _candle('2025-12-31', 10.4),
+            _candle('2026-01-02', 10.6),
+        ],
+        'sz000001': [
+            _candle('2025-12-30', 8.0),
+            _candle('2025-12-31', 8.1),
+            _candle('2026-01-02', 8.2),
+        ],
+    }
+
+    def _get_candles(symbol: str):
+        return candles_map.get(symbol, [])
+
+    key = engine.build_cache_key(
+        symbols=['sh600000', 'sz000001'],
+        date_from='2025-12-31',
+        date_to='2026-01-02',
+        data_version='tdx_only|bars=500',
+        window_set=(10, 20, 60),
+        algo_version='matrix-v1',
+    )
+    bundle, cache_hit = engine.build_bundle(
+        symbols=['sh600000', 'sz000001'],
+        get_candles=_get_candles,
+        date_from='2025-12-31',
+        date_to='2026-01-02',
+        max_lookback_days=60,
+        cache_key=key,
+        use_cache=True,
+    )
+
+    assert cache_hit is False
+    assert bundle.shape() == (4, 2)
+    # sh600000 在 2025-12-29 有值；sz000001 在该日缺失。
+    assert bool(bundle.valid_mask[0, 0]) is True
+    assert bool(bundle.valid_mask[0, 1]) is False
+
+
+def test_matrix_cache_hit_roundtrip(tmp_path: Path) -> None:
+    engine = BacktestMatrixEngine(cache_dir=tmp_path)
+
+    candles_map = {
+        'sh600000': [_candle('2026-01-02', 10.0), _candle('2026-01-03', 10.1)],
+    }
+
+    def _get_candles(symbol: str):
+        return candles_map.get(symbol, [])
+
+    key = engine.build_cache_key(
+        symbols=['sh600000'],
+        date_from='2026-01-02',
+        date_to='2026-01-03',
+        data_version='tdx_only|bars=500',
+        window_set=(10, 20, 60),
+        algo_version='matrix-v1',
+    )
+
+    first_bundle, first_hit = engine.build_bundle(
+        symbols=['sh600000'],
+        get_candles=_get_candles,
+        date_from='2026-01-02',
+        date_to='2026-01-03',
+        max_lookback_days=60,
+        cache_key=key,
+        use_cache=True,
+    )
+    second_bundle, second_hit = engine.build_bundle(
+        symbols=['sh600000'],
+        get_candles=_get_candles,
+        date_from='2026-01-02',
+        date_to='2026-01-03',
+        max_lookback_days=60,
+        cache_key=key,
+        use_cache=True,
+    )
+
+    assert first_hit is False
+    assert second_hit is True
+    assert first_bundle.dates == second_bundle.dates
+    assert first_bundle.symbols == second_bundle.symbols
+    assert np.allclose(first_bundle.close, second_bundle.close, equal_nan=True)
+
+
+def test_signal_matrix_shape_and_missing_handling() -> None:
+    dates = ['2026-01-01', '2026-01-02', '2026-01-03']
+    symbols = ['sh600000', 'sz000001']
+
+    close = np.asarray(
+        [
+            [10.0, 20.0],
+            [10.1, np.nan],
+            [10.2, 20.2],
+        ],
+        dtype=np.float64,
+    )
+    open_ = close * 0.99
+    high = close * 1.02
+    low = close * 0.98
+    volume = np.asarray(
+        [
+            [1000.0, 2000.0],
+            [1100.0, np.nan],
+            [1200.0, 2100.0],
+        ],
+        dtype=np.float64,
+    )
+    valid_mask = np.asarray(
+        [
+            [True, True],
+            [True, False],
+            [True, True],
+        ],
+        dtype=bool,
+    )
+
+    bundle = MatrixBundle(
+        dates=dates,
+        symbols=symbols,
+        open=open_,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+        valid_mask=valid_mask,
+    )
+    matrix = compute_backtest_signal_matrix(bundle, top_n=2)
+
+    assert matrix.buy_signal.shape == (3, 2)
+    assert matrix.sell_signal.shape == (3, 2)
+    assert matrix.score.shape == (3, 2)
+    assert bool(matrix.buy_signal[1, 1]) is False
+    assert bool(matrix.sell_signal[1, 1]) is False
+    assert float(matrix.score[1, 1]) == 0.0

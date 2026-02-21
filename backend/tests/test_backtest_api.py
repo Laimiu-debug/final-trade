@@ -351,3 +351,34 @@ def test_backtest_task_rejects_when_candle_coverage_insufficient(monkeypatch: py
     assert body["code"] == "BACKTEST_DATA_COVERAGE_INSUFFICIENT"
     assert "2025-01-01" in body["message"]
     assert "2025-11-03" in body["message"]
+
+
+def test_backtest_run_full_market_daily_matrix_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-10]
+    date_to = dates[-6]
+
+    def _fake_universe(*args, **kwargs):  # noqa: ANN002, ANN003
+        scan_dates = store._build_backtest_scan_dates(date_from, date_to)
+        allowed = {day: {"sz300750"} for day in scan_dates}
+        return ["sz300750"], allowed, ["mock matrix universe"], scan_dates, scan_dates
+
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_ENGINE", "1")
+    monkeypatch.setattr(store, "_build_full_market_rolling_universe", _fake_universe)
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "daily",
+        "date_from": date_from,
+        "date_to": date_to,
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+    }
+
+    resp = client.post("/api/backtest/run", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["range"]["date_from"] == date_from
+    assert body["range"]["date_to"] == date_to
+    assert any("矩阵引擎已启用" in note for note in body["notes"])

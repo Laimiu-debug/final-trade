@@ -101,6 +101,8 @@ from .utils.text_utils import TextProcessor, URLUtils
 from .core.signal_analyzer import SignalAnalyzer, WYCKOFF_ACC_EVENTS, WYCKOFF_RISK_EVENTS, WYCKOFF_EVENT_ORDER
 from .core.ai_analyzer import AIAnalyzer, create_ai_analyzer
 from .core.backtest_engine import BacktestEngine
+from .core.backtest_matrix_engine import BacktestMatrixEngine
+from .core.backtest_signal_matrix import compute_backtest_signal_matrix
 from .core.wyckoff_event_store import WyckoffEventStore, build_wyckoff_params_hash
 from .core.screener import ScreenerEngine, create_screener_engine, THEME_STAGES
 from .core.candle_analyzer import CandleAnalyzer, create_candle_analyzer
@@ -153,6 +155,8 @@ class InMemoryStore:
         self._backtest_running_worker_ids: set[str] = set()
         self._backtest_task_state_path = self._resolve_backtest_task_state_path()
         self._backtest_task_state_last_persist_at = 0.0
+        self._backtest_matrix_engine = BacktestMatrixEngine()
+        self._backtest_matrix_algo_version = os.getenv("TDX_TREND_BACKTEST_MATRIX_ALGO_VERSION", "").strip() or "matrix-v1"
         self._wyckoff_event_store_enabled = self._env_flag("TDX_TREND_WYCKOFF_STORE_ENABLED", True)
         self._wyckoff_event_store_read_only = self._env_flag("TDX_TREND_WYCKOFF_STORE_READ_ONLY", False)
         self._wyckoff_event_algo_version = os.getenv("TDX_TREND_WYCKOFF_ALGO_VERSION", "").strip() or "wyckoff-v1"
@@ -4260,6 +4264,110 @@ class InMemoryStore:
             notes.append(f"有 {empty_days} 个交易日筛选为空，当日不会产生候选信号。")
         return sorted(symbols_union), allowed_symbols_by_date, notes, scan_dates, refresh_dates_used
 
+    def _is_backtest_matrix_engine_enabled(self) -> bool:
+        return self._env_flag("TDX_TREND_BACKTEST_MATRIX_ENGINE", False)
+
+    def _run_backtest_matrix_full_market_daily(
+        self,
+        *,
+        payload: BacktestRunRequest,
+        board_filters: list[BoardFilter],
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+    ) -> BacktestResponse:
+        rolling_symbols, rolling_allowed_by_date, pool_notes, scan_dates, _ = self._build_full_market_rolling_universe(
+            payload=payload,
+            board_filters=board_filters,
+            refresh_dates=None,
+            progress_callback=progress_callback,
+        )
+        if not rolling_symbols:
+            reason_text = "；".join(pool_notes) if pool_notes else "滚动筛选结果为空。"
+            raise ValueError(f"回测股票池为空：{reason_text}")
+        self._validate_backtest_data_coverage(
+            payload,
+            rolling_symbols,
+            scope_label="滚动池并集",
+        )
+
+        matrix_windows = tuple(sorted(set([10, 20, 40, 60, max(20, int(payload.window_days))])))
+        data_version = (
+            f"{self._config.market_data_source}|bars={int(self._config.candles_window_bars)}|"
+            f"wy={self._wyckoff_event_data_version}"
+        )
+        cache_key = self._backtest_matrix_engine.build_cache_key(
+            symbols=rolling_symbols,
+            date_from=payload.date_from,
+            date_to=payload.date_to,
+            data_version=data_version,
+            window_set=matrix_windows,
+            algo_version=self._backtest_matrix_algo_version,
+        )
+        bundle, cache_hit = self._backtest_matrix_engine.build_bundle(
+            symbols=rolling_symbols,
+            get_candles=self._ensure_candles,
+            date_from=payload.date_from,
+            date_to=payload.date_to,
+            max_lookback_days=max(matrix_windows),
+            cache_key=cache_key,
+            use_cache=True,
+        )
+        if not bundle.dates or not bundle.symbols:
+            raise ValueError("矩阵引擎未构建出有效数据，请检查K线覆盖范围。")
+
+        signal_matrix = compute_backtest_signal_matrix(
+            bundle,
+            top_n=max(50, min(2000, int(self._config.top_n))),
+        )
+        if progress_callback is not None:
+            progress_callback(
+                payload.date_to,
+                max(1, len(scan_dates)),
+                max(1, len(scan_dates)),
+                "矩阵信号计算完成，开始执行回测撮合...",
+            )
+
+        engine = BacktestEngine(
+            get_candles=self._ensure_candles,
+            build_row=self._build_row_from_candles,
+            calc_snapshot=lambda row, window_days, as_of_date: self._calc_wyckoff_snapshot(
+                row,
+                window_days=window_days,
+                as_of_date=as_of_date,
+            ),
+            resolve_symbol_name=self._resolve_symbol_name,
+        )
+        result = engine.run(
+            payload=payload,
+            symbols=rolling_symbols,
+            allowed_symbols_by_date=rolling_allowed_by_date,
+            matrix_bundle=bundle,
+            matrix_signals=signal_matrix,
+        )
+
+        shape_t, shape_n = bundle.shape()
+        matrix_notes = [
+            (
+                "矩阵引擎已启用："
+                f"shape={shape_t}x{shape_n}，windows={list(matrix_windows)}，"
+                f"cache={'hit' if cache_hit else 'miss'}，key={cache_key[:12]}..."
+            ),
+        ]
+
+        notes = [*matrix_notes, *pool_notes, *list(result.notes)]
+        if board_filters:
+            notes.insert(0, f"候选池板块过滤: {','.join(board_filters)}（每日滚动生效）")
+        notes.insert(
+            0,
+            self._build_backtest_param_snapshot_note(
+                payload,
+                resolved_run_id=None,
+                board_filters=board_filters,
+            ),
+        )
+        if notes != result.notes:
+            result = result.model_copy(update={"notes": notes})
+        return result
+
     def _summarize_backtest_candle_coverage(
         self,
         *,
@@ -4387,6 +4495,21 @@ class InMemoryStore:
         progress_callback: Callable[[str, int, int, str], None] | None = None,
     ) -> BacktestResponse:
         board_filters = [item for item in payload.board_filters if item in {"main", "gem", "star", "beijing", "st"}]
+        matrix_fallback_note: str | None = None
+        if (
+            self._is_backtest_matrix_engine_enabled()
+            and payload.mode == "full_market"
+            and payload.pool_roll_mode == "daily"
+        ):
+            try:
+                return self._run_backtest_matrix_full_market_daily(
+                    payload=payload,
+                    board_filters=board_filters,
+                    progress_callback=progress_callback,
+                )
+            except Exception as exc:
+                matrix_fallback_note = f"矩阵引擎执行失败，已回退旧路径：{exc}"
+
         degraded_reason: str | None = None
         resolved_run_id: str | None = None
         trend_pool_params: ScreenerParams | None = None
@@ -4400,6 +4523,8 @@ class InMemoryStore:
             ) = self._resolve_backtest_trend_pool_params(payload.run_id)
 
         pool_notes: list[str] = []
+        if matrix_fallback_note:
+            pool_notes.append(matrix_fallback_note)
         if trend_pool_fallback_note:
             pool_notes.append(trend_pool_fallback_note)
 

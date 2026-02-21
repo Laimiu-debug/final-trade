@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+import numpy as np
+
 from ..models import (
     BacktestResponse,
     BacktestRunRequest,
@@ -18,6 +20,8 @@ from ..models import (
     ReviewStats,
     SimTradingConfig,
 )
+from .backtest_matrix_engine import MatrixBundle
+from .backtest_signal_matrix import BacktestSignalMatrix
 
 ENTRY_EVENT_WEIGHTS: dict[str, float] = {
     "PS": 1.0,
@@ -204,6 +208,198 @@ class BacktestEngine:
         fallback_index = last_sellable_index if last_sellable_index is not None else (len(candles) - 1)
         return fallback_index, float(candles[fallback_index].close), "eod_exit"
 
+    @staticmethod
+    def _resolve_exit_matrix(
+        *,
+        dates: list[str],
+        entry_index: int,
+        entry_date: str,
+        entry_price: float,
+        high_col: np.ndarray,
+        low_col: np.ndarray,
+        close_col: np.ndarray,
+        valid_col: np.ndarray,
+        sell_col: np.ndarray,
+        payload: BacktestRunRequest,
+    ) -> tuple[int, float, str] | None:
+        if entry_index >= len(dates):
+            return None
+        if (not math.isfinite(entry_price)) or entry_price <= 0:
+            return None
+
+        stop_price = entry_price * (1 - payload.stop_loss) if payload.stop_loss > 0 else None
+        take_price = entry_price * (1 + payload.take_profit) if payload.take_profit > 0 else None
+        last_sellable_index: int | None = None
+
+        for bar_index in range(entry_index, len(dates)):
+            if not bool(valid_col[bar_index]):
+                continue
+            day = str(dates[bar_index])
+            if payload.enforce_t1 and day <= entry_date:
+                continue
+            last_sellable_index = bar_index
+
+            low_price = float(low_col[bar_index])
+            high_price = float(high_col[bar_index])
+            close_price = float(close_col[bar_index])
+            if not (math.isfinite(low_price) and math.isfinite(high_price) and math.isfinite(close_price)):
+                continue
+            if low_price <= 0 or high_price <= 0 or close_price <= 0:
+                continue
+
+            if stop_price is not None and low_price <= stop_price:
+                return bar_index, float(stop_price), "stop_loss"
+            if take_price is not None and high_price >= take_price:
+                return bar_index, float(take_price), "take_profit"
+            if bool(sell_col[bar_index]):
+                return bar_index, float(close_price), "event_exit:MATRIX_SELL"
+            if (bar_index - entry_index + 1) >= payload.max_hold_days:
+                return bar_index, float(close_price), "time_exit"
+
+        if payload.enforce_t1 and last_sellable_index is None:
+            return None
+        fallback_index = last_sellable_index if last_sellable_index is not None else (len(dates) - 1)
+        fallback_price = float(close_col[fallback_index]) if math.isfinite(float(close_col[fallback_index])) else entry_price
+        if fallback_price <= 0:
+            fallback_price = entry_price
+        return fallback_index, fallback_price, "eod_exit"
+
+    def _build_candidates_from_matrix(
+        self,
+        *,
+        payload: BacktestRunRequest,
+        symbols: list[str],
+        start_date: str,
+        end_date: str,
+        matrix_bundle: MatrixBundle,
+        matrix_signals: BacktestSignalMatrix,
+        allowed_symbols_by_date: dict[str, set[str]] | None = None,
+    ) -> tuple[list[CandidateTrade], int]:
+        dates = list(matrix_bundle.dates)
+        if not dates:
+            return [], 0
+
+        total_shape = (len(dates), len(matrix_bundle.symbols))
+        if (
+            matrix_bundle.open.shape != total_shape
+            or matrix_bundle.high.shape != total_shape
+            or matrix_bundle.low.shape != total_shape
+            or matrix_bundle.close.shape != total_shape
+            or matrix_bundle.valid_mask.shape != total_shape
+            or matrix_signals.buy_signal.shape != total_shape
+            or matrix_signals.sell_signal.shape != total_shape
+            or matrix_signals.score.shape != total_shape
+        ):
+            raise ValueError("matrix bundle / signals shape mismatch")
+
+        in_range_indexes = [
+            idx for idx, day in enumerate(dates) if start_date <= day <= end_date
+        ]
+        if len(in_range_indexes) < 2:
+            return [], 0
+
+        symbol_to_col = matrix_bundle.symbol_to_index()
+        out: list[CandidateTrade] = []
+        t1_no_sellable_skips = 0
+
+        for raw_symbol in symbols:
+            symbol = str(raw_symbol).strip().lower()
+            col = symbol_to_col.get(symbol)
+            if col is None:
+                continue
+
+            open_col = matrix_bundle.open[:, col]
+            high_col = matrix_bundle.high[:, col]
+            low_col = matrix_bundle.low[:, col]
+            close_col = matrix_bundle.close[:, col]
+            valid_col = matrix_bundle.valid_mask[:, col]
+
+            buy_col = matrix_signals.buy_signal[:, col]
+            sell_col = matrix_signals.sell_signal[:, col]
+            score_col = matrix_signals.score[:, col]
+
+            cursor = 0
+            while cursor < len(in_range_indexes) - 1:
+                signal_index = in_range_indexes[cursor]
+                signal_day = dates[signal_index]
+                if not bool(valid_col[signal_index]):
+                    cursor += 1
+                    continue
+                if allowed_symbols_by_date is not None:
+                    allowed_today = allowed_symbols_by_date.get(signal_day, set())
+                    if symbol not in allowed_today:
+                        cursor += 1
+                        continue
+                if not bool(buy_col[signal_index]):
+                    cursor += 1
+                    continue
+
+                entry_index = signal_index + 1
+                if entry_index >= len(dates):
+                    break
+                if not bool(valid_col[entry_index]):
+                    cursor += 1
+                    continue
+
+                entry_price = float(open_col[entry_index])
+                if (not math.isfinite(entry_price)) or entry_price <= 0:
+                    cursor += 1
+                    continue
+
+                exit_resolved = self._resolve_exit_matrix(
+                    dates=dates,
+                    entry_index=entry_index,
+                    entry_date=dates[entry_index],
+                    entry_price=entry_price,
+                    high_col=high_col,
+                    low_col=low_col,
+                    close_col=close_col,
+                    valid_col=valid_col,
+                    sell_col=sell_col,
+                    payload=payload,
+                )
+                if exit_resolved is None:
+                    t1_no_sellable_skips += 1
+                    cursor += 1
+                    continue
+
+                exit_index, exit_price, exit_reason = exit_resolved
+                entry_tags: list[str] = []
+                if bool(matrix_signals.s5[signal_index, col]):
+                    entry_tags.append("M5")
+                if bool(matrix_signals.s6[signal_index, col]):
+                    entry_tags.append("M6")
+                if not entry_tags:
+                    entry_tags.append("MATRIX")
+                entry_phase = "鍚哥D" if bool(matrix_signals.s7[signal_index, col]) else "闃舵鏈槑"
+                entry_quality_score = float(score_col[signal_index]) if math.isfinite(float(score_col[signal_index])) else 0.0
+
+                out.append(
+                    CandidateTrade(
+                        symbol=symbol,
+                        signal_date=dates[signal_index],
+                        entry_date=dates[entry_index],
+                        exit_date=dates[exit_index],
+                        entry_signal=" / ".join(entry_tags),
+                        entry_phase=entry_phase,
+                        entry_quality_score=max(0.0, min(100.0, entry_quality_score)),
+                        entry_phase_score=float(PHASE_PRIORITY_SCORE.get(entry_phase, 0.0)),
+                        entry_events_weight=float(len(entry_tags)),
+                        entry_structure_score=int(bool(matrix_signals.in_pool[signal_index, col])),
+                        entry_trend_score=max(0.0, min(100.0, entry_quality_score)),
+                        entry_volatility_score=max(0.0, min(100.0, entry_quality_score)),
+                        entry_price=entry_price,
+                        exit_price=float(exit_price),
+                        holding_days=max(0, exit_index - entry_index + 1),
+                        exit_reason=exit_reason,
+                    )
+                )
+
+                while cursor < len(in_range_indexes) and in_range_indexes[cursor] <= exit_index:
+                    cursor += 1
+
+        return out, t1_no_sellable_skips
+
     def _build_candidates_for_symbol(
         self,
         symbol: str,
@@ -335,6 +531,8 @@ class BacktestEngine:
         payload: BacktestRunRequest,
         symbols: list[str],
         allowed_symbols_by_date: dict[str, set[str]] | None = None,
+        matrix_bundle: MatrixBundle | None = None,
+        matrix_signals: BacktestSignalMatrix | None = None,
     ) -> BacktestResponse:
         start_dt = self._parse_date(payload.date_from)
         end_dt = self._parse_date(payload.date_to)
@@ -346,18 +544,30 @@ class BacktestEngine:
         end_date = end_dt.strftime("%Y-%m-%d")
 
         notes: list[str] = []
-        candidates: list[CandidateTrade] = []
-        total_t1_skips = 0
-        for symbol in symbols:
-            rows, t1_skips = self._build_candidates_for_symbol(
-                symbol,
-                payload,
-                start_date,
-                end_date,
+        if matrix_bundle is not None and matrix_signals is not None:
+            candidates, total_t1_skips = self._build_candidates_from_matrix(
+                payload=payload,
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+                matrix_bundle=matrix_bundle,
+                matrix_signals=matrix_signals,
                 allowed_symbols_by_date=allowed_symbols_by_date,
             )
-            candidates.extend(rows)
-            total_t1_skips += t1_skips
+            notes.append("鐭╅樀淇″彿寮曟搸: 浣跨敤 (T,N) 淇″彿鍒囩墖璺緞锛岃烦杩囬€愯偂閫愭棩 snapshot 閲嶇畻銆?")
+        else:
+            candidates = []
+            total_t1_skips = 0
+            for symbol in symbols:
+                rows, t1_skips = self._build_candidates_for_symbol(
+                    symbol,
+                    payload,
+                    start_date,
+                    end_date,
+                    allowed_symbols_by_date=allowed_symbols_by_date,
+                )
+                candidates.extend(rows)
+                total_t1_skips += t1_skips
         if total_t1_skips > 0:
             notes.append(f"T+1 约束下有 {total_t1_skips} 笔信号因样本内无可卖出日被跳过。")
 
