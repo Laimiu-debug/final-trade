@@ -1,4 +1,4 @@
-import { apiRequest } from '@/shared/api/client'
+import { ApiError, apiRequest } from '@/shared/api/client'
 import type {
   AIAnalysisRecord,
   AIProviderTestRequest,
@@ -264,13 +264,51 @@ export function runBacktest(payload: BacktestRunRequest) {
   })
 }
 
-export function runBacktestPlateau(payload: BacktestPlateauRunRequest) {
-  return apiRequest<BacktestPlateauResponse>('/api/backtest/plateau', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-    timeoutMs: 600_000,
+const BACKTEST_PLATEAU_LEGACY_POLL_INTERVAL_MS = 1_500
+const BACKTEST_PLATEAU_LEGACY_MAX_WAIT_MS = 12 * 60 * 60 * 1000
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    globalThis.setTimeout(resolve, Math.max(0, Number(ms) || 0))
   })
+}
+
+async function waitBacktestPlateauTaskResult(taskId: string): Promise<BacktestPlateauResponse> {
+  const deadline = Date.now() + BACKTEST_PLATEAU_LEGACY_MAX_WAIT_MS
+  while (true) {
+    const status = await getBacktestPlateauTask(taskId)
+    if (status.status === 'succeeded') {
+      if (status.result) return status.result
+      throw new ApiError({
+        code: 'BACKTEST_PLATEAU_TASK_EMPTY_RESULT',
+        message: '收益平原任务已完成，但未返回结果。',
+      })
+    }
+    if (status.status === 'failed') {
+      throw new ApiError({
+        code: status.error_code || 'BACKTEST_PLATEAU_TASK_FAILED',
+        message: status.error || '收益平原任务失败',
+      })
+    }
+    if (status.status === 'cancelled') {
+      throw new ApiError({
+        code: 'BACKTEST_PLATEAU_TASK_CANCELLED',
+        message: '收益平原任务已停止',
+      })
+    }
+    if (Date.now() >= deadline) {
+      throw new ApiError({
+        code: 'BACKTEST_PLATEAU_TASK_POLL_TIMEOUT',
+        message: '收益平原任务等待超时，请在任务列表继续查看进度。',
+      })
+    }
+    await sleep(BACKTEST_PLATEAU_LEGACY_POLL_INTERVAL_MS)
+  }
+}
+
+export async function runBacktestPlateau(payload: BacktestPlateauRunRequest) {
+  const started = await startBacktestPlateauTask(payload)
+  return waitBacktestPlateauTaskResult(started.task_id)
 }
 
 export function startBacktestPlateauTask(payload: BacktestPlateauRunRequest) {
