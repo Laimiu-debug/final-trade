@@ -26,7 +26,6 @@ import { Link } from 'react-router-dom'
 import { ApiError } from '@/shared/api/client'
 import {
   cancelBacktestTask,
-  getLatestScreenerRun,
   pauseBacktestTask,
   runBacktestPlateau,
   resumeBacktestTask,
@@ -77,6 +76,41 @@ const BACKTEST_FORM_CACHE_KEY = 'tdx-trend-backtest-form-v2'
 const WY_EVENTS = ['PS', 'SC', 'AR', 'ST', 'TSO', 'Spring', 'SOS', 'JOC', 'LPS', 'UTAD', 'SOW', 'LPSY']
 const BACKTEST_DEFAULT_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star']
 const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 'st']
+type BacktestPlateauTableRow = BacktestPlateauPoint & { __rowKey: string; __rank: number }
+type PlateauAxisKey =
+  | 'window_days'
+  | 'min_score'
+  | 'stop_loss'
+  | 'take_profit'
+  | 'max_positions'
+  | 'position_pct'
+  | 'max_symbols'
+  | 'priority_topk_per_day'
+type PlateauMetricKey = 'score' | 'total_return'
+
+const PLATEAU_AXIS_OPTIONS: Array<{ value: PlateauAxisKey; label: string }> = [
+  { value: 'window_days', label: '信号窗口天数' },
+  { value: 'min_score', label: '最低评分' },
+  { value: 'stop_loss', label: '止损比例(%)' },
+  { value: 'take_profit', label: '止盈比例(%)' },
+  { value: 'max_positions', label: '最大并发持仓' },
+  { value: 'position_pct', label: '单笔仓位占比(%)' },
+  { value: 'max_symbols', label: '最大股票数' },
+  { value: 'priority_topk_per_day', label: '同日TopK' },
+]
+
+const PLATEAU_METRIC_OPTIONS: Array<{ value: PlateauMetricKey; label: string }> = [
+  { value: 'score', label: '评分' },
+  { value: 'total_return', label: '总收益率' },
+]
+
+const PLATEAU_AXIS_LABEL_MAP: Record<PlateauAxisKey, string> = Object.fromEntries(
+  PLATEAU_AXIS_OPTIONS.map((item) => [item.value, item.label]),
+) as Record<PlateauAxisKey, string>
+
+const PLATEAU_METRIC_LABEL_MAP: Record<PlateauMetricKey, string> = Object.fromEntries(
+  PLATEAU_METRIC_OPTIONS.map((item) => [item.value, item.label]),
+) as Record<PlateauMetricKey, string>
 
 type BacktestFormDraft = {
   mode: SignalScanMode
@@ -162,6 +196,68 @@ function parseNumericList(
     result.push(value)
   }
   return result
+}
+
+function buildPlateauRowKey(row: BacktestPlateauPoint, index: number) {
+  const params = row.params
+  return [
+    params.window_days,
+    Number(params.min_score).toFixed(4),
+    Number(params.stop_loss).toFixed(6),
+    Number(params.take_profit).toFixed(6),
+    params.max_positions,
+    Number(params.position_pct).toFixed(6),
+    params.max_symbols,
+    params.priority_topk_per_day,
+    index,
+  ].join('|')
+}
+
+function buildPlateauParamsKey(point: BacktestPlateauPoint): string {
+  const params = point.params
+  return [
+    params.window_days,
+    Number(params.min_score).toFixed(4),
+    Number(params.stop_loss).toFixed(6),
+    Number(params.take_profit).toFixed(6),
+    params.max_positions,
+    Number(params.position_pct).toFixed(6),
+    params.max_symbols,
+    params.priority_topk_per_day,
+  ].join('|')
+}
+
+function getPlateauAxisRawValue(point: BacktestPlateauPoint, axis: PlateauAxisKey): number {
+  if (axis === 'window_days') return Number(point.params.window_days)
+  if (axis === 'min_score') return Number(point.params.min_score)
+  if (axis === 'stop_loss') return Number(point.params.stop_loss) * 100
+  if (axis === 'take_profit') return Number(point.params.take_profit) * 100
+  if (axis === 'max_positions') return Number(point.params.max_positions)
+  if (axis === 'position_pct') return Number(point.params.position_pct) * 100
+  if (axis === 'max_symbols') return Number(point.params.max_symbols)
+  return Number(point.params.priority_topk_per_day)
+}
+
+function formatPlateauAxisCategory(axis: PlateauAxisKey, value: number): string {
+  if (axis === 'window_days' || axis === 'max_positions' || axis === 'max_symbols' || axis === 'priority_topk_per_day') {
+    return String(Math.round(value))
+  }
+  if (axis === 'min_score') return Number(value).toFixed(2)
+  return `${Number(value).toFixed(2)}%`
+}
+
+function getPlateauMetricValue(point: BacktestPlateauPoint, metric: PlateauMetricKey): number {
+  if (metric === 'score') return Number(point.score)
+  return Number(point.stats.total_return)
+}
+
+function formatPlateauMetricValue(metric: PlateauMetricKey, value: number): string {
+  if (metric === 'score') return Number(value).toFixed(3)
+  return formatPct(Number(value))
+}
+
+function buildPlateauCellKey(xValue: number, yValue: number): string {
+  return `${Number(xValue).toFixed(6)}|${Number(yValue).toFixed(6)}`
 }
 
 function sanitizeBoardFilters(raw: unknown): BoardFilter[] {
@@ -361,7 +457,7 @@ const tradeColumns: ColumnsType<BacktestTrade> = [
   },
 ]
 
-const plateauColumns: ColumnsType<BacktestPlateauPoint> = [
+const plateauColumns: ColumnsType<BacktestPlateauTableRow> = [
   {
     title: '评分',
     dataIndex: 'score',
@@ -467,6 +563,15 @@ export function BacktestPage() {
   const [plateauResult, setPlateauResult] = useState<BacktestPlateauResponse | null>(null)
   const [plateauError, setPlateauError] = useState<string | null>(null)
   const [plateauApplyRank, setPlateauApplyRank] = useState(1)
+  const [plateauHeatmapXAxis, setPlateauHeatmapXAxis] = useState<PlateauAxisKey>('window_days')
+  const [plateauHeatmapYAxis, setPlateauHeatmapYAxis] = useState<PlateauAxisKey>('min_score')
+  const [plateauHeatmapMetric, setPlateauHeatmapMetric] = useState<PlateauMetricKey>('score')
+  const [plateauHeatmapShowBestPath, setPlateauHeatmapShowBestPath] = useState(true)
+  const [plateauHeatmapShowCellLabel, setPlateauHeatmapShowCellLabel] = useState(false)
+  const [plateauHeatmapSelectedCoord, setPlateauHeatmapSelectedCoord] = useState<[string, string] | null>(null)
+  const [plateauBrushSelectedKeys, setPlateauBrushSelectedKeys] = useState<string[]>([])
+  const [plateauCandidatePoints, setPlateauCandidatePoints] = useState<BacktestPlateauPoint[]>([])
+  const [plateauCandidatePickRank, setPlateauCandidatePickRank] = useState(1)
   const [tradePage, setTradePage] = useState(1)
   const [tradePageSize, setTradePageSize] = useState(initialDraft.trades_page_size)
   const [runError, setRunError] = useState<string | null>(null)
@@ -619,15 +724,6 @@ export function BacktestPage() {
     },
   })
 
-  const bindLatestRunMutation = useMutation({
-    mutationFn: getLatestScreenerRun,
-    onSuccess: (detail) => {
-      applyRunMeta(detail.run_id, detail.as_of_date?.trim() || undefined)
-      message.success(`已带入最新筛选任务：${detail.run_id}`)
-    },
-    onError: (error) => message.error(formatApiError(error)),
-  })
-
   const controlTaskMutation = useMutation({
     mutationFn: async (payload: { action: 'pause' | 'resume' | 'cancel'; taskId: string }) => {
       if (payload.action === 'pause') return pauseBacktestTask(payload.taskId)
@@ -656,6 +752,21 @@ export function BacktestPage() {
   useEffect(() => {
     setPlateauApplyRank(1)
   }, [plateauResult?.generated_at])
+
+  useEffect(() => {
+    setPlateauHeatmapSelectedCoord(null)
+    setPlateauBrushSelectedKeys([])
+  }, [plateauResult?.generated_at, plateauHeatmapXAxis, plateauHeatmapYAxis, plateauHeatmapMetric])
+
+  useEffect(() => {
+    if (plateauCandidatePoints.length <= 0) {
+      if (plateauCandidatePickRank !== 1) setPlateauCandidatePickRank(1)
+      return
+    }
+    if (plateauCandidatePickRank < 1 || plateauCandidatePickRank > plateauCandidatePoints.length) {
+      setPlateauCandidatePickRank(1)
+    }
+  }, [plateauCandidatePickRank, plateauCandidatePoints.length])
 
   useEffect(() => {
     if (selectedTaskId) return
@@ -758,7 +869,6 @@ export function BacktestPage() {
   }
 
   function handleBindLatestRunId() {
-    if (bindLatestRunMutation.isPending) return
     const cached = readScreenerRunMetaFromStorage()
     if (cached?.runId) {
       applyRunMeta(cached.runId, cached.asOfDate)
@@ -768,7 +878,7 @@ export function BacktestPage() {
       message.success(`已从本地筛选缓存带入任务：${cached.runId}`)
       return
     }
-    bindLatestRunMutation.mutate()
+    message.info('未找到本地筛选缓存，请先在“趋势选股”页执行一次选股，或手动填写 run_id。')
   }
 
   function handleRunPlateau() {
@@ -860,7 +970,7 @@ export function BacktestPage() {
     setPriorityTopK(Number(point.params.priority_topk_per_day))
     setRunError(null)
     const prefix = rankLabel ? `${rankLabel}参数已回填` : '参数已回填'
-    message.success(`${prefix}：window=${point.params.window_days}, min_score=${point.params.min_score.toFixed(2)}`)
+    message.success(`${prefix}：信号窗口=${point.params.window_days}，最低评分=${point.params.min_score.toFixed(2)}`)
   }
 
   const taskRunning = taskStatus?.status === 'running' || taskStatus?.status === 'pending' || taskStatus?.status === 'paused'
@@ -875,111 +985,475 @@ export function BacktestPage() {
     () =>
       plateauValidPoints.slice(0, 20).map((row, idx) => ({
         value: idx + 1,
-        label: `#${idx + 1} | score ${row.score.toFixed(3)} | 收益 ${formatPct(row.stats.total_return)}`,
+        label: `第${idx + 1}名 | 评分 ${row.score.toFixed(3)} | 收益 ${formatPct(row.stats.total_return)}`,
       })),
     [plateauValidPoints],
   )
+  const plateauTableRows = useMemo<BacktestPlateauTableRow[]>(
+    () =>
+      (plateauResult?.points ?? []).map((row, index) => ({
+        ...row,
+        __rank: index + 1,
+        __rowKey: buildPlateauRowKey(row, index),
+      })),
+    [plateauResult?.points],
+  )
   const selectedRankPoint = plateauValidPoints[plateauApplyRank - 1] ?? null
-  const plateauColumnsWithAction: ColumnsType<BacktestPlateauPoint> = [
+  const plateauColumnsWithAction: ColumnsType<BacktestPlateauTableRow> = [
     ...plateauColumns,
     {
       title: '操作',
       key: 'action',
       width: 90,
-      render: (_value, row, index) => (
+      render: (_value, row) => (
         <Button
           size="small"
           disabled={Boolean(row.error)}
-          onClick={() => applyPlateauPointToForm(row, `第${index + 1}名`)}
+          onClick={() => applyPlateauPointToForm(row, `第${row.__rank}名`)}
         >
           回填
         </Button>
       ),
     },
   ]
-  const plateauHeatmapOption = useMemo(() => {
-    const rows = (plateauResult?.points || []).filter((item) => !item.error)
+  const plateauScoreBarOption = useMemo(() => {
+    const rows = plateauValidPoints.slice(0, 30)
     if (rows.length === 0) return null
-    const xAxis = Array.from(new Set(rows.map((row) => row.params.window_days))).sort((a, b) => a - b)
-    const yAxis = Array.from(new Set(rows.map((row) => Number(row.params.min_score.toFixed(2))))).sort((a, b) => a - b)
-    if (xAxis.length <= 1 || yAxis.length <= 1) return null
-    const scoreMap = new Map<string, number>()
-    rows.forEach((row) => {
-      const x = row.params.window_days
-      const y = Number(row.params.min_score.toFixed(2))
-      const key = `${x}|${y}`
-      const prev = scoreMap.get(key)
-      if (typeof prev !== 'number' || row.score > prev) {
-        scoreMap.set(key, row.score)
-      }
-    })
-    const data: Array<[number, number, number]> = []
-    let minScoreValue = Number.POSITIVE_INFINITY
-    let maxScoreValue = Number.NEGATIVE_INFINITY
-    xAxis.forEach((x, xIdx) => {
-      yAxis.forEach((y, yIdx) => {
-        const score = scoreMap.get(`${x}|${y}`)
-        if (typeof score === 'number') {
-          data.push([xIdx, yIdx, Number(score.toFixed(4))])
-          minScoreValue = Math.min(minScoreValue, score)
-          maxScoreValue = Math.max(maxScoreValue, score)
-        }
-      })
-    })
-    if (data.length === 0) return null
-    const visualMin = Number.isFinite(minScoreValue) ? Number(minScoreValue.toFixed(4)) : 0
-    const visualMax = Number.isFinite(maxScoreValue) ? Number(maxScoreValue.toFixed(4)) : 1
     return {
       tooltip: {
-        position: 'top',
-        formatter: (params: { data: [number, number, number] }) => {
-          const [xIdx, yIdx, score] = params.data
-          const windowDays = xAxis[xIdx]
-          const minScore = yAxis[yIdx]
-          return `窗口: ${windowDays}<br/>最低分: ${minScore}<br/>评分: ${score}`
-        },
+        trigger: 'axis',
+        axisPointer: { type: 'shadow' },
       },
       grid: {
-        left: 72,
-        right: 24,
+        left: 56,
+        right: 20,
         top: 24,
-        bottom: 66,
+        bottom: 56,
       },
       xAxis: {
         type: 'category',
-        data: xAxis.map((item) => String(item)),
-        name: 'window_days',
+        data: rows.map((_row, idx) => `第${idx + 1}名`),
       },
       yAxis: {
-        type: 'category',
-        data: yAxis.map((item) => item.toFixed(2)),
-        name: 'min_score',
-      },
-      visualMap: {
-        min: visualMin,
-        max: visualMax,
-        calculable: true,
-        orient: 'horizontal',
-        left: 'center',
-        bottom: 10,
+        type: 'value',
+        name: '评分',
       },
       series: [
         {
-          type: 'heatmap',
-          data,
-          label: {
-            show: false,
-          },
-          emphasis: {
-            itemStyle: {
-              shadowBlur: 8,
-              shadowColor: 'rgba(0, 0, 0, 0.35)',
-            },
+          type: 'bar',
+          data: rows.map((row) => Number(row.score.toFixed(4))),
+          itemStyle: {
+            color: '#0f8b6f',
+            borderRadius: [3, 3, 0, 0],
           },
         },
       ],
     }
-  }, [plateauResult])
+  }, [plateauValidPoints])
+  const plateauHeatmapView = useMemo(() => {
+    const xAxisLabel = PLATEAU_AXIS_LABEL_MAP[plateauHeatmapXAxis]
+    const yAxisLabel = PLATEAU_AXIS_LABEL_MAP[plateauHeatmapYAxis]
+    const metricLabel = PLATEAU_METRIC_LABEL_MAP[plateauHeatmapMetric]
+    const rows = plateauValidPoints
+    if (rows.length === 0) {
+      return {
+        option: null,
+        reason: '暂无可视化数据，请先执行收益平原扫描。',
+        chartHeight: 320,
+        xAxisLabel,
+        yAxisLabel,
+        metricLabel,
+        pointByCategory: new Map<string, BacktestPlateauPoint>(),
+        cellKeyByDataIndex: [] as string[],
+      }
+    }
+    if (plateauHeatmapXAxis === plateauHeatmapYAxis) {
+      return {
+        option: null,
+        reason: '横轴与纵轴不能相同，请分别选择不同参数。',
+        chartHeight: 320,
+        xAxisLabel,
+        yAxisLabel,
+        metricLabel,
+        pointByCategory: new Map<string, BacktestPlateauPoint>(),
+        cellKeyByDataIndex: [] as string[],
+      }
+    }
+
+    const xAxisValues = Array.from(
+      new Set(rows.map((row) => getPlateauAxisRawValue(row, plateauHeatmapXAxis))),
+    ).sort((a, b) => a - b)
+    const yAxisValues = Array.from(
+      new Set(rows.map((row) => getPlateauAxisRawValue(row, plateauHeatmapYAxis))),
+    ).sort((a, b) => a - b)
+
+    if (xAxisValues.length <= 1 || yAxisValues.length <= 1) {
+      return {
+        option: null,
+        reason: `当前结果中“${xAxisLabel}”或“${yAxisLabel}”只有一个取值，无法绘制二维方块热力图。`,
+        chartHeight: 320,
+        xAxisLabel,
+        yAxisLabel,
+        metricLabel,
+        pointByCategory: new Map<string, BacktestPlateauPoint>(),
+        cellKeyByDataIndex: [] as string[],
+      }
+    }
+
+    const metricByCell = new Map<string, number>()
+    const bestPointByCell = new Map<string, BacktestPlateauPoint>()
+    rows.forEach((row) => {
+      const xValue = getPlateauAxisRawValue(row, plateauHeatmapXAxis)
+      const yValue = getPlateauAxisRawValue(row, plateauHeatmapYAxis)
+      const metric = getPlateauMetricValue(row, plateauHeatmapMetric)
+      const key = buildPlateauCellKey(xValue, yValue)
+      const prev = metricByCell.get(key)
+      if (typeof prev !== 'number' || metric > prev) {
+        metricByCell.set(key, metric)
+        bestPointByCell.set(key, row)
+      }
+    })
+
+    const xAxisCategories = xAxisValues.map((value) => formatPlateauAxisCategory(plateauHeatmapXAxis, value))
+    const yAxisCategories = yAxisValues.map((value) => formatPlateauAxisCategory(plateauHeatmapYAxis, value))
+    const heatmapData: Array<[string, string, number]> = []
+    const cellKeyByDataIndex: string[] = []
+    const metricByCategory = new Map<string, number>()
+    const pointByCategory = new Map<string, BacktestPlateauPoint>()
+    let minMetricValue = Number.POSITIVE_INFINITY
+    let maxMetricValue = Number.NEGATIVE_INFINITY
+
+    xAxisValues.forEach((xValue) => {
+      yAxisValues.forEach((yValue) => {
+        const metric = metricByCell.get(buildPlateauCellKey(xValue, yValue))
+        if (typeof metric !== 'number') return
+        const xCategory = formatPlateauAxisCategory(plateauHeatmapXAxis, xValue)
+        const yCategory = formatPlateauAxisCategory(plateauHeatmapYAxis, yValue)
+        const categoryKey = `${xCategory}|${yCategory}`
+        const roundedMetric = Number(metric.toFixed(6))
+        heatmapData.push([xCategory, yCategory, roundedMetric])
+        cellKeyByDataIndex.push(categoryKey)
+        metricByCategory.set(categoryKey, roundedMetric)
+        const point = bestPointByCell.get(buildPlateauCellKey(xValue, yValue))
+        if (point) {
+          pointByCategory.set(categoryKey, point)
+        }
+        minMetricValue = Math.min(minMetricValue, roundedMetric)
+        maxMetricValue = Math.max(maxMetricValue, roundedMetric)
+      })
+    })
+
+    if (heatmapData.length === 0) {
+      return {
+        option: null,
+        reason: '当前参数组合没有形成有效二维网格数据，请扩大参数扫描范围后重试。',
+        chartHeight: 320,
+        xAxisLabel,
+        yAxisLabel,
+        metricLabel,
+        pointByCategory: new Map<string, BacktestPlateauPoint>(),
+        cellKeyByDataIndex: [] as string[],
+      }
+    }
+
+    const bestPathData: Array<[string, string]> = []
+    if (plateauHeatmapShowBestPath) {
+      xAxisValues.forEach((xValue) => {
+        let bestMetric = Number.NEGATIVE_INFINITY
+        let bestYCategory: string | null = null
+        yAxisValues.forEach((yValue) => {
+          const metric = metricByCell.get(buildPlateauCellKey(xValue, yValue))
+          if (typeof metric !== 'number') return
+          if (metric > bestMetric) {
+            bestMetric = metric
+            bestYCategory = formatPlateauAxisCategory(plateauHeatmapYAxis, yValue)
+          }
+        })
+        if (bestYCategory) {
+          bestPathData.push([
+            formatPlateauAxisCategory(plateauHeatmapXAxis, xValue),
+            bestYCategory,
+          ])
+        }
+      })
+    }
+
+    const visualMin = Number.isFinite(minMetricValue) ? Number(minMetricValue.toFixed(6)) : 0
+    const visualMax = Number.isFinite(maxMetricValue) ? Number(maxMetricValue.toFixed(6)) : 1
+    const chartHeight = Math.max(320, yAxisCategories.length * 34 + 180)
+    const selectedKey = plateauHeatmapSelectedCoord
+      ? `${plateauHeatmapSelectedCoord[0]}|${plateauHeatmapSelectedCoord[1]}`
+      : ''
+    const selectedCoordData =
+      selectedKey && pointByCategory.has(selectedKey) && plateauHeatmapSelectedCoord
+        ? [[plateauHeatmapSelectedCoord[0], plateauHeatmapSelectedCoord[1]]]
+        : []
+
+    const option = {
+      tooltip: {
+        trigger: 'item',
+        formatter: (params: { value?: [string, string, number] }) => {
+          const value = params?.value
+          if (!Array.isArray(value) || value.length < 3) return ''
+          const [xCategory, yCategory, metric] = value
+          const actualMetric = metricByCategory.get(`${xCategory}|${yCategory}`) ?? Number(metric)
+          return [
+            `${xAxisLabel}: ${xCategory}`,
+            `${yAxisLabel}: ${yCategory}`,
+            `${metricLabel}: ${formatPlateauMetricValue(plateauHeatmapMetric, actualMetric)}`,
+          ].join('<br/>')
+        },
+      },
+      grid: {
+        left: 96,
+        right: 28,
+        top: 30,
+        bottom: 92,
+      },
+      xAxis: {
+        type: 'category',
+        data: xAxisCategories,
+        name: xAxisLabel,
+        nameLocation: 'middle',
+        nameGap: 38,
+      },
+      yAxis: {
+        type: 'category',
+        data: yAxisCategories,
+        name: yAxisLabel,
+        nameLocation: 'middle',
+        nameGap: 62,
+      },
+      visualMap: {
+        min: visualMin,
+        max: visualMax,
+        dimension: 2,
+        calculable: true,
+        orient: 'horizontal',
+        left: 'center',
+        bottom: 18,
+        text: [metricLabel, ''],
+        inRange: {
+          color: ['#dff5e8', '#8fd7b8', '#3aaf87', '#0f8b6f'],
+        },
+      },
+      toolbox: {
+        right: 8,
+        top: 2,
+        feature: {
+          brush: {
+            type: ['rect', 'clear'],
+          },
+        },
+      },
+      brush: {
+        xAxisIndex: 'all',
+        yAxisIndex: 'all',
+        brushLink: 'all',
+        inBrush: {
+          opacity: 1,
+        },
+        outOfBrush: {
+          opacity: 0.25,
+        },
+      },
+      series: [
+        {
+          type: 'heatmap',
+          data: heatmapData,
+          itemStyle: {
+            borderColor: 'rgba(255,255,255,0.9)',
+            borderWidth: 1,
+          },
+          label: {
+            show: plateauHeatmapShowCellLabel,
+            color: '#123026',
+            fontSize: 10,
+            formatter: (params: { value?: [string, string, number] }) => {
+              const metric = Number(params?.value?.[2] ?? 0)
+              return formatPlateauMetricValue(plateauHeatmapMetric, metric)
+            },
+          },
+          emphasis: {
+            itemStyle: {
+              shadowBlur: 10,
+              shadowColor: 'rgba(15, 139, 111, 0.35)',
+            },
+          },
+          z: 1,
+        },
+        ...(bestPathData.length > 0
+          ? [
+              {
+                type: 'line',
+                data: bestPathData,
+                showSymbol: true,
+                symbol: 'diamond',
+                symbolSize: 9,
+                lineStyle: {
+                  color: '#fa8c16',
+                  width: 2,
+                },
+                itemStyle: {
+                  color: '#fa8c16',
+                  borderColor: '#fff',
+                  borderWidth: 1,
+                },
+                z: 3,
+              },
+            ]
+          : []),
+        ...(selectedCoordData.length > 0
+          ? [
+              {
+                type: 'scatter',
+                data: selectedCoordData,
+                symbol: 'roundRect',
+                symbolSize: 14,
+                itemStyle: {
+                  color: '#f5222d',
+                  borderColor: '#fff',
+                  borderWidth: 1,
+                },
+                z: 4,
+              },
+            ]
+          : []),
+      ],
+    }
+
+    return {
+      option,
+      reason: null,
+      chartHeight,
+      xAxisLabel,
+      yAxisLabel,
+      metricLabel,
+      pointByCategory,
+      cellKeyByDataIndex,
+    }
+  }, [
+    plateauHeatmapMetric,
+    plateauHeatmapShowBestPath,
+    plateauHeatmapShowCellLabel,
+    plateauHeatmapSelectedCoord,
+    plateauHeatmapXAxis,
+    plateauHeatmapYAxis,
+    plateauValidPoints,
+  ])
+  const plateauHeatmapOption = plateauHeatmapView.option
+  const plateauHeatmapUnavailableReason = plateauHeatmapView.reason
+  const plateauHeatmapChartHeight = plateauHeatmapView.chartHeight
+  const plateauHeatmapTitle = `方块热力图（${plateauHeatmapView.xAxisLabel} × ${plateauHeatmapView.yAxisLabel}，值=${plateauHeatmapView.metricLabel}）`
+  const plateauHeatmapPointByCategory = plateauHeatmapView.pointByCategory
+  const plateauHeatmapCellKeyByDataIndex = plateauHeatmapView.cellKeyByDataIndex
+  const plateauBrushSelectedPoints = useMemo(
+    () =>
+      plateauBrushSelectedKeys
+        .map((key) => plateauHeatmapPointByCategory.get(key))
+        .filter((item): item is BacktestPlateauPoint => Boolean(item)),
+    [plateauBrushSelectedKeys, plateauHeatmapPointByCategory],
+  )
+  const plateauCandidateOptions = useMemo(
+    () =>
+      plateauCandidatePoints.map((point, index) => ({
+        value: index + 1,
+        label: `候选#${index + 1} | 评分 ${point.score.toFixed(3)} | 收益 ${formatPct(point.stats.total_return)}`,
+      })),
+    [plateauCandidatePoints],
+  )
+  const selectedCandidatePoint = plateauCandidatePoints[plateauCandidatePickRank - 1] ?? null
+
+  function appendPointsToCandidateSet(points: BacktestPlateauPoint[], sourceLabel: string) {
+    if (points.length <= 0) {
+      message.info(`未从${sourceLabel}获取可加入的参数组。`)
+      return
+    }
+    let addedCount = 0
+    setPlateauCandidatePoints((prev) => {
+      const next = [...prev]
+      const seen = new Set(prev.map((item) => buildPlateauParamsKey(item)))
+      points.forEach((point) => {
+        const key = buildPlateauParamsKey(point)
+        if (seen.has(key)) return
+        seen.add(key)
+        next.push(point)
+        addedCount += 1
+      })
+      return next
+    })
+    setPlateauCandidatePickRank(1)
+    if (addedCount > 0) {
+      message.success(`已从${sourceLabel}加入候选参数 ${addedCount} 组。`)
+    } else {
+      message.info(`候选参数集中已包含${sourceLabel}选中的参数组。`)
+    }
+  }
+
+  function handleAddBrushSelectionToCandidates() {
+    appendPointsToCandidateSet(plateauBrushSelectedPoints, '框选区域')
+  }
+
+  function handleApplySelectedCandidatePoint() {
+    if (!selectedCandidatePoint) {
+      message.info('请先选择一个候选参数组。')
+      return
+    }
+    applyPlateauPointToForm(selectedCandidatePoint, `候选#${plateauCandidatePickRank}`)
+  }
+
+  function handleClearCandidatePoints() {
+    setPlateauCandidatePoints([])
+    setPlateauCandidatePickRank(1)
+  }
+
+  const plateauHeatmapOnEvents = useMemo(
+    () => ({
+      click: (params: { seriesType?: string; value?: unknown }) => {
+        if (params?.seriesType !== 'heatmap') return
+        const value = params?.value
+        if (!Array.isArray(value) || value.length < 2) return
+        const xCategory = String(value[0] ?? '').trim()
+        const yCategory = String(value[1] ?? '').trim()
+        if (!xCategory || !yCategory) return
+        const key = `${xCategory}|${yCategory}`
+        const point = plateauHeatmapPointByCategory.get(key)
+        if (!point) return
+        setPlateauHeatmapSelectedCoord([xCategory, yCategory])
+        applyPlateauPointToForm(point, `热力图点(${xCategory}, ${yCategory})`)
+      },
+      brushSelected: (params: {
+        batch?: Array<{
+          selected?: Array<{
+            seriesIndex?: number
+            dataIndex?: number[]
+          }>
+        }>
+      }) => {
+        const indexSet = new Set<number>()
+        const batches = Array.isArray(params?.batch) ? params.batch : []
+        batches.forEach((batchItem) => {
+          const selectedSeries = Array.isArray(batchItem?.selected) ? batchItem.selected : []
+          selectedSeries.forEach((seriesItem) => {
+            if (typeof seriesItem?.seriesIndex === 'number' && seriesItem.seriesIndex !== 0) return
+            const dataIndices = Array.isArray(seriesItem?.dataIndex) ? seriesItem.dataIndex : []
+            dataIndices.forEach((idx) => {
+              const numericIndex = Number(idx)
+              if (Number.isInteger(numericIndex) && numericIndex >= 0) {
+                indexSet.add(numericIndex)
+              }
+            })
+          })
+        })
+        const keys = Array.from(indexSet)
+          .sort((a, b) => a - b)
+          .map((idx) => plateauHeatmapCellKeyByDataIndex[idx])
+          .filter((item): item is string => Boolean(item))
+        setPlateauBrushSelectedKeys(keys)
+      },
+    }),
+    [applyPlateauPointToForm, plateauHeatmapCellKeyByDataIndex, plateauHeatmapPointByCategory],
+  )
   const effectiveRunError =
     runError
     || (taskStatus?.status === 'failed' ? (taskStatus.error?.trim() || '回测任务失败') : null)
@@ -1044,7 +1518,7 @@ export function BacktestPage() {
                   onChange={(event) => setRunId(event.target.value)}
                   placeholder="请输入筛选任务 run_id"
                 />
-                <Button loading={bindLatestRunMutation.isPending} onClick={handleBindLatestRunId}>
+                <Button onClick={handleBindLatestRunId}>
                   带入最新筛选
                 </Button>
               </div>
@@ -1393,8 +1867,8 @@ export function BacktestPage() {
                   optionType="button"
                   onChange={(event) => setPlateauSamplingMode(event.target.value)}
                   options={[
-                    { label: 'LHS（推荐）', value: 'lhs' },
-                    { label: 'Grid', value: 'grid' },
+                    { label: '拉丁超立方（推荐）', value: 'lhs' },
+                    { label: '网格枚举', value: 'grid' },
                   ]}
                 />
               </Space>
@@ -1431,7 +1905,7 @@ export function BacktestPage() {
             </Col>
             <Col xs={24} md={6}>
               <Space orientation="vertical" style={{ width: '100%' }}>
-                <span>window_days 列表</span>
+                <span>信号窗口天数列表（window_days）</span>
                 <Input
                   value={plateauWindowListRaw}
                   placeholder="如: 40,60,80"
@@ -1441,7 +1915,7 @@ export function BacktestPage() {
             </Col>
             <Col xs={24} md={6}>
               <Space orientation="vertical" style={{ width: '100%' }}>
-                <span>min_score 列表</span>
+                <span>最低评分列表（min_score）</span>
                 <Input
                   value={plateauMinScoreListRaw}
                   placeholder="如: 50,55,60"
@@ -1451,7 +1925,7 @@ export function BacktestPage() {
             </Col>
             <Col xs={24} md={6}>
               <Space orientation="vertical" style={{ width: '100%' }}>
-                <span>stop_loss 列表(%)</span>
+                <span>止损比例列表（stop_loss，%）</span>
                 <Input
                   value={plateauStopLossPctListRaw}
                   placeholder="如: 3,5,8"
@@ -1461,7 +1935,7 @@ export function BacktestPage() {
             </Col>
             <Col xs={24} md={6}>
               <Space orientation="vertical" style={{ width: '100%' }}>
-                <span>take_profit 列表(%)</span>
+                <span>止盈比例列表（take_profit，%）</span>
                 <Input
                   value={plateauTakeProfitPctListRaw}
                   placeholder="如: 10,15,20"
@@ -1471,7 +1945,7 @@ export function BacktestPage() {
             </Col>
             <Col xs={24} md={6}>
               <Space orientation="vertical" style={{ width: '100%' }}>
-                <span>max_positions 列表</span>
+                <span>最大并发持仓列表（max_positions）</span>
                 <Input
                   value={plateauMaxPositionsListRaw}
                   placeholder="如: 3,5,8"
@@ -1481,7 +1955,7 @@ export function BacktestPage() {
             </Col>
             <Col xs={24} md={6}>
               <Space orientation="vertical" style={{ width: '100%' }}>
-                <span>position_pct 列表(%)</span>
+                <span>单笔仓位占比列表（position_pct，%）</span>
                 <Input
                   value={plateauPositionPctListRaw}
                   placeholder="如: 10,15,20"
@@ -1491,7 +1965,7 @@ export function BacktestPage() {
             </Col>
             <Col xs={24} md={6}>
               <Space orientation="vertical" style={{ width: '100%' }}>
-                <span>max_symbols 列表</span>
+                <span>最大股票数列表（max_symbols）</span>
                 <Input
                   value={plateauMaxSymbolsListRaw}
                   placeholder="如: 80,120,200"
@@ -1501,7 +1975,7 @@ export function BacktestPage() {
             </Col>
             <Col xs={24} md={6}>
               <Space orientation="vertical" style={{ width: '100%' }}>
-                <span>priority_topk 列表</span>
+                <span>同日 TopK 列表（priority_topk）</span>
                 <Input
                   value={plateauTopKListRaw}
                   placeholder="如: 0,5,10"
@@ -1515,7 +1989,7 @@ export function BacktestPage() {
             type="info"
             showIcon
             title="参数说明"
-            description="列表为空时自动使用当前回测表单值；LHS 会在区间内采样，Grid 会按离散列表组合。"
+            description="列表为空时自动使用当前回测表单值；拉丁超立方会在区间内采样，网格枚举会按离散列表组合。"
           />
 
           <Space>
@@ -1586,18 +2060,120 @@ export function BacktestPage() {
             </Col>
           </Row>
 
-          {plateauHeatmapOption ? (
-            <Card title="评分热力图（window_days × min_score）">
-              <ReactECharts option={plateauHeatmapOption} style={{ height: 320 }} />
+          {plateauScoreBarOption ? (
+            <Card title="评分可视化（Top 30）">
+              <ReactECharts option={plateauScoreBarOption} style={{ height: 280 }} />
             </Card>
           ) : null}
+
+          <Card title="热力图设置">
+            <Row gutter={[12, 12]}>
+              <Col xs={24} md={6}>
+                <Space orientation="vertical" style={{ width: '100%' }}>
+                  <span>横轴参数</span>
+                  <Select
+                    value={plateauHeatmapXAxis}
+                    options={PLATEAU_AXIS_OPTIONS.filter((item) => item.value !== plateauHeatmapYAxis)}
+                    onChange={(value) => setPlateauHeatmapXAxis(value as PlateauAxisKey)}
+                  />
+                </Space>
+              </Col>
+              <Col xs={24} md={6}>
+                <Space orientation="vertical" style={{ width: '100%' }}>
+                  <span>纵轴参数</span>
+                  <Select
+                    value={plateauHeatmapYAxis}
+                    options={PLATEAU_AXIS_OPTIONS.filter((item) => item.value !== plateauHeatmapXAxis)}
+                    onChange={(value) => setPlateauHeatmapYAxis(value as PlateauAxisKey)}
+                  />
+                </Space>
+              </Col>
+              <Col xs={24} md={6}>
+                <Space orientation="vertical" style={{ width: '100%' }}>
+                  <span>颜色映射指标</span>
+                  <Select
+                    value={plateauHeatmapMetric}
+                    options={PLATEAU_METRIC_OPTIONS}
+                    onChange={(value) => setPlateauHeatmapMetric(value as PlateauMetricKey)}
+                  />
+                </Space>
+              </Col>
+              <Col xs={24} md={3}>
+                <Space orientation="vertical" style={{ width: '100%' }}>
+                  <span>显示方块值</span>
+                  <Switch checked={plateauHeatmapShowCellLabel} onChange={setPlateauHeatmapShowCellLabel} />
+                </Space>
+              </Col>
+              <Col xs={24} md={3}>
+                <Space orientation="vertical" style={{ width: '100%' }}>
+                  <span>最佳点连线</span>
+                  <Switch checked={plateauHeatmapShowBestPath} onChange={setPlateauHeatmapShowBestPath} />
+                </Space>
+              </Col>
+            </Row>
+          </Card>
+
+          {plateauHeatmapOption ? (
+            <Card title={plateauHeatmapTitle}>
+              <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+                <Alert
+                  type="info"
+                  showIcon
+                  title="交互说明"
+                  description="点击任意方块可直接回填对应参数组；也可框选多个方块后加入候选参数集。橙色连线表示每个横轴取值下的最优纵轴点。"
+                />
+                <Space wrap>
+                  <Tag color="blue">{`框选方块: ${plateauBrushSelectedKeys.length}`}</Tag>
+                  <Button disabled={plateauBrushSelectedKeys.length <= 0} onClick={handleAddBrushSelectionToCandidates}>
+                    加入候选参数集
+                  </Button>
+                  <Button
+                    disabled={plateauBrushSelectedKeys.length <= 0}
+                    onClick={() => setPlateauBrushSelectedKeys([])}
+                  >
+                    清空框选
+                  </Button>
+                  <Tag color="geekblue">{`候选参数: ${plateauCandidatePoints.length}`}</Tag>
+                  {plateauCandidateOptions.length > 0 ? (
+                    <Select
+                      style={{ minWidth: 320 }}
+                      value={plateauCandidatePickRank}
+                      options={plateauCandidateOptions}
+                      onChange={(value) => setPlateauCandidatePickRank(Number(value))}
+                    />
+                  ) : null}
+                  <Button disabled={!selectedCandidatePoint} onClick={handleApplySelectedCandidatePoint}>
+                    回填候选参数
+                  </Button>
+                  <Button disabled={plateauCandidatePoints.length <= 0} onClick={handleClearCandidatePoints}>
+                    清空候选
+                  </Button>
+                </Space>
+                <ReactECharts
+                  option={plateauHeatmapOption}
+                  style={{ height: plateauHeatmapChartHeight }}
+                  onEvents={plateauHeatmapOnEvents}
+                />
+              </Space>
+            </Card>
+          ) : (
+            <Alert
+              type="info"
+              showIcon
+              title="热力图暂不可用"
+              description={
+                plateauHeatmapUnavailableReason
+                || '当前参数分布不足以形成二维网格，请扩展参数扫描范围后重试。'
+              }
+            />
+          )}
 
           <Card title="收益平原结果（按评分排序）">
             <Table
               size="small"
               columns={plateauColumnsWithAction}
-              dataSource={plateauResult.points}
-              rowKey={(row, idx) => `${row.params.window_days}-${row.params.min_score}-${row.params.max_positions}-${idx}`}
+              dataSource={plateauTableRows}
+              rowKey="__rowKey"
               scroll={{ x: 1460 }}
               pagination={{
                 defaultPageSize: 10,
@@ -1637,7 +2213,7 @@ export function BacktestPage() {
             <div>
               进度：{taskProgress?.processed_dates ?? 0} / {taskProgress?.total_dates ?? 0}
             </div>
-            {taskProgress?.warning ? <Alert type="warning" showIcon message={taskProgress.warning} /> : null}
+            {taskProgress?.warning ? <Alert type="warning" showIcon title={taskProgress.warning} /> : null}
           </Space>
         </Card>
       ) : null}
