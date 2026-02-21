@@ -1,9 +1,15 @@
 ﻿from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import os
 import struct
+import time
+from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
+from threading import RLock
 from typing import TypedDict
 
 from .models import CandlePoint, IntradayPoint, ScreenerResult, Stage, ThemeStage, TrendClass
@@ -15,6 +21,9 @@ TNF_RECORD_SIZE = 360
 DBF_HEADER = struct.Struct("<BBBBIHH20x")
 DBF_FIELD_SIZE = 32
 DBF_TERMINATOR = 0x0D
+_INPUT_POOL_RUNTIME_CACHE: dict[str, tuple[float, tuple[dict[str, object], ...], str | None]] = {}
+_INPUT_POOL_RUNTIME_CACHE_LOCK = RLock()
+_INPUT_POOL_RUNTIME_CACHE_MAX_KEYS = 16
 
 
 class ParsedSeries(TypedDict):
@@ -84,6 +93,11 @@ def _tnf_file_for_market(market: str) -> str:
     if market == "bj":
         return "bjs.tnf"
     return ""
+
+
+@lru_cache(maxsize=16)
+def _cached_symbol_name_map_from_tnf(tdx_root: str, markets_key: tuple[str, ...]) -> dict[str, str]:
+    return _load_symbol_name_map_from_tnf(tdx_root, list(markets_key))
 
 
 def _load_symbol_name_map_from_tnf(tdx_root: str, markets: list[str]) -> dict[str, str]:
@@ -243,6 +257,14 @@ def _load_float_shares_from_base_dbf(
         last_error = "FLOAT_SHARES_DBF_EMPTY"
 
     return {}, last_error
+
+
+@lru_cache(maxsize=16)
+def _cached_float_shares_from_base_dbf(
+    tdx_root: str,
+    markets_key: tuple[str, ...],
+) -> tuple[dict[str, float], str | None]:
+    return _load_float_shares_from_base_dbf(tdx_root, list(markets_key))
 
 
 def _is_a_share_symbol(symbol: str) -> bool:
@@ -435,6 +457,22 @@ def _resolve_series_end_index(dates: list[str], as_of_date: str | None) -> int |
         if dates[idx] <= as_of_date:
             return idx
     return None
+
+
+def _resolve_day_parse_bars(return_window_days: int, as_of_date: str | None) -> int:
+    if not as_of_date:
+        return 360
+    try:
+        as_of_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
+    except Exception:
+        return 3000
+
+    today = datetime.now()
+    gap_days = max(0, (today.date() - as_of_dt.date()).days)
+    approx_gap_bars = int(gap_days * 0.65)
+    baseline = max(80, int(return_window_days) * 2 + 40)
+    estimated = approx_gap_bars + baseline
+    return max(320, min(3000, estimated))
 
 
 def _build_row(
@@ -691,21 +729,110 @@ def load_candles_for_symbol(
     return None
 
 
+def _input_pool_runtime_cache_enabled() -> bool:
+    raw = os.getenv("TDX_TREND_INPUT_POOL_RUNTIME_CACHE", "").strip().lower()
+    if not raw:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _input_pool_runtime_cache_ttl_sec() -> float:
+    raw = os.getenv("TDX_TREND_INPUT_POOL_RUNTIME_CACHE_TTL_SEC", "").strip()
+    if not raw:
+        return 1800.0
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        return 1800.0
+
+
+def _input_pool_runtime_cache_key(
+    *,
+    tdx_root: str,
+    markets: list[str],
+    return_window_days: int,
+    as_of_date: str | None,
+) -> str:
+    payload = {
+        "tdx_root": str(Path(tdx_root)),
+        "markets": sorted({str(item).strip().lower() for item in markets if str(item).strip()}),
+        "return_window_days": int(return_window_days),
+        "as_of_date": str(as_of_date or "").strip() or "__latest__",
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _load_input_pool_runtime_cache(
+    cache_key: str,
+) -> tuple[list[ScreenerResult], str | None] | None:
+    ttl_sec = _input_pool_runtime_cache_ttl_sec()
+    with _INPUT_POOL_RUNTIME_CACHE_LOCK:
+        cached = _INPUT_POOL_RUNTIME_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        cached_at, payload_rows, load_error = cached
+        if ttl_sec > 0 and max(0.0, time.time() - cached_at) > ttl_sec:
+            _INPUT_POOL_RUNTIME_CACHE.pop(cache_key, None)
+            return None
+    rows: list[ScreenerResult] = []
+    for item in payload_rows:
+        try:
+            rows.append(ScreenerResult(**item))
+        except Exception:
+            continue
+    return rows, load_error
+
+
+def _save_input_pool_runtime_cache(
+    cache_key: str,
+    rows: list[ScreenerResult],
+    load_error: str | None,
+) -> None:
+    payload_rows = tuple(row.model_dump(exclude_none=True) for row in rows)
+    with _INPUT_POOL_RUNTIME_CACHE_LOCK:
+        _INPUT_POOL_RUNTIME_CACHE[cache_key] = (time.time(), payload_rows, load_error)
+        overflow = len(_INPUT_POOL_RUNTIME_CACHE) - _INPUT_POOL_RUNTIME_CACHE_MAX_KEYS
+        if overflow > 0:
+            old_keys = sorted(
+                _INPUT_POOL_RUNTIME_CACHE.items(),
+                key=lambda item: item[1][0],
+            )[:overflow]
+            for old_key, _ in old_keys:
+                _INPUT_POOL_RUNTIME_CACHE.pop(old_key, None)
+
+
 def load_input_pool_from_tdx(
     tdx_root: str,
     markets: list[str],
     return_window_days: int,
     as_of_date: str | None = None,
 ) -> tuple[list[ScreenerResult], str | None]:
+    normalized_markets = [str(market).strip().lower() for market in markets if str(market).strip()]
+    cache_key = _input_pool_runtime_cache_key(
+        tdx_root=tdx_root,
+        markets=normalized_markets,
+        return_window_days=return_window_days,
+        as_of_date=as_of_date,
+    )
+    if _input_pool_runtime_cache_enabled():
+        cached = _load_input_pool_runtime_cache(cache_key)
+        if cached is not None:
+            return cached
+
     root = Path(tdx_root)
     if not root.exists():
         return [], "TDX_PATH_NOT_FOUND"
 
-    symbol_name_map = _load_symbol_name_map_from_tnf(tdx_root, markets)
-    float_shares_map, float_shares_error = _load_float_shares_from_base_dbf(tdx_root, markets)
+    markets_key = tuple(sorted(set(normalized_markets)))
+    symbol_name_map = _cached_symbol_name_map_from_tnf(tdx_root, markets_key)
+    float_shares_map, float_shares_error = _cached_float_shares_from_base_dbf(tdx_root, markets_key)
     rows: list[ScreenerResult] = []
     missing_float_shares = 0
-    for market in markets:
+    parse_bars = _resolve_day_parse_bars(return_window_days, as_of_date)
+    for market in markets_key:
         market_dir = root / market / "lday"
         if not market_dir.exists():
             continue
@@ -714,7 +841,17 @@ def load_input_pool_from_tdx(
             symbol = _normalize_symbol(file_path.stem, market)
             if not symbol or not _is_a_share_symbol(symbol):
                 continue
-            parsed = _parse_day_file(file_path, symbol, max_bars=3000 if as_of_date else 360)
+            parsed = _parse_day_file(file_path, symbol, max_bars=parse_bars)
+            if as_of_date and parse_bars < 3000:
+                need_retry_full = False
+                if not parsed:
+                    need_retry_full = True
+                elif parsed["dates"]:
+                    first_loaded = str(parsed["dates"][0]).strip()
+                    if first_loaded and first_loaded > as_of_date:
+                        need_retry_full = True
+                if need_retry_full:
+                    parsed = _parse_day_file(file_path, symbol, max_bars=3000)
             if not parsed:
                 continue
             row = _build_row(parsed, return_window_days, float_shares_map.get(symbol), as_of_date)
@@ -731,11 +868,15 @@ def load_input_pool_from_tdx(
 
     rows.sort(key=lambda item: item.ret40, reverse=True)
 
+    result_error: str | None = None
     if not float_shares_map:
-        return rows, float_shares_error or "FLOAT_SHARES_NOT_FOUND"
-    if missing_float_shares > 0:
-        return rows, "PARTIAL_FLOAT_SHARES_MISSING"
-    return rows, None
+        result_error = float_shares_error or "FLOAT_SHARES_NOT_FOUND"
+    elif missing_float_shares > 0:
+        result_error = "PARTIAL_FLOAT_SHARES_MISSING"
+
+    if _input_pool_runtime_cache_enabled():
+        _save_input_pool_runtime_cache(cache_key, rows, result_error)
+    return rows, result_error
 
 
 def _decode_lc1_date(raw_date: int) -> str | None:

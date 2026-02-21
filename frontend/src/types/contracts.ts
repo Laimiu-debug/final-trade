@@ -445,6 +445,55 @@ export interface BacktestTaskStatusResponse {
   error_code?: string | null
 }
 
+export interface BacktestPlateauRunRequest {
+  base_payload: BacktestRunRequest
+  sampling_mode?: 'grid' | 'lhs'
+  window_days_list: number[]
+  min_score_list: number[]
+  stop_loss_list: number[]
+  take_profit_list: number[]
+  max_positions_list: number[]
+  position_pct_list: number[]
+  max_symbols_list: number[]
+  priority_topk_per_day_list: number[]
+  sample_points?: number
+  random_seed?: number
+  max_points: number
+}
+
+export interface BacktestPlateauParams {
+  window_days: number
+  min_score: number
+  stop_loss: number
+  take_profit: number
+  max_positions: number
+  position_pct: number
+  max_symbols: number
+  priority_topk_per_day: number
+}
+
+export interface BacktestPlateauPoint {
+  params: BacktestPlateauParams
+  stats: ReviewStats
+  candidate_count: number
+  skipped_count: number
+  fill_rate: number
+  max_concurrent_positions: number
+  score: number
+  cache_hit: boolean
+  error?: string | null
+}
+
+export interface BacktestPlateauResponse {
+  base_payload: BacktestRunRequest
+  total_combinations: number
+  evaluated_combinations: number
+  points: BacktestPlateauPoint[]
+  best_point?: BacktestPlateauPoint | null
+  generated_at: string
+  notes: string[]
+}
+
 export type ReviewTagType = 'emotion' | 'reason'
 
 export interface ReviewTag {

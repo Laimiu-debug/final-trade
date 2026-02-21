@@ -7,6 +7,8 @@ import type {
   BacktestTaskStartResponse,
   BacktestTaskStatusResponse,
   BacktestResponse,
+  BacktestPlateauResponse,
+  BacktestPlateauRunRequest,
   BacktestRunRequest,
   BoardFilter,
   CandlePoint,
@@ -57,7 +59,7 @@ export function runScreener(params: ScreenerParams) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
-    timeoutMs: 60_000,
+    timeoutMs: 240_000,
   })
 }
 
@@ -132,8 +134,9 @@ export function getSignals(params?: {
     query.set('min_event_count', String(params.min_event_count))
   }
   const suffix = query.toString()
+  const timeoutMs = params?.mode === 'full_market' ? 240_000 : 45_000
   return apiRequest<SignalsResponse>(`/api/signals${suffix ? `?${suffix}` : ''}`, {
-    timeoutMs: 45_000,
+    timeoutMs,
   })
 }
 
@@ -257,6 +260,15 @@ export function runBacktest(payload: BacktestRunRequest) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     timeoutMs,
+  })
+}
+
+export function runBacktestPlateau(payload: BacktestPlateauRunRequest) {
+  return apiRequest<BacktestPlateauResponse>('/api/backtest/plateau', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 600_000,
   })
 }
 

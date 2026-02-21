@@ -4,6 +4,9 @@ import type {
   AIProviderTestRequest,
   AIProviderTestResponse,
   AppConfig,
+  BacktestPlateauPoint,
+  BacktestPlateauResponse,
+  BacktestPlateauRunRequest,
   BacktestResponse,
   BacktestRunRequest,
   BacktestTrade,
@@ -1369,6 +1372,185 @@ export function runBacktestStore(payload: BacktestRunRequest): BacktestResponse 
     skipped_count: skippedCount,
     fill_rate: Number(fillRate.toFixed(6)),
     max_concurrent_positions: maxConcurrentPositions,
+  }
+}
+
+export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): BacktestPlateauResponse {
+  const samplingMode = payload.sampling_mode ?? 'lhs'
+  const samplePoints = Math.max(1, Math.min(2000, payload.sample_points ?? payload.max_points ?? 120))
+
+  const base = payload.base_payload
+  const axisWindow = payload.window_days_list.length > 0 ? payload.window_days_list : [base.window_days]
+  const axisMinScore = payload.min_score_list.length > 0 ? payload.min_score_list : [base.min_score]
+  const axisStopLoss = payload.stop_loss_list.length > 0 ? payload.stop_loss_list : [base.stop_loss]
+  const axisTakeProfit = payload.take_profit_list.length > 0 ? payload.take_profit_list : [base.take_profit]
+  const axisMaxPositions = payload.max_positions_list.length > 0 ? payload.max_positions_list : [base.max_positions]
+  const axisPositionPct = payload.position_pct_list.length > 0 ? payload.position_pct_list : [base.position_pct]
+  const axisMaxSymbols = payload.max_symbols_list.length > 0 ? payload.max_symbols_list : [base.max_symbols]
+  const axisTopK = payload.priority_topk_per_day_list.length > 0
+    ? payload.priority_topk_per_day_list
+    : [base.priority_topk_per_day]
+
+  const gridTotal = Math.max(
+    1,
+    axisWindow.length
+    * axisMinScore.length
+    * axisStopLoss.length
+    * axisTakeProfit.length
+    * axisMaxPositions.length
+    * axisPositionPct.length
+    * axisMaxSymbols.length
+    * axisTopK.length,
+  )
+
+  let seed = Number.isFinite(payload.random_seed) ? Number(payload.random_seed) : 20260221
+  const nextRandom = () => {
+    seed = (seed * 1664525 + 1013904223) % 4294967296
+    return seed / 4294967296
+  }
+  const randomBetween = (min: number, max: number) => {
+    if (max <= min) return min
+    return min + (max - min) * nextRandom()
+  }
+  const randomIntBetween = (min: number, max: number) => {
+    if (max <= min) return min
+    return Math.round(randomBetween(min, max))
+  }
+
+  const points: BacktestPlateauPoint[] = []
+  const notes: string[] = []
+  const targetEvaluate = samplingMode === 'lhs' ? samplePoints : Math.min(samplePoints, gridTotal)
+  const windowBounds: [number, number] = [Math.min(...axisWindow), Math.max(...axisWindow)]
+  const minScoreBounds: [number, number] = [Math.min(...axisMinScore), Math.max(...axisMinScore)]
+  const stopLossBounds: [number, number] = [Math.min(...axisStopLoss), Math.max(...axisStopLoss)]
+  const takeProfitBounds: [number, number] = [Math.min(...axisTakeProfit), Math.max(...axisTakeProfit)]
+  const maxPositionsBounds: [number, number] = [Math.min(...axisMaxPositions), Math.max(...axisMaxPositions)]
+  const positionPctBounds: [number, number] = [Math.min(...axisPositionPct), Math.max(...axisPositionPct)]
+  const maxSymbolsBounds: [number, number] = [Math.min(...axisMaxSymbols), Math.max(...axisMaxSymbols)]
+  const topKBounds: [number, number] = [Math.min(...axisTopK), Math.max(...axisTopK)]
+  const seen = new Set<string>()
+
+  const appendPoint = (candidate: {
+    window_days: number
+    min_score: number
+    stop_loss: number
+    take_profit: number
+    max_positions: number
+    position_pct: number
+    max_symbols: number
+    priority_topk_per_day: number
+  }) => {
+    const key = [
+      candidate.window_days,
+      candidate.min_score.toFixed(4),
+      candidate.stop_loss.toFixed(6),
+      candidate.take_profit.toFixed(6),
+      candidate.max_positions,
+      candidate.position_pct.toFixed(6),
+      candidate.max_symbols,
+      candidate.priority_topk_per_day,
+    ].join('|')
+    if (seen.has(key)) return
+    seen.add(key)
+    const runPayload: BacktestRunRequest = {
+      ...base,
+      window_days: candidate.window_days,
+      min_score: candidate.min_score,
+      stop_loss: candidate.stop_loss,
+      take_profit: candidate.take_profit,
+      max_positions: candidate.max_positions,
+      position_pct: candidate.position_pct,
+      max_symbols: candidate.max_symbols,
+      priority_topk_per_day: candidate.priority_topk_per_day,
+    }
+    const result = runBacktestStore(runPayload)
+    const totalReturn = Number(result.stats.total_return)
+    const maxDrawdown = Math.abs(Math.min(0, Number(result.stats.max_drawdown)))
+    const winRate = Math.max(0, Math.min(1, Number(result.stats.win_rate)))
+    const profitFactorRaw = Number(result.stats.profit_factor)
+    const profitFactor = Number.isFinite(profitFactorRaw) ? Math.max(0, Math.min(5, profitFactorRaw)) : 5
+    const score = Number((totalReturn - maxDrawdown * 0.6 + winRate * 0.1 + profitFactor * 0.02).toFixed(6))
+    points.push({
+      params: candidate,
+      stats: result.stats,
+      candidate_count: result.candidate_count,
+      skipped_count: result.skipped_count,
+      fill_rate: result.fill_rate,
+      max_concurrent_positions: result.max_concurrent_positions,
+      score,
+      cache_hit: false,
+      error: null,
+    })
+  }
+
+  if (samplingMode === 'grid') {
+    for (const windowDays of axisWindow) {
+      for (const minScore of axisMinScore) {
+        for (const stopLoss of axisStopLoss) {
+          for (const takeProfit of axisTakeProfit) {
+            for (const maxPositions of axisMaxPositions) {
+              for (const positionPct of axisPositionPct) {
+                for (const maxSymbols of axisMaxSymbols) {
+                  for (const topK of axisTopK) {
+                    if (points.length >= targetEvaluate) break
+                    appendPoint({
+                      window_days: Math.max(20, Math.min(240, Math.round(windowDays))),
+                      min_score: Number(Math.max(0, Math.min(100, minScore)).toFixed(4)),
+                      stop_loss: Number(Math.max(0, Math.min(0.5, stopLoss)).toFixed(6)),
+                      take_profit: Number(Math.max(0, Math.min(1.5, takeProfit)).toFixed(6)),
+                      max_positions: Math.max(1, Math.min(100, Math.round(maxPositions))),
+                      position_pct: Number(Math.max(0.0001, Math.min(1, positionPct)).toFixed(6)),
+                      max_symbols: Math.max(20, Math.min(2000, Math.round(maxSymbols))),
+                      priority_topk_per_day: Math.max(0, Math.min(500, Math.round(topK))),
+                    })
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if (gridTotal > targetEvaluate) {
+      notes.push(`参数组合总数 ${gridTotal} 超过上限，已截断评估前 ${targetEvaluate} 组。`)
+    }
+  } else {
+    let guard = 0
+    const guardMax = Math.max(targetEvaluate * 20, 512)
+    while (points.length < targetEvaluate && guard < guardMax) {
+      guard += 1
+      appendPoint({
+        window_days: Math.max(20, Math.min(240, randomIntBetween(windowBounds[0], windowBounds[1]))),
+        min_score: Number(randomBetween(minScoreBounds[0], minScoreBounds[1]).toFixed(4)),
+        stop_loss: Number(randomBetween(stopLossBounds[0], stopLossBounds[1]).toFixed(6)),
+        take_profit: Number(randomBetween(takeProfitBounds[0], takeProfitBounds[1]).toFixed(6)),
+        max_positions: Math.max(1, Math.min(100, randomIntBetween(maxPositionsBounds[0], maxPositionsBounds[1]))),
+        position_pct: Number(Math.max(0.0001, Math.min(1, randomBetween(positionPctBounds[0], positionPctBounds[1]))).toFixed(6)),
+        max_symbols: Math.max(20, Math.min(2000, randomIntBetween(maxSymbolsBounds[0], maxSymbolsBounds[1]))),
+        priority_topk_per_day: Math.max(0, Math.min(500, randomIntBetween(topKBounds[0], topKBounds[1]))),
+      })
+    }
+    notes.push(`参数采样模式: lhs，目标采样 ${targetEvaluate} 组。`)
+    if (typeof payload.random_seed === 'number') {
+      notes.push(`LHS 随机种子: ${payload.random_seed}。`)
+    }
+    if (points.length < targetEvaluate) {
+      notes.push(`LHS 去重后仅生成 ${points.length} 组有效参数（目标 ${targetEvaluate} 组）。`)
+    }
+    notes.push(`参考网格组合规模（按列表离散值估算）: ${gridTotal}。`)
+  }
+
+  points.sort((left, right) => right.score - left.score)
+  const bestPoint = points[0] ?? null
+  notes.push(`收益平原评估完成：总组合 ${samplingMode === 'lhs' ? targetEvaluate : gridTotal}，实际评估 ${points.length}。`)
+  return {
+    base_payload: base,
+    total_combinations: samplingMode === 'lhs' ? targetEvaluate : gridTotal,
+    evaluated_combinations: points.length,
+    points,
+    best_point: bestPoint,
+    generated_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    notes,
   }
 }
 

@@ -14,6 +14,8 @@ from .models import (
     AIRecordsResponse,
     BacktestResponse,
     BacktestRunRequest,
+    BacktestPlateauRunRequest,
+    BacktestPlateauResponse,
     BacktestTaskStartResponse,
     BacktestTaskStatusResponse,
     BoardFilter,
@@ -194,6 +196,16 @@ def get_signals(
 def post_backtest_run(payload: BacktestRunRequest) -> BacktestResponse | JSONResponse:
     try:
         return store.run_backtest(payload)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.post("/api/backtest/plateau", response_model=BacktestPlateauResponse)
+def post_backtest_plateau(payload: BacktestPlateauRunRequest) -> BacktestPlateauResponse | JSONResponse:
+    try:
+        return store.run_backtest_plateau(payload)
     except BacktestValidationError as exc:
         return error_response(400, exc.code, str(exc))
     except ValueError as exc:

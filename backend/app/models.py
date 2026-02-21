@@ -443,6 +443,55 @@ class BacktestTaskStatusResponse(BaseModel):
     error_code: str | None = None
 
 
+class BacktestPlateauRunRequest(BaseModel):
+    base_payload: BacktestRunRequest
+    sampling_mode: Literal["grid", "lhs"] = "lhs"
+    window_days_list: list[int] = Field(default_factory=list, max_length=16)
+    min_score_list: list[float] = Field(default_factory=list, max_length=16)
+    stop_loss_list: list[float] = Field(default_factory=list, max_length=16)
+    take_profit_list: list[float] = Field(default_factory=list, max_length=16)
+    max_positions_list: list[int] = Field(default_factory=list, max_length=16)
+    position_pct_list: list[float] = Field(default_factory=list, max_length=16)
+    max_symbols_list: list[int] = Field(default_factory=list, max_length=16)
+    priority_topk_per_day_list: list[int] = Field(default_factory=list, max_length=16)
+    sample_points: int | None = Field(default=None, ge=1, le=2000)
+    random_seed: int | None = Field(default=None, ge=0, le=2_147_483_647)
+    max_points: int = Field(default=120, ge=1, le=2000)
+
+
+class BacktestPlateauParams(BaseModel):
+    window_days: int
+    min_score: float
+    stop_loss: float
+    take_profit: float
+    max_positions: int
+    position_pct: float
+    max_symbols: int
+    priority_topk_per_day: int
+
+
+class BacktestPlateauPoint(BaseModel):
+    params: BacktestPlateauParams
+    stats: ReviewStats
+    candidate_count: int = 0
+    skipped_count: int = 0
+    fill_rate: float = 0.0
+    max_concurrent_positions: int = 0
+    score: float = 0.0
+    cache_hit: bool = False
+    error: str | None = None
+
+
+class BacktestPlateauResponse(BaseModel):
+    base_payload: BacktestRunRequest
+    total_combinations: int
+    evaluated_combinations: int
+    points: list[BacktestPlateauPoint] = Field(default_factory=list)
+    best_point: BacktestPlateauPoint | None = None
+    generated_at: str
+    notes: list[str] = Field(default_factory=list)
+
+
 class ReviewTag(BaseModel):
     id: str
     name: str

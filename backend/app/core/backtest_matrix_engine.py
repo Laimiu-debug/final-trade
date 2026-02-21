@@ -2,9 +2,13 @@
 
 import hashlib
 import json
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import RLock
 from typing import Callable
 
 import numpy as np
@@ -33,12 +37,14 @@ class MatrixBundle:
 class BacktestMatrixEngine:
     def __init__(self, cache_dir: str | Path | None = None) -> None:
         self._cache_dir = self._resolve_cache_dir(cache_dir)
+        self._runtime_cache: dict[str, tuple[float, MatrixBundle]] = {}
+        self._runtime_cache_lock = RLock()
 
     @staticmethod
     def _resolve_cache_dir(cache_dir: str | Path | None) -> Path:
         if cache_dir is not None and str(cache_dir).strip():
             return Path(str(cache_dir).strip()).expanduser()
-        env_value = str(__import__('os').getenv('TDX_TREND_BACKTEST_MATRIX_CACHE_DIR', '')).strip()
+        env_value = str(os.getenv('TDX_TREND_BACKTEST_MATRIX_CACHE_DIR', '')).strip()
         if env_value:
             return Path(env_value).expanduser()
         return Path.home() / '.tdx-trend' / 'backtest-matrix-cache'
@@ -46,6 +52,82 @@ class BacktestMatrixEngine:
     @staticmethod
     def _parse_date(value: str) -> datetime:
         return datetime.strptime(value, '%Y-%m-%d')
+
+    @staticmethod
+    def _resolve_build_workers() -> int:
+        raw = str(os.getenv('TDX_TREND_BACKTEST_MATRIX_BUILD_WORKERS', '')).strip()
+        if raw:
+            try:
+                return max(1, int(raw))
+            except Exception:
+                pass
+        cpu_count = os.cpu_count() or 4
+        return max(1, min(8, cpu_count))
+
+    @staticmethod
+    def _is_runtime_cache_enabled() -> bool:
+        raw = str(os.getenv('TDX_TREND_BACKTEST_MATRIX_RUNTIME_CACHE', '')).strip().lower()
+        if not raw:
+            return True
+        if raw in {'1', 'true', 'yes', 'on', 'y'}:
+            return True
+        if raw in {'0', 'false', 'no', 'off', 'n'}:
+            return False
+        return True
+
+    @staticmethod
+    def _runtime_cache_ttl_sec() -> float:
+        raw = str(os.getenv('TDX_TREND_BACKTEST_MATRIX_RUNTIME_CACHE_TTL_SEC', '')).strip()
+        if not raw:
+            return 15 * 60.0
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 15 * 60.0
+
+    @staticmethod
+    def _runtime_cache_max_items() -> int:
+        raw = str(os.getenv('TDX_TREND_BACKTEST_MATRIX_RUNTIME_CACHE_MAX_ITEMS', '')).strip()
+        if not raw:
+            return 16
+        try:
+            return max(1, int(raw))
+        except Exception:
+            return 16
+
+    def _load_runtime_cache(self, cache_key: str) -> MatrixBundle | None:
+        if not self._is_runtime_cache_enabled():
+            return None
+        ttl_sec = self._runtime_cache_ttl_sec()
+        with self._runtime_cache_lock:
+            cached = self._runtime_cache.get(cache_key)
+            if cached is None:
+                return None
+            created_at, bundle = cached
+            if ttl_sec > 0 and (time.time() - created_at) > ttl_sec:
+                self._runtime_cache.pop(cache_key, None)
+                return None
+            return bundle
+
+    def _save_runtime_cache(self, cache_key: str, bundle: MatrixBundle) -> None:
+        if not self._is_runtime_cache_enabled():
+            return
+        now_ts = time.time()
+        with self._runtime_cache_lock:
+            self._runtime_cache[cache_key] = (now_ts, bundle)
+            max_items = self._runtime_cache_max_items()
+            if len(self._runtime_cache) > max_items:
+                stale_items = sorted(
+                    self._runtime_cache.items(),
+                    key=lambda item: float(item[1][0]),
+                )
+                overflow = len(self._runtime_cache) - max_items
+                for key, _value in stale_items[:overflow]:
+                    self._runtime_cache.pop(key, None)
+
+    def clear_runtime_cache(self) -> None:
+        with self._runtime_cache_lock:
+            self._runtime_cache.clear()
 
     @classmethod
     def _with_lookback_start(cls, date_from: str, max_lookback_days: int) -> str:
@@ -86,6 +168,10 @@ class BacktestMatrixEngine:
         return self._cache_dir / f'{cache_key}.npz'
 
     def load_bundle_from_cache(self, cache_key: str) -> MatrixBundle | None:
+        cached_runtime = self._load_runtime_cache(cache_key)
+        if cached_runtime is not None:
+            return cached_runtime
+
         path = self._cache_file(cache_key)
         if not path.exists():
             return None
@@ -110,7 +196,7 @@ class BacktestMatrixEngine:
                 or valid_mask.shape != expected_shape
             ):
                 return None
-            return MatrixBundle(
+            bundle = MatrixBundle(
                 dates=dates,
                 symbols=symbols,
                 open=open_,
@@ -120,6 +206,8 @@ class BacktestMatrixEngine:
                 volume=volume,
                 valid_mask=valid_mask,
             )
+            self._save_runtime_cache(cache_key, bundle)
+            return bundle
         except Exception:
             return None
 
@@ -139,6 +227,7 @@ class BacktestMatrixEngine:
             valid_mask=bundle.valid_mask.astype(np.uint8),
         )
         tmp.replace(path)
+        self._save_runtime_cache(cache_key, bundle)
 
     def build_bundle(
         self,
@@ -178,9 +267,10 @@ class BacktestMatrixEngine:
         filtered_rows_by_symbol: dict[str, list[CandlePoint]] = {}
         all_dates: set[str] = set()
 
-        for symbol in deduped_symbols:
+        def _load_symbol_rows(symbol: str) -> tuple[str, list[CandlePoint], list[str]]:
             candles = get_candles(symbol)
             rows: list[CandlePoint] = []
+            local_dates: list[str] = []
             for item in candles:
                 day = str(item.time).strip()
                 if not day:
@@ -188,8 +278,25 @@ class BacktestMatrixEngine:
                 if day < lookback_start or day > date_to:
                     continue
                 rows.append(item)
-                all_dates.add(day)
-            filtered_rows_by_symbol[symbol] = rows
+                local_dates.append(day)
+            return symbol, rows, local_dates
+
+        workers = self._resolve_build_workers()
+        if workers <= 1 or len(deduped_symbols) <= 1:
+            for symbol in deduped_symbols:
+                loaded_symbol, rows, local_dates = _load_symbol_rows(symbol)
+                filtered_rows_by_symbol[loaded_symbol] = rows
+                all_dates.update(local_dates)
+        else:
+            with ThreadPoolExecutor(max_workers=min(workers, len(deduped_symbols))) as executor:
+                future_map = {
+                    executor.submit(_load_symbol_rows, symbol): symbol
+                    for symbol in deduped_symbols
+                }
+                for future in as_completed(future_map):
+                    loaded_symbol, rows, local_dates = future.result()
+                    filtered_rows_by_symbol[loaded_symbol] = rows
+                    all_dates.update(local_dates)
 
         dates = sorted(all_dates)
         date_to_idx = {day: idx for idx, day in enumerate(dates)}

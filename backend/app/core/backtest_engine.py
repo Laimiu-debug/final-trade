@@ -211,9 +211,7 @@ class BacktestEngine:
     @staticmethod
     def _resolve_exit_matrix(
         *,
-        dates: list[str],
         entry_index: int,
-        entry_date: str,
         entry_price: float,
         high_col: np.ndarray,
         low_col: np.ndarray,
@@ -222,7 +220,8 @@ class BacktestEngine:
         sell_col: np.ndarray,
         payload: BacktestRunRequest,
     ) -> tuple[int, float, str] | None:
-        if entry_index >= len(dates):
+        total_bars = int(valid_col.shape[0])
+        if entry_index >= total_bars:
             return None
         if (not math.isfinite(entry_price)) or entry_price <= 0:
             return None
@@ -231,11 +230,9 @@ class BacktestEngine:
         take_price = entry_price * (1 + payload.take_profit) if payload.take_profit > 0 else None
         last_sellable_index: int | None = None
 
-        for bar_index in range(entry_index, len(dates)):
+        start_index = entry_index + 1 if payload.enforce_t1 else entry_index
+        for bar_index in range(start_index, total_bars):
             if not bool(valid_col[bar_index]):
-                continue
-            day = str(dates[bar_index])
-            if payload.enforce_t1 and day <= entry_date:
                 continue
             last_sellable_index = bar_index
 
@@ -258,7 +255,7 @@ class BacktestEngine:
 
         if payload.enforce_t1 and last_sellable_index is None:
             return None
-        fallback_index = last_sellable_index if last_sellable_index is not None else (len(dates) - 1)
+        fallback_index = last_sellable_index if last_sellable_index is not None else (total_bars - 1)
         fallback_price = float(close_col[fallback_index]) if math.isfinite(float(close_col[fallback_index])) else entry_price
         if fallback_price <= 0:
             fallback_price = entry_price
@@ -274,6 +271,7 @@ class BacktestEngine:
         matrix_bundle: MatrixBundle,
         matrix_signals: BacktestSignalMatrix,
         allowed_symbols_by_date: dict[str, set[str]] | None = None,
+        allow_reentry_after_skipped: bool = False,
         control_callback: Callable[[], None] | None = None,
     ) -> tuple[list[CandidateTrade], int]:
         dates = list(matrix_bundle.dates)
@@ -293,15 +291,19 @@ class BacktestEngine:
         ):
             raise ValueError("matrix bundle / signals shape mismatch")
 
-        in_range_indexes = [
-            idx for idx, day in enumerate(dates) if start_date <= day <= end_date
-        ]
-        if len(in_range_indexes) < 2:
+        in_range_mask = np.fromiter(
+            (start_date <= day <= end_date for day in dates),
+            dtype=bool,
+            count=len(dates),
+        )
+        if int(np.count_nonzero(in_range_mask)) < 2:
             return [], 0
 
         symbol_to_col = matrix_bundle.symbol_to_index()
         out: list[CandidateTrade] = []
         t1_no_sellable_skips = 0
+        in_range_valid_buy = matrix_signals.buy_signal & matrix_bundle.valid_mask & in_range_mask[:, np.newaxis]
+        buy_any_by_col = np.any(in_range_valid_buy, axis=0)
 
         for raw_symbol in symbols:
             if control_callback is not None:
@@ -310,6 +312,8 @@ class BacktestEngine:
             col = symbol_to_col.get(symbol)
             if col is None:
                 continue
+            if not bool(buy_any_by_col[col]):
+                continue
 
             open_col = matrix_bundle.open[:, col]
             high_col = matrix_bundle.high[:, col]
@@ -317,44 +321,41 @@ class BacktestEngine:
             close_col = matrix_bundle.close[:, col]
             valid_col = matrix_bundle.valid_mask[:, col]
 
-            buy_col = matrix_signals.buy_signal[:, col]
             sell_col = matrix_signals.sell_signal[:, col]
             score_col = matrix_signals.score[:, col]
 
-            cursor = 0
-            while cursor < len(in_range_indexes) - 1:
+            buy_indexes = np.flatnonzero(in_range_valid_buy[:, col])
+            if buy_indexes.size <= 0:
+                continue
+            if allowed_symbols_by_date is not None:
+                filtered_indexes = [
+                    int(idx)
+                    for idx in buy_indexes.tolist()
+                    if symbol in allowed_symbols_by_date.get(dates[int(idx)], set())
+                ]
+                if not filtered_indexes:
+                    continue
+                buy_indexes = np.asarray(filtered_indexes, dtype=np.int64)
+
+            blocked_until = -1
+            for signal_index in buy_indexes.tolist():
                 if control_callback is not None:
                     control_callback()
-                signal_index = in_range_indexes[cursor]
-                signal_day = dates[signal_index]
-                if not bool(valid_col[signal_index]):
-                    cursor += 1
-                    continue
-                if allowed_symbols_by_date is not None:
-                    allowed_today = allowed_symbols_by_date.get(signal_day, set())
-                    if symbol not in allowed_today:
-                        cursor += 1
-                        continue
-                if not bool(buy_col[signal_index]):
-                    cursor += 1
+                if (not allow_reentry_after_skipped) and signal_index <= blocked_until:
                     continue
 
                 entry_index = signal_index + 1
                 if entry_index >= len(dates):
-                    break
+                    continue
                 if not bool(valid_col[entry_index]):
-                    cursor += 1
                     continue
 
                 entry_price = float(open_col[entry_index])
                 if (not math.isfinite(entry_price)) or entry_price <= 0:
-                    cursor += 1
                     continue
 
                 exit_resolved = self._resolve_exit_matrix(
-                    dates=dates,
                     entry_index=entry_index,
-                    entry_date=dates[entry_index],
                     entry_price=entry_price,
                     high_col=high_col,
                     low_col=low_col,
@@ -365,7 +366,6 @@ class BacktestEngine:
                 )
                 if exit_resolved is None:
                     t1_no_sellable_skips += 1
-                    cursor += 1
                     continue
 
                 exit_index, exit_price, exit_reason = exit_resolved
@@ -399,9 +399,8 @@ class BacktestEngine:
                         exit_reason=exit_reason,
                     )
                 )
-
-                while cursor < len(in_range_indexes) and in_range_indexes[cursor] <= exit_index:
-                    cursor += 1
+                if not allow_reentry_after_skipped:
+                    blocked_until = max(blocked_until, int(exit_index))
 
         return out, t1_no_sellable_skips
 
@@ -412,6 +411,7 @@ class BacktestEngine:
         start_date: str,
         end_date: str,
         allowed_symbols_by_date: dict[str, set[str]] | None = None,
+        allow_reentry_after_skipped: bool = False,
         control_callback: Callable[[], None] | None = None,
     ) -> tuple[list[CandidateTrade], int]:
         candles = self._get_candles(symbol)
@@ -528,8 +528,11 @@ class BacktestEngine:
                 )
             )
 
-            while cursor < len(in_range_indexes) and in_range_indexes[cursor] <= exit_index:
+            if allow_reentry_after_skipped:
                 cursor += 1
+            else:
+                while cursor < len(in_range_indexes) and in_range_indexes[cursor] <= exit_index:
+                    cursor += 1
 
         return out, t1_no_sellable_skips
 
@@ -553,6 +556,7 @@ class BacktestEngine:
             start_dt, end_dt = end_dt, start_dt
         start_date = start_dt.strftime("%Y-%m-%d")
         end_date = end_dt.strftime("%Y-%m-%d")
+        allow_reentry_after_skipped = payload.pool_roll_mode == "position"
 
         notes: list[str] = []
         if matrix_bundle is not None and matrix_signals is not None:
@@ -564,6 +568,7 @@ class BacktestEngine:
                 matrix_bundle=matrix_bundle,
                 matrix_signals=matrix_signals,
                 allowed_symbols_by_date=allowed_symbols_by_date,
+                allow_reentry_after_skipped=allow_reentry_after_skipped,
                 control_callback=control_callback,
             )
             notes.append("鐭╅樀淇″彿寮曟搸: 浣跨敤 (T,N) 淇″彿鍒囩墖璺緞锛岃烦杩囬€愯偂閫愭棩 snapshot 閲嶇畻銆?")
@@ -579,12 +584,15 @@ class BacktestEngine:
                     start_date,
                     end_date,
                     allowed_symbols_by_date=allowed_symbols_by_date,
+                    allow_reentry_after_skipped=allow_reentry_after_skipped,
                     control_callback=control_callback,
                 )
                 candidates.extend(rows)
                 total_t1_skips += t1_skips
         if total_t1_skips > 0:
             notes.append(f"T+1 约束下有 {total_t1_skips} 笔信号因样本内无可卖出日被跳过。")
+        if allow_reentry_after_skipped:
+            notes.append("持仓触发滚动：未成交信号不会阻断同一标的后续信号。")
 
         if payload.prioritize_signals:
             candidates.sort(key=lambda row: self._candidate_sort_key(row, priority_mode=payload.priority_mode))
@@ -623,10 +631,12 @@ class BacktestEngine:
             "max_positions": 0,
             "insufficient_cash": 0,
             "invalid_price": 0,
+            "duplicate_symbol": 0,
         }
+        active_symbols: set[str] = set()
 
         def release_until(current_entry_date: str) -> None:
-            nonlocal cash, equity, active_positions
+            nonlocal cash, equity, active_positions, active_symbols
             if not active_positions:
                 return
             remaining_positions: list[dict[str, float | str]] = []
@@ -635,6 +645,9 @@ class BacktestEngine:
                 if exit_date < current_entry_date:
                     cash += float(item.get("exit_amount", 0.0))
                     equity += float(item.get("pnl_amount", 0.0))
+                    symbol_text = str(item.get("symbol", "")).strip().lower()
+                    if symbol_text:
+                        active_symbols.discard(symbol_text)
                 else:
                     remaining_positions.append(item)
             active_positions = remaining_positions
@@ -643,6 +656,10 @@ class BacktestEngine:
             if control_callback is not None:
                 control_callback()
             release_until(row.entry_date)
+
+            if row.symbol in active_symbols:
+                skip_reasons["duplicate_symbol"] += 1
+                continue
 
             if len(active_positions) >= payload.max_positions:
                 skip_reasons["max_positions"] += 1
@@ -672,11 +689,13 @@ class BacktestEngine:
 
             active_positions.append(
                 {
+                    "symbol": row.symbol,
                     "exit_date": row.exit_date,
                     "exit_amount": float(exit_amount),
                     "pnl_amount": float(pnl_amount),
                 }
             )
+            active_symbols.add(row.symbol)
             max_concurrent_positions = max(max_concurrent_positions, len(active_positions))
 
             executed.append(
@@ -743,19 +762,43 @@ class BacktestEngine:
         input_symbols = {str(symbol).strip().lower() for symbol in symbols if str(symbol).strip()}
         calendar_dates_set: set[str] = set()
         close_map_by_symbol: dict[str, dict[str, float]] = {}
-        for symbol in input_symbols:
-            day_close: dict[str, float] = {}
-            for bar in self._get_candles(symbol):
-                if bar.time < start_date or bar.time > end_date:
+        if matrix_bundle is not None and matrix_bundle.dates:
+            matrix_dates = list(matrix_bundle.dates)
+            in_range_indexes = [
+                idx for idx, day in enumerate(matrix_dates) if start_date <= day <= end_date
+            ]
+            for idx in in_range_indexes:
+                calendar_dates_set.add(matrix_dates[idx])
+
+            symbol_to_col = matrix_bundle.symbol_to_index()
+            for symbol in executed_symbols:
+                col = symbol_to_col.get(symbol)
+                if col is None:
                     continue
-                calendar_dates_set.add(bar.time)
-                if symbol not in executed_symbols:
-                    continue
-                close_price = float(bar.close)
-                if math.isfinite(close_price) and close_price > 0:
-                    day_close[bar.time] = close_price
-            if symbol in executed_symbols:
+                close_col = matrix_bundle.close[:, col]
+                valid_col = matrix_bundle.valid_mask[:, col]
+                day_close: dict[str, float] = {}
+                for idx in in_range_indexes:
+                    if not bool(valid_col[idx]):
+                        continue
+                    close_price = float(close_col[idx])
+                    if math.isfinite(close_price) and close_price > 0:
+                        day_close[matrix_dates[idx]] = close_price
                 close_map_by_symbol[symbol] = day_close
+        else:
+            for symbol in input_symbols:
+                day_close: dict[str, float] = {}
+                for bar in self._get_candles(symbol):
+                    if bar.time < start_date or bar.time > end_date:
+                        continue
+                    calendar_dates_set.add(bar.time)
+                    if symbol not in executed_symbols:
+                        continue
+                    close_price = float(bar.close)
+                    if math.isfinite(close_price) and close_price > 0:
+                        day_close[bar.time] = close_price
+                if symbol in executed_symbols:
+                    close_map_by_symbol[symbol] = day_close
 
         for symbol in executed_symbols:
             if symbol in close_map_by_symbol:

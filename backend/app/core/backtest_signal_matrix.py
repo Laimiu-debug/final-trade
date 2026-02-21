@@ -31,6 +31,45 @@ def _to_bool_array(frame: pd.DataFrame) -> np.ndarray:
     return np.array(values, dtype=bool, copy=True)
 
 
+def _top_n_mask_from_returns(
+    returns: np.ndarray,
+    *,
+    top_n: int,
+) -> np.ndarray:
+    if returns.ndim != 2:
+        return np.zeros((0, 0), dtype=bool)
+    t, n = returns.shape
+    if t <= 0 or n <= 0:
+        return np.zeros((t, n), dtype=bool)
+
+    keep_n = max(1, int(top_n))
+    out = np.zeros((t, n), dtype=bool)
+    for row_idx in range(t):
+        row = returns[row_idx]
+        valid_idx = np.flatnonzero(np.isfinite(row))
+        valid_count = int(valid_idx.size)
+        if valid_count <= 0:
+            continue
+        k = min(keep_n, valid_count)
+        if k >= valid_count:
+            out[row_idx, valid_idx] = True
+            continue
+
+        valid_values = row[valid_idx]
+        pivot = valid_count - k
+        part = np.argpartition(valid_values, pivot)[pivot:]
+        chosen = valid_idx[part]
+
+        # 在边界存在并列时，按值降序 + 列序升序稳定收敛。
+        if chosen.size > k:
+            chosen_values = row[chosen]
+            order = np.lexsort((chosen, -chosen_values))
+            chosen = chosen[order[:k]]
+
+        out[row_idx, chosen] = True
+    return out
+
+
 def compute_backtest_signal_matrix(
     bundle: MatrixBundle,
     *,
@@ -77,8 +116,10 @@ def compute_backtest_signal_matrix(
     s2 = vol_ratio < 0.6
 
     ret_40d = close.pct_change(40, fill_method=None)
-    rank_40d = ret_40d.rank(axis=1, ascending=False, method='first')
-    s3 = rank_40d <= max(1, int(top_n))
+    s3_b = _top_n_mask_from_returns(
+        ret_40d.to_numpy(dtype=np.float64, copy=False),
+        top_n=top_n,
+    )
 
     # 横盘识别：20日振幅收敛且价格靠近20日均线。
     sideways_ratio = range20 / close.replace(0.0, np.nan)
@@ -104,7 +145,6 @@ def compute_backtest_signal_matrix(
 
     s1_b = _to_bool_array(s1)
     s2_b = _to_bool_array(s2)
-    s3_b = _to_bool_array(s3)
     s4_b = _to_bool_array(s4)
     s5_b = _to_bool_array(s5)
     s6_b = _to_bool_array(s6)

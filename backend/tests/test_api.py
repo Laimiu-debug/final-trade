@@ -21,6 +21,7 @@ os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_ENABLED", "1")
 os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_READ_ONLY", "0")
 
 from app.main import app
+from app.models import ScreenerResult
 from app.store import store
 from app.tdx_loader import load_candles_for_symbol
 
@@ -145,6 +146,88 @@ def test_run_and_get_screener() -> None:
     assert body["as_of_date"] == as_of_date
     assert body["step_summary"]["input_count"] > 0
     assert body["step_pools"]["input"][0]["name"] != "绉戞妧鏍锋湰1"
+
+
+def test_screener_result_cache_reuses_persisted_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TDX_TREND_SCREENER_RESULT_CACHE", "1")
+    monkeypatch.setenv("TDX_TREND_SCREENER_RESULT_CACHE_TTL_SEC", "3600")
+    monkeypatch.setenv("TDX_TREND_SCREENER_RESULT_CACHE_DIR", str(tmp_path / "screener-result-cache"))
+
+    call_counter = {"count": 0}
+
+    def _fake_load_input_pool_rows(
+        *,
+        markets: list[str],
+        return_window_days: int,
+        as_of_date: str | None,
+    ) -> tuple[list[ScreenerResult], str | None, bool]:
+        _ = (markets, return_window_days)
+        call_counter["count"] += 1
+        day = str(as_of_date or "2025-01-02")
+        row = ScreenerResult(
+            symbol="sz300750",
+            name="宁德时代",
+            latest_price=10.0,
+            day_change=0.1,
+            day_change_pct=0.01,
+            score=80,
+            ret40=0.25,
+            turnover20=0.08,
+            amount20=8e8,
+            amplitude20=0.05,
+            retrace20=0.03,
+            pullback_days=3,
+            ma10_above_ma20_days=8,
+            ma5_above_ma10_days=6,
+            price_vs_ma20=0.06,
+            vol_slope20=0.1,
+            up_down_volume_ratio=1.4,
+            pullback_volume_ratio=0.7,
+            has_blowoff_top=False,
+            has_divergence_5d=False,
+            has_upper_shadow_risk=False,
+            ai_confidence=0.7,
+            theme_stage="发酵中",
+            trend_class="A",
+            stage="Mid",
+            labels=[day],
+            reject_reasons=[],
+            degraded=False,
+            degraded_reason=None,
+        )
+        return [row], None, False
+
+    monkeypatch.setattr(store, "_load_input_pool_rows", _fake_load_input_pool_rows)
+
+    payload = {
+        "markets": ["sh", "sz"],
+        "mode": "strict",
+        "as_of_date": "2025-01-03",
+        "return_window_days": 40,
+        "top_n": 500,
+        "turnover_threshold": 0.05,
+        "amount_threshold": 500000000,
+        "amplitude_threshold": 0.03,
+    }
+    run1 = client.post("/api/screener/run", json=payload)
+    assert run1.status_code == 200
+    run1_id = run1.json()["run_id"]
+    detail1 = client.get(f"/api/screener/runs/{run1_id}")
+    assert detail1.status_code == 200
+    assert detail1.json()["step_summary"]["input_count"] == 1
+
+    run2 = client.post("/api/screener/run", json=payload)
+    assert run2.status_code == 200
+    run2_id = run2.json()["run_id"]
+    assert run2_id != run1_id
+    detail2 = client.get(f"/api/screener/runs/{run2_id}")
+    assert detail2.status_code == 200
+    assert detail2.json()["step_summary"]["input_count"] == 1
+
+    assert call_counter["count"] == 1
 
 
 def test_annotation_roundtrip() -> None:
@@ -435,6 +518,86 @@ def test_signals_endpoint_trend_pool_mode() -> None:
     assert body["source_count"] >= 0
     assert isinstance(body["items"], list)
     assert all(item["trigger_date"] <= as_of_date for item in body["items"])
+
+
+def test_signals_disk_cache_reuses_persisted_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TDX_TREND_SIGNALS_DISK_CACHE", "1")
+    monkeypatch.setenv("TDX_TREND_SIGNALS_DISK_CACHE_TTL_SEC", "3600")
+    monkeypatch.setenv("TDX_TREND_SIGNALS_CACHE_DIR", str(tmp_path / "signals-cache"))
+
+    dates = _load_symbol_dates("sz300750")
+    as_of_date = dates[-8]
+    run_payload = {
+        "markets": ["sh", "sz"],
+        "mode": "strict",
+        "as_of_date": as_of_date,
+        "return_window_days": 40,
+        "top_n": 500,
+        "turnover_threshold": 0.05,
+        "amount_threshold": 500000000,
+        "amplitude_threshold": 0.03,
+    }
+    run_resp = client.post("/api/screener/run", json=run_payload)
+    assert run_resp.status_code == 200
+    run_id = run_resp.json()["run_id"]
+
+    call_counter = {"count": 0}
+
+    def _fake_snapshot(
+        row,
+        window_days: int,
+        *,
+        as_of_date: str | None = None,
+    ) -> dict[str, object]:
+        _ = (row, window_days)
+        call_counter["count"] += 1
+        day = str(as_of_date or "2025-01-02")
+        return {
+            "events": ["SOS"],
+            "risk_events": [],
+            "event_dates": {"SOS": day},
+            "event_chain": [{"event": "SOS", "date": day, "category": "accumulation"}],
+            "sequence_ok": True,
+            "entry_quality_score": 88.0,
+            "trigger_date": day,
+            "signal": "SOS",
+            "phase": "吸筹D",
+            "phase_hint": "test",
+            "structure_hhh": "HH|HL|HQ",
+            "event_strength_score": 70.0,
+            "phase_score": 72.0,
+            "structure_score": 68.0,
+            "trend_score": 75.0,
+            "volatility_score": 62.0,
+        }
+
+    monkeypatch.setattr(store, "_calc_wyckoff_snapshot", _fake_snapshot)
+    store._signals_cache = {}
+
+    params = {
+        "mode": "trend_pool",
+        "run_id": run_id,
+        "as_of_date": as_of_date,
+        "window_days": 60,
+        "min_score": 0,
+        "min_event_count": 0,
+    }
+    resp1 = client.get("/api/signals", params=params)
+    assert resp1.status_code == 200
+    body1 = resp1.json()
+    assert body1["cache_hit"] is False
+    assert call_counter["count"] > 0
+
+    store._signals_cache = {}
+    call_counter["count"] = 0
+    resp2 = client.get("/api/signals", params=params)
+    assert resp2.status_code == 200
+    body2 = resp2.json()
+    assert body2["cache_hit"] is True
+    assert call_counter["count"] == 0
 
 
 def test_wyckoff_event_store_lazy_fill_and_reuse(monkeypatch: pytest.MonkeyPatch) -> None:

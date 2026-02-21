@@ -28,12 +28,15 @@ import {
   cancelBacktestTask,
   getLatestScreenerRun,
   pauseBacktestTask,
+  runBacktestPlateau,
   resumeBacktestTask,
   startBacktestTask,
 } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { useBacktestTaskStore } from '@/state/backtestTaskStore'
 import type {
+  BacktestPlateauPoint,
+  BacktestPlateauResponse,
   BacktestPoolRollMode,
   BacktestPriorityMode,
   BacktestTaskStatusResponse,
@@ -117,6 +120,48 @@ function toPercent(value: number) {
 function toRatio(percentValue: number, fallback: number, lower: number, upper: number) {
   const raw = Number.isFinite(percentValue) ? percentValue / 100 : fallback
   return Math.max(lower, Math.min(upper, Number(raw.toFixed(6))))
+}
+
+function parseNumericList(
+  raw: string,
+  options: {
+    integer?: boolean
+    min: number
+    max: number
+    precision?: number
+    maxLength?: number
+  },
+): number[] {
+  const {
+    integer = false,
+    min,
+    max,
+    precision = 6,
+    maxLength = 16,
+  } = options
+  const tokens = String(raw || '')
+    .split(/[,\s，、;；]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+  if (tokens.length === 0) return []
+  const result: number[] = []
+  const seen = new Set<string>()
+  for (const token of tokens) {
+    if (result.length >= maxLength) break
+    const parsed = Number(token)
+    if (!Number.isFinite(parsed)) continue
+    let value = Math.max(min, Math.min(max, parsed))
+    if (integer) {
+      value = Math.round(value)
+    } else {
+      value = Number(value.toFixed(precision))
+    }
+    const key = integer ? String(Math.round(value)) : value.toFixed(precision)
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push(value)
+  }
+  return result
 }
 
 function sanitizeBoardFilters(raw: unknown): BoardFilter[] {
@@ -316,6 +361,67 @@ const tradeColumns: ColumnsType<BacktestTrade> = [
   },
 ]
 
+const plateauColumns: ColumnsType<BacktestPlateauPoint> = [
+  {
+    title: '评分',
+    dataIndex: 'score',
+    width: 90,
+    render: (value: number) => value.toFixed(3),
+  },
+  {
+    title: '总收益',
+    dataIndex: ['stats', 'total_return'],
+    width: 90,
+    render: (value: number) => formatPct(value),
+  },
+  {
+    title: '最大回撤',
+    dataIndex: ['stats', 'max_drawdown'],
+    width: 100,
+    render: (value: number) => formatPct(value),
+  },
+  {
+    title: '胜率',
+    dataIndex: ['stats', 'win_rate'],
+    width: 90,
+    render: (value: number) => formatPct(value),
+  },
+  { title: '交易数', dataIndex: ['stats', 'trade_count'], width: 80 },
+  { title: '窗口', dataIndex: ['params', 'window_days'], width: 70 },
+  { title: '最低分', dataIndex: ['params', 'min_score'], width: 80 },
+  {
+    title: '止损%',
+    dataIndex: ['params', 'stop_loss'],
+    width: 80,
+    render: (value: number) => `${(Number(value) * 100).toFixed(2)}%`,
+  },
+  {
+    title: '止盈%',
+    dataIndex: ['params', 'take_profit'],
+    width: 80,
+    render: (value: number) => `${(Number(value) * 100).toFixed(2)}%`,
+  },
+  { title: '仓位上限', dataIndex: ['params', 'max_positions'], width: 86 },
+  {
+    title: '单笔%',
+    dataIndex: ['params', 'position_pct'],
+    width: 78,
+    render: (value: number) => `${(Number(value) * 100).toFixed(1)}%`,
+  },
+  { title: '股票数', dataIndex: ['params', 'max_symbols'], width: 78 },
+  { title: 'TopK', dataIndex: ['params', 'priority_topk_per_day'], width: 70 },
+  {
+    title: '状态',
+    dataIndex: 'error',
+    width: 90,
+    render: (value: string | null | undefined, row) => {
+      if (value) return <Tag color="error">失败</Tag>
+      if (row.cache_hit) return <Tag color="processing">缓存</Tag>
+      return <Tag color="success">成功</Tag>
+    },
+  },
+]
+
 export function BacktestPage() {
   const { message } = AntdApp.useApp()
   const initialDraft = useMemo(() => loadBacktestDraft(), [])
@@ -347,6 +453,20 @@ export function BacktestPage() {
   const [priorityTopK, setPriorityTopK] = useState(initialDraft.priority_topk_per_day)
   const [enforceT1, setEnforceT1] = useState(initialDraft.enforce_t1)
   const [maxSymbols, setMaxSymbols] = useState(initialDraft.max_symbols)
+  const [plateauSamplingMode, setPlateauSamplingMode] = useState<'grid' | 'lhs'>('lhs')
+  const [plateauSamplePoints, setPlateauSamplePoints] = useState(120)
+  const [plateauRandomSeed, setPlateauRandomSeed] = useState<number | null>(20260221)
+  const [plateauWindowListRaw, setPlateauWindowListRaw] = useState('')
+  const [plateauMinScoreListRaw, setPlateauMinScoreListRaw] = useState('')
+  const [plateauStopLossPctListRaw, setPlateauStopLossPctListRaw] = useState('')
+  const [plateauTakeProfitPctListRaw, setPlateauTakeProfitPctListRaw] = useState('')
+  const [plateauMaxPositionsListRaw, setPlateauMaxPositionsListRaw] = useState('')
+  const [plateauPositionPctListRaw, setPlateauPositionPctListRaw] = useState('')
+  const [plateauMaxSymbolsListRaw, setPlateauMaxSymbolsListRaw] = useState('')
+  const [plateauTopKListRaw, setPlateauTopKListRaw] = useState('')
+  const [plateauResult, setPlateauResult] = useState<BacktestPlateauResponse | null>(null)
+  const [plateauError, setPlateauError] = useState<string | null>(null)
+  const [plateauApplyRank, setPlateauApplyRank] = useState(1)
   const [tradePage, setTradePage] = useState(1)
   const [tradePageSize, setTradePageSize] = useState(initialDraft.trades_page_size)
   const [runError, setRunError] = useState<string | null>(null)
@@ -485,6 +605,20 @@ export function BacktestPage() {
     },
   })
 
+  const runPlateauMutation = useMutation({
+    mutationFn: runBacktestPlateau,
+    onSuccess: (payload) => {
+      setPlateauResult(payload)
+      setPlateauError(null)
+      message.success(`收益平原评估完成：${payload.evaluated_combinations} 组`)
+    },
+    onError: (error) => {
+      const text = formatApiError(error)
+      setPlateauError(text)
+      message.error(text)
+    },
+  })
+
   const bindLatestRunMutation = useMutation({
     mutationFn: getLatestScreenerRun,
     onSuccess: (detail) => {
@@ -518,6 +652,10 @@ export function BacktestPage() {
   useEffect(() => {
     setTradePage(1)
   }, [result?.trades])
+
+  useEffect(() => {
+    setPlateauApplyRank(1)
+  }, [plateauResult?.generated_at])
 
   useEffect(() => {
     if (selectedTaskId) return
@@ -568,28 +706,13 @@ export function BacktestPage() {
     }
   }, [result?.drawdown_curve])
 
-  function handleRun() {
-    if (runLoading) return
-    if (entryEvents.length === 0 || exitEvents.length === 0) {
-      message.warning('请至少选择一个入场事件和离场事件')
-      return
-    }
-    const cached = readScreenerRunMetaFromStorage()
-    const effectiveBoardFilters = cached?.boardFilters?.length ? cached.boardFilters : boardFilters
-    const shouldApplyBoardFilters = mode === 'trend_pool'
-    if (shouldApplyBoardFilters && effectiveBoardFilters.length === 0) {
-      message.warning('请至少选择一个板块后再回测')
-      return
-    }
-    if (cached?.boardFilters?.length) {
-      setBoardFilters(cached.boardFilters)
-    }
-    const payload = {
+  function buildBacktestPayload(effectiveBoardFilters?: BoardFilter[]) {
+    return {
       mode,
       run_id: runId.trim() || undefined,
       trend_step: trendStep,
       pool_roll_mode: poolRollMode,
-      board_filters: shouldApplyBoardFilters ? effectiveBoardFilters : undefined,
+      board_filters: mode === 'trend_pool' ? effectiveBoardFilters : undefined,
       date_from: range[0].format('YYYY-MM-DD'),
       date_to: range[1].format('YYYY-MM-DD'),
       window_days: windowDays,
@@ -611,6 +734,25 @@ export function BacktestPage() {
       enforce_t1: enforceT1,
       max_symbols: maxSymbols,
     }
+  }
+
+  function handleRun() {
+    if (runLoading) return
+    if (entryEvents.length === 0 || exitEvents.length === 0) {
+      message.warning('请至少选择一个入场事件和离场事件')
+      return
+    }
+    const cached = readScreenerRunMetaFromStorage()
+    const effectiveBoardFilters = cached?.boardFilters?.length ? cached.boardFilters : boardFilters
+    const shouldApplyBoardFilters = mode === 'trend_pool'
+    if (shouldApplyBoardFilters && effectiveBoardFilters.length === 0) {
+      message.warning('请至少选择一个板块后再回测')
+      return
+    }
+    if (cached?.boardFilters?.length) {
+      setBoardFilters(cached.boardFilters)
+    }
+    const payload = buildBacktestPayload(shouldApplyBoardFilters ? effectiveBoardFilters : undefined)
     setRunError(null)
     startTaskMutation.mutate(payload)
   }
@@ -629,8 +771,215 @@ export function BacktestPage() {
     bindLatestRunMutation.mutate()
   }
 
+  function handleRunPlateau() {
+    if (runPlateauMutation.isPending) return
+    if (entryEvents.length === 0 || exitEvents.length === 0) {
+      message.warning('请至少选择一个入场事件和离场事件')
+      return
+    }
+    const cached = readScreenerRunMetaFromStorage()
+    const effectiveBoardFilters = cached?.boardFilters?.length ? cached.boardFilters : boardFilters
+    if (mode === 'trend_pool' && effectiveBoardFilters.length === 0) {
+      message.warning('请至少选择一个板块后再执行收益平原')
+      return
+    }
+    if (cached?.boardFilters?.length) {
+      setBoardFilters(cached.boardFilters)
+    }
+    const stopLossPctList = parseNumericList(plateauStopLossPctListRaw, {
+      integer: false,
+      min: 0,
+      max: 50,
+      precision: 4,
+    })
+    const takeProfitPctList = parseNumericList(plateauTakeProfitPctListRaw, {
+      integer: false,
+      min: 0,
+      max: 150,
+      precision: 4,
+    })
+    const positionPctList = parseNumericList(plateauPositionPctListRaw, {
+      integer: false,
+      min: 1,
+      max: 100,
+      precision: 4,
+    })
+    const samplePoints = Math.max(1, Math.min(2000, Number(plateauSamplePoints || 120)))
+    const payload = {
+      base_payload: buildBacktestPayload(mode === 'trend_pool' ? effectiveBoardFilters : undefined),
+      sampling_mode: plateauSamplingMode,
+      window_days_list: parseNumericList(plateauWindowListRaw, {
+        integer: true,
+        min: 20,
+        max: 240,
+      }),
+      min_score_list: parseNumericList(plateauMinScoreListRaw, {
+        integer: false,
+        min: 0,
+        max: 100,
+        precision: 4,
+      }),
+      stop_loss_list: stopLossPctList.map((item) => Number((item / 100).toFixed(6))),
+      take_profit_list: takeProfitPctList.map((item) => Number((item / 100).toFixed(6))),
+      max_positions_list: parseNumericList(plateauMaxPositionsListRaw, {
+        integer: true,
+        min: 1,
+        max: 100,
+      }),
+      position_pct_list: positionPctList.map((item) => Number((item / 100).toFixed(6))),
+      max_symbols_list: parseNumericList(plateauMaxSymbolsListRaw, {
+        integer: true,
+        min: 20,
+        max: 2000,
+      }),
+      priority_topk_per_day_list: parseNumericList(plateauTopKListRaw, {
+        integer: true,
+        min: 0,
+        max: 500,
+      }),
+      sample_points: samplePoints,
+      random_seed: plateauRandomSeed ?? undefined,
+      max_points: samplePoints,
+    }
+    setPlateauError(null)
+    runPlateauMutation.mutate(payload)
+  }
+
+  function applyPlateauPointToForm(point: BacktestPlateauPoint, rankLabel?: string) {
+    if (point.error) {
+      message.warning('该参数组评估失败，无法回填')
+      return
+    }
+    setWindowDays(Number(point.params.window_days))
+    setMinScore(Number(point.params.min_score))
+    setStopLossPercent(toPercent(Number(point.params.stop_loss)))
+    setTakeProfitPercent(toPercent(Number(point.params.take_profit)))
+    setMaxPositions(Number(point.params.max_positions))
+    setPositionPctPercent(toPercent(Number(point.params.position_pct)))
+    setMaxSymbols(Number(point.params.max_symbols))
+    setPriorityTopK(Number(point.params.priority_topk_per_day))
+    setRunError(null)
+    const prefix = rankLabel ? `${rankLabel}参数已回填` : '参数已回填'
+    message.success(`${prefix}：window=${point.params.window_days}, min_score=${point.params.min_score.toFixed(2)}`)
+  }
+
   const taskRunning = taskStatus?.status === 'running' || taskStatus?.status === 'pending' || taskStatus?.status === 'paused'
   const runLoading = startTaskMutation.isPending
+  const plateauLoading = runPlateauMutation.isPending
+  const plateauBestPoint = plateauResult?.best_point ?? null
+  const plateauValidPoints = useMemo(
+    () => (plateauResult?.points ?? []).filter((row) => !row.error),
+    [plateauResult?.points],
+  )
+  const plateauTopRankOptions = useMemo(
+    () =>
+      plateauValidPoints.slice(0, 20).map((row, idx) => ({
+        value: idx + 1,
+        label: `#${idx + 1} | score ${row.score.toFixed(3)} | 收益 ${formatPct(row.stats.total_return)}`,
+      })),
+    [plateauValidPoints],
+  )
+  const selectedRankPoint = plateauValidPoints[plateauApplyRank - 1] ?? null
+  const plateauColumnsWithAction: ColumnsType<BacktestPlateauPoint> = [
+    ...plateauColumns,
+    {
+      title: '操作',
+      key: 'action',
+      width: 90,
+      render: (_value, row, index) => (
+        <Button
+          size="small"
+          disabled={Boolean(row.error)}
+          onClick={() => applyPlateauPointToForm(row, `第${index + 1}名`)}
+        >
+          回填
+        </Button>
+      ),
+    },
+  ]
+  const plateauHeatmapOption = useMemo(() => {
+    const rows = (plateauResult?.points || []).filter((item) => !item.error)
+    if (rows.length === 0) return null
+    const xAxis = Array.from(new Set(rows.map((row) => row.params.window_days))).sort((a, b) => a - b)
+    const yAxis = Array.from(new Set(rows.map((row) => Number(row.params.min_score.toFixed(2))))).sort((a, b) => a - b)
+    if (xAxis.length <= 1 || yAxis.length <= 1) return null
+    const scoreMap = new Map<string, number>()
+    rows.forEach((row) => {
+      const x = row.params.window_days
+      const y = Number(row.params.min_score.toFixed(2))
+      const key = `${x}|${y}`
+      const prev = scoreMap.get(key)
+      if (typeof prev !== 'number' || row.score > prev) {
+        scoreMap.set(key, row.score)
+      }
+    })
+    const data: Array<[number, number, number]> = []
+    let minScoreValue = Number.POSITIVE_INFINITY
+    let maxScoreValue = Number.NEGATIVE_INFINITY
+    xAxis.forEach((x, xIdx) => {
+      yAxis.forEach((y, yIdx) => {
+        const score = scoreMap.get(`${x}|${y}`)
+        if (typeof score === 'number') {
+          data.push([xIdx, yIdx, Number(score.toFixed(4))])
+          minScoreValue = Math.min(minScoreValue, score)
+          maxScoreValue = Math.max(maxScoreValue, score)
+        }
+      })
+    })
+    if (data.length === 0) return null
+    const visualMin = Number.isFinite(minScoreValue) ? Number(minScoreValue.toFixed(4)) : 0
+    const visualMax = Number.isFinite(maxScoreValue) ? Number(maxScoreValue.toFixed(4)) : 1
+    return {
+      tooltip: {
+        position: 'top',
+        formatter: (params: { data: [number, number, number] }) => {
+          const [xIdx, yIdx, score] = params.data
+          const windowDays = xAxis[xIdx]
+          const minScore = yAxis[yIdx]
+          return `窗口: ${windowDays}<br/>最低分: ${minScore}<br/>评分: ${score}`
+        },
+      },
+      grid: {
+        left: 72,
+        right: 24,
+        top: 24,
+        bottom: 66,
+      },
+      xAxis: {
+        type: 'category',
+        data: xAxis.map((item) => String(item)),
+        name: 'window_days',
+      },
+      yAxis: {
+        type: 'category',
+        data: yAxis.map((item) => item.toFixed(2)),
+        name: 'min_score',
+      },
+      visualMap: {
+        min: visualMin,
+        max: visualMax,
+        calculable: true,
+        orient: 'horizontal',
+        left: 'center',
+        bottom: 10,
+      },
+      series: [
+        {
+          type: 'heatmap',
+          data,
+          label: {
+            show: false,
+          },
+          emphasis: {
+            itemStyle: {
+              shadowBlur: 8,
+              shadowColor: 'rgba(0, 0, 0, 0.35)',
+            },
+          },
+        },
+      ],
+    }
+  }, [plateauResult])
   const effectiveRunError =
     runError
     || (taskStatus?.status === 'failed' ? (taskStatus.error?.trim() || '回测任务失败') : null)
@@ -1032,6 +1381,246 @@ export function BacktestPage() {
           {result ? <Tag color="green">{`${result.range.date_from} ~ ${result.range.date_to}`}</Tag> : null}
         </Space>
       </Card>
+
+      <Card title="收益平原（参数扫描）">
+        <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+          <Row gutter={[12, 12]}>
+            <Col xs={24} md={8}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>采样模式</span>
+                <Radio.Group
+                  value={plateauSamplingMode}
+                  optionType="button"
+                  onChange={(event) => setPlateauSamplingMode(event.target.value)}
+                  options={[
+                    { label: 'LHS（推荐）', value: 'lhs' },
+                    { label: 'Grid', value: 'grid' },
+                  ]}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={8}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>{plateauSamplingMode === 'lhs' ? '采样点数' : '最多评估点数'}</span>
+                <InputNumber
+                  min={1}
+                  max={2000}
+                  value={plateauSamplePoints}
+                  onChange={(value) => setPlateauSamplePoints(Number(value || 120))}
+                  style={{ width: '100%' }}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={8}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>随机种子（可选）</span>
+                <InputNumber
+                  min={0}
+                  max={2_147_483_647}
+                  value={plateauRandomSeed ?? undefined}
+                  onChange={(value) => {
+                    if (value === null || value === undefined) {
+                      setPlateauRandomSeed(null)
+                      return
+                    }
+                    setPlateauRandomSeed(Number(value))
+                  }}
+                  style={{ width: '100%' }}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={6}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>window_days 列表</span>
+                <Input
+                  value={plateauWindowListRaw}
+                  placeholder="如: 40,60,80"
+                  onChange={(event) => setPlateauWindowListRaw(event.target.value)}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={6}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>min_score 列表</span>
+                <Input
+                  value={plateauMinScoreListRaw}
+                  placeholder="如: 50,55,60"
+                  onChange={(event) => setPlateauMinScoreListRaw(event.target.value)}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={6}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>stop_loss 列表(%)</span>
+                <Input
+                  value={plateauStopLossPctListRaw}
+                  placeholder="如: 3,5,8"
+                  onChange={(event) => setPlateauStopLossPctListRaw(event.target.value)}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={6}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>take_profit 列表(%)</span>
+                <Input
+                  value={plateauTakeProfitPctListRaw}
+                  placeholder="如: 10,15,20"
+                  onChange={(event) => setPlateauTakeProfitPctListRaw(event.target.value)}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={6}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>max_positions 列表</span>
+                <Input
+                  value={plateauMaxPositionsListRaw}
+                  placeholder="如: 3,5,8"
+                  onChange={(event) => setPlateauMaxPositionsListRaw(event.target.value)}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={6}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>position_pct 列表(%)</span>
+                <Input
+                  value={plateauPositionPctListRaw}
+                  placeholder="如: 10,15,20"
+                  onChange={(event) => setPlateauPositionPctListRaw(event.target.value)}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={6}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>max_symbols 列表</span>
+                <Input
+                  value={plateauMaxSymbolsListRaw}
+                  placeholder="如: 80,120,200"
+                  onChange={(event) => setPlateauMaxSymbolsListRaw(event.target.value)}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={6}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>priority_topk 列表</span>
+                <Input
+                  value={plateauTopKListRaw}
+                  placeholder="如: 0,5,10"
+                  onChange={(event) => setPlateauTopKListRaw(event.target.value)}
+                />
+              </Space>
+            </Col>
+          </Row>
+
+          <Alert
+            type="info"
+            showIcon
+            title="参数说明"
+            description="列表为空时自动使用当前回测表单值；LHS 会在区间内采样，Grid 会按离散列表组合。"
+          />
+
+          <Space>
+            <Button type="primary" ghost loading={plateauLoading} onClick={handleRunPlateau}>
+              开始平原扫描
+            </Button>
+            {plateauResult ? (
+              <Tag color="green">
+                {`已评估 ${plateauResult.evaluated_combinations} / ${plateauResult.total_combinations}`}
+              </Tag>
+            ) : null}
+            {plateauBestPoint ? (
+              <Tag color="processing">
+                {`最佳评分 ${plateauBestPoint.score.toFixed(3)} | 收益 ${formatPct(plateauBestPoint.stats.total_return)}`}
+              </Tag>
+            ) : null}
+            {plateauTopRankOptions.length > 0 ? (
+              <Select
+                style={{ minWidth: 260 }}
+                value={plateauApplyRank}
+                options={plateauTopRankOptions}
+                onChange={(value) => setPlateauApplyRank(Number(value))}
+              />
+            ) : null}
+            {plateauBestPoint ? (
+              <Button onClick={() => applyPlateauPointToForm(plateauBestPoint, '最佳')}>
+                回填最佳参数
+              </Button>
+            ) : null}
+            {selectedRankPoint ? (
+              <Button onClick={() => applyPlateauPointToForm(selectedRankPoint, `第${plateauApplyRank}名`)}>
+                回填第 {plateauApplyRank} 名
+              </Button>
+            ) : null}
+          </Space>
+        </Space>
+      </Card>
+
+      {plateauError ? <Alert type="error" title={plateauError} showIcon /> : null}
+
+      {plateauResult ? (
+        <>
+          <Row gutter={[12, 12]}>
+            <Col xs={12} md={6}>
+              <Card>
+                <Statistic title="总组合" value={plateauResult.total_combinations} />
+              </Card>
+            </Col>
+            <Col xs={12} md={6}>
+              <Card>
+                <Statistic title="评估组数" value={plateauResult.evaluated_combinations} />
+              </Card>
+            </Col>
+            <Col xs={12} md={6}>
+              <Card>
+                <Statistic title="最佳评分" value={plateauBestPoint?.score ?? 0} precision={3} />
+              </Card>
+            </Col>
+            <Col xs={12} md={6}>
+              <Card>
+                <Statistic
+                  title="最佳收益"
+                  value={(plateauBestPoint?.stats.total_return ?? 0) * 100}
+                  precision={2}
+                  suffix="%"
+                />
+              </Card>
+            </Col>
+          </Row>
+
+          {plateauHeatmapOption ? (
+            <Card title="评分热力图（window_days × min_score）">
+              <ReactECharts option={plateauHeatmapOption} style={{ height: 320 }} />
+            </Card>
+          ) : null}
+
+          <Card title="收益平原结果（按评分排序）">
+            <Table
+              size="small"
+              columns={plateauColumnsWithAction}
+              dataSource={plateauResult.points}
+              rowKey={(row, idx) => `${row.params.window_days}-${row.params.min_score}-${row.params.max_positions}-${idx}`}
+              scroll={{ x: 1460 }}
+              pagination={{
+                defaultPageSize: 10,
+                pageSizeOptions: [10, 20, 50, 100],
+                showSizeChanger: true,
+                showTotal: (total) => `共 ${total} 条`,
+              }}
+            />
+          </Card>
+
+          <Card title="平原运行说明">
+            {plateauResult.notes.length === 0 ? (
+              <span>无说明。</span>
+            ) : (
+              <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+                {plateauResult.notes.map((note, idx) => (
+                  <li key={`${idx}-${note}`}>{note}</li>
+                ))}
+              </ul>
+            )}
+          </Card>
+        </>
+      ) : null}
 
       {effectiveRunError ? <Alert type="error" title={effectiveRunError} showIcon /> : null}
 

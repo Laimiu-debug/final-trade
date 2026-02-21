@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -114,6 +115,60 @@ def test_matrix_cache_hit_roundtrip(tmp_path: Path) -> None:
     assert second_hit is True
     assert first_bundle.dates == second_bundle.dates
     assert first_bundle.symbols == second_bundle.symbols
+    assert np.allclose(first_bundle.close, second_bundle.close, equal_nan=True)
+
+
+def test_matrix_runtime_cache_hit_without_disk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_RUNTIME_CACHE", "1")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_RUNTIME_CACHE_TTL_SEC", "600")
+    engine = BacktestMatrixEngine(cache_dir=tmp_path)
+    call_counter = {"count": 0}
+
+    candles_map = {
+        "sh600000": [_candle("2026-01-02", 10.0), _candle("2026-01-03", 10.1)],
+    }
+
+    def _get_candles(symbol: str):
+        call_counter["count"] += 1
+        return candles_map.get(symbol, [])
+
+    key = engine.build_cache_key(
+        symbols=["sh600000"],
+        date_from="2026-01-02",
+        date_to="2026-01-03",
+        data_version="tdx_only|bars=500",
+        window_set=(10, 20, 60),
+        algo_version="matrix-v1",
+    )
+
+    first_bundle, first_hit = engine.build_bundle(
+        symbols=["sh600000"],
+        get_candles=_get_candles,
+        date_from="2026-01-02",
+        date_to="2026-01-03",
+        max_lookback_days=60,
+        cache_key=key,
+        use_cache=True,
+    )
+    assert first_hit is False
+    assert call_counter["count"] == 1
+
+    cache_file = tmp_path / f"{key}.npz"
+    assert cache_file.exists()
+    cache_file.unlink()
+
+    second_bundle, second_hit = engine.build_bundle(
+        symbols=["sh600000"],
+        get_candles=_get_candles,
+        date_from="2026-01-02",
+        date_to="2026-01-03",
+        max_lookback_days=60,
+        cache_key=key,
+        use_cache=True,
+    )
+    assert second_hit is True
+    assert call_counter["count"] == 1
+    assert first_bundle.dates == second_bundle.dates
     assert np.allclose(first_bundle.close, second_bundle.close, equal_nan=True)
 
 

@@ -8,16 +8,19 @@ import random
 import re
 import time
 import html
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
+from itertools import product
 from pathlib import Path
 from threading import RLock, Thread
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
 import xml.etree.ElementTree as ET
 
 import httpx
+import numpy as np
 
 from .models import (
     AIAnalysisRecord,
@@ -27,6 +30,10 @@ from .models import (
     AppConfig,
     CandlePoint,
     BacktestRunRequest,
+    BacktestPlateauRunRequest,
+    BacktestPlateauResponse,
+    BacktestPlateauPoint,
+    BacktestPlateauParams,
     BacktestPoolRollMode,
     BacktestResponse,
     BacktestTaskProgress,
@@ -101,8 +108,8 @@ from .utils.text_utils import TextProcessor, URLUtils
 from .core.signal_analyzer import SignalAnalyzer, WYCKOFF_ACC_EVENTS, WYCKOFF_RISK_EVENTS, WYCKOFF_EVENT_ORDER
 from .core.ai_analyzer import AIAnalyzer, create_ai_analyzer
 from .core.backtest_engine import BacktestEngine
-from .core.backtest_matrix_engine import BacktestMatrixEngine
-from .core.backtest_signal_matrix import compute_backtest_signal_matrix
+from .core.backtest_matrix_engine import BacktestMatrixEngine, MatrixBundle
+from .core.backtest_signal_matrix import BacktestSignalMatrix, compute_backtest_signal_matrix
 from .core.wyckoff_event_store import WyckoffEventStore, build_wyckoff_params_hash
 from .core.screener import ScreenerEngine, create_screener_engine, THEME_STAGES
 from .core.candle_analyzer import CandleAnalyzer, create_candle_analyzer
@@ -136,6 +143,13 @@ class BacktestTaskCancelledError(RuntimeError):
 class InMemoryStore:
     _APP_STATE_SCHEMA_VERSION = 2
     _FULL_MARKET_SYSTEM_PROTECT_LIMIT = 6000
+    _BACKTEST_INPUT_POOL_CACHE_VERSION = "input-pool-v1"
+    _SCREENER_RESULT_CACHE_VERSION = "screener-run-v1"
+    _SIGNALS_RESULT_CACHE_VERSION = "signals-v1"
+    _BACKTEST_TREND_FILTER_CACHE_VERSION = "trend-filter-v1"
+    _BACKTEST_RESULT_CACHE_VERSION = "backtest-result-v1"
+    _BACKTEST_SIGNAL_MATRIX_CACHE_VERSION = "signal-matrix-v1"
+    _BACKTEST_PRECHECK_CACHE_VERSION = "precheck-v1"
 
     def __init__(self, app_state_path: str | None = None, sim_state_path: str | None = None) -> None:
         self._lock = RLock()
@@ -161,6 +175,12 @@ class InMemoryStore:
         self._backtest_task_state_last_persist_at = 0.0
         self._backtest_matrix_engine = BacktestMatrixEngine()
         self._backtest_matrix_algo_version = os.getenv("TDX_TREND_BACKTEST_MATRIX_ALGO_VERSION", "").strip() or "matrix-v1"
+        self._backtest_signal_matrix_runtime_cache: dict[str, tuple[float, BacktestSignalMatrix]] = {}
+        self._backtest_signal_matrix_runtime_cache_lock = RLock()
+        self._backtest_input_pool_runtime_cache: dict[str, tuple[float, list[ScreenerResult], str | None]] = {}
+        self._backtest_input_pool_runtime_cache_lock = RLock()
+        self._backtest_precheck_cache: dict[str, tuple[float, str | None, str | None]] = {}
+        self._backtest_precheck_cache_lock = RLock()
         self._wyckoff_event_store_enabled = self._env_flag("TDX_TREND_WYCKOFF_STORE_ENABLED", True)
         self._wyckoff_event_store_read_only = self._env_flag("TDX_TREND_WYCKOFF_STORE_READ_ONLY", False)
         self._wyckoff_event_algo_version = os.getenv("TDX_TREND_WYCKOFF_ALGO_VERSION", "").strip() or "wyckoff-v1"
@@ -241,6 +261,48 @@ class InMemoryStore:
         if env_value:
             return cls._resolve_user_path(env_value)
         return Path.home() / ".tdx-trend" / "backtest_tasks.json"
+
+    @classmethod
+    def _resolve_backtest_input_pool_cache_dir(cls) -> Path:
+        env_value = os.getenv("TDX_TREND_BACKTEST_INPUT_POOL_CACHE_DIR", "").strip()
+        if env_value:
+            return cls._resolve_user_path(env_value)
+        return Path.home() / ".tdx-trend" / "backtest-input-cache"
+
+    @classmethod
+    def _resolve_screener_result_cache_dir(cls) -> Path:
+        env_value = os.getenv("TDX_TREND_SCREENER_RESULT_CACHE_DIR", "").strip()
+        if env_value:
+            return cls._resolve_user_path(env_value)
+        return Path.home() / ".tdx-trend" / "screener-result-cache"
+
+    @classmethod
+    def _resolve_signals_cache_dir(cls) -> Path:
+        env_value = os.getenv("TDX_TREND_SIGNALS_CACHE_DIR", "").strip()
+        if env_value:
+            return cls._resolve_user_path(env_value)
+        return Path.home() / ".tdx-trend" / "signals-cache"
+
+    @classmethod
+    def _resolve_backtest_trend_filter_cache_dir(cls) -> Path:
+        env_value = os.getenv("TDX_TREND_BACKTEST_TREND_FILTER_CACHE_DIR", "").strip()
+        if env_value:
+            return cls._resolve_user_path(env_value)
+        return Path.home() / ".tdx-trend" / "backtest-trend-filter-cache"
+
+    @classmethod
+    def _resolve_backtest_result_cache_dir(cls) -> Path:
+        env_value = os.getenv("TDX_TREND_BACKTEST_RESULT_CACHE_DIR", "").strip()
+        if env_value:
+            return cls._resolve_user_path(env_value)
+        return Path.home() / ".tdx-trend" / "backtest-result-cache"
+
+    @classmethod
+    def _resolve_backtest_signal_matrix_cache_dir(cls) -> Path:
+        env_value = os.getenv("TDX_TREND_BACKTEST_SIGNAL_MATRIX_CACHE_DIR", "").strip()
+        if env_value:
+            return cls._resolve_user_path(env_value)
+        return Path.home() / ".tdx-trend" / "backtest-signal-matrix-cache"
 
     def _build_app_state_payload(self) -> dict[str, object]:
         return {
@@ -3121,15 +3183,147 @@ class InMemoryStore:
     ) -> list[ScreenerResult]:
         return [self._pool_record(start + i, mode, stage) for i in range(count)]
 
+    @staticmethod
+    def _build_screener_run_id() -> str:
+        return f"{int(datetime.now().timestamp() * 1000)}-{uuid4().hex[:6]}"
+
+    def _store_screener_run_detail(self, detail: ScreenerRunDetail) -> ScreenerRunDetail:
+        latest_rows: dict[str, ScreenerResult] = {}
+        for row in detail.step_pools.input:
+            latest_rows[row.symbol] = row
+        for row in detail.step_pools.step1:
+            latest_rows[row.symbol] = row
+        for row in detail.step_pools.step2:
+            latest_rows[row.symbol] = row
+        for row in detail.step_pools.step3:
+            latest_rows[row.symbol] = row
+        for row in detail.step_pools.step4:
+            latest_rows[row.symbol] = row
+        self._latest_rows = latest_rows
+        self._run_store[detail.run_id] = detail
+        return detail
+
+    def _is_screener_result_cache_enabled(self) -> bool:
+        return self._env_flag("TDX_TREND_SCREENER_RESULT_CACHE", True)
+
+    @staticmethod
+    def _screener_result_cache_ttl_sec() -> float:
+        raw = os.getenv("TDX_TREND_SCREENER_RESULT_CACHE_TTL_SEC", "").strip()
+        if not raw:
+            return 24 * 3600.0
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 24 * 3600.0
+
+    @staticmethod
+    def _is_screener_result_cache_eligible(params: ScreenerParams) -> bool:
+        return bool(str(params.as_of_date or "").strip())
+
+    def _build_screener_result_cache_key(self, params: ScreenerParams) -> str:
+        payload = {
+            "version": self._SCREENER_RESULT_CACHE_VERSION,
+            "params": params.model_dump(exclude_none=True),
+            "config": {
+                "tdx_root": str(self._resolve_user_path(self._config.tdx_data_path)),
+                "market_data_source": str(self._config.market_data_source).strip(),
+                "candles_window_bars": int(self._config.candles_window_bars),
+            },
+            "algo": {
+                "wyckoff_algo_version": str(self._wyckoff_event_algo_version).strip(),
+                "wyckoff_data_version": str(self._wyckoff_event_data_version).strip(),
+            },
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _screener_result_cache_file(self, params: ScreenerParams) -> Path:
+        cache_key = self._build_screener_result_cache_key(params)
+        return self._resolve_screener_result_cache_dir() / f"{cache_key}.json"
+
+    def _load_screener_result_cache(self, params: ScreenerParams) -> ScreenerRunDetail | None:
+        if not self._is_screener_result_cache_enabled():
+            return None
+        if not self._is_screener_result_cache_eligible(params):
+            return None
+        path = self._screener_result_cache_file(params)
+        if not path.exists():
+            return None
+        ttl_sec = self._screener_result_cache_ttl_sec()
+        if ttl_sec > 0:
+            try:
+                age_sec = max(0.0, time.time() - path.stat().st_mtime)
+                if age_sec > ttl_sec:
+                    return None
+            except Exception:
+                return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return None
+            detail_raw = raw.get("detail")
+            if not isinstance(detail_raw, dict):
+                return None
+            return ScreenerRunDetail(**detail_raw)
+        except Exception:
+            return None
+
+    def _save_screener_result_cache(self, params: ScreenerParams, detail: ScreenerRunDetail) -> bool:
+        if not self._is_screener_result_cache_enabled():
+            return False
+        if not self._is_screener_result_cache_eligible(params):
+            return False
+        path = self._screener_result_cache_file(params)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "schema_version": 1,
+                "created_at": self._now_datetime(),
+                "detail": detail.model_dump(exclude_none=True),
+            }
+            tmp_path = path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            tmp_path.replace(path)
+            return True
+        except Exception:
+            return False
+
+    def _clone_screener_detail_for_new_run(
+        self,
+        cached_detail: ScreenerRunDetail,
+        *,
+        run_id: str,
+        params: ScreenerParams,
+    ) -> ScreenerRunDetail:
+        return cached_detail.model_copy(
+            update={
+                "run_id": run_id,
+                "created_at": self._now_datetime(),
+                "as_of_date": params.as_of_date,
+                "params": params,
+            }
+        )
+
     def create_screener_run(self, params: ScreenerParams) -> ScreenerRunDetail:
-        real_input_pool, real_error = load_input_pool_from_tdx(
-            tdx_root=self._config.tdx_data_path,
+        run_id = self._build_screener_run_id()
+        cached_detail = self._load_screener_result_cache(params)
+        if cached_detail is not None:
+            detail = self._clone_screener_detail_for_new_run(
+                cached_detail,
+                run_id=run_id,
+                params=params,
+            )
+            return self._store_screener_run_detail(detail)
+
+        real_input_pool, real_error, _cache_hit = self._load_input_pool_rows(
             markets=params.markets,
             return_window_days=params.return_window_days,
             as_of_date=params.as_of_date,
         )
         if real_input_pool:
-            run_id = f"{int(datetime.now().timestamp() * 1000)}-{uuid4().hex[:6]}"
             step1_pool = (
                 sorted(
                     (
@@ -3214,20 +3408,13 @@ class InMemoryStore:
                     step4=step4_pool,
                 ),
                 results=step4_pool,
-                degraded=has_degraded_rows,
-                degraded_reason=real_error if has_degraded_rows else None,
+                degraded=bool(has_degraded_rows or real_error),
+                degraded_reason=real_error,
             )
-            latest_rows = {row.symbol: row for row in real_input_pool}
-            latest_rows.update({row.symbol: row for row in step1_pool})
-            latest_rows.update({row.symbol: row for row in step2_pool})
-            latest_rows.update({row.symbol: row for row in step3_pool})
-            latest_rows.update({row.symbol: row for row in step4_pool})
-            self._latest_rows = latest_rows
-            self._run_store[run_id] = detail
-            return detail
+            self._save_screener_result_cache(params, detail)
+            return self._store_screener_run_detail(detail)
 
         mode = params.mode
-        run_id = f"{int(datetime.now().timestamp() * 1000)}-{uuid4().hex[:6]}"
 
         input_count = 5100
         step1_count = 400
@@ -3286,11 +3473,7 @@ class InMemoryStore:
             if any(item.degraded for item in step4_pool)
             else None,
         )
-        latest_rows = {row.symbol: row for row in input_pool}
-        latest_rows.update({row.symbol: row for row in step4_pool})
-        self._latest_rows = latest_rows
-        self._run_store[run_id] = detail
-        return detail
+        return self._store_screener_run_detail(detail)
 
     def get_screener_run(self, run_id: str) -> ScreenerRunDetail | None:
         return self._run_store.get(run_id)
@@ -3442,8 +3625,7 @@ class InMemoryStore:
                 return [], reason, resolved_run_id, (as_of_date or run.as_of_date)
             return source, run.degraded_reason if run.degraded else None, resolved_run_id, (as_of_date or run.as_of_date)
 
-        source, error = load_input_pool_from_tdx(
-            tdx_root=self._config.tdx_data_path,
+        source, error, cache_hit = self._load_input_pool_rows(
             markets=self._config.markets,
             return_window_days=self._config.return_window_days,
             as_of_date=as_of_date,
@@ -3476,6 +3658,8 @@ class InMemoryStore:
         reasons: list[str] = []
         if error:
             reasons.append(str(error))
+        if cache_hit:
+            reasons.append("INPUT_POOL_CACHE_HIT")
         if protect_hit:
             reasons.append("FULL_MARKET_SYSTEM_LIMIT_HIT")
         degraded_reason = ";".join(reasons) if reasons else None
@@ -3532,6 +3716,77 @@ class InMemoryStore:
             if write_ok:
                 self._bump_wyckoff_metric("lazy_fill_writes", 1)
         return snapshot
+
+    def _is_signals_disk_cache_enabled(self) -> bool:
+        return self._env_flag("TDX_TREND_SIGNALS_DISK_CACHE", True)
+
+    @staticmethod
+    def _signals_disk_cache_ttl_sec() -> float:
+        raw = os.getenv("TDX_TREND_SIGNALS_DISK_CACHE_TTL_SEC", "").strip()
+        if not raw:
+            return 6 * 3600.0
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 6 * 3600.0
+
+    def _build_signals_disk_cache_key(self, core_cache_key: str) -> str:
+        payload = {
+            "version": self._SIGNALS_RESULT_CACHE_VERSION,
+            "core_key": str(core_cache_key).strip(),
+            "market_data_source": str(self._config.market_data_source).strip(),
+            "candles_window_bars": int(self._config.candles_window_bars),
+            "wyckoff_algo_version": str(self._wyckoff_event_algo_version).strip(),
+            "wyckoff_data_version": str(self._wyckoff_event_data_version).strip(),
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _signals_disk_cache_file(self, core_cache_key: str) -> Path:
+        cache_key = self._build_signals_disk_cache_key(core_cache_key)
+        return self._resolve_signals_cache_dir() / f"{cache_key}.json"
+
+    def _load_signals_disk_cache(self, core_cache_key: str) -> SignalsResponse | None:
+        path = self._signals_disk_cache_file(core_cache_key)
+        if not path.exists():
+            return None
+        ttl_sec = self._signals_disk_cache_ttl_sec()
+        if ttl_sec > 0:
+            try:
+                age_sec = max(0.0, time.time() - path.stat().st_mtime)
+                if age_sec > ttl_sec:
+                    return None
+            except Exception:
+                return None
+        try:
+            payload_raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload_raw, dict):
+                return None
+            body = payload_raw.get("payload")
+            if not isinstance(body, dict):
+                return None
+            return SignalsResponse(**body)
+        except Exception:
+            return None
+
+    def _save_signals_disk_cache(self, core_cache_key: str, payload: SignalsResponse) -> bool:
+        path = self._signals_disk_cache_file(core_cache_key)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            body = {
+                "schema_version": 1,
+                "created_at": self._now_datetime(),
+                "payload": payload.model_dump(exclude_none=True),
+            }
+            tmp_path = path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            tmp_path.replace(path)
+            return True
+        except Exception:
+            return False
 
     def _signals_cache_key(
         self,
@@ -3619,6 +3874,20 @@ class InMemoryStore:
                     "source_count": source_count or cached_payload.source_count,
                 }
             )
+
+        if (not refresh) and self._is_signals_disk_cache_enabled():
+            cached_disk_payload = self._load_signals_disk_cache(cache_key)
+            if cached_disk_payload is not None:
+                self._signals_cache[cache_key] = (now_ts, cached_disk_payload)
+                return cached_disk_payload.model_copy(
+                    update={
+                        "cache_hit": True,
+                        "as_of_date": resolved_as_of_date or cached_disk_payload.as_of_date,
+                        "degraded": cached_disk_payload.degraded or bool(degraded_reason),
+                        "degraded_reason": degraded_reason or cached_disk_payload.degraded_reason,
+                        "source_count": source_count or cached_disk_payload.source_count,
+                    }
+                )
 
         items: list[SignalResult] = []
         seen_symbols: set[str] = set()
@@ -3752,6 +4021,8 @@ class InMemoryStore:
             source_count=source_count,
         )
         self._signals_cache[cache_key] = (now_ts, payload)
+        if self._is_signals_disk_cache_enabled():
+            self._save_signals_disk_cache(cache_key, payload)
         return payload
 
     @staticmethod
@@ -3958,6 +4229,543 @@ class InMemoryStore:
         refresh_dates_used = [day for day in refresh_dates if day in scan_date_set]
         return refresh_dates_used or [scan_dates[0]]
 
+    def _is_backtest_input_pool_cache_enabled(self) -> bool:
+        return self._env_flag("TDX_TREND_BACKTEST_INPUT_POOL_CACHE", True)
+
+    @staticmethod
+    def _backtest_input_pool_preload_workers() -> int:
+        raw = os.getenv("TDX_TREND_BACKTEST_INPUT_POOL_WORKERS", "").strip()
+        if raw:
+            try:
+                return max(1, int(raw))
+            except Exception:
+                pass
+        cpu_count = os.cpu_count() or 4
+        return max(1, min(8, cpu_count))
+
+    @staticmethod
+    def _backtest_input_pool_runtime_ttl_sec() -> float:
+        raw = os.getenv("TDX_TREND_BACKTEST_INPUT_POOL_RUNTIME_TTL_SEC", "").strip()
+        if not raw:
+            return 15 * 60.0
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 15 * 60.0
+
+    @staticmethod
+    def _backtest_input_pool_runtime_max_items() -> int:
+        raw = os.getenv("TDX_TREND_BACKTEST_INPUT_POOL_RUNTIME_MAX_ITEMS", "").strip()
+        if not raw:
+            return 512
+        try:
+            return max(32, int(raw))
+        except Exception:
+            return 512
+
+    def _load_backtest_input_pool_runtime_cache(
+        self,
+        cache_key: str,
+    ) -> tuple[list[ScreenerResult], str | None] | None:
+        ttl_sec = self._backtest_input_pool_runtime_ttl_sec()
+        with self._backtest_input_pool_runtime_cache_lock:
+            cached = self._backtest_input_pool_runtime_cache.get(cache_key)
+            if cached is None:
+                return None
+            created_at, rows, load_error = cached
+            if ttl_sec > 0 and (time.time() - created_at) > ttl_sec:
+                self._backtest_input_pool_runtime_cache.pop(cache_key, None)
+                return None
+            return list(rows), load_error
+
+    def _save_backtest_input_pool_runtime_cache(
+        self,
+        cache_key: str,
+        rows: list[ScreenerResult],
+        load_error: str | None,
+    ) -> None:
+        if not rows and (not load_error):
+            return
+        now_ts = time.time()
+        with self._backtest_input_pool_runtime_cache_lock:
+            self._backtest_input_pool_runtime_cache[cache_key] = (now_ts, list(rows), load_error)
+            max_items = self._backtest_input_pool_runtime_max_items()
+            if len(self._backtest_input_pool_runtime_cache) > max_items:
+                stale_keys = sorted(
+                    self._backtest_input_pool_runtime_cache.items(),
+                    key=lambda item: float(item[1][0]),
+                )
+                overflow = len(self._backtest_input_pool_runtime_cache) - max_items
+                for key, _value in stale_keys[:overflow]:
+                    self._backtest_input_pool_runtime_cache.pop(key, None)
+
+    def _clear_backtest_input_pool_runtime_cache(self) -> None:
+        with self._backtest_input_pool_runtime_cache_lock:
+            self._backtest_input_pool_runtime_cache.clear()
+
+    @staticmethod
+    def _backtest_input_pool_cache_ttl_sec() -> float:
+        raw = os.getenv("TDX_TREND_BACKTEST_INPUT_POOL_CACHE_TTL_SEC", "").strip()
+        if not raw:
+            return 12 * 3600.0
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 12 * 3600.0
+
+    def _build_backtest_input_pool_cache_key(
+        self,
+        *,
+        tdx_root: str,
+        markets: list[str],
+        return_window_days: int,
+        as_of_date: str,
+    ) -> str:
+        payload = {
+            "version": self._BACKTEST_INPUT_POOL_CACHE_VERSION,
+            "tdx_root": str(self._resolve_user_path(tdx_root)),
+            "markets": sorted({str(item).strip().lower() for item in markets if str(item).strip()}),
+            "return_window_days": int(return_window_days),
+            "as_of_date": str(as_of_date).strip(),
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _backtest_input_pool_cache_file(self, cache_key: str) -> Path:
+        cache_dir = self._resolve_backtest_input_pool_cache_dir()
+        return cache_dir / f"{cache_key}.json"
+
+    def _load_backtest_input_pool_cache(
+        self,
+        *,
+        tdx_root: str,
+        markets: list[str],
+        return_window_days: int,
+        as_of_date: str,
+    ) -> tuple[list[ScreenerResult], str | None] | None:
+        cache_key = self._build_backtest_input_pool_cache_key(
+            tdx_root=tdx_root,
+            markets=markets,
+            return_window_days=return_window_days,
+            as_of_date=as_of_date,
+        )
+        path = self._backtest_input_pool_cache_file(cache_key)
+        if not path.exists():
+            return None
+        ttl_sec = self._backtest_input_pool_cache_ttl_sec()
+        if ttl_sec > 0:
+            try:
+                age_sec = max(0.0, time.time() - path.stat().st_mtime)
+                if age_sec > ttl_sec:
+                    return None
+            except Exception:
+                return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return None
+            rows_raw = payload.get("rows")
+            if not isinstance(rows_raw, list):
+                return None
+            rows: list[ScreenerResult] = []
+            for item in rows_raw:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    rows.append(ScreenerResult(**item))
+                except Exception:
+                    continue
+            load_error_raw = payload.get("load_error")
+            load_error = str(load_error_raw).strip() if isinstance(load_error_raw, str) and load_error_raw.strip() else None
+            return rows, load_error
+        except Exception:
+            return None
+
+    def _save_backtest_input_pool_cache(
+        self,
+        *,
+        tdx_root: str,
+        markets: list[str],
+        return_window_days: int,
+        as_of_date: str,
+        rows: list[ScreenerResult],
+        load_error: str | None,
+    ) -> bool:
+        if not rows:
+            return False
+        cache_key = self._build_backtest_input_pool_cache_key(
+            tdx_root=tdx_root,
+            markets=markets,
+            return_window_days=return_window_days,
+            as_of_date=as_of_date,
+        )
+        path = self._backtest_input_pool_cache_file(cache_key)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload: dict[str, Any] = {
+                "schema_version": 1,
+                "created_at": self._now_datetime(),
+                "as_of_date": str(as_of_date).strip(),
+                "load_error": (str(load_error).strip() if (load_error and str(load_error).strip()) else None),
+                "rows": [row.model_dump(exclude_none=True) for row in rows],
+            }
+            tmp_path = path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            tmp_path.replace(path)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _normalize_input_pool_cache_as_of_date(as_of_date: str | None) -> str:
+        text = str(as_of_date or "").strip()
+        if text:
+            return text
+        return "__latest__"
+
+    def _load_input_pool_rows(
+        self,
+        *,
+        markets: list[str],
+        return_window_days: int,
+        as_of_date: str | None,
+    ) -> tuple[list[ScreenerResult], str | None, bool]:
+        tdx_root = self._config.tdx_data_path
+        cache_enabled = self._is_backtest_input_pool_cache_enabled()
+        cache_as_of_date = self._normalize_input_pool_cache_as_of_date(as_of_date)
+        cache_key = self._build_backtest_input_pool_cache_key(
+            tdx_root=tdx_root,
+            markets=markets,
+            return_window_days=return_window_days,
+            as_of_date=cache_as_of_date,
+        )
+        if cache_enabled:
+            cached_runtime = self._load_backtest_input_pool_runtime_cache(cache_key)
+            if cached_runtime is not None:
+                rows_cached, load_error_cached = cached_runtime
+                return list(rows_cached), load_error_cached, True
+
+            cached = self._load_backtest_input_pool_cache(
+                tdx_root=tdx_root,
+                markets=markets,
+                return_window_days=return_window_days,
+                as_of_date=cache_as_of_date,
+            )
+            if cached is not None:
+                rows_cached, load_error_cached = cached
+                self._save_backtest_input_pool_runtime_cache(cache_key, list(rows_cached), load_error_cached)
+                return list(rows_cached), load_error_cached, True
+
+        rows, load_error = load_input_pool_from_tdx(
+            tdx_root=tdx_root,
+            markets=markets,
+            return_window_days=return_window_days,
+            as_of_date=as_of_date,
+        )
+        typed_rows = [row for row in rows if isinstance(row, ScreenerResult)]
+        if cache_enabled:
+            self._save_backtest_input_pool_runtime_cache(cache_key, typed_rows, load_error)
+        if cache_enabled and typed_rows:
+            self._save_backtest_input_pool_cache(
+                tdx_root=tdx_root,
+                markets=markets,
+                return_window_days=return_window_days,
+                as_of_date=cache_as_of_date,
+                rows=typed_rows,
+                load_error=load_error,
+            )
+        return rows, load_error, False
+
+    def _is_backtest_trend_filter_cache_enabled(self) -> bool:
+        return self._env_flag("TDX_TREND_BACKTEST_TREND_FILTER_CACHE", True)
+
+    @staticmethod
+    def _backtest_trend_filter_cache_ttl_sec() -> float:
+        raw = os.getenv("TDX_TREND_BACKTEST_TREND_FILTER_CACHE_TTL_SEC", "").strip()
+        if not raw:
+            return 24 * 3600.0
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 24 * 3600.0
+
+    def _build_backtest_trend_filter_cache_key(
+        self,
+        *,
+        as_of_date: str,
+        trend_step: TrendPoolStep,
+        board_filters: list[BoardFilter],
+        max_symbols: int,
+        screener_params: ScreenerParams,
+    ) -> str:
+        payload = {
+            "version": self._BACKTEST_TREND_FILTER_CACHE_VERSION,
+            "as_of_date": str(as_of_date).strip(),
+            "trend_step": str(trend_step).strip(),
+            "board_filters": sorted({str(item).strip().lower() for item in board_filters if str(item).strip()}),
+            "max_symbols": int(max_symbols),
+            "tdx_root": str(self._resolve_user_path(self._config.tdx_data_path)),
+            "markets": sorted({str(item).strip().lower() for item in screener_params.markets if str(item).strip()}),
+            "mode": str(screener_params.mode).strip(),
+            "return_window_days": int(screener_params.return_window_days),
+            "top_n": int(screener_params.top_n),
+            "turnover_threshold": round(float(screener_params.turnover_threshold), 8),
+            "amount_threshold": round(float(screener_params.amount_threshold), 4),
+            "amplitude_threshold": round(float(screener_params.amplitude_threshold), 8),
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _backtest_trend_filter_cache_file(self, cache_key: str) -> Path:
+        cache_dir = self._resolve_backtest_trend_filter_cache_dir()
+        return cache_dir / f"{cache_key}.json"
+
+    def _load_backtest_trend_filter_cache(
+        self,
+        *,
+        as_of_date: str,
+        trend_step: TrendPoolStep,
+        board_filters: list[BoardFilter],
+        max_symbols: int,
+        screener_params: ScreenerParams,
+    ) -> list[str] | None:
+        cache_key = self._build_backtest_trend_filter_cache_key(
+            as_of_date=as_of_date,
+            trend_step=trend_step,
+            board_filters=board_filters,
+            max_symbols=max_symbols,
+            screener_params=screener_params,
+        )
+        path = self._backtest_trend_filter_cache_file(cache_key)
+        if not path.exists():
+            return None
+        ttl_sec = self._backtest_trend_filter_cache_ttl_sec()
+        if ttl_sec > 0:
+            try:
+                age_sec = max(0.0, time.time() - path.stat().st_mtime)
+                if age_sec > ttl_sec:
+                    return None
+            except Exception:
+                return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return None
+            symbols_raw = payload.get("symbols")
+            if not isinstance(symbols_raw, list):
+                return None
+            out: list[str] = []
+            seen: set[str] = set()
+            for item in symbols_raw:
+                symbol = str(item).strip().lower()
+                if not symbol or symbol in seen:
+                    continue
+                seen.add(symbol)
+                out.append(symbol)
+            return out
+        except Exception:
+            return None
+
+    def _save_backtest_trend_filter_cache(
+        self,
+        *,
+        as_of_date: str,
+        trend_step: TrendPoolStep,
+        board_filters: list[BoardFilter],
+        max_symbols: int,
+        screener_params: ScreenerParams,
+        symbols: list[str],
+    ) -> bool:
+        if not symbols:
+            return False
+        cache_key = self._build_backtest_trend_filter_cache_key(
+            as_of_date=as_of_date,
+            trend_step=trend_step,
+            board_filters=board_filters,
+            max_symbols=max_symbols,
+            screener_params=screener_params,
+        )
+        path = self._backtest_trend_filter_cache_file(cache_key)
+        try:
+            deduped_symbols = list(dict.fromkeys(str(item).strip().lower() for item in symbols if str(item).strip()))
+            if not deduped_symbols:
+                return False
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "schema_version": 1,
+                "created_at": self._now_datetime(),
+                "as_of_date": str(as_of_date).strip(),
+                "symbols": deduped_symbols,
+            }
+            tmp_path = path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            tmp_path.replace(path)
+            return True
+        except Exception:
+            return False
+
+    def _load_backtest_input_rows_by_dates(
+        self,
+        *,
+        tdx_root: str,
+        markets: list[str],
+        return_window_days: int,
+        refresh_dates: list[str],
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+    ) -> tuple[dict[str, tuple[list[object], str | None]], dict[str, int]]:
+        refresh_unique = list(dict.fromkeys(str(day).strip() for day in refresh_dates if str(day).strip()))
+        if not refresh_unique:
+            return {}, {"cache_hit_days": 0, "cache_miss_days": 0, "cache_write_days": 0}
+
+        cache_enabled = self._is_backtest_input_pool_cache_enabled()
+        out: dict[str, tuple[list[object], str | None]] = {}
+        cache_hit_days = 0
+        cache_write_days = 0
+        pending_days: list[str] = []
+        total_days = len(refresh_unique)
+        done_days_progress = 0
+
+        def _emit_progress(day: str, done: int, total: int, message: str) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(day, done, total, message)
+            except Exception:
+                return
+
+        if cache_enabled:
+            for day in refresh_unique:
+                cache_key = self._build_backtest_input_pool_cache_key(
+                    tdx_root=tdx_root,
+                    markets=markets,
+                    return_window_days=return_window_days,
+                    as_of_date=day,
+                )
+                cached_runtime = self._load_backtest_input_pool_runtime_cache(cache_key)
+                if cached_runtime is not None:
+                    rows_cached_runtime, load_error_cached_runtime = cached_runtime
+                    out[day] = (list(rows_cached_runtime), load_error_cached_runtime)
+                    cache_hit_days += 1
+                    continue
+                cached = self._load_backtest_input_pool_cache(
+                    tdx_root=tdx_root,
+                    markets=markets,
+                    return_window_days=return_window_days,
+                    as_of_date=day,
+                )
+                if cached is None:
+                    pending_days.append(day)
+                    continue
+                rows_cached, load_error_cached = cached
+                out[day] = (list(rows_cached), load_error_cached)
+                self._save_backtest_input_pool_runtime_cache(cache_key, list(rows_cached), load_error_cached)
+                cache_hit_days += 1
+            done_days_progress = cache_hit_days
+            if cache_hit_days > 0:
+                _emit_progress(
+                    refresh_unique[min(len(refresh_unique) - 1, cache_hit_days - 1)],
+                    done_days_progress,
+                    total_days,
+                    f"滚动筛选准备：输入池预加载 {done_days_progress}/{total_days}（cache hit）",
+                )
+        else:
+            pending_days = list(refresh_unique)
+
+        def _load_for_day(as_of_date: str) -> tuple[str, list[object], str | None]:
+            rows, load_error = load_input_pool_from_tdx(
+                tdx_root=tdx_root,
+                markets=markets,
+                return_window_days=return_window_days,
+                as_of_date=as_of_date,
+            )
+            return as_of_date, list(rows), load_error
+
+        if len(pending_days) <= 1:
+            for day in pending_days:
+                as_of_date, rows, load_error = _load_for_day(day)
+                out[as_of_date] = (rows, load_error)
+                if cache_enabled:
+                    cache_key = self._build_backtest_input_pool_cache_key(
+                        tdx_root=tdx_root,
+                        markets=markets,
+                        return_window_days=return_window_days,
+                        as_of_date=as_of_date,
+                    )
+                    typed_rows = [row for row in rows if isinstance(row, ScreenerResult)]
+                    self._save_backtest_input_pool_runtime_cache(cache_key, typed_rows, load_error)
+                    if self._save_backtest_input_pool_cache(
+                        tdx_root=tdx_root,
+                        markets=markets,
+                        return_window_days=return_window_days,
+                        as_of_date=as_of_date,
+                        rows=typed_rows,
+                        load_error=load_error,
+                    ):
+                        cache_write_days += 1
+                done_days_progress += 1
+                _emit_progress(
+                    as_of_date,
+                    done_days_progress,
+                    total_days,
+                    f"滚动筛选准备：输入池预加载 {done_days_progress}/{total_days}",
+                )
+            return out, {
+                "cache_hit_days": int(cache_hit_days if cache_enabled else 0),
+                "cache_miss_days": int(len(pending_days)),
+                "cache_write_days": int(cache_write_days),
+            }
+
+        workers = max(1, min(self._backtest_input_pool_preload_workers(), len(pending_days)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(_load_for_day, day): day
+                for day in pending_days
+            }
+            for future in as_completed(future_map):
+                day = future_map[future]
+                try:
+                    as_of_date, rows, load_error = future.result()
+                    out[as_of_date] = (rows, load_error)
+                    if cache_enabled:
+                        cache_key = self._build_backtest_input_pool_cache_key(
+                            tdx_root=tdx_root,
+                            markets=markets,
+                            return_window_days=return_window_days,
+                            as_of_date=as_of_date,
+                        )
+                        typed_rows = [row for row in rows if isinstance(row, ScreenerResult)]
+                        self._save_backtest_input_pool_runtime_cache(cache_key, typed_rows, load_error)
+                        if self._save_backtest_input_pool_cache(
+                            tdx_root=tdx_root,
+                            markets=markets,
+                            return_window_days=return_window_days,
+                            as_of_date=as_of_date,
+                            rows=typed_rows,
+                            load_error=load_error,
+                        ):
+                            cache_write_days += 1
+                except Exception as exc:  # noqa: BLE001
+                    out[day] = ([], f"LOADER_EXCEPTION:{type(exc).__name__}")
+                    as_of_date = day
+                done_days_progress += 1
+                _emit_progress(
+                    as_of_date,
+                    done_days_progress,
+                    total_days,
+                    f"滚动筛选准备：输入池预加载 {done_days_progress}/{total_days}",
+                )
+        return out, {
+            "cache_hit_days": int(cache_hit_days if cache_enabled else 0),
+            "cache_miss_days": int(len(pending_days)),
+            "cache_write_days": int(cache_write_days),
+        }
+
     @staticmethod
     def _build_allowed_symbols_by_date(
         *,
@@ -4071,18 +4879,66 @@ class InMemoryStore:
             pool_roll_mode=payload.pool_roll_mode,
             refresh_dates=refresh_dates,
         )
+        total_refresh = max(1, len(refresh_dates_used))
+        preload_progress_cap = max(1, total_refresh // 4)
+
+        def _preload_progress(day: str, done: int, total: int, message: str) -> None:
+            if progress_callback is None:
+                return
+            total_safe = max(1, int(total))
+            cap = min(total_safe, preload_progress_cap)
+            done_safe = max(0, min(int(done), total_safe))
+            processed = min(cap, int(round((done_safe / total_safe) * cap)))
+            progress_callback(day, processed, total_safe, message)
 
         pool_by_refresh_date: dict[str, set[str]] = {}
         empty_refresh_days = 0
         loader_error_counter: dict[str, int] = {}
         source_rows_total = 0
-        for idx, as_of_date in enumerate(refresh_dates_used, start=1):
-            input_rows, load_error = load_input_pool_from_tdx(
+        trend_cache_enabled = self._is_backtest_trend_filter_cache_enabled()
+        trend_cache_hit_days = 0
+        trend_cache_miss_days = 0
+        trend_cache_write_days = 0
+        pending_refresh_dates: list[str] = []
+        if trend_cache_enabled:
+            for as_of_date in refresh_dates_used:
+                cached_symbols = self._load_backtest_trend_filter_cache(
+                    as_of_date=as_of_date,
+                    trend_step=payload.trend_step,
+                    board_filters=board_filters,
+                    max_symbols=payload.max_symbols,
+                    screener_params=screener_params,
+                )
+                if cached_symbols is None:
+                    pending_refresh_dates.append(as_of_date)
+                    trend_cache_miss_days += 1
+                    continue
+                pool_by_refresh_date[as_of_date] = set(cached_symbols)
+                trend_cache_hit_days += 1
+        else:
+            pending_refresh_dates = list(refresh_dates_used)
+
+        loaded_rows_by_date: dict[str, tuple[list[object], str | None]] = {}
+        loader_cache_stats = {"cache_hit_days": 0, "cache_miss_days": 0, "cache_write_days": 0}
+        if pending_refresh_dates:
+            loaded_rows_by_date, loader_cache_stats = self._load_backtest_input_rows_by_dates(
                 tdx_root=self._config.tdx_data_path,
                 markets=screener_params.markets,
                 return_window_days=screener_params.return_window_days,
-                as_of_date=as_of_date,
+                refresh_dates=pending_refresh_dates,
+                progress_callback=_preload_progress,
             )
+        for idx, as_of_date in enumerate(refresh_dates_used, start=1):
+            if as_of_date in pool_by_refresh_date:
+                if progress_callback is not None:
+                    progress_callback(
+                        as_of_date,
+                        idx,
+                        len(refresh_dates_used),
+                        f"滚动筛选进度 {idx}/{len(refresh_dates_used)}（趋势快照 cache hit）",
+                    )
+                continue
+            input_rows, load_error = loaded_rows_by_date.get(as_of_date, ([], "LOADER_MISS"))
             if load_error:
                 loader_error_counter[load_error] = loader_error_counter.get(load_error, 0) + 1
             source_rows_total += len(input_rows)
@@ -4125,6 +4981,16 @@ class InMemoryStore:
                     break
 
             pool_by_refresh_date[as_of_date] = set(day_symbols)
+            if trend_cache_enabled and day_symbols:
+                if self._save_backtest_trend_filter_cache(
+                    as_of_date=as_of_date,
+                    trend_step=payload.trend_step,
+                    board_filters=board_filters,
+                    max_symbols=payload.max_symbols,
+                    screener_params=screener_params,
+                    symbols=day_symbols,
+                ):
+                    trend_cache_write_days += 1
             if progress_callback is not None:
                 progress_callback(
                     as_of_date,
@@ -4159,6 +5025,17 @@ class InMemoryStore:
             notes.append(f"刷新日数据加载提示: {'; '.join(parts)}")
         if empty_days > 0:
             notes.append(f"有 {empty_days} 个交易日筛选为空，当日不会产生候选信号。")
+        cache_hit_days = int(loader_cache_stats.get("cache_hit_days", 0))
+        cache_miss_days = int(loader_cache_stats.get("cache_miss_days", 0))
+        cache_write_days = int(loader_cache_stats.get("cache_write_days", 0))
+        if (cache_hit_days + cache_miss_days) > 0:
+            notes.append(
+                f"刷新日输入池缓存: hit {cache_hit_days} / miss {cache_miss_days} / write {cache_write_days}。"
+            )
+        if trend_cache_enabled and (trend_cache_hit_days + trend_cache_miss_days) > 0:
+            notes.append(
+                f"趋势快照缓存: hit {trend_cache_hit_days} / miss {trend_cache_miss_days} / write {trend_cache_write_days}。"
+            )
         return sorted(symbols_union), allowed_symbols_by_date, notes, scan_dates, refresh_dates_used
 
     def _build_full_market_rolling_universe(
@@ -4178,6 +5055,17 @@ class InMemoryStore:
             pool_roll_mode=payload.pool_roll_mode,
             refresh_dates=refresh_dates,
         )
+        total_refresh = max(1, len(refresh_dates_used))
+        preload_progress_cap = max(1, total_refresh // 4)
+
+        def _preload_progress(day: str, done: int, total: int, message: str) -> None:
+            if progress_callback is None:
+                return
+            total_safe = max(1, int(total))
+            cap = min(total_safe, preload_progress_cap)
+            done_safe = max(0, min(int(done), total_safe))
+            processed = min(cap, int(round((done_safe / total_safe) * cap)))
+            progress_callback(day, processed, total_safe, message)
 
         markets = [item for item in self._config.markets if item in {"sh", "sz", "bj"}]
         if not markets:
@@ -4189,14 +5077,16 @@ class InMemoryStore:
         source_rows_total = 0
         protect_limit = max(1000, int(self._FULL_MARKET_SYSTEM_PROTECT_LIMIT))
         system_limit_hit_days = 0
+        loaded_rows_by_date, loader_cache_stats = self._load_backtest_input_rows_by_dates(
+            tdx_root=self._config.tdx_data_path,
+            markets=markets,
+            return_window_days=max(5, min(120, int(self._config.return_window_days))),
+            refresh_dates=refresh_dates_used,
+            progress_callback=_preload_progress,
+        )
 
         for idx, as_of_date in enumerate(refresh_dates_used, start=1):
-            input_rows, load_error = load_input_pool_from_tdx(
-                tdx_root=self._config.tdx_data_path,
-                markets=markets,
-                return_window_days=max(5, min(120, int(self._config.return_window_days))),
-                as_of_date=as_of_date,
-            )
+            input_rows, load_error = loaded_rows_by_date.get(as_of_date, ([], "LOADER_MISS"))
             if load_error:
                 loader_error_counter[load_error] = loader_error_counter.get(load_error, 0) + 1
             source_rows_total += len(input_rows)
@@ -4266,6 +5156,13 @@ class InMemoryStore:
             notes.append(f"刷新日数据加载提示: {'; '.join(parts)}")
         if empty_days > 0:
             notes.append(f"有 {empty_days} 个交易日筛选为空，当日不会产生候选信号。")
+        cache_hit_days = int(loader_cache_stats.get("cache_hit_days", 0))
+        cache_miss_days = int(loader_cache_stats.get("cache_miss_days", 0))
+        cache_write_days = int(loader_cache_stats.get("cache_write_days", 0))
+        if (cache_hit_days + cache_miss_days) > 0:
+            notes.append(
+                f"刷新日输入池缓存: hit {cache_hit_days} / miss {cache_miss_days} / write {cache_write_days}。"
+            )
         return sorted(symbols_union), allowed_symbols_by_date, notes, scan_dates, refresh_dates_used
 
     def _is_backtest_matrix_engine_enabled(self) -> bool:
@@ -4274,6 +5171,192 @@ class InMemoryStore:
     @staticmethod
     def _build_backtest_matrix_windows(payload: BacktestRunRequest) -> tuple[int, ...]:
         return tuple(sorted(set([10, 20, 40, 60, max(20, int(payload.window_days))])))
+
+    def _is_backtest_signal_matrix_runtime_cache_enabled(self) -> bool:
+        return self._env_flag("TDX_TREND_BACKTEST_SIGNAL_MATRIX_RUNTIME_CACHE", True)
+
+    @staticmethod
+    def _backtest_signal_matrix_runtime_ttl_sec() -> float:
+        raw = os.getenv("TDX_TREND_BACKTEST_SIGNAL_MATRIX_RUNTIME_CACHE_TTL_SEC", "").strip()
+        if not raw:
+            return 15 * 60.0
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 15 * 60.0
+
+    @staticmethod
+    def _backtest_signal_matrix_runtime_max_items() -> int:
+        raw = os.getenv("TDX_TREND_BACKTEST_SIGNAL_MATRIX_RUNTIME_CACHE_MAX_ITEMS", "").strip()
+        if not raw:
+            return 32
+        try:
+            return max(1, int(raw))
+        except Exception:
+            return 32
+
+    @staticmethod
+    def _build_backtest_signal_matrix_runtime_cache_key(*, matrix_cache_key: str, top_n: int) -> str:
+        return f"{matrix_cache_key}|top_n={int(top_n)}"
+
+    def _load_backtest_signal_matrix_runtime_cache(self, cache_key: str) -> BacktestSignalMatrix | None:
+        if not self._is_backtest_signal_matrix_runtime_cache_enabled():
+            return None
+        ttl_sec = self._backtest_signal_matrix_runtime_ttl_sec()
+        with self._backtest_signal_matrix_runtime_cache_lock:
+            cached = self._backtest_signal_matrix_runtime_cache.get(cache_key)
+            if cached is None:
+                return None
+            created_at, matrix = cached
+            if ttl_sec > 0 and (time.time() - created_at) > ttl_sec:
+                self._backtest_signal_matrix_runtime_cache.pop(cache_key, None)
+                return None
+            return matrix
+
+    def _save_backtest_signal_matrix_runtime_cache(self, cache_key: str, matrix: BacktestSignalMatrix) -> None:
+        if not self._is_backtest_signal_matrix_runtime_cache_enabled():
+            return
+        now_ts = time.time()
+        with self._backtest_signal_matrix_runtime_cache_lock:
+            self._backtest_signal_matrix_runtime_cache[cache_key] = (now_ts, matrix)
+            max_items = self._backtest_signal_matrix_runtime_max_items()
+            if len(self._backtest_signal_matrix_runtime_cache) > max_items:
+                stale_items = sorted(
+                    self._backtest_signal_matrix_runtime_cache.items(),
+                    key=lambda item: float(item[1][0]),
+                )
+                overflow = len(self._backtest_signal_matrix_runtime_cache) - max_items
+                for key, _value in stale_items[:overflow]:
+                    self._backtest_signal_matrix_runtime_cache.pop(key, None)
+
+    def _clear_backtest_signal_matrix_runtime_cache(self) -> None:
+        with self._backtest_signal_matrix_runtime_cache_lock:
+            self._backtest_signal_matrix_runtime_cache.clear()
+
+    def _is_backtest_signal_matrix_disk_cache_enabled(self) -> bool:
+        return self._env_flag("TDX_TREND_BACKTEST_SIGNAL_MATRIX_DISK_CACHE", True)
+
+    @staticmethod
+    def _backtest_signal_matrix_disk_cache_ttl_sec() -> float:
+        raw = os.getenv("TDX_TREND_BACKTEST_SIGNAL_MATRIX_CACHE_TTL_SEC", "").strip()
+        if not raw:
+            return 48 * 3600.0
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 48 * 3600.0
+
+    def _build_backtest_signal_matrix_disk_cache_key(self, *, matrix_cache_key: str, top_n: int) -> str:
+        payload = {
+            "version": self._BACKTEST_SIGNAL_MATRIX_CACHE_VERSION,
+            "matrix_cache_key": str(matrix_cache_key).strip(),
+            "top_n": int(top_n),
+            "algo": str(self._backtest_matrix_algo_version).strip(),
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _backtest_signal_matrix_disk_cache_file(self, cache_key: str) -> Path:
+        return self._resolve_backtest_signal_matrix_cache_dir() / f"{cache_key}.npz"
+
+    def _load_backtest_signal_matrix_disk_cache(
+        self,
+        *,
+        cache_key: str,
+        expected_shape: tuple[int, int],
+    ) -> BacktestSignalMatrix | None:
+        if not self._is_backtest_signal_matrix_disk_cache_enabled():
+            return None
+        path = self._backtest_signal_matrix_disk_cache_file(cache_key)
+        if not path.exists():
+            return None
+        ttl_sec = self._backtest_signal_matrix_disk_cache_ttl_sec()
+        if ttl_sec > 0:
+            try:
+                age_sec = max(0.0, time.time() - path.stat().st_mtime)
+                if age_sec > ttl_sec:
+                    return None
+            except Exception:
+                return None
+        bool_fields = (
+            "s1",
+            "s2",
+            "s3",
+            "s4",
+            "s5",
+            "s6",
+            "s7",
+            "s8",
+            "s9",
+            "in_pool",
+            "buy_signal",
+            "sell_signal",
+        )
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                out_bool: dict[str, np.ndarray] = {}
+                for field in bool_fields:
+                    if field not in data:
+                        return None
+                    arr = np.array(data[field], dtype=bool, copy=True)
+                    if arr.shape != expected_shape:
+                        return None
+                    out_bool[field] = arr
+                if "score" not in data:
+                    return None
+                score = np.array(data["score"], dtype=np.float64, copy=True)
+                if score.shape != expected_shape:
+                    return None
+            return BacktestSignalMatrix(
+                s1=out_bool["s1"],
+                s2=out_bool["s2"],
+                s3=out_bool["s3"],
+                s4=out_bool["s4"],
+                s5=out_bool["s5"],
+                s6=out_bool["s6"],
+                s7=out_bool["s7"],
+                s8=out_bool["s8"],
+                s9=out_bool["s9"],
+                in_pool=out_bool["in_pool"],
+                buy_signal=out_bool["buy_signal"],
+                sell_signal=out_bool["sell_signal"],
+                score=score,
+            )
+        except Exception:
+            return None
+
+    def _save_backtest_signal_matrix_disk_cache(
+        self,
+        *,
+        cache_key: str,
+        matrix: BacktestSignalMatrix,
+    ) -> bool:
+        if not self._is_backtest_signal_matrix_disk_cache_enabled():
+            return False
+        path = self._backtest_signal_matrix_disk_cache_file(cache_key)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(".tmp.npz")
+            np.savez_compressed(
+                tmp_path,
+                s1=matrix.s1.astype(np.uint8),
+                s2=matrix.s2.astype(np.uint8),
+                s3=matrix.s3.astype(np.uint8),
+                s4=matrix.s4.astype(np.uint8),
+                s5=matrix.s5.astype(np.uint8),
+                s6=matrix.s6.astype(np.uint8),
+                s7=matrix.s7.astype(np.uint8),
+                s8=matrix.s8.astype(np.uint8),
+                s9=matrix.s9.astype(np.uint8),
+                in_pool=matrix.in_pool.astype(np.uint8),
+                buy_signal=matrix.buy_signal.astype(np.uint8),
+                sell_signal=matrix.sell_signal.astype(np.uint8),
+                score=matrix.score.astype(np.float64),
+            )
+            tmp_path.replace(path)
+            return True
+        except Exception:
+            return False
 
     def _build_backtest_engine(self) -> BacktestEngine:
         return BacktestEngine(
@@ -4299,11 +5382,7 @@ class InMemoryStore:
     ) -> tuple[BacktestResponse, str]:
         if control_callback is not None:
             control_callback()
-        self._validate_backtest_data_coverage(
-            payload,
-            symbols,
-            scope_label="滚动池并集",
-        )
+        total_start_ts = time.perf_counter()
 
         matrix_windows = self._build_backtest_matrix_windows(payload)
         data_version = (
@@ -4318,6 +5397,7 @@ class InMemoryStore:
             window_set=matrix_windows,
             algo_version=self._backtest_matrix_algo_version,
         )
+        bundle_start_ts = time.perf_counter()
         bundle, cache_hit = self._backtest_matrix_engine.build_bundle(
             symbols=symbols,
             get_candles=self._ensure_candles,
@@ -4327,15 +5407,51 @@ class InMemoryStore:
             cache_key=cache_key,
             use_cache=True,
         )
+        bundle_elapsed = time.perf_counter() - bundle_start_ts
         if control_callback is not None:
             control_callback()
         if not bundle.dates or not bundle.symbols:
             raise ValueError("矩阵引擎未构建出有效数据，请检查K线覆盖范围。")
-
-        signal_matrix = compute_backtest_signal_matrix(
+        self._validate_backtest_data_coverage_with_matrix_bundle(
+            payload,
+            symbols,
             bundle,
-            top_n=max(50, min(2000, int(self._config.top_n))),
+            scope_label="滚动池并集",
         )
+
+        signal_start_ts = time.perf_counter()
+        signal_top_n = max(50, min(2000, int(self._config.top_n)))
+        signal_runtime_cache_key = self._build_backtest_signal_matrix_runtime_cache_key(
+            matrix_cache_key=cache_key,
+            top_n=signal_top_n,
+        )
+        signal_disk_cache_key = self._build_backtest_signal_matrix_disk_cache_key(
+            matrix_cache_key=cache_key,
+            top_n=signal_top_n,
+        )
+        signal_cache_source = "miss"
+        signal_matrix = self._load_backtest_signal_matrix_runtime_cache(signal_runtime_cache_key)
+        if signal_matrix is not None:
+            signal_cache_source = "runtime"
+        else:
+            signal_matrix = self._load_backtest_signal_matrix_disk_cache(
+                cache_key=signal_disk_cache_key,
+                expected_shape=bundle.shape(),
+            )
+            if signal_matrix is not None:
+                signal_cache_source = "disk"
+                self._save_backtest_signal_matrix_runtime_cache(signal_runtime_cache_key, signal_matrix)
+            else:
+                signal_matrix = compute_backtest_signal_matrix(
+                    bundle,
+                    top_n=signal_top_n,
+                )
+                self._save_backtest_signal_matrix_runtime_cache(signal_runtime_cache_key, signal_matrix)
+                self._save_backtest_signal_matrix_disk_cache(
+                    cache_key=signal_disk_cache_key,
+                    matrix=signal_matrix,
+                )
+        signal_elapsed = time.perf_counter() - signal_start_ts
         if control_callback is not None:
             control_callback()
         if progress_callback is not None and progress_total_dates is not None:
@@ -4348,6 +5464,7 @@ class InMemoryStore:
             )
 
         engine = self._build_backtest_engine()
+        execute_start_ts = time.perf_counter()
         result = engine.run(
             payload=payload,
             symbols=symbols,
@@ -4356,12 +5473,16 @@ class InMemoryStore:
             matrix_signals=signal_matrix,
             control_callback=control_callback,
         )
+        execute_elapsed = time.perf_counter() - execute_start_ts
+        total_elapsed = time.perf_counter() - total_start_ts
 
         shape_t, shape_n = bundle.shape()
         matrix_note = (
             "矩阵引擎已启用："
             f"shape={shape_t}x{shape_n}，windows={list(matrix_windows)}，"
-            f"cache={'hit' if cache_hit else 'miss'}，key={cache_key[:12]}..."
+            f"cache={'hit' if cache_hit else 'miss'}，signal_cache={signal_cache_source}，"
+            f"key={cache_key[:12]}...；"
+            f"耗时[建矩阵={bundle_elapsed:.2f}s, 算信号={signal_elapsed:.2f}s, 撮合={execute_elapsed:.2f}s, 总计={total_elapsed:.2f}s]"
         )
         return result, matrix_note
 
@@ -4556,11 +5677,62 @@ class InMemoryStore:
 
         return effective_start, effective_end, covered_from_count, covered_to_count, checked_count
 
-    def _validate_backtest_data_coverage(
+    @staticmethod
+    def _summarize_backtest_candle_coverage_from_matrix_bundle(
+        *,
+        symbols: list[str],
+        date_from: str,
+        date_to: str,
+        matrix_bundle: MatrixBundle,
+    ) -> tuple[str | None, str | None, int, int, int]:
+        dates = list(matrix_bundle.dates)
+        valid_mask = matrix_bundle.valid_mask
+        if not dates or valid_mask.size <= 0:
+            return None, None, 0, 0, 0
+        if valid_mask.ndim != 2 or valid_mask.shape[0] != len(dates):
+            return None, None, 0, 0, 0
+
+        has_data = np.any(valid_mask, axis=0)
+        if not bool(np.any(has_data)):
+            return None, None, 0, 0, 0
+        first_indexes = np.argmax(valid_mask, axis=0)
+        last_indexes = (valid_mask.shape[0] - 1) - np.argmax(valid_mask[::-1, :], axis=0)
+
+        symbol_to_col = matrix_bundle.symbol_to_index()
+        effective_start: str | None = None
+        effective_end: str | None = None
+        covered_from_count = 0
+        covered_to_count = 0
+        checked_count = 0
+
+        for raw_symbol in symbols:
+            symbol = str(raw_symbol).strip().lower()
+            if not symbol:
+                continue
+            col = symbol_to_col.get(symbol)
+            if col is None or (not bool(has_data[col])):
+                continue
+            first_date = str(dates[int(first_indexes[col])]).strip()
+            last_date = str(dates[int(last_indexes[col])]).strip()
+            if not first_date or not last_date:
+                continue
+            checked_count += 1
+            if effective_start is None or first_date < effective_start:
+                effective_start = first_date
+            if effective_end is None or last_date > effective_end:
+                effective_end = last_date
+            if first_date <= date_from <= last_date:
+                covered_from_count += 1
+            if first_date <= date_to <= last_date:
+                covered_to_count += 1
+
+        return effective_start, effective_end, covered_from_count, covered_to_count, checked_count
+
+    def _validate_backtest_data_coverage_by_summary(
         self,
         payload: BacktestRunRequest,
-        symbols: list[str],
         *,
+        summary: tuple[str | None, str | None, int, int, int],
         scope_label: str,
     ) -> None:
         (
@@ -4569,11 +5741,7 @@ class InMemoryStore:
             covered_from_count,
             covered_to_count,
             checked_count,
-        ) = self._summarize_backtest_candle_coverage(
-            symbols=symbols,
-            date_from=payload.date_from,
-            date_to=payload.date_to,
-        )
+        ) = summary
         if checked_count <= 0:
             raise BacktestValidationError(
                 "BACKTEST_DATA_COVERAGE_INSUFFICIENT",
@@ -4604,6 +5772,44 @@ class InMemoryStore:
                 f"可覆盖结束日标的 {covered_to_count}/{checked_count}。"
                 "请增大K线窗口或缩短回测区间。"
             ),
+        )
+
+    def _validate_backtest_data_coverage_with_matrix_bundle(
+        self,
+        payload: BacktestRunRequest,
+        symbols: list[str],
+        matrix_bundle: MatrixBundle,
+        *,
+        scope_label: str,
+    ) -> None:
+        summary = self._summarize_backtest_candle_coverage_from_matrix_bundle(
+            symbols=symbols,
+            date_from=payload.date_from,
+            date_to=payload.date_to,
+            matrix_bundle=matrix_bundle,
+        )
+        self._validate_backtest_data_coverage_by_summary(
+            payload,
+            summary=summary,
+            scope_label=scope_label,
+        )
+
+    def _validate_backtest_data_coverage(
+        self,
+        payload: BacktestRunRequest,
+        symbols: list[str],
+        *,
+        scope_label: str,
+    ) -> None:
+        summary = self._summarize_backtest_candle_coverage(
+            symbols=symbols,
+            date_from=payload.date_from,
+            date_to=payload.date_to,
+        )
+        self._validate_backtest_data_coverage_by_summary(
+            payload,
+            summary=summary,
+            scope_label=scope_label,
         )
 
     def _precheck_backtest_data_coverage_before_task(self, payload: BacktestRunRequest) -> None:
@@ -4640,6 +5846,632 @@ class InMemoryStore:
             scope_label="首个刷新日候选池",
         )
 
+    def _is_backtest_task_precheck_async_enabled(self) -> bool:
+        return self._env_flag("TDX_TREND_BACKTEST_TASK_PRECHECK_ASYNC", False)
+
+    @staticmethod
+    def _backtest_precheck_cache_ttl_sec() -> float:
+        raw = os.getenv("TDX_TREND_BACKTEST_PRECHECK_CACHE_TTL_SEC", "").strip()
+        if not raw:
+            return 10 * 60.0
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 10 * 60.0
+
+    def _build_backtest_precheck_cache_key(self, payload: BacktestRunRequest) -> str:
+        payload_raw = payload.model_dump(exclude_none=True)
+        board_filters = payload_raw.get("board_filters")
+        if isinstance(board_filters, list):
+            payload_raw["board_filters"] = sorted(
+                {str(item).strip().lower() for item in board_filters if str(item).strip()}
+            )
+        cache_payload = {
+            "version": self._BACKTEST_PRECHECK_CACHE_VERSION,
+            "payload": payload_raw,
+            "config": {
+                "tdx_root": str(self._resolve_user_path(self._config.tdx_data_path)),
+                "market_data_source": str(self._config.market_data_source).strip(),
+                "candles_window_bars": int(self._config.candles_window_bars),
+                "markets": sorted({str(item).strip().lower() for item in self._config.markets if str(item).strip()}),
+                "return_window_days": int(self._config.return_window_days),
+                "top_n": int(self._config.top_n),
+            },
+            "algo": {
+                "matrix_algo_version": str(self._backtest_matrix_algo_version).strip(),
+                "wyckoff_algo_version": str(self._wyckoff_event_algo_version).strip(),
+                "wyckoff_data_version": str(self._wyckoff_event_data_version).strip(),
+            },
+        }
+        raw = json.dumps(cache_payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _load_backtest_precheck_cache(
+        self,
+        cache_key: str,
+    ) -> tuple[str | None, str | None] | None:
+        ttl_sec = self._backtest_precheck_cache_ttl_sec()
+        with self._backtest_precheck_cache_lock:
+            cached = self._backtest_precheck_cache.get(cache_key)
+            if cached is None:
+                return None
+            created_at, error_code, error_message = cached
+            if ttl_sec > 0 and (time.time() - created_at) > ttl_sec:
+                self._backtest_precheck_cache.pop(cache_key, None)
+                return None
+            return error_code, error_message
+
+    def _save_backtest_precheck_cache(
+        self,
+        cache_key: str,
+        *,
+        error_code: str | None,
+        error_message: str | None,
+    ) -> None:
+        now_ts = time.time()
+        with self._backtest_precheck_cache_lock:
+            self._backtest_precheck_cache[cache_key] = (now_ts, error_code, error_message)
+            if len(self._backtest_precheck_cache) > 256:
+                stale_items = sorted(
+                    self._backtest_precheck_cache.items(),
+                    key=lambda item: float(item[1][0]),
+                )
+                overflow = len(self._backtest_precheck_cache) - 256
+                for key, _value in stale_items[:overflow]:
+                    self._backtest_precheck_cache.pop(key, None)
+
+    def _clear_backtest_precheck_cache(self) -> None:
+        with self._backtest_precheck_cache_lock:
+            self._backtest_precheck_cache.clear()
+
+    def _run_backtest_precheck_with_cache(self, payload: BacktestRunRequest) -> None:
+        cache_key = self._build_backtest_precheck_cache_key(payload)
+        cached = self._load_backtest_precheck_cache(cache_key)
+        if cached is not None:
+            cached_error_code, cached_error_message = cached
+            if cached_error_code and cached_error_message:
+                raise BacktestValidationError(cached_error_code, cached_error_message)
+            return
+        try:
+            self._precheck_backtest_data_coverage_before_task(payload)
+        except BacktestValidationError as exc:
+            self._save_backtest_precheck_cache(
+                cache_key,
+                error_code=exc.code,
+                error_message=str(exc),
+            )
+            raise
+        self._save_backtest_precheck_cache(cache_key, error_code=None, error_message=None)
+
+    def _is_backtest_result_cache_enabled(self) -> bool:
+        return self._env_flag("TDX_TREND_BACKTEST_RESULT_CACHE", True)
+
+    @staticmethod
+    def _backtest_result_cache_ttl_sec() -> float:
+        raw = os.getenv("TDX_TREND_BACKTEST_RESULT_CACHE_TTL_SEC", "").strip()
+        if not raw:
+            return 48 * 3600.0
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 48 * 3600.0
+
+    @staticmethod
+    def _is_backtest_result_cache_eligible(payload: BacktestRunRequest) -> bool:
+        if payload.mode == "trend_pool" and not str(payload.run_id or "").strip():
+            # 没有显式 run_id 时会回落到 latest_run，结果来源不稳定，不做持久缓存。
+            return False
+        return True
+
+    def _build_backtest_result_cache_key(self, payload: BacktestRunRequest) -> str:
+        payload_raw = payload.model_dump(exclude_none=True)
+        board_filters = payload_raw.get("board_filters")
+        if isinstance(board_filters, list):
+            payload_raw["board_filters"] = sorted(
+                {str(item).strip().lower() for item in board_filters if str(item).strip()}
+            )
+        payload_meta = {
+            "version": self._BACKTEST_RESULT_CACHE_VERSION,
+            "payload": payload_raw,
+            "config": {
+                "tdx_root": str(self._resolve_user_path(self._config.tdx_data_path)),
+                "market_data_source": str(self._config.market_data_source).strip(),
+                "candles_window_bars": int(self._config.candles_window_bars),
+                "return_window_days": int(self._config.return_window_days),
+                "top_n": int(self._config.top_n),
+            },
+            "algo": {
+                "matrix_algo_version": str(self._backtest_matrix_algo_version).strip(),
+                "wyckoff_algo_version": str(self._wyckoff_event_algo_version).strip(),
+                "wyckoff_data_version": str(self._wyckoff_event_data_version).strip(),
+                "matrix_enabled": bool(self._is_backtest_matrix_engine_enabled()),
+            },
+        }
+        raw = json.dumps(payload_meta, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _backtest_result_cache_file(self, cache_key: str) -> Path:
+        return self._resolve_backtest_result_cache_dir() / f"{cache_key}.json"
+
+    def _load_backtest_result_cache(self, payload: BacktestRunRequest) -> BacktestResponse | None:
+        if not self._is_backtest_result_cache_enabled():
+            return None
+        if not self._is_backtest_result_cache_eligible(payload):
+            return None
+        cache_key = self._build_backtest_result_cache_key(payload)
+        path = self._backtest_result_cache_file(cache_key)
+        if not path.exists():
+            return None
+        ttl_sec = self._backtest_result_cache_ttl_sec()
+        if ttl_sec > 0:
+            try:
+                age_sec = max(0.0, time.time() - path.stat().st_mtime)
+                if age_sec > ttl_sec:
+                    return None
+            except Exception:
+                return None
+        try:
+            payload_raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload_raw, dict):
+                return None
+            result_raw = payload_raw.get("result")
+            if not isinstance(result_raw, dict):
+                return None
+            return BacktestResponse(**result_raw)
+        except Exception:
+            return None
+
+    def _save_backtest_result_cache(self, payload: BacktestRunRequest, result: BacktestResponse) -> bool:
+        if not self._is_backtest_result_cache_enabled():
+            return False
+        if not self._is_backtest_result_cache_eligible(payload):
+            return False
+        cache_key = self._build_backtest_result_cache_key(payload)
+        path = self._backtest_result_cache_file(cache_key)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            body = {
+                "schema_version": 1,
+                "created_at": self._now_datetime(),
+                "cache_key": cache_key,
+                "result": result.model_dump(exclude_none=True),
+            }
+            tmp_path = path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            tmp_path.replace(path)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _normalize_plateau_axis_int(
+        values: list[int],
+        *,
+        base: int,
+        lower: int,
+        upper: int,
+    ) -> list[int]:
+        source = values if values else [int(base)]
+        out: list[int] = []
+        seen: set[int] = set()
+        for raw in source:
+            value = int(raw)
+            value = max(lower, min(upper, value))
+            if value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        if not out:
+            out.append(max(lower, min(upper, int(base))))
+        return out
+
+    @staticmethod
+    def _normalize_plateau_axis_float(
+        values: list[float],
+        *,
+        base: float,
+        lower: float,
+        upper: float,
+        precision: int = 6,
+    ) -> list[float]:
+        source = values if values else [float(base)]
+        out: list[float] = []
+        seen: set[float] = set()
+        for raw in source:
+            value = float(raw)
+            value = max(lower, min(upper, value))
+            value = round(value, precision)
+            if value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        if not out:
+            out.append(round(max(lower, min(upper, float(base))), precision))
+        return out
+
+    @staticmethod
+    def _backtest_plateau_score(result: BacktestResponse) -> float:
+        total_return = float(result.stats.total_return)
+        max_drawdown = abs(min(0.0, float(result.stats.max_drawdown)))
+        win_rate = max(0.0, min(1.0, float(result.stats.win_rate)))
+        profit_factor = float(result.stats.profit_factor)
+        if not math.isfinite(profit_factor):
+            profit_factor = 5.0
+        profit_factor = max(0.0, min(profit_factor, 5.0))
+        return round(total_return - max_drawdown * 0.6 + win_rate * 0.1 + profit_factor * 0.02, 6)
+
+    @staticmethod
+    def _resolve_plateau_sample_points(payload: BacktestPlateauRunRequest) -> int:
+        if payload.sample_points is not None:
+            return max(1, int(payload.sample_points))
+        return max(1, int(payload.max_points))
+
+    @staticmethod
+    def _lhs_unit_matrix(point_count: int, dim_count: int, rng: random.Random) -> list[list[float]]:
+        if point_count <= 0:
+            return []
+        matrix: list[list[float]] = [[0.0 for _ in range(dim_count)] for _ in range(point_count)]
+        for dim in range(dim_count):
+            bins = list(range(point_count))
+            rng.shuffle(bins)
+            for row in range(point_count):
+                matrix[row][dim] = (float(bins[row]) + rng.random()) / float(point_count)
+        return matrix
+
+    @staticmethod
+    def _map_plateau_int_from_unit(
+        unit_value: float,
+        *,
+        lower: int,
+        upper: int,
+    ) -> int:
+        if upper <= lower:
+            return int(lower)
+        mapped = int(round(float(lower) + float(unit_value) * float(upper - lower)))
+        return max(int(lower), min(int(upper), mapped))
+
+    @staticmethod
+    def _map_plateau_float_from_unit(
+        unit_value: float,
+        *,
+        lower: float,
+        upper: float,
+        precision: int,
+    ) -> float:
+        if upper <= lower:
+            return round(float(lower), int(precision))
+        mapped = float(lower) + float(unit_value) * float(upper - lower)
+        mapped = max(float(lower), min(float(upper), mapped))
+        return round(mapped, int(precision))
+
+    def _build_plateau_lhs_params(
+        self,
+        *,
+        point_count: int,
+        random_seed: int | None,
+        window_axis: list[int],
+        min_score_axis: list[float],
+        stop_loss_axis: list[float],
+        take_profit_axis: list[float],
+        max_positions_axis: list[int],
+        position_pct_axis: list[float],
+        max_symbols_axis: list[int],
+        priority_topk_axis: list[int],
+    ) -> list[BacktestPlateauParams]:
+        if point_count <= 0:
+            return []
+
+        rng = random.Random(int(random_seed)) if random_seed is not None else random.Random()
+        window_bounds = (min(window_axis), max(window_axis))
+        min_score_bounds = (min(min_score_axis), max(min_score_axis))
+        stop_loss_bounds = (min(stop_loss_axis), max(stop_loss_axis))
+        take_profit_bounds = (min(take_profit_axis), max(take_profit_axis))
+        max_positions_bounds = (min(max_positions_axis), max(max_positions_axis))
+        position_pct_bounds = (min(position_pct_axis), max(position_pct_axis))
+        max_symbols_bounds = (min(max_symbols_axis), max(max_symbols_axis))
+        priority_topk_bounds = (min(priority_topk_axis), max(priority_topk_axis))
+
+        seen: set[tuple[object, ...]] = set()
+        params: list[BacktestPlateauParams] = []
+
+        def _try_append(unit_values: list[float]) -> None:
+            candidate = BacktestPlateauParams(
+                window_days=self._map_plateau_int_from_unit(
+                    unit_values[0],
+                    lower=int(window_bounds[0]),
+                    upper=int(window_bounds[1]),
+                ),
+                min_score=self._map_plateau_float_from_unit(
+                    unit_values[1],
+                    lower=float(min_score_bounds[0]),
+                    upper=float(min_score_bounds[1]),
+                    precision=4,
+                ),
+                stop_loss=self._map_plateau_float_from_unit(
+                    unit_values[2],
+                    lower=float(stop_loss_bounds[0]),
+                    upper=float(stop_loss_bounds[1]),
+                    precision=6,
+                ),
+                take_profit=self._map_plateau_float_from_unit(
+                    unit_values[3],
+                    lower=float(take_profit_bounds[0]),
+                    upper=float(take_profit_bounds[1]),
+                    precision=6,
+                ),
+                max_positions=self._map_plateau_int_from_unit(
+                    unit_values[4],
+                    lower=int(max_positions_bounds[0]),
+                    upper=int(max_positions_bounds[1]),
+                ),
+                position_pct=self._map_plateau_float_from_unit(
+                    unit_values[5],
+                    lower=float(position_pct_bounds[0]),
+                    upper=float(position_pct_bounds[1]),
+                    precision=6,
+                ),
+                max_symbols=self._map_plateau_int_from_unit(
+                    unit_values[6],
+                    lower=int(max_symbols_bounds[0]),
+                    upper=int(max_symbols_bounds[1]),
+                ),
+                priority_topk_per_day=self._map_plateau_int_from_unit(
+                    unit_values[7],
+                    lower=int(priority_topk_bounds[0]),
+                    upper=int(priority_topk_bounds[1]),
+                ),
+            )
+            key = (
+                int(candidate.window_days),
+                float(candidate.min_score),
+                float(candidate.stop_loss),
+                float(candidate.take_profit),
+                int(candidate.max_positions),
+                float(candidate.position_pct),
+                int(candidate.max_symbols),
+                int(candidate.priority_topk_per_day),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            params.append(candidate)
+
+        lhs_units = self._lhs_unit_matrix(point_count, 8, rng)
+        for row in lhs_units:
+            _try_append(row)
+            if len(params) >= point_count:
+                return params
+
+        max_attempts = max(512, point_count * 64)
+        attempts = 0
+        while len(params) < point_count and attempts < max_attempts:
+            attempts += 1
+            _try_append([rng.random() for _ in range(8)])
+
+        return params[:point_count]
+
+    def run_backtest_plateau(self, payload: BacktestPlateauRunRequest) -> BacktestPlateauResponse:
+        base = payload.base_payload.model_copy(deep=True)
+        window_axis = self._normalize_plateau_axis_int(
+            payload.window_days_list,
+            base=int(base.window_days),
+            lower=20,
+            upper=240,
+        )
+        min_score_axis = self._normalize_plateau_axis_float(
+            payload.min_score_list,
+            base=float(base.min_score),
+            lower=0.0,
+            upper=100.0,
+            precision=4,
+        )
+        stop_loss_axis = self._normalize_plateau_axis_float(
+            payload.stop_loss_list,
+            base=float(base.stop_loss),
+            lower=0.0,
+            upper=0.5,
+            precision=6,
+        )
+        take_profit_axis = self._normalize_plateau_axis_float(
+            payload.take_profit_list,
+            base=float(base.take_profit),
+            lower=0.0,
+            upper=1.5,
+            precision=6,
+        )
+        max_positions_axis = self._normalize_plateau_axis_int(
+            payload.max_positions_list,
+            base=int(base.max_positions),
+            lower=1,
+            upper=100,
+        )
+        position_pct_axis = self._normalize_plateau_axis_float(
+            payload.position_pct_list,
+            base=float(base.position_pct),
+            lower=0.0001,
+            upper=1.0,
+            precision=6,
+        )
+        max_symbols_axis = self._normalize_plateau_axis_int(
+            payload.max_symbols_list,
+            base=int(base.max_symbols),
+            lower=20,
+            upper=2000,
+        )
+        priority_topk_axis = self._normalize_plateau_axis_int(
+            payload.priority_topk_per_day_list,
+            base=int(base.priority_topk_per_day),
+            lower=0,
+            upper=500,
+        )
+
+        axis_lengths = [
+            len(window_axis),
+            len(min_score_axis),
+            len(stop_loss_axis),
+            len(take_profit_axis),
+            len(max_positions_axis),
+            len(position_pct_axis),
+            len(max_symbols_axis),
+            len(priority_topk_axis),
+        ]
+        grid_total_combinations = 1
+        for size in axis_lengths:
+            grid_total_combinations *= max(1, int(size))
+
+        points: list[BacktestPlateauPoint] = []
+        failure_count = 0
+        evaluated = 0
+        sampling_mode = payload.sampling_mode
+        sample_points = self._resolve_plateau_sample_points(payload)
+
+        params_to_evaluate: list[BacktestPlateauParams] = []
+        total_combinations = int(grid_total_combinations)
+        if sampling_mode == "lhs":
+            total_combinations = int(sample_points)
+            params_to_evaluate = self._build_plateau_lhs_params(
+                point_count=sample_points,
+                random_seed=payload.random_seed,
+                window_axis=window_axis,
+                min_score_axis=min_score_axis,
+                stop_loss_axis=stop_loss_axis,
+                take_profit_axis=take_profit_axis,
+                max_positions_axis=max_positions_axis,
+                position_pct_axis=position_pct_axis,
+                max_symbols_axis=max_symbols_axis,
+                priority_topk_axis=priority_topk_axis,
+            )
+        else:
+            for combo in product(
+                window_axis,
+                min_score_axis,
+                stop_loss_axis,
+                take_profit_axis,
+                max_positions_axis,
+                position_pct_axis,
+                max_symbols_axis,
+                priority_topk_axis,
+            ):
+                if len(params_to_evaluate) >= sample_points:
+                    break
+                (
+                    window_days,
+                    min_score,
+                    stop_loss,
+                    take_profit,
+                    max_positions,
+                    position_pct,
+                    max_symbols,
+                    priority_topk_per_day,
+                ) = combo
+                params_to_evaluate.append(
+                    BacktestPlateauParams(
+                        window_days=int(window_days),
+                        min_score=float(min_score),
+                        stop_loss=float(stop_loss),
+                        take_profit=float(take_profit),
+                        max_positions=int(max_positions),
+                        position_pct=float(position_pct),
+                        max_symbols=int(max_symbols),
+                        priority_topk_per_day=int(priority_topk_per_day),
+                    )
+                )
+
+        for params in params_to_evaluate:
+            run_payload = base.model_copy(
+                update={
+                    "window_days": params.window_days,
+                    "min_score": params.min_score,
+                    "stop_loss": params.stop_loss,
+                    "take_profit": params.take_profit,
+                    "max_positions": params.max_positions,
+                    "position_pct": params.position_pct,
+                    "max_symbols": params.max_symbols,
+                    "priority_topk_per_day": params.priority_topk_per_day,
+                },
+                deep=True,
+            )
+            evaluated += 1
+            try:
+                result = self.run_backtest(run_payload)
+                cache_hit = any("回测结果缓存命中" in str(note) for note in result.notes)
+                point = BacktestPlateauPoint(
+                    params=params,
+                    stats=result.stats,
+                    candidate_count=int(result.candidate_count),
+                    skipped_count=int(result.skipped_count),
+                    fill_rate=float(result.fill_rate),
+                    max_concurrent_positions=int(result.max_concurrent_positions),
+                    score=self._backtest_plateau_score(result),
+                    cache_hit=cache_hit,
+                    error=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                failure_count += 1
+                point = BacktestPlateauPoint(
+                    params=params,
+                    stats=ReviewStats(
+                        win_rate=0.0,
+                        total_return=0.0,
+                        max_drawdown=0.0,
+                        avg_pnl_ratio=0.0,
+                        trade_count=0,
+                        win_count=0,
+                        loss_count=0,
+                        profit_factor=0.0,
+                    ),
+                    candidate_count=0,
+                    skipped_count=0,
+                    fill_rate=0.0,
+                    max_concurrent_positions=0,
+                    score=-9999.0,
+                    cache_hit=False,
+                    error=str(exc),
+                )
+            points.append(point)
+
+        points.sort(
+            key=lambda row: (
+                row.error is None,
+                row.score,
+                row.stats.total_return,
+                row.stats.win_rate,
+            ),
+            reverse=True,
+        )
+        best_point = next((row for row in points if row.error is None), None)
+        notes: list[str] = []
+        if sampling_mode == "grid" and grid_total_combinations > sample_points:
+            notes.append(
+                f"参数组合总数 {grid_total_combinations} 超过上限，已截断评估前 {sample_points} 组。"
+            )
+        if sampling_mode == "lhs":
+            notes.append(f"参数采样模式: lhs，目标采样 {sample_points} 组。")
+            if payload.random_seed is not None:
+                notes.append(f"LHS 随机种子: {payload.random_seed}。")
+            if len(params_to_evaluate) < sample_points:
+                notes.append(
+                    f"LHS 去重后仅生成 {len(params_to_evaluate)} 组有效参数（目标 {sample_points} 组）。"
+                )
+            notes.append(f"参考网格组合规模（按列表离散值估算）: {grid_total_combinations}。")
+        if failure_count > 0:
+            notes.append(f"有 {failure_count} 组参数评估失败，详情见 points.error。")
+        notes.append(
+            f"收益平原评估完成：总组合 {total_combinations}，实际评估 {evaluated}。"
+        )
+        return BacktestPlateauResponse(
+            base_payload=base,
+            total_combinations=int(total_combinations),
+            evaluated_combinations=int(evaluated),
+            points=points,
+            best_point=best_point,
+            generated_at=self._now_datetime(),
+            notes=notes,
+        )
+
     def run_backtest(
         self,
         payload: BacktestRunRequest,
@@ -4660,6 +6492,23 @@ class InMemoryStore:
 
             effective_progress_callback = _progress_with_control
 
+        cached_result = self._load_backtest_result_cache(payload)
+        if cached_result is not None:
+            if effective_progress_callback is not None:
+                effective_progress_callback(
+                    payload.date_to,
+                    1,
+                    1,
+                    "回测结果缓存命中，直接返回。",
+                )
+            cached_notes = list(cached_result.notes)
+            cache_note = "回测结果缓存命中：复用本地持久化结果。"
+            if cache_note not in cached_notes:
+                cached_notes.insert(0, cache_note)
+            if cached_notes != cached_result.notes:
+                return cached_result.model_copy(update={"notes": cached_notes})
+            return cached_result
+
         matrix_fallback_note: str | None = None
         matrix_supported = (
             payload.mode in {"full_market", "trend_pool"}
@@ -4667,12 +6516,14 @@ class InMemoryStore:
         )
         if self._is_backtest_matrix_engine_enabled() and matrix_supported:
             try:
-                return self._run_backtest_matrix(
+                matrix_result = self._run_backtest_matrix(
                     payload=payload,
                     board_filters=board_filters,
                     progress_callback=effective_progress_callback,
                     control_callback=control_callback,
                 )
+                self._save_backtest_result_cache(payload, matrix_result)
+                return matrix_result
             except BacktestTaskCancelledError:
                 raise
             except Exception as exc:
@@ -4873,6 +6724,7 @@ class InMemoryStore:
             notes.append(f"候选池降级原因: {degraded_reason}")
         if notes != result.notes:
             result = result.model_copy(update={"notes": notes})
+        self._save_backtest_result_cache(payload, result)
         return result
 
     def _estimate_backtest_progress_total_dates(self, payload: BacktestRunRequest) -> int:
@@ -5173,6 +7025,7 @@ class InMemoryStore:
         payload: BacktestRunRequest,
         *,
         resumed: bool = False,
+        run_precheck: bool = False,
     ) -> None:
         with self._backtest_task_lock:
             if task_id in self._backtest_running_worker_ids:
@@ -5206,13 +7059,50 @@ class InMemoryStore:
                     )
                 )
 
+                if run_precheck:
+                    self._await_backtest_task_runnable(task_id)
+                    precheck_task = self.get_backtest_task(task_id)
+                    if precheck_task is not None:
+                        precheck_progress = precheck_task.progress.model_copy(
+                            update={
+                                "message": "任务预检中：检查K线覆盖...",
+                                "updated_at": self._now_datetime(),
+                            }
+                        )
+                        self._upsert_backtest_task(
+                            precheck_task.model_copy(
+                                update={
+                                    "status": "running",
+                                    "progress": precheck_progress,
+                                }
+                            )
+                        )
+                    self._run_backtest_precheck_with_cache(payload)
+                    post_precheck_task = self.get_backtest_task(task_id)
+                    if post_precheck_task is not None:
+                        post_precheck_progress = post_precheck_task.progress.model_copy(
+                            update={
+                                "message": "任务预检完成，开始回测...",
+                                "updated_at": self._now_datetime(),
+                            }
+                        )
+                        self._upsert_backtest_task(
+                            post_precheck_task.model_copy(
+                                update={
+                                    "status": "running",
+                                    "progress": post_precheck_progress,
+                                }
+                            )
+                        )
+
                 def _progress(current_date: str, processed_dates: int, total: int, message: str) -> None:
                     self._await_backtest_task_runnable(task_id)
                     current_task = self.get_backtest_task(task_id)
                     if current_task is None:
                         return
-                    total_safe = max(1, int(total))
+                    total_safe = max(1, int(total), int(current_task.progress.total_dates or 0))
                     processed_safe = max(0, min(int(processed_dates), total_safe))
+                    processed_safe = max(int(current_task.progress.processed_dates or 0), processed_safe)
                     percent = round((processed_safe / total_safe) * 100.0, 2)
                     next_progress = current_task.progress.model_copy(
                         update={
@@ -5308,7 +7198,9 @@ class InMemoryStore:
         Thread(target=_worker, daemon=True).start()
 
     def start_backtest_task(self, payload: BacktestRunRequest) -> str:
-        self._precheck_backtest_data_coverage_before_task(payload)
+        async_precheck = self._is_backtest_task_precheck_async_enabled()
+        if not async_precheck:
+            self._run_backtest_precheck_with_cache(payload)
 
         task_id = f"bt_{uuid4().hex[:16]}"
         now_text = self._now_datetime()
@@ -5323,7 +7215,7 @@ class InMemoryStore:
             processed_dates=0,
             total_dates=total_dates,
             percent=0.0,
-            message="任务已创建，等待执行。",
+            message=("任务已创建，等待预检。" if async_precheck else "任务已创建，等待执行。"),
             warning=warning,
             started_at=now_text,
             updated_at=now_text,
@@ -5340,7 +7232,12 @@ class InMemoryStore:
                 error_code=None,
             )
         )
-        self._start_backtest_task_worker(task_id, payload, resumed=False)
+        self._start_backtest_task_worker(
+            task_id,
+            payload,
+            resumed=False,
+            run_precheck=async_precheck,
+        )
         return task_id
 
     def create_order(self, payload: CreateOrderRequest) -> CreateOrderResponse:
@@ -6352,6 +8249,10 @@ class InMemoryStore:
         self._candles_map = {}
         self._latest_rows = {}
         self._signals_cache = {}
+        self._backtest_matrix_engine.clear_runtime_cache()
+        self._clear_backtest_signal_matrix_runtime_cache()
+        self._clear_backtest_input_pool_runtime_cache()
+        self._clear_backtest_precheck_cache()
         self._persist_app_state()
         return self._config
 
@@ -6652,6 +8553,10 @@ class InMemoryStore:
                 self._candles_map = {}
                 self._latest_rows = {}
                 self._signals_cache = {}
+                self._backtest_matrix_engine.clear_runtime_cache()
+                self._clear_backtest_signal_matrix_runtime_cache()
+                self._clear_backtest_input_pool_runtime_cache()
+                self._clear_backtest_precheck_cache()
             errors = [str(item) for item in summary.get("errors", []) if str(item).strip()]
             failed = int(summary.get("fail_count", 0))
             ok = failed == 0

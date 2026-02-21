@@ -40,6 +40,7 @@ import {
   setConfigStore,
   testAIProvider,
   runBacktestStore,
+  runBacktestPlateauStore,
   updateReviewFillTagStore,
   upsertDailyReviewStore,
   upsertWeeklyReviewStore,
@@ -47,6 +48,7 @@ import {
 import type {
   AIProviderTestRequest,
   AppConfig,
+  BacktestPlateauRunRequest,
   BacktestRunRequest,
   BacktestResponse,
   BoardFilter,
@@ -191,6 +193,12 @@ export const handlers = [
     await delay(220)
     const payload = (await request.json()) as BacktestRunRequest
     return HttpResponse.json(runBacktestStore(payload))
+  }),
+
+  http.post('/api/backtest/plateau', async ({ request }) => {
+    await delay(280)
+    const payload = (await request.json()) as BacktestPlateauRunRequest
+    return HttpResponse.json(runBacktestPlateauStore(payload))
   }),
 
   http.post('/api/backtest/tasks', async ({ request }) => {
