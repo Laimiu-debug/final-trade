@@ -6,6 +6,7 @@ import json
 import os
 import struct
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -763,6 +764,61 @@ def _normalize_input_pool_load_timeout_sec(raw_value: object) -> float | None:
     return parsed
 
 
+def _input_pool_load_workers() -> int:
+    raw = os.getenv("TDX_TREND_INPUT_POOL_LOAD_WORKERS", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except Exception:
+            pass
+    cpu_count = os.cpu_count() or 4
+    return max(1, min(8, int(cpu_count)))
+
+
+def _decode_day_int_to_text(raw_day: int) -> str | None:
+    if raw_day <= 0:
+        return None
+    day_text = str(int(raw_day))
+    if len(day_text) != 8:
+        return None
+    year = int(day_text[0:4])
+    month = int(day_text[4:6])
+    day = int(day_text[6:8])
+    if not (1990 <= year <= 2100):
+        return None
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _probe_day_file_bounds(file_path: Path) -> tuple[int, str | None, str | None] | None:
+    try:
+        size = file_path.stat().st_size
+    except OSError:
+        return None
+    if size < DAY_RECORD.size * 60:
+        return None
+
+    total_bars = int(size // DAY_RECORD.size)
+    if total_bars < 60:
+        return None
+
+    try:
+        with file_path.open("rb") as fp:
+            first_chunk = fp.read(DAY_RECORD.size)
+            fp.seek((total_bars - 1) * DAY_RECORD.size)
+            last_chunk = fp.read(DAY_RECORD.size)
+    except OSError:
+        return None
+
+    if len(first_chunk) < DAY_RECORD.size or len(last_chunk) < DAY_RECORD.size:
+        return None
+
+    first_day = _decode_day_int_to_text(int(DAY_RECORD.unpack(first_chunk)[0]))
+    last_day = _decode_day_int_to_text(int(DAY_RECORD.unpack(last_chunk)[0]))
+    return total_bars, first_day, last_day
+
+
 def _input_pool_runtime_cache_key(
     *,
     tdx_root: str,
@@ -819,6 +875,46 @@ def _save_input_pool_runtime_cache(
                 _INPUT_POOL_RUNTIME_CACHE.pop(old_key, None)
 
 
+def _parse_input_pool_day_file_to_row(
+    *,
+    file_path: Path,
+    symbol: str,
+    parse_bars: int,
+    return_window_days: int,
+    as_of_date: str | None,
+    float_shares: float | None,
+    mapped_name: str | None,
+) -> tuple[ScreenerResult | None, bool]:
+    if as_of_date and parse_bars < 3000:
+        probed = _probe_day_file_bounds(file_path)
+        if probed is None:
+            return None, False
+        _total_bars, first_day, _last_day = probed
+        if first_day and first_day > as_of_date:
+            return None, False
+
+    parsed = _parse_day_file(file_path, symbol, max_bars=parse_bars)
+    if as_of_date and parse_bars < 3000:
+        need_retry_full = False
+        if not parsed:
+            need_retry_full = True
+        elif parsed["dates"]:
+            first_loaded = str(parsed["dates"][0]).strip()
+            if first_loaded and first_loaded > as_of_date:
+                need_retry_full = True
+        if need_retry_full:
+            parsed = _parse_day_file(file_path, symbol, max_bars=3000)
+    if not parsed:
+        return None, False
+
+    row = _build_row(parsed, return_window_days, float_shares, as_of_date)
+    if row is None:
+        return None, False
+    if mapped_name:
+        row = row.model_copy(update={"name": mapped_name})
+    return row, bool(row.degraded)
+
+
 def load_input_pool_from_tdx(
     tdx_root: str,
     markets: list[str],
@@ -851,6 +947,7 @@ def load_input_pool_from_tdx(
     timeout_sec = _normalize_input_pool_load_timeout_sec(load_timeout_sec)
     deadline_ts = (time.perf_counter() + timeout_sec) if timeout_sec is not None else None
     timed_out = False
+    load_workers = _input_pool_load_workers()
     for market in markets_key:
         if deadline_ts is not None and time.perf_counter() >= deadline_ts:
             timed_out = True
@@ -859,34 +956,68 @@ def load_input_pool_from_tdx(
         if not market_dir.exists():
             continue
 
+        candidates: list[tuple[str, Path]] = []
         for file_path in market_dir.glob("*.day"):
-            if deadline_ts is not None and time.perf_counter() >= deadline_ts:
-                timed_out = True
-                break
             symbol = _normalize_symbol(file_path.stem, market)
             if not symbol or not _is_a_share_symbol(symbol):
                 continue
-            parsed = _parse_day_file(file_path, symbol, max_bars=parse_bars)
-            if as_of_date and parse_bars < 3000:
-                need_retry_full = False
-                if not parsed:
-                    need_retry_full = True
-                elif parsed["dates"]:
-                    first_loaded = str(parsed["dates"][0]).strip()
-                    if first_loaded and first_loaded > as_of_date:
-                        need_retry_full = True
-                if need_retry_full:
-                    parsed = _parse_day_file(file_path, symbol, max_bars=3000)
-            if not parsed:
+            try:
+                if file_path.stat().st_size < DAY_RECORD.size * 60:
+                    continue
+            except OSError:
                 continue
-            row = _build_row(parsed, return_window_days, float_shares_map.get(symbol), as_of_date)
-            if row:
-                mapped_name = symbol_name_map.get(symbol)
-                if mapped_name:
-                    row = row.model_copy(update={"name": mapped_name})
-                if row.degraded:
+            candidates.append((symbol, file_path))
+        if not candidates:
+            continue
+
+        def _parse_candidate(candidate: tuple[str, Path]) -> tuple[ScreenerResult | None, bool]:
+            symbol_local, path_local = candidate
+            return _parse_input_pool_day_file_to_row(
+                file_path=path_local,
+                symbol=symbol_local,
+                parse_bars=parse_bars,
+                return_window_days=return_window_days,
+                as_of_date=as_of_date,
+                float_shares=float_shares_map.get(symbol_local),
+                mapped_name=symbol_name_map.get(symbol_local),
+            )
+
+        if load_workers <= 1 or len(candidates) <= 1:
+            for candidate in candidates:
+                if deadline_ts is not None and time.perf_counter() >= deadline_ts:
+                    timed_out = True
+                    break
+                row, degraded = _parse_candidate(candidate)
+                if row is None:
+                    continue
+                if degraded:
                     missing_float_shares += 1
                 rows.append(row)
+        else:
+            worker_count = max(1, min(load_workers, len(candidates)))
+            executor = ThreadPoolExecutor(max_workers=worker_count)
+            future_map = {
+                executor.submit(_parse_candidate, candidate): candidate[0]
+                for candidate in candidates
+            }
+            try:
+                timeout_left = None
+                if deadline_ts is not None:
+                    timeout_left = max(0.0, deadline_ts - time.perf_counter())
+                for future in as_completed(future_map, timeout=timeout_left):
+                    try:
+                        row, degraded = future.result()
+                    except Exception:
+                        continue
+                    if row is None:
+                        continue
+                    if degraded:
+                        missing_float_shares += 1
+                    rows.append(row)
+            except FuturesTimeoutError:
+                timed_out = True
+            finally:
+                executor.shutdown(wait=not timed_out, cancel_futures=timed_out)
         if timed_out:
             break
 

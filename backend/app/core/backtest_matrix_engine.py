@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import RLock
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -39,6 +39,9 @@ class BacktestMatrixEngine:
         self._cache_dir = self._resolve_cache_dir(cache_dir)
         self._runtime_cache: dict[str, tuple[float, MatrixBundle]] = {}
         self._runtime_cache_lock = RLock()
+        self._incremental_manifest_lock = RLock()
+        self._build_meta_lock = RLock()
+        self._build_meta_by_cache_key: dict[str, dict[str, object]] = {}
 
     @staticmethod
     def _resolve_cache_dir(cache_dir: str | Path | None) -> Path:
@@ -129,6 +132,107 @@ class BacktestMatrixEngine:
         with self._runtime_cache_lock:
             self._runtime_cache.clear()
 
+    @staticmethod
+    def _is_incremental_cache_enabled() -> bool:
+        raw = str(os.getenv('TDX_TREND_BACKTEST_MATRIX_INCREMENTAL_CACHE', '')).strip().lower()
+        if not raw:
+            return True
+        if raw in {'0', 'false', 'no', 'off', 'n'}:
+            return False
+        return True
+
+    @staticmethod
+    def _build_meta_max_items() -> int:
+        raw = str(os.getenv('TDX_TREND_BACKTEST_MATRIX_BUILD_META_MAX_ITEMS', '')).strip()
+        if not raw:
+            return 128
+        try:
+            return max(8, int(raw))
+        except Exception:
+            return 128
+
+    def _save_build_meta(self, cache_key: str, meta: dict[str, object]) -> None:
+        with self._build_meta_lock:
+            self._build_meta_by_cache_key[cache_key] = dict(meta)
+            max_items = self._build_meta_max_items()
+            overflow = len(self._build_meta_by_cache_key) - max_items
+            if overflow > 0:
+                stale_keys = list(self._build_meta_by_cache_key.keys())[:overflow]
+                for key in stale_keys:
+                    self._build_meta_by_cache_key.pop(key, None)
+
+    def get_build_meta(self, cache_key: str) -> dict[str, object] | None:
+        with self._build_meta_lock:
+            row = self._build_meta_by_cache_key.get(cache_key)
+            if row is None:
+                return None
+            return dict(row)
+
+    def _incremental_manifest_file(self) -> Path:
+        return self._cache_dir / '_incremental_manifest.json'
+
+    def _load_incremental_manifest(self) -> dict[str, dict[str, str]]:
+        path = self._incremental_manifest_file()
+        if not path.exists():
+            return {}
+        try:
+            with path.open('r', encoding='utf-8') as fp:
+                raw = json.load(fp)
+        except Exception:
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, dict[str, str]] = {}
+        for sig, row in raw.items():
+            key = str(sig).strip()
+            if not key or not isinstance(row, dict):
+                continue
+            cache_key = str(row.get('cache_key') or '').strip()
+            last_date = str(row.get('last_date') or '').strip()
+            if not cache_key:
+                continue
+            out[key] = {'cache_key': cache_key, 'last_date': last_date}
+        return out
+
+    def _save_incremental_manifest(self, payload: dict[str, dict[str, str]]) -> None:
+        path = self._incremental_manifest_file()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix('.tmp.json')
+            with tmp_path.open('w', encoding='utf-8') as fp:
+                json.dump(payload, fp, ensure_ascii=True, sort_keys=True)
+            tmp_path.replace(path)
+        except Exception:
+            return
+
+    def _resolve_incremental_base_cache_key(self, signature: str) -> tuple[str | None, str | None]:
+        sig = str(signature).strip()
+        if not sig:
+            return None, None
+        with self._incremental_manifest_lock:
+            manifest = self._load_incremental_manifest()
+            row = manifest.get(sig) or {}
+            cache_key = str(row.get('cache_key') or '').strip() or None
+            last_date = str(row.get('last_date') or '').strip() or None
+            return cache_key, last_date
+
+    def _update_incremental_manifest(self, signature: str, cache_key: str, last_date: str | None) -> None:
+        sig = str(signature).strip()
+        key = str(cache_key).strip()
+        if not sig or not key:
+            return
+        with self._incremental_manifest_lock:
+            manifest = self._load_incremental_manifest()
+            manifest[sig] = {
+                'cache_key': key,
+                'last_date': str(last_date or '').strip(),
+            }
+            if len(manifest) > 512:
+                # Keep a bounded manifest; retain the latest insertion keys.
+                keep_keys = list(manifest.keys())[-512:]
+                manifest = {name: manifest[name] for name in keep_keys}
+            self._save_incremental_manifest(manifest)
+
     @classmethod
     def _with_lookback_start(cls, date_from: str, max_lookback_days: int) -> str:
         if max_lookback_days <= 0:
@@ -164,8 +268,81 @@ class BacktestMatrixEngine:
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(',', ':'))
         return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:24]
 
+    def build_incremental_signature(
+        self,
+        *,
+        symbols: list[str],
+        date_from: str,
+        max_lookback_days: int,
+        data_version: str,
+        window_set: tuple[int, ...],
+        algo_version: str,
+    ) -> str:
+        payload = {
+            'symbols_hash': self._symbols_hash(symbols),
+            'date_from': str(date_from).strip(),
+            'lookback_start': self._with_lookback_start(date_from, max_lookback_days),
+            'data_version': str(data_version).strip(),
+            'window_set': list(window_set),
+            'algo_version': str(algo_version).strip(),
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(',', ':'))
+        return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:24]
+
     def _cache_file(self, cache_key: str) -> Path:
         return self._cache_dir / f'{cache_key}.npz'
+
+    @staticmethod
+    def _build_empty_bundle() -> MatrixBundle:
+        empty = np.zeros((0, 0), dtype=np.float64)
+        return MatrixBundle(
+            dates=[],
+            symbols=[],
+            open=empty,
+            high=empty,
+            low=empty,
+            close=empty,
+            volume=empty,
+            valid_mask=np.zeros((0, 0), dtype=bool),
+        )
+
+    @staticmethod
+    def _normalize_symbols(symbols: list[str]) -> list[str]:
+        normalized = [str(item).strip().lower() for item in symbols if str(item).strip()]
+        return sorted(set(normalized))
+
+    @staticmethod
+    def _is_valid_ohlcv(o: float, h: float, l: float, c: float, v: float) -> bool:
+        if not (np.isfinite(o) and np.isfinite(h) and np.isfinite(l) and np.isfinite(c) and np.isfinite(v)):
+            return False
+        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+            return False
+        return True
+
+    @staticmethod
+    def _slice_bundle_by_date_to(bundle: MatrixBundle, *, date_to: str) -> MatrixBundle | None:
+        if not bundle.dates:
+            return None
+        end = 0
+        for idx, day in enumerate(bundle.dates):
+            if day <= date_to:
+                end = idx + 1
+            else:
+                break
+        if end <= 0:
+            return None
+        if end >= len(bundle.dates):
+            return bundle
+        return MatrixBundle(
+            dates=list(bundle.dates[:end]),
+            symbols=list(bundle.symbols),
+            open=np.array(bundle.open[:end, :], dtype=np.float64, copy=True),
+            high=np.array(bundle.high[:end, :], dtype=np.float64, copy=True),
+            low=np.array(bundle.low[:end, :], dtype=np.float64, copy=True),
+            close=np.array(bundle.close[:end, :], dtype=np.float64, copy=True),
+            volume=np.array(bundle.volume[:end, :], dtype=np.float64, copy=True),
+            valid_mask=np.array(bundle.valid_mask[:end, :], dtype=bool, copy=True),
+        )
 
     def load_bundle_from_cache(self, cache_key: str) -> MatrixBundle | None:
         cached_runtime = self._load_runtime_cache(cache_key)
@@ -211,7 +388,13 @@ class BacktestMatrixEngine:
         except Exception:
             return None
 
-    def save_bundle_to_cache(self, cache_key: str, bundle: MatrixBundle) -> None:
+    def save_bundle_to_cache(
+        self,
+        cache_key: str,
+        bundle: MatrixBundle,
+        *,
+        incremental_signature: str | None = None,
+    ) -> None:
         path = self._cache_file(cache_key)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix('.tmp.npz')
@@ -228,6 +411,12 @@ class BacktestMatrixEngine:
         )
         tmp.replace(path)
         self._save_runtime_cache(cache_key, bundle)
+        if incremental_signature and bundle.dates:
+            self._update_incremental_manifest(
+                incremental_signature,
+                cache_key,
+                bundle.dates[-1],
+            )
 
     def build_bundle(
         self,
@@ -238,36 +427,58 @@ class BacktestMatrixEngine:
         date_to: str,
         max_lookback_days: int,
         cache_key: str,
+        incremental_signature: str | None = None,
         use_cache: bool = True,
     ) -> tuple[MatrixBundle, bool]:
+        started_at = time.perf_counter()
         if use_cache:
             cached = self.load_bundle_from_cache(cache_key)
             if cached is not None:
+                self._save_build_meta(
+                    cache_key,
+                    {
+                        'mode': 'cache_hit',
+                        'cache_hit': True,
+                        'elapsed_sec': max(0.0, time.perf_counter() - started_at),
+                        'shape_t': int(cached.close.shape[0]),
+                        'shape_n': int(cached.close.shape[1]),
+                        'last_date': str(cached.dates[-1]) if cached.dates else '',
+                    },
+                )
+                if incremental_signature and cached.dates:
+                    self._update_incremental_manifest(
+                        incremental_signature,
+                        cache_key,
+                        cached.dates[-1],
+                    )
                 return cached, True
 
-        normalized_symbols = [str(item).strip().lower() for item in symbols if str(item).strip()]
-        deduped_symbols = sorted(set(normalized_symbols))
+        deduped_symbols = self._normalize_symbols(symbols)
         if not deduped_symbols:
-            empty = np.zeros((0, 0), dtype=np.float64)
+            empty_bundle = self._build_empty_bundle()
+            self._save_build_meta(
+                cache_key,
+                {
+                    'mode': 'empty',
+                    'cache_hit': False,
+                    'elapsed_sec': max(0.0, time.perf_counter() - started_at),
+                    'shape_t': 0,
+                    'shape_n': 0,
+                    'last_date': '',
+                },
+            )
             return (
-                MatrixBundle(
-                    dates=[],
-                    symbols=[],
-                    open=empty,
-                    high=empty,
-                    low=empty,
-                    close=empty,
-                    volume=empty,
-                    valid_mask=np.zeros((0, 0), dtype=bool),
-                ),
+                empty_bundle,
                 False,
             )
 
         lookback_start = self._with_lookback_start(date_from, max_lookback_days)
-        filtered_rows_by_symbol: dict[str, list[CandlePoint]] = {}
-        all_dates: set[str] = set()
 
-        def _load_symbol_rows(symbol: str) -> tuple[str, list[CandlePoint], list[str]]:
+        def _load_symbol_rows(
+            symbol: str,
+            *,
+            lower_bound_exclusive: str | None,
+        ) -> tuple[str, list[CandlePoint], list[str]]:
             candles = get_candles(symbol)
             rows: list[CandlePoint] = []
             local_dates: list[str] = []
@@ -277,70 +488,187 @@ class BacktestMatrixEngine:
                     continue
                 if day < lookback_start or day > date_to:
                     continue
+                if lower_bound_exclusive is not None and day <= lower_bound_exclusive:
+                    continue
                 rows.append(item)
                 local_dates.append(day)
             return symbol, rows, local_dates
 
-        workers = self._resolve_build_workers()
-        if workers <= 1 or len(deduped_symbols) <= 1:
-            for symbol in deduped_symbols:
-                loaded_symbol, rows, local_dates = _load_symbol_rows(symbol)
-                filtered_rows_by_symbol[loaded_symbol] = rows
-                all_dates.update(local_dates)
-        else:
+        def _collect_rows(
+            *,
+            lower_bound_exclusive: str | None,
+        ) -> tuple[dict[str, list[CandlePoint]], set[str]]:
+            filtered_rows_by_symbol: dict[str, list[CandlePoint]] = {}
+            all_dates: set[str] = set()
+            workers = self._resolve_build_workers()
+            if workers <= 1 or len(deduped_symbols) <= 1:
+                for symbol in deduped_symbols:
+                    loaded_symbol, rows, local_dates = _load_symbol_rows(
+                        symbol,
+                        lower_bound_exclusive=lower_bound_exclusive,
+                    )
+                    filtered_rows_by_symbol[loaded_symbol] = rows
+                    all_dates.update(local_dates)
+                return filtered_rows_by_symbol, all_dates
+
             with ThreadPoolExecutor(max_workers=min(workers, len(deduped_symbols))) as executor:
                 future_map = {
-                    executor.submit(_load_symbol_rows, symbol): symbol
+                    executor.submit(
+                        _load_symbol_rows,
+                        symbol,
+                        lower_bound_exclusive=lower_bound_exclusive,
+                    ): symbol
                     for symbol in deduped_symbols
                 }
                 for future in as_completed(future_map):
                     loaded_symbol, rows, local_dates = future.result()
                     filtered_rows_by_symbol[loaded_symbol] = rows
                     all_dates.update(local_dates)
+            return filtered_rows_by_symbol, all_dates
 
-        dates = sorted(all_dates)
-        date_to_idx = {day: idx for idx, day in enumerate(dates)}
-        t = len(dates)
-        n = len(deduped_symbols)
+        def _build_bundle_from_rows(
+            filtered_rows_by_symbol: dict[str, list[CandlePoint]],
+            *,
+            existing_dates: list[str] | None = None,
+            existing_open: np.ndarray | None = None,
+            existing_high: np.ndarray | None = None,
+            existing_low: np.ndarray | None = None,
+            existing_close: np.ndarray | None = None,
+            existing_volume: np.ndarray | None = None,
+            existing_valid_mask: np.ndarray | None = None,
+        ) -> MatrixBundle:
+            date_set: set[str] = set(existing_dates or [])
+            for rows in filtered_rows_by_symbol.values():
+                for item in rows:
+                    day = str(item.time).strip()
+                    if day:
+                        date_set.add(day)
+            dates = sorted(date_set)
+            date_to_idx = {day: idx for idx, day in enumerate(dates)}
+            t = len(dates)
+            n = len(deduped_symbols)
 
-        open_ = np.full((t, n), np.nan, dtype=np.float64)
-        high = np.full((t, n), np.nan, dtype=np.float64)
-        low = np.full((t, n), np.nan, dtype=np.float64)
-        close = np.full((t, n), np.nan, dtype=np.float64)
-        volume = np.full((t, n), np.nan, dtype=np.float64)
-        valid_mask = np.zeros((t, n), dtype=bool)
+            open_ = np.full((t, n), np.nan, dtype=np.float64)
+            high = np.full((t, n), np.nan, dtype=np.float64)
+            low = np.full((t, n), np.nan, dtype=np.float64)
+            close = np.full((t, n), np.nan, dtype=np.float64)
+            volume = np.full((t, n), np.nan, dtype=np.float64)
+            valid_mask = np.zeros((t, n), dtype=bool)
 
-        for col, symbol in enumerate(deduped_symbols):
-            for row in filtered_rows_by_symbol.get(symbol, []):
-                idx = date_to_idx.get(str(row.time).strip())
-                if idx is None:
-                    continue
-                o = float(row.open)
-                h = float(row.high)
-                l = float(row.low)
-                c = float(row.close)
-                v = float(row.volume)
-                if not (np.isfinite(o) and np.isfinite(h) and np.isfinite(l) and np.isfinite(c) and np.isfinite(v)):
-                    continue
-                if o <= 0 or h <= 0 or l <= 0 or c <= 0:
-                    continue
-                open_[idx, col] = o
-                high[idx, col] = h
-                low[idx, col] = l
-                close[idx, col] = c
-                volume[idx, col] = max(0.0, v)
-                valid_mask[idx, col] = True
+            if existing_dates and existing_open is not None:
+                existing_t = min(len(existing_dates), existing_open.shape[0])
+                if existing_t > 0:
+                    open_[:existing_t, :] = existing_open[:existing_t, :]
+                    high[:existing_t, :] = existing_high[:existing_t, :]
+                    low[:existing_t, :] = existing_low[:existing_t, :]
+                    close[:existing_t, :] = existing_close[:existing_t, :]
+                    volume[:existing_t, :] = existing_volume[:existing_t, :]
+                    valid_mask[:existing_t, :] = existing_valid_mask[:existing_t, :]
 
-        bundle = MatrixBundle(
-            dates=dates,
-            symbols=deduped_symbols,
-            open=open_,
-            high=high,
-            low=low,
-            close=close,
-            volume=volume,
-            valid_mask=valid_mask,
-        )
+            for col, symbol in enumerate(deduped_symbols):
+                for row in filtered_rows_by_symbol.get(symbol, []):
+                    idx = date_to_idx.get(str(row.time).strip())
+                    if idx is None:
+                        continue
+                    o = float(row.open)
+                    h = float(row.high)
+                    l = float(row.low)
+                    c = float(row.close)
+                    v = float(row.volume)
+                    if not self._is_valid_ohlcv(o, h, l, c, v):
+                        continue
+                    open_[idx, col] = o
+                    high[idx, col] = h
+                    low[idx, col] = l
+                    close[idx, col] = c
+                    volume[idx, col] = max(0.0, v)
+                    valid_mask[idx, col] = True
+
+            return MatrixBundle(
+                dates=dates,
+                symbols=deduped_symbols,
+                open=open_,
+                high=high,
+                low=low,
+                close=close,
+                volume=volume,
+                valid_mask=valid_mask,
+            )
+
+        base_cache_key: str | None = None
+        base_last_date: str | None = None
+        base_bundle: MatrixBundle | None = None
+        mode_label = 'full_build'
+        appended_rows = 0
+
+        if (
+            use_cache
+            and self._is_incremental_cache_enabled()
+            and str(incremental_signature or '').strip()
+        ):
+            candidate_base_cache_key, manifest_last_date = self._resolve_incremental_base_cache_key(
+                str(incremental_signature),
+            )
+            if candidate_base_cache_key and candidate_base_cache_key != cache_key:
+                cached_base = self.load_bundle_from_cache(candidate_base_cache_key)
+                if (
+                    cached_base is not None
+                    and cached_base.symbols == deduped_symbols
+                    and cached_base.dates
+                ):
+                    resolved_base = self._slice_bundle_by_date_to(cached_base, date_to=date_to)
+                    if resolved_base is not None and resolved_base.dates:
+                        resolved_last_date = resolved_base.dates[-1]
+                        manifest_last = str(manifest_last_date or '').strip()
+                        if manifest_last and resolved_last_date < manifest_last:
+                            resolved_last_date = manifest_last
+                        if resolved_last_date >= lookback_start:
+                            base_cache_key = candidate_base_cache_key
+                            base_bundle = resolved_base
+                            base_last_date = resolved_base.dates[-1]
+
+        if base_bundle is not None and base_last_date is not None and base_last_date < date_to:
+            incremental_rows_by_symbol, _ = _collect_rows(
+                lower_bound_exclusive=base_last_date,
+            )
+            bundle = _build_bundle_from_rows(
+                incremental_rows_by_symbol,
+                existing_dates=base_bundle.dates,
+                existing_open=base_bundle.open,
+                existing_high=base_bundle.high,
+                existing_low=base_bundle.low,
+                existing_close=base_bundle.close,
+                existing_volume=base_bundle.volume,
+                existing_valid_mask=base_bundle.valid_mask,
+            )
+            appended_rows = max(0, len(bundle.dates) - len(base_bundle.dates))
+            mode_label = 'incremental_append' if appended_rows > 0 else 'incremental_reuse'
+        elif base_bundle is not None and base_last_date is not None and base_last_date >= date_to:
+            bundle = base_bundle
+            mode_label = 'incremental_reuse'
+        else:
+            rows_by_symbol, _ = _collect_rows(lower_bound_exclusive=None)
+            bundle = _build_bundle_from_rows(rows_by_symbol)
+
         if use_cache:
-            self.save_bundle_to_cache(cache_key, bundle)
+            self.save_bundle_to_cache(
+                cache_key,
+                bundle,
+                incremental_signature=incremental_signature,
+            )
+
+        self._save_build_meta(
+            cache_key,
+            {
+                'mode': mode_label,
+                'cache_hit': False,
+                'base_cache_key': str(base_cache_key or ''),
+                'base_last_date': str(base_last_date or ''),
+                'append_rows': int(appended_rows),
+                'elapsed_sec': max(0.0, time.perf_counter() - started_at),
+                'shape_t': int(bundle.close.shape[0]),
+                'shape_n': int(bundle.close.shape[1]),
+                'last_date': str(bundle.dates[-1]) if bundle.dates else '',
+            },
+        )
         return bundle, False

@@ -5411,6 +5411,7 @@ class InMemoryStore:
         total_start_ts = time.perf_counter()
 
         matrix_windows = self._build_backtest_matrix_windows(payload)
+        matrix_max_lookback_days = max(matrix_windows)
         data_version = (
             f"{self._config.market_data_source}|bars={int(self._config.candles_window_bars)}|"
             f"wy={self._wyckoff_event_data_version}|mode={payload.mode}|roll={payload.pool_roll_mode}"
@@ -5423,17 +5424,30 @@ class InMemoryStore:
             window_set=matrix_windows,
             algo_version=self._backtest_matrix_algo_version,
         )
+        incremental_signature = self._backtest_matrix_engine.build_incremental_signature(
+            symbols=symbols,
+            date_from=payload.date_from,
+            max_lookback_days=matrix_max_lookback_days,
+            data_version=data_version,
+            window_set=matrix_windows,
+            algo_version=self._backtest_matrix_algo_version,
+        )
         bundle_start_ts = time.perf_counter()
         bundle, cache_hit = self._backtest_matrix_engine.build_bundle(
             symbols=symbols,
             get_candles=self._ensure_candles,
             date_from=payload.date_from,
             date_to=payload.date_to,
-            max_lookback_days=max(matrix_windows),
+            max_lookback_days=matrix_max_lookback_days,
             cache_key=cache_key,
+            incremental_signature=incremental_signature,
             use_cache=True,
         )
         bundle_elapsed = time.perf_counter() - bundle_start_ts
+        bundle_meta = self._backtest_matrix_engine.get_build_meta(cache_key) or {}
+        bundle_mode = str(bundle_meta.get("mode") or ("cache_hit" if cache_hit else "full_build")).strip()
+        bundle_append_rows = int(bundle_meta.get("append_rows") or 0)
+        bundle_base_key = str(bundle_meta.get("base_cache_key") or "").strip()
         if control_callback is not None:
             control_callback()
         if not bundle.dates or not bundle.symbols:
@@ -5508,7 +5522,10 @@ class InMemoryStore:
             "矩阵引擎已启用："
             f"shape={shape_t}x{shape_n}，windows={list(matrix_windows)}，"
             f"cache={'hit' if cache_hit else 'miss'}，signal_cache={signal_cache_source}，"
-            f"key={cache_key[:12]}...，probe={'light' if lightweight_probe else 'full'}；"
+            f"build={bundle_mode}"
+            + (f"(append={bundle_append_rows})" if bundle_append_rows > 0 else "")
+            + (f"(base={bundle_base_key[:8]}...)" if bundle_base_key else "")
+            + f"，key={cache_key[:12]}...，probe={'light' if lightweight_probe else 'full'}；"
             f"耗时[建矩阵={bundle_elapsed:.2f}s, 算信号={signal_elapsed:.2f}s, 撮合={execute_elapsed:.2f}s, 总计={total_elapsed:.2f}s]"
         )
         return result, matrix_note

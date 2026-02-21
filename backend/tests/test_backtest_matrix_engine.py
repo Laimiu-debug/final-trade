@@ -172,6 +172,94 @@ def test_matrix_runtime_cache_hit_without_disk(monkeypatch: pytest.MonkeyPatch, 
     assert np.allclose(first_bundle.close, second_bundle.close, equal_nan=True)
 
 
+def test_matrix_incremental_append_reuses_base_cache(tmp_path: Path) -> None:
+    engine = BacktestMatrixEngine(cache_dir=tmp_path)
+    symbols = ["sh600000", "sz000001"]
+    windows = (10, 20, 60)
+    data_version = "tdx_only|bars=500"
+
+    candles_map = {
+        "sh600000": [
+            _candle("2025-12-29", 10.0),
+            _candle("2025-12-30", 10.1),
+            _candle("2025-12-31", 10.2),
+            _candle("2026-01-02", 10.3),
+            _candle("2026-01-03", 10.4),
+            _candle("2026-01-04", 10.5),
+            _candle("2026-01-05", 10.6),
+        ],
+        "sz000001": [
+            _candle("2025-12-30", 8.0),
+            _candle("2025-12-31", 8.1),
+            _candle("2026-01-02", 8.2),
+            _candle("2026-01-03", 8.3),
+            _candle("2026-01-05", 8.5),
+        ],
+    }
+
+    def _get_candles(symbol: str):
+        return candles_map.get(symbol, [])
+
+    signature = engine.build_incremental_signature(
+        symbols=symbols,
+        date_from="2026-01-02",
+        max_lookback_days=60,
+        data_version=data_version,
+        window_set=windows,
+        algo_version="matrix-v1",
+    )
+    key_first = engine.build_cache_key(
+        symbols=symbols,
+        date_from="2026-01-02",
+        date_to="2026-01-03",
+        data_version=data_version,
+        window_set=windows,
+        algo_version="matrix-v1",
+    )
+    first_bundle, first_hit = engine.build_bundle(
+        symbols=symbols,
+        get_candles=_get_candles,
+        date_from="2026-01-02",
+        date_to="2026-01-03",
+        max_lookback_days=60,
+        cache_key=key_first,
+        incremental_signature=signature,
+        use_cache=True,
+    )
+    assert first_hit is False
+
+    key_second = engine.build_cache_key(
+        symbols=symbols,
+        date_from="2026-01-02",
+        date_to="2026-01-05",
+        data_version=data_version,
+        window_set=windows,
+        algo_version="matrix-v1",
+    )
+    second_bundle, second_hit = engine.build_bundle(
+        symbols=symbols,
+        get_candles=_get_candles,
+        date_from="2026-01-02",
+        date_to="2026-01-05",
+        max_lookback_days=60,
+        cache_key=key_second,
+        incremental_signature=signature,
+        use_cache=True,
+    )
+    assert second_hit is False
+    assert len(second_bundle.dates) >= len(first_bundle.dates)
+    assert np.allclose(
+        first_bundle.close,
+        second_bundle.close[: len(first_bundle.dates), :],
+        equal_nan=True,
+    )
+
+    meta = engine.get_build_meta(key_second) or {}
+    assert str(meta.get("mode") or "") in {"incremental_append", "incremental_reuse"}
+    assert str(meta.get("base_cache_key") or "") == key_first
+    assert int(meta.get("append_rows") or 0) >= 0
+
+
 def test_signal_matrix_shape_and_missing_handling() -> None:
     dates = ['2026-01-01', '2026-01-02', '2026-01-03']
     symbols = ['sh600000', 'sz000001']
