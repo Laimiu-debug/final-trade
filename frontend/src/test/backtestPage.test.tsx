@@ -4,6 +4,8 @@ import { delay, http, HttpResponse } from 'msw'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { server } from '@/mocks/server'
 import { BacktestPage } from '@/pages/backtest/BacktestPage'
+import { BacktestTaskWatcher } from '@/shared/components/BacktestTaskWatcher'
+import { useBacktestTaskStore } from '@/state/backtestTaskStore'
 import { renderWithProviders } from '@/test/renderWithProviders'
 
 vi.mock('echarts-for-react', () => ({
@@ -13,6 +15,11 @@ vi.mock('echarts-for-react', () => ({
 describe('BacktestPage', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    useBacktestTaskStore.setState({
+      tasksById: {},
+      activeTaskIds: [],
+      selectedTaskId: undefined,
+    })
   })
 
   it('runs backtest and renders result summary', async () => {
@@ -121,7 +128,13 @@ describe('BacktestPage', () => {
       }),
     )
 
-    renderWithProviders(<BacktestPage />, '/backtest')
+    renderWithProviders(
+      <>
+        <BacktestTaskWatcher />
+        <BacktestPage />
+      </>,
+      '/backtest',
+    )
     const runButton = await screen.findByRole('button', { name: '开始回测' })
     await userEvent.click(runButton)
 
@@ -171,7 +184,13 @@ describe('BacktestPage', () => {
       }),
     )
 
-    renderWithProviders(<BacktestPage />, '/backtest')
+    renderWithProviders(
+      <>
+        <BacktestTaskWatcher />
+        <BacktestPage />
+      </>,
+      '/backtest',
+    )
     const bindButton = await screen.findByRole('button', { name: '带入最新筛选' })
     await userEvent.click(bindButton)
 
@@ -244,7 +263,13 @@ describe('BacktestPage', () => {
       }),
     )
 
-    renderWithProviders(<BacktestPage />, '/backtest')
+    renderWithProviders(
+      <>
+        <BacktestTaskWatcher />
+        <BacktestPage />
+      </>,
+      '/backtest',
+    )
     await userEvent.click(await screen.findByText('全市场'))
     await userEvent.click(await screen.findByRole('button', { name: '开始回测' }))
 

@@ -121,6 +121,12 @@ STOCK_POOL: list[dict[str, str]] = [
 
 
 
+class BacktestValidationError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = str(code or "BACKTEST_INVALID")
+
+
 class InMemoryStore:
     _APP_STATE_SCHEMA_VERSION = 2
     _FULL_MARKET_SYSTEM_PROTECT_LIMIT = 6000
@@ -142,7 +148,11 @@ class InMemoryStore:
         self._quote_profile_cache: dict[str, tuple[float, dict[str, str]]] = {}
         self._signals_cache: dict[str, tuple[float, SignalsResponse]] = {}
         self._backtest_tasks: dict[str, BacktestTaskStatusResponse] = {}
+        self._backtest_task_payloads: dict[str, BacktestRunRequest] = {}
         self._backtest_task_lock = RLock()
+        self._backtest_running_worker_ids: set[str] = set()
+        self._backtest_task_state_path = self._resolve_backtest_task_state_path()
+        self._backtest_task_state_last_persist_at = 0.0
         self._wyckoff_event_store_enabled = self._env_flag("TDX_TREND_WYCKOFF_STORE_ENABLED", True)
         self._wyckoff_event_store_read_only = self._env_flag("TDX_TREND_WYCKOFF_STORE_READ_ONLY", False)
         self._wyckoff_event_algo_version = os.getenv("TDX_TREND_WYCKOFF_ALGO_VERSION", "").strip() or "wyckoff-v1"
@@ -182,6 +192,8 @@ class InMemoryStore:
             now_datetime=self._now_datetime,
             state_path=sim_state_path or os.getenv("TDX_TREND_SIM_STATE_PATH", "").strip() or None,
         )
+        self._load_backtest_task_state()
+        self._resume_backtest_tasks_after_boot()
 
     @staticmethod
     def _resolve_user_path(value: str) -> Path:
@@ -214,6 +226,13 @@ class InMemoryStore:
         if env_value:
             return cls._resolve_user_path(env_value)
         return Path.home() / ".tdx-trend" / "wyckoff_events.sqlite"
+
+    @classmethod
+    def _resolve_backtest_task_state_path(cls) -> Path:
+        env_value = os.getenv("TDX_TREND_BACKTEST_TASK_STATE_PATH", "").strip()
+        if env_value:
+            return cls._resolve_user_path(env_value)
+        return Path.home() / ".tdx-trend" / "backtest_tasks.json"
 
     def _build_app_state_payload(self) -> dict[str, object]:
         return {
@@ -4241,6 +4260,126 @@ class InMemoryStore:
             notes.append(f"有 {empty_days} 个交易日筛选为空，当日不会产生候选信号。")
         return sorted(symbols_union), allowed_symbols_by_date, notes, scan_dates, refresh_dates_used
 
+    def _summarize_backtest_candle_coverage(
+        self,
+        *,
+        symbols: list[str],
+        date_from: str,
+        date_to: str,
+    ) -> tuple[str | None, str | None, int, int, int]:
+        effective_start: str | None = None
+        effective_end: str | None = None
+        covered_from_count = 0
+        covered_to_count = 0
+        checked_count = 0
+
+        for raw_symbol in symbols:
+            symbol = str(raw_symbol).strip().lower()
+            if not symbol:
+                continue
+            candles = self._ensure_candles(symbol)
+            if not candles:
+                continue
+            first_date = str(candles[0].time).strip()
+            last_date = str(candles[-1].time).strip()
+            if not first_date or not last_date:
+                continue
+            checked_count += 1
+            if effective_start is None or first_date < effective_start:
+                effective_start = first_date
+            if effective_end is None or last_date > effective_end:
+                effective_end = last_date
+            if first_date <= date_from <= last_date:
+                covered_from_count += 1
+            if first_date <= date_to <= last_date:
+                covered_to_count += 1
+
+        return effective_start, effective_end, covered_from_count, covered_to_count, checked_count
+
+    def _validate_backtest_data_coverage(
+        self,
+        payload: BacktestRunRequest,
+        symbols: list[str],
+        *,
+        scope_label: str,
+    ) -> None:
+        (
+            effective_start,
+            effective_end,
+            covered_from_count,
+            covered_to_count,
+            checked_count,
+        ) = self._summarize_backtest_candle_coverage(
+            symbols=symbols,
+            date_from=payload.date_from,
+            date_to=payload.date_to,
+        )
+        if checked_count <= 0:
+            raise BacktestValidationError(
+                "BACKTEST_DATA_COVERAGE_INSUFFICIENT",
+                (
+                    "回测K线覆盖不足：候选池未读取到可用K线。"
+                    "请检查行情源与数据路径。"
+                ),
+            )
+
+        coverage_insufficient = (
+            effective_start is None
+            or effective_end is None
+            or covered_from_count <= 0
+            or covered_to_count <= 0
+            or effective_start > payload.date_from
+            or effective_end < payload.date_to
+        )
+        if not coverage_insufficient:
+            return
+
+        raise BacktestValidationError(
+            "BACKTEST_DATA_COVERAGE_INSUFFICIENT",
+            (
+                f"回测K线覆盖不足：请求区间 {payload.date_from} ~ {payload.date_to}，"
+                f"{scope_label}在当前K线窗口(candles_window_bars={int(self._config.candles_window_bars)})下"
+                f"有效覆盖约 {effective_start or 'N/A'} ~ {effective_end or 'N/A'}；"
+                f"可覆盖起始日标的 {covered_from_count}/{checked_count}，"
+                f"可覆盖结束日标的 {covered_to_count}/{checked_count}。"
+                "请增大K线窗口或缩短回测区间。"
+            ),
+        )
+
+    def _precheck_backtest_data_coverage_before_task(self, payload: BacktestRunRequest) -> None:
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        if not scan_dates:
+            raise BacktestValidationError("BACKTEST_INVALID", "回测区间内无可扫描交易日。")
+        first_refresh_date = [scan_dates[0]]
+        board_filters = [item for item in payload.board_filters if item in {"main", "gem", "star", "beijing", "st"}]
+
+        if payload.mode == "trend_pool":
+            trend_pool_params, _, _, _ = self._resolve_backtest_trend_pool_params(payload.run_id)
+            seed_symbols, _, _, _, _ = self._build_trend_pool_rolling_universe(
+                payload=payload,
+                screener_params=trend_pool_params,
+                board_filters=board_filters,
+                refresh_dates=first_refresh_date,
+                progress_callback=None,
+            )
+        elif payload.mode == "full_market":
+            seed_symbols, _, _, _, _ = self._build_full_market_rolling_universe(
+                payload=payload,
+                board_filters=board_filters,
+                refresh_dates=first_refresh_date,
+                progress_callback=None,
+            )
+        else:
+            raise BacktestValidationError("BACKTEST_INVALID", f"不支持的回测模式: {payload.mode}")
+
+        if not seed_symbols:
+            return
+        self._validate_backtest_data_coverage(
+            payload,
+            seed_symbols,
+            scope_label="首个刷新日候选池",
+        )
+
     def run_backtest(
         self,
         payload: BacktestRunRequest,
@@ -4402,6 +4541,12 @@ class InMemoryStore:
         if not symbols:
             raise ValueError("回测股票池为空，请先执行筛选或调整回测模式")
 
+        self._validate_backtest_data_coverage(
+            payload,
+            symbols,
+            scope_label="滚动池并集",
+        )
+
         result = engine.run(
             payload=payload,
             symbols=symbols,
@@ -4444,7 +4589,138 @@ class InMemoryStore:
             return max(1, len(scan_dates))
         return max(1, len(scan_dates))
 
+    def _build_backtest_task_state_payload(self) -> dict[str, object]:
+        with self._backtest_task_lock:
+            tasks = []
+            for task_id, task in self._backtest_tasks.items():
+                payload = self._backtest_task_payloads.get(task_id)
+                task_payload = task.model_dump(exclude_none=True, exclude={"result"})
+                tasks.append(
+                    {
+                        "task": task_payload,
+                        "payload": payload.model_dump(exclude_none=True) if payload is not None else None,
+                    }
+                )
+            return {
+                "schema_version": 1,
+                "updated_at": self._now_datetime(),
+                "tasks": tasks,
+            }
+
+    def _write_backtest_task_state_payload(self, payload: dict[str, object]) -> None:
+        self._backtest_task_state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self._backtest_task_state_path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self._backtest_task_state_path)
+
+    def _persist_backtest_task_state(self, *, force: bool = False) -> None:
+        now_ts = time.time()
+        if (not force) and (now_ts - self._backtest_task_state_last_persist_at < 1.5):
+            return
+        try:
+            payload = self._build_backtest_task_state_payload()
+            self._write_backtest_task_state_payload(payload)
+            self._backtest_task_state_last_persist_at = now_ts
+        except Exception:
+            pass
+
+    def _load_backtest_task_state(self) -> None:
+        if not self._backtest_task_state_path.exists():
+            return
+        try:
+            raw = json.loads(self._backtest_task_state_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return
+            items = raw.get("tasks")
+            if not isinstance(items, list):
+                return
+            restored_tasks: dict[str, BacktestTaskStatusResponse] = {}
+            restored_payloads: dict[str, BacktestRunRequest] = {}
+            for row in items:
+                if not isinstance(row, dict):
+                    continue
+                task_raw = row.get("task")
+                if not isinstance(task_raw, dict):
+                    continue
+                try:
+                    task = BacktestTaskStatusResponse(**task_raw)
+                except Exception:
+                    continue
+                restored_tasks[task.task_id] = task
+                payload_raw = row.get("payload")
+                if isinstance(payload_raw, dict):
+                    try:
+                        restored_payloads[task.task_id] = BacktestRunRequest(**payload_raw)
+                    except Exception:
+                        pass
+            with self._backtest_task_lock:
+                self._backtest_tasks = restored_tasks
+                self._backtest_task_payloads = restored_payloads
+        except Exception:
+            return
+
+    def _resume_backtest_tasks_after_boot(self) -> None:
+        resumable: list[tuple[str, BacktestRunRequest]] = []
+        unrecoverable_task_ids: list[str] = []
+        with self._backtest_task_lock:
+            for task_id, task in list(self._backtest_tasks.items()):
+                if task.status not in {"pending", "running"}:
+                    continue
+                payload = self._backtest_task_payloads.get(task_id)
+                if payload is None:
+                    unrecoverable_task_ids.append(task_id)
+                    continue
+                resumable.append((task_id, payload))
+
+        now_text = self._now_datetime()
+        for task_id in unrecoverable_task_ids:
+            task = self.get_backtest_task(task_id)
+            if task is None:
+                continue
+            failed_progress = task.progress.model_copy(
+                update={
+                    "message": "服务重启后无法恢复：缺少任务参数。",
+                    "updated_at": now_text,
+                }
+            )
+            self._upsert_backtest_task(
+                task.model_copy(
+                    update={
+                        "status": "failed",
+                        "progress": failed_progress,
+                        "error": "服务重启后无法恢复任务：缺少任务参数。",
+                        "error_code": "BACKTEST_TASK_RESUME_PAYLOAD_MISSING",
+                    }
+                )
+            )
+
+        for task_id, payload in resumable:
+            task = self.get_backtest_task(task_id)
+            if task is None:
+                continue
+            pending_progress = task.progress.model_copy(
+                update={
+                    "message": "检测到服务重启，任务已自动续跑。",
+                    "updated_at": now_text,
+                }
+            )
+            self._upsert_backtest_task(
+                task.model_copy(
+                    update={
+                        "status": "pending",
+                        "progress": pending_progress,
+                        "error": None,
+                        "error_code": None,
+                    }
+                )
+            )
+            self._start_backtest_task_worker(task_id, payload, resumed=True)
+
     def _upsert_backtest_task(self, task: BacktestTaskStatusResponse) -> None:
+        force_persist = task.status in {"succeeded", "failed"}
         with self._backtest_task_lock:
             self._backtest_tasks[task.task_id] = task
             if len(self._backtest_tasks) > 80:
@@ -4454,6 +4730,8 @@ class InMemoryStore:
                 )
                 for old_task_id, _ in sorted_items[: max(0, len(sorted_items) - 80)]:
                     self._backtest_tasks.pop(old_task_id, None)
+                    self._backtest_task_payloads.pop(old_task_id, None)
+        self._persist_backtest_task_state(force=force_persist)
 
     def get_backtest_task(self, task_id: str) -> BacktestTaskStatusResponse | None:
         with self._backtest_task_lock:
@@ -4462,67 +4740,62 @@ class InMemoryStore:
                 return None
             return task.model_copy(deep=True)
 
-    def start_backtest_task(self, payload: BacktestRunRequest) -> str:
-        task_id = f"bt_{uuid4().hex[:16]}"
-        now_text = self._now_datetime()
-        total_dates = self._estimate_backtest_progress_total_dates(payload)
-        warning: str | None = None
-        if payload.pool_roll_mode in {"daily", "weekly"} and total_dates >= 45:
-            warning = "滚动回测日期较长，耗时可能较久，请耐心等待。"
-
-        initial_progress = BacktestTaskProgress(
-            mode=payload.pool_roll_mode,
-            current_date=None,
-            processed_dates=0,
-            total_dates=total_dates,
-            percent=0.0,
-            message="任务已创建，等待执行。",
-            warning=warning,
-            started_at=now_text,
-            updated_at=now_text,
-        )
-        self._upsert_backtest_task(
-            BacktestTaskStatusResponse(
-                task_id=task_id,
-                status="pending",
-                progress=initial_progress,
-                result=None,
-                error=None,
-            )
-        )
+    def _start_backtest_task_worker(
+        self,
+        task_id: str,
+        payload: BacktestRunRequest,
+        *,
+        resumed: bool = False,
+    ) -> None:
+        with self._backtest_task_lock:
+            if task_id in self._backtest_running_worker_ids:
+                return
+            self._backtest_running_worker_ids.add(task_id)
 
         def _worker() -> None:
-            task = self.get_backtest_task(task_id)
-            if task is None:
-                return
-            running_progress = task.progress.model_copy(
-                update={
-                    "message": "任务执行中...",
-                    "updated_at": self._now_datetime(),
-                }
-            )
-            self._upsert_backtest_task(task.model_copy(update={"status": "running", "progress": running_progress}))
-
-            def _progress(current_date: str, processed_dates: int, total: int, message: str) -> None:
-                current_task = self.get_backtest_task(task_id)
-                if current_task is None:
+            try:
+                task = self.get_backtest_task(task_id)
+                if task is None:
                     return
-                total_safe = max(1, int(total))
-                processed_safe = max(0, min(int(processed_dates), total_safe))
-                percent = round((processed_safe / total_safe) * 100.0, 2)
-                next_progress = current_task.progress.model_copy(
+                running_message = "任务执行中..." if not resumed else "服务重启后自动续跑中..."
+                running_progress = task.progress.model_copy(
                     update={
-                        "current_date": current_date,
-                        "processed_dates": processed_safe,
-                        "total_dates": total_safe,
-                        "percent": percent,
-                        "message": message,
+                        "message": running_message,
                         "updated_at": self._now_datetime(),
                     }
                 )
-                self._upsert_backtest_task(current_task.model_copy(update={"status": "running", "progress": next_progress}))
+                self._upsert_backtest_task(
+                    task.model_copy(
+                        update={
+                            "status": "running",
+                            "progress": running_progress,
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                )
 
-            try:
+                def _progress(current_date: str, processed_dates: int, total: int, message: str) -> None:
+                    current_task = self.get_backtest_task(task_id)
+                    if current_task is None:
+                        return
+                    total_safe = max(1, int(total))
+                    processed_safe = max(0, min(int(processed_dates), total_safe))
+                    percent = round((processed_safe / total_safe) * 100.0, 2)
+                    next_progress = current_task.progress.model_copy(
+                        update={
+                            "current_date": current_date,
+                            "processed_dates": processed_safe,
+                            "total_dates": total_safe,
+                            "percent": percent,
+                            "message": message,
+                            "updated_at": self._now_datetime(),
+                        }
+                    )
+                    self._upsert_backtest_task(
+                        current_task.model_copy(update={"status": "running", "progress": next_progress})
+                    )
+
                 result = self.run_backtest(payload, progress_callback=_progress)
                 finished_task = self.get_backtest_task(task_id)
                 if finished_task is None:
@@ -4542,6 +4815,7 @@ class InMemoryStore:
                             "progress": done_progress,
                             "result": result,
                             "error": None,
+                            "error_code": None,
                         }
                     )
                 )
@@ -4555,17 +4829,60 @@ class InMemoryStore:
                         "updated_at": self._now_datetime(),
                     }
                 )
+                error_code = "BACKTEST_TASK_FAILED"
+                if isinstance(exc, BacktestValidationError):
+                    error_code = exc.code
                 self._upsert_backtest_task(
                     failed_task.model_copy(
                         update={
                             "status": "failed",
                             "progress": failed_progress,
                             "error": str(exc),
+                            "error_code": error_code,
                         }
                     )
                 )
+            finally:
+                with self._backtest_task_lock:
+                    self._backtest_running_worker_ids.discard(task_id)
+                self._persist_backtest_task_state(force=True)
 
         Thread(target=_worker, daemon=True).start()
+
+    def start_backtest_task(self, payload: BacktestRunRequest) -> str:
+        self._precheck_backtest_data_coverage_before_task(payload)
+
+        task_id = f"bt_{uuid4().hex[:16]}"
+        now_text = self._now_datetime()
+        total_dates = self._estimate_backtest_progress_total_dates(payload)
+        warning: str | None = None
+        if payload.pool_roll_mode in {"daily", "weekly"} and total_dates >= 45:
+            warning = "滚动回测日期较长，耗时可能较久，请耐心等待。"
+
+        initial_progress = BacktestTaskProgress(
+            mode=payload.pool_roll_mode,
+            current_date=None,
+            processed_dates=0,
+            total_dates=total_dates,
+            percent=0.0,
+            message="任务已创建，等待执行。",
+            warning=warning,
+            started_at=now_text,
+            updated_at=now_text,
+        )
+        with self._backtest_task_lock:
+            self._backtest_task_payloads[task_id] = payload.model_copy(deep=True)
+        self._upsert_backtest_task(
+            BacktestTaskStatusResponse(
+                task_id=task_id,
+                status="pending",
+                progress=initial_progress,
+                result=None,
+                error=None,
+                error_code=None,
+            )
+        )
+        self._start_backtest_task_worker(task_id, payload, resumed=False)
         return task_id
 
     def create_order(self, payload: CreateOrderRequest) -> CreateOrderResponse:

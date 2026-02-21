@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -315,3 +316,38 @@ def test_backtest_run_full_market_position_mode() -> None:
     assert body["range"]["date_from"] == date_from
     assert body["range"]["date_to"] == date_to
     assert any("持仓触发滚动" in note for note in body["notes"])
+
+
+def test_backtest_task_rejects_when_candle_coverage_insufficient(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_scan_dates(_: str, __: str) -> list[str]:
+        return ["2025-01-02", "2025-01-03"]
+
+    def _fake_universe(*args, **kwargs):  # noqa: ANN002, ANN003
+        return ["sz300750", "sh600519"], {}, [], ["2025-01-02", "2025-01-03"], ["2025-01-02"]
+
+    def _fake_candles(_: str):
+        return [
+            SimpleNamespace(time="2025-11-03"),
+            SimpleNamespace(time="2026-02-13"),
+        ]
+
+    monkeypatch.setattr(store, "_build_backtest_scan_dates", _fake_scan_dates)
+    monkeypatch.setattr(store, "_build_full_market_rolling_universe", _fake_universe)
+    monkeypatch.setattr(store, "_ensure_candles", _fake_candles)
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "daily",
+        "date_from": "2025-01-01",
+        "date_to": "2025-12-31",
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 120,
+    }
+
+    resp = client.post("/api/backtest/tasks", json=payload)
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["code"] == "BACKTEST_DATA_COVERAGE_INSUFFICIENT"
+    assert "2025-01-01" in body["message"]
+    assert "2025-11-03" in body["message"]

@@ -442,6 +442,7 @@ export interface BacktestTaskStatusResponse {
   progress: BacktestTaskProgress
   result?: BacktestResponse | null
   error?: string | null
+  error_code?: string | null
 }
 
 export type ReviewTagType = 'emotion' | 'reason'

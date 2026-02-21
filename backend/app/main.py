@@ -62,7 +62,7 @@ from .models import (
     WeeklyReviewRecord,
 )
 from .sim_engine import SimEngineError
-from .store import store
+from .store import BacktestValidationError, store
 
 app = FastAPI(title="Final trade API", version="0.1.0")
 
@@ -194,6 +194,8 @@ def get_signals(
 def post_backtest_run(payload: BacktestRunRequest) -> BacktestResponse | JSONResponse:
     try:
         return store.run_backtest(payload)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
     except ValueError as exc:
         return error_response(400, "BACKTEST_INVALID", str(exc))
 
@@ -203,6 +205,8 @@ def post_backtest_task(payload: BacktestRunRequest) -> BacktestTaskStartResponse
     try:
         task_id = store.start_backtest_task(payload)
         return BacktestTaskStartResponse(task_id=task_id)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
     except ValueError as exc:
         return error_response(400, "BACKTEST_INVALID", str(exc))
 

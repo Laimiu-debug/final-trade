@@ -440,6 +440,7 @@ class BacktestTaskStatusResponse(BaseModel):
     progress: BacktestTaskProgress
     result: BacktestResponse | None = None
     error: str | None = None
+    error_code: str | None = None
 
 
 class ReviewTag(BaseModel):

@@ -24,12 +24,12 @@ import type { ColumnsType } from 'antd/es/table'
 import ReactECharts from 'echarts-for-react'
 import { Link } from 'react-router-dom'
 import { ApiError } from '@/shared/api/client'
-import { getBacktestTask, getLatestScreenerRun, startBacktestTask } from '@/shared/api/endpoints'
+import { getLatestScreenerRun, startBacktestTask } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
+import { useBacktestTaskStore } from '@/state/backtestTaskStore'
 import type {
   BacktestPoolRollMode,
   BacktestPriorityMode,
-  BacktestResponse,
   BacktestTaskStatusResponse,
   BacktestTrade,
   BoardFilter,
@@ -223,6 +223,20 @@ function buildChartPath(symbol: string, name?: string) {
   return `/stocks/${symbolText}/chart${query ? `?${query}` : ''}`
 }
 
+function taskStatusLabel(status: BacktestTaskStatusResponse['status']) {
+  if (status === 'pending') return '排队中'
+  if (status === 'running') return '运行中'
+  if (status === 'succeeded') return '已完成'
+  return '失败'
+}
+
+function taskStatusColor(status: BacktestTaskStatusResponse['status']) {
+  if (status === 'pending') return 'default'
+  if (status === 'running') return 'processing'
+  if (status === 'succeeded') return 'success'
+  return 'error'
+}
+
 const tradeColumns: ColumnsType<BacktestTrade> = [
   {
     title: '代码',
@@ -325,10 +339,31 @@ export function BacktestPage() {
   const [maxSymbols, setMaxSymbols] = useState(initialDraft.max_symbols)
   const [tradePage, setTradePage] = useState(1)
   const [tradePageSize, setTradePageSize] = useState(initialDraft.trades_page_size)
-  const [result, setResult] = useState<BacktestResponse | undefined>(undefined)
   const [runError, setRunError] = useState<string | null>(null)
-  const [taskId, setTaskId] = useState('')
-  const [taskStatus, setTaskStatus] = useState<BacktestTaskStatusResponse | null>(null)
+  const tasksById = useBacktestTaskStore((state) => state.tasksById)
+  const activeTaskIds = useBacktestTaskStore((state) => state.activeTaskIds)
+  const selectedTaskId = useBacktestTaskStore((state) => state.selectedTaskId)
+  const enqueueTask = useBacktestTaskStore((state) => state.enqueueTask)
+  const setSelectedTask = useBacktestTaskStore((state) => state.setSelectedTask)
+
+  const taskOptions = useMemo(
+    () =>
+      Object.values(tasksById)
+        .sort((left, right) => {
+          const leftTs = Date.parse(left.progress.updated_at || left.progress.started_at || '')
+          const rightTs = Date.parse(right.progress.updated_at || right.progress.started_at || '')
+          return rightTs - leftTs
+        })
+        .map((task) => ({
+          value: task.task_id,
+          label: `${taskStatusLabel(task.status)} | ${task.task_id.slice(0, 12)} | ${task.progress.updated_at}`,
+        })),
+    [tasksById],
+  )
+  const taskStatus = selectedTaskId ? tasksById[selectedTaskId] ?? null : null
+  const taskProgress = taskStatus?.progress
+  const result = taskStatus?.result ?? undefined
+  const runningTaskCount = activeTaskIds.length
 
   function applyRunMeta(nextRunId: string, asOfDate?: string) {
     setMode('trend_pool')
@@ -427,10 +462,9 @@ export function BacktestPage() {
   const startTaskMutation = useMutation({
     mutationFn: startBacktestTask,
     onSuccess: (payload) => {
-      setTaskId(payload.task_id)
-      setTaskStatus(null)
+      enqueueTask(payload.task_id, poolRollMode)
+      setSelectedTask(payload.task_id)
       setRunError(null)
-      setResult(undefined)
       message.info('回测任务已提交，正在按日期滚动计算...')
     },
     onError: (error) => {
@@ -454,45 +488,12 @@ export function BacktestPage() {
   }, [result?.trades])
 
   useEffect(() => {
-    if (!taskId) return
-    let active = true
-    let timer: ReturnType<typeof setTimeout> | null = null
-
-    const poll = async () => {
-      try {
-        const status = await getBacktestTask(taskId)
-        if (!active) return
-        setTaskStatus(status)
-        if (status.status === 'succeeded') {
-          setResult(status.result ?? undefined)
-          setRunError(null)
-          setTaskId('')
-          return
-        }
-        if (status.status === 'failed') {
-          const text = status.error?.trim() || '回测任务失败'
-          setRunError(text)
-          message.error(text)
-          setTaskId('')
-          return
-        }
-      } catch (error) {
-        if (!active) return
-        const text = formatApiError(error)
-        setRunError(text)
-        message.error(text)
-        setTaskId('')
-        return
-      }
-      timer = setTimeout(poll, 400)
-    }
-
-    void poll()
-    return () => {
-      active = false
-      if (timer) clearTimeout(timer)
-    }
-  }, [taskId, message])
+    if (selectedTaskId) return
+    if (taskOptions.length <= 0) return
+    const firstTaskId = String(taskOptions[0]?.value || '').trim()
+    if (!firstTaskId) return
+    setSelectedTask(firstTaskId)
+  }, [selectedTaskId, setSelectedTask, taskOptions])
 
   const equityOption = useMemo(() => {
     const curve = result?.equity_curve ?? []
@@ -596,9 +597,11 @@ export function BacktestPage() {
     bindLatestRunMutation.mutate()
   }
 
-  const taskRunning = Boolean(taskId) || startTaskMutation.isPending
-  const runLoading = taskRunning
-  const taskProgress = taskStatus?.progress
+  const taskRunning = taskStatus?.status === 'running' || taskStatus?.status === 'pending'
+  const runLoading = startTaskMutation.isPending
+  const effectiveRunError =
+    runError
+    || (taskStatus?.status === 'failed' ? (taskStatus.error?.trim() || '回测任务失败') : null)
 
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
@@ -954,13 +957,26 @@ export function BacktestPage() {
           <Button type="primary" loading={runLoading} onClick={handleRun}>
             开始回测
           </Button>
+          {taskOptions.length > 0 ? (
+            <Select
+              style={{ minWidth: 320 }}
+              placeholder="选择回测任务"
+              value={selectedTaskId}
+              options={taskOptions}
+              onChange={(value) => setSelectedTask(String(value))}
+            />
+          ) : null}
+          {runningTaskCount > 0 ? <Tag color="processing">{`运行中 ${runningTaskCount}`}</Tag> : null}
+          {taskStatus ? (
+            <Tag color={taskStatusColor(taskStatus.status)}>{taskStatusLabel(taskStatus.status)}</Tag>
+          ) : null}
           {result ? <Tag color="green">{`${result.range.date_from} ~ ${result.range.date_to}`}</Tag> : null}
         </Space>
       </Card>
 
-      {runError ? <Alert type="error" title={runError} showIcon /> : null}
+      {effectiveRunError ? <Alert type="error" title={effectiveRunError} showIcon /> : null}
 
-      {taskRunning || taskStatus?.status === 'running' || taskStatus?.status === 'pending' ? (
+      {taskRunning ? (
         <Card title="回测进度">
           <Space orientation="vertical" size={8} style={{ width: '100%' }}>
             <Progress percent={Math.max(0, Math.min(100, Number(taskProgress?.percent ?? 0)))} status="active" />
