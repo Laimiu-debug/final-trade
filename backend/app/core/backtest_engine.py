@@ -376,7 +376,7 @@ class BacktestEngine:
                     entry_tags.append("M6")
                 if not entry_tags:
                     entry_tags.append("MATRIX")
-                entry_phase = "鍚哥D" if bool(matrix_signals.s7[signal_index, col]) else "闃舵鏈槑"
+                entry_phase = "吸筹D" if bool(matrix_signals.s7[signal_index, col]) else "阶段未明"
                 entry_quality_score = float(score_col[signal_index]) if math.isfinite(float(score_col[signal_index])) else 0.0
 
                 out.append(
@@ -571,7 +571,7 @@ class BacktestEngine:
                 allow_reentry_after_skipped=allow_reentry_after_skipped,
                 control_callback=control_callback,
             )
-            notes.append("鐭╅樀淇″彿寮曟搸: 浣跨敤 (T,N) 淇″彿鍒囩墖璺緞锛岃烦杩囬€愯偂閫愭棩 snapshot 閲嶇畻銆?")
+            notes.append("矩阵信号引擎: 使用 (T,N) 信号切片路径，跳过逐股逐日 snapshot 重算。")
         else:
             candidates = []
             total_t1_skips = 0

@@ -73,10 +73,12 @@ const TRADE_BACKTEST_DEFAULTS = {
 
 const SCREENER_CACHE_KEY = 'tdx-trend-screener-cache-v4'
 const BACKTEST_FORM_CACHE_KEY = 'tdx-trend-backtest-form-v2'
+const BACKTEST_PLATEAU_PRESETS_KEY = 'tdx-trend-backtest-plateau-presets-v1'
 const WY_EVENTS = ['PS', 'SC', 'AR', 'ST', 'TSO', 'Spring', 'SOS', 'JOC', 'LPS', 'UTAD', 'SOW', 'LPSY']
 const BACKTEST_DEFAULT_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star']
 const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 'st']
 type BacktestPlateauTableRow = BacktestPlateauPoint & { __rowKey: string; __rank: number }
+type BacktestPlateauPreset = { id: string; name: string; saved_at: string; point: BacktestPlateauPoint }
 type PlateauAxisKey =
   | 'window_days'
   | 'min_score'
@@ -340,6 +342,46 @@ function persistBacktestDraft(draft: BacktestFormDraft) {
   }
 }
 
+function loadBacktestPlateauPresets(): BacktestPlateauPreset[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = window.localStorage.getItem(BACKTEST_PLATEAU_PRESETS_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) return []
+    const out: BacktestPlateauPreset[] = []
+    for (const item of parsed) {
+      const row = item as Partial<BacktestPlateauPreset>
+      const id = String(row?.id || '').trim()
+      const name = String(row?.name || '').trim()
+      const savedAt = String(row?.saved_at || '').trim()
+      const point = row?.point as BacktestPlateauPoint | undefined
+      if (!id || !name || !savedAt || !point || !point.params || !point.stats) continue
+      out.push({
+        id,
+        name,
+        saved_at: savedAt,
+        point,
+      })
+    }
+    return out.slice(0, 300)
+  } catch {
+    return []
+  }
+}
+
+function persistBacktestPlateauPresets(presets: BacktestPlateauPreset[]) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(
+      BACKTEST_PLATEAU_PRESETS_KEY,
+      JSON.stringify(presets.slice(0, 300)),
+    )
+  } catch {
+    // ignore local storage errors
+  }
+}
+
 type ExitReasonView = {
   label: string
   color?: string
@@ -572,6 +614,8 @@ export function BacktestPage() {
   const [plateauBrushSelectedKeys, setPlateauBrushSelectedKeys] = useState<string[]>([])
   const [plateauCandidatePoints, setPlateauCandidatePoints] = useState<BacktestPlateauPoint[]>([])
   const [plateauCandidatePickRank, setPlateauCandidatePickRank] = useState(1)
+  const [plateauSavedPresets, setPlateauSavedPresets] = useState<BacktestPlateauPreset[]>(() => loadBacktestPlateauPresets())
+  const [plateauSavedPresetId, setPlateauSavedPresetId] = useState<string | null>(null)
   const [tradePage, setTradePage] = useState(1)
   const [tradePageSize, setTradePageSize] = useState(initialDraft.trades_page_size)
   const [runError, setRunError] = useState<string | null>(null)
@@ -767,6 +811,20 @@ export function BacktestPage() {
       setPlateauCandidatePickRank(1)
     }
   }, [plateauCandidatePickRank, plateauCandidatePoints.length])
+
+  useEffect(() => {
+    persistBacktestPlateauPresets(plateauSavedPresets)
+  }, [plateauSavedPresets])
+
+  useEffect(() => {
+    if (plateauSavedPresets.length <= 0) {
+      if (plateauSavedPresetId !== null) setPlateauSavedPresetId(null)
+      return
+    }
+    if (!plateauSavedPresetId || !plateauSavedPresets.some((item) => item.id === plateauSavedPresetId)) {
+      setPlateauSavedPresetId(plateauSavedPresets[0].id)
+    }
+  }, [plateauSavedPresetId, plateauSavedPresets])
 
   useEffect(() => {
     if (selectedTaskId) return
@@ -1363,6 +1421,132 @@ export function BacktestPage() {
     [plateauCandidatePoints],
   )
   const selectedCandidatePoint = plateauCandidatePoints[plateauCandidatePickRank - 1] ?? null
+  const plateauSavedPresetOptions = useMemo(
+    () =>
+      plateauSavedPresets.map((item, index) => ({
+        value: item.id,
+        label: `收藏#${index + 1} | ${item.name} | ${item.saved_at}`,
+      })),
+    [plateauSavedPresets],
+  )
+  const selectedSavedPreset = useMemo(
+    () => plateauSavedPresets.find((item) => item.id === plateauSavedPresetId) ?? null,
+    [plateauSavedPresetId, plateauSavedPresets],
+  )
+  const plateauSavedPresetColumns = useMemo<ColumnsType<BacktestPlateauPreset>>(
+    () => [
+      {
+        title: '收藏名',
+        dataIndex: 'name',
+        width: 280,
+      },
+      {
+        title: '保存时间',
+        dataIndex: 'saved_at',
+        width: 170,
+      },
+      {
+        title: '评分',
+        width: 90,
+        render: (_value, row) => row.point.score.toFixed(3),
+      },
+      {
+        title: '收益',
+        width: 100,
+        render: (_value, row) => formatPct(row.point.stats.total_return),
+      },
+      {
+        title: '参数摘要',
+        width: 360,
+        render: (_value, row) => {
+          const p = row.point.params
+          return `window=${p.window_days}, min_score=${Number(p.min_score).toFixed(2)}, stop_loss=${(Number(p.stop_loss) * 100).toFixed(2)}%, take_profit=${(Number(p.take_profit) * 100).toFixed(2)}%, pos=${p.max_positions}`
+        },
+      },
+      {
+        title: '操作',
+        key: 'action',
+        width: 150,
+        render: (_value, row) => (
+          <Space size={6}>
+            <Button size="small" onClick={() => applyPlateauPointToForm(row.point, '收藏参数')}>
+              回填
+            </Button>
+            <Button
+              size="small"
+              danger
+              onClick={() => {
+                setPlateauSavedPresets((prev) => prev.filter((item) => item.id !== row.id))
+                if (plateauSavedPresetId === row.id) setPlateauSavedPresetId(null)
+              }}
+            >
+              删除
+            </Button>
+          </Space>
+        ),
+      },
+    ],
+    [applyPlateauPointToForm, plateauSavedPresetId],
+  )
+
+  function savePlateauPreset(point: BacktestPlateauPoint, sourceLabel: string) {
+    if (point.error) {
+      message.warning('该参数组评估失败，无法保存。')
+      return
+    }
+    const nowText = dayjs().format('YYYY-MM-DD HH:mm:ss')
+    const paramsKey = buildPlateauParamsKey(point)
+    const presetName = `${sourceLabel} | 评分 ${point.score.toFixed(3)} | 收益 ${formatPct(point.stats.total_return)}`
+    let persistedId = ''
+    setPlateauSavedPresets((prev) => {
+      const idx = prev.findIndex((item) => buildPlateauParamsKey(item.point) === paramsKey)
+      if (idx >= 0) {
+        const next = [...prev]
+        const existing = next[idx]
+        persistedId = existing.id
+        next[idx] = {
+          ...existing,
+          name: presetName,
+          saved_at: nowText,
+          point,
+        }
+        return next
+      }
+      const created: BacktestPlateauPreset = {
+        id: `pp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+        name: presetName,
+        saved_at: nowText,
+        point,
+      }
+      persistedId = created.id
+      return [created, ...prev].slice(0, 300)
+    })
+    if (persistedId) {
+      setPlateauSavedPresetId(persistedId)
+    }
+    message.success(`已保存参数：${presetName}`)
+  }
+
+  function handleApplySavedPreset() {
+    if (!selectedSavedPreset) {
+      message.info('请先选择一个收藏参数。')
+      return
+    }
+    applyPlateauPointToForm(selectedSavedPreset.point, '收藏参数')
+  }
+
+  function handleDeleteSavedPreset() {
+    if (!selectedSavedPreset) {
+      message.info('请先选择一个收藏参数。')
+      return
+    }
+    const deletingId = selectedSavedPreset.id
+    setPlateauSavedPresets((prev) => prev.filter((item) => item.id !== deletingId))
+    if (plateauSavedPresetId === deletingId) {
+      setPlateauSavedPresetId(null)
+    }
+    message.success('已删除收藏参数。')
+  }
 
   function appendPointsToCandidateSet(points: BacktestPlateauPoint[], sourceLabel: string) {
     if (points.length <= 0) {
@@ -2019,9 +2203,24 @@ export function BacktestPage() {
                 回填最佳参数
               </Button>
             ) : null}
+            {plateauBestPoint ? (
+              <Button onClick={() => savePlateauPreset(plateauBestPoint, '最佳参数')}>
+                保存最佳参数
+              </Button>
+            ) : null}
             {selectedRankPoint ? (
               <Button onClick={() => applyPlateauPointToForm(selectedRankPoint, `第${plateauApplyRank}名`)}>
                 回填第 {plateauApplyRank} 名
+              </Button>
+            ) : null}
+            {selectedRankPoint ? (
+              <Button onClick={() => savePlateauPreset(selectedRankPoint, `第${plateauApplyRank}名`)}>
+                保存第 {plateauApplyRank} 名
+              </Button>
+            ) : null}
+            {selectedCandidatePoint ? (
+              <Button onClick={() => savePlateauPreset(selectedCandidatePoint, `候选#${plateauCandidatePickRank}`)}>
+                保存候选参数
               </Button>
             ) : null}
           </Space>
@@ -2167,6 +2366,41 @@ export function BacktestPage() {
               }
             />
           )}
+
+          <Card title="参数收藏库（本地持久化）">
+            <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+              <Space wrap>
+                <Tag color="geekblue">{`已收藏: ${plateauSavedPresets.length}`}</Tag>
+                {plateauSavedPresetOptions.length > 0 ? (
+                  <Select
+                    style={{ minWidth: 420 }}
+                    value={plateauSavedPresetId ?? undefined}
+                    options={plateauSavedPresetOptions}
+                    onChange={(value) => setPlateauSavedPresetId(String(value))}
+                  />
+                ) : null}
+                <Button disabled={!selectedSavedPreset} onClick={handleApplySavedPreset}>
+                  回填收藏参数
+                </Button>
+                <Button danger disabled={!selectedSavedPreset} onClick={handleDeleteSavedPreset}>
+                  删除当前收藏
+                </Button>
+              </Space>
+              <Table
+                size="small"
+                columns={plateauSavedPresetColumns}
+                dataSource={plateauSavedPresets}
+                rowKey="id"
+                scroll={{ x: 1220 }}
+                pagination={{
+                  defaultPageSize: 8,
+                  pageSizeOptions: [8, 20, 50, 100],
+                  showSizeChanger: true,
+                  showTotal: (total) => `共 ${total} 条`,
+                }}
+              />
+            </Space>
+          </Card>
 
           <Card title="收益平原结果（按评分排序）">
             <Table
