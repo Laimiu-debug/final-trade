@@ -26,8 +26,9 @@ class BacktestSignalMatrix:
 
 
 def _to_bool_array(frame: pd.DataFrame) -> np.ndarray:
-    values = frame.fillna(False).to_numpy(dtype=bool)
-    return values
+    # Pandas/NumPy may return read-only views for some blocks; force writable copies.
+    values = frame.fillna(False).to_numpy(dtype=bool, copy=True)
+    return np.array(values, dtype=bool, copy=True)
 
 
 def compute_backtest_signal_matrix(
@@ -126,18 +127,18 @@ def compute_backtest_signal_matrix(
     score = np.clip(raw_score / 8.5 * 100.0, 0.0, 100.0)
 
     valid_mask = np.asarray(bundle.valid_mask, dtype=bool)
-    s1_b &= valid_mask
-    s2_b &= valid_mask
-    s3_b &= valid_mask
-    s4_b &= valid_mask
-    s5_b &= valid_mask
-    s6_b &= valid_mask
-    s7_b &= valid_mask
-    s8_b &= valid_mask
-    s9_b &= valid_mask
-    in_pool &= valid_mask
-    buy_signal &= valid_mask
-    sell_signal &= valid_mask
+    s1_b = s1_b & valid_mask
+    s2_b = s2_b & valid_mask
+    s3_b = s3_b & valid_mask
+    s4_b = s4_b & valid_mask
+    s5_b = s5_b & valid_mask
+    s6_b = s6_b & valid_mask
+    s7_b = s7_b & valid_mask
+    s8_b = s8_b & valid_mask
+    s9_b = s9_b & valid_mask
+    in_pool = in_pool & valid_mask
+    buy_signal = buy_signal & valid_mask
+    sell_signal = sell_signal & valid_mask
     score = np.where(valid_mask, score, 0.0)
 
     return BacktestSignalMatrix(

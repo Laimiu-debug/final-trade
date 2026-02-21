@@ -167,3 +167,32 @@ def test_signal_matrix_shape_and_missing_handling() -> None:
     assert bool(matrix.buy_signal[1, 1]) is False
     assert bool(matrix.sell_signal[1, 1]) is False
     assert float(matrix.score[1, 1]) == 0.0
+
+
+def test_signal_matrix_accepts_readonly_arrays() -> None:
+    dates = ['2026-01-01', '2026-01-02', '2026-01-03']
+    symbols = ['sh600000']
+
+    close = np.asarray([[10.0], [10.1], [10.2]], dtype=np.float64)
+    open_ = close * 0.99
+    high = close * 1.02
+    low = close * 0.98
+    volume = np.asarray([[1000.0], [1100.0], [1200.0]], dtype=np.float64)
+    valid_mask = np.asarray([[True], [True], [True]], dtype=bool)
+
+    for arr in (open_, high, low, close, volume, valid_mask):
+        arr.setflags(write=False)
+
+    bundle = MatrixBundle(
+        dates=dates,
+        symbols=symbols,
+        open=open_,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+        valid_mask=valid_mask,
+    )
+    matrix = compute_backtest_signal_matrix(bundle, top_n=1)
+    assert matrix.buy_signal.shape == (3, 1)
+    assert matrix.sell_signal.shape == (3, 1)

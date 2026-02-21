@@ -787,6 +787,7 @@ class BacktestEngine:
         cash_mark = float(payload.initial_capital)
         open_positions: dict[int, dict[str, float | str]] = {}
         last_close_by_symbol: dict[str, float] = {}
+        days_with_positions = 0
 
         equity_curve: list[EquityPoint] = []
         for day in trading_dates:
@@ -821,6 +822,8 @@ class BacktestEngine:
                 if mark is None or not math.isfinite(mark) or mark <= 0:
                     mark = float(position.get("entry_price", 0.0))
                 market_value += quantity * mark
+            if open_positions:
+                days_with_positions += 1
 
             equity_curve.append(
                 EquityPoint(
@@ -838,6 +841,10 @@ class BacktestEngine:
                     realized_pnl=0.0,
                 )
             )
+        notes.append(
+            f"并发持仓峰值: {max_concurrent_positions}/{payload.max_positions}；"
+            f"持仓覆盖交易日: {days_with_positions}/{len(trading_dates)}。"
+        )
 
         drawdown_curve: list[DrawdownPoint] = []
         peak = -float("inf")

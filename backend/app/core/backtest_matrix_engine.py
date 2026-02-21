@@ -93,12 +93,13 @@ class BacktestMatrixEngine:
             with np.load(path, allow_pickle=False) as data:
                 dates = data['dates'].astype(str).tolist()
                 symbols = data['symbols'].astype(str).tolist()
-                open_ = np.asarray(data['open'], dtype=np.float64)
-                high = np.asarray(data['high'], dtype=np.float64)
-                low = np.asarray(data['low'], dtype=np.float64)
-                close = np.asarray(data['close'], dtype=np.float64)
-                volume = np.asarray(data['volume'], dtype=np.float64)
-                valid_mask = np.asarray(data['valid_mask'], dtype=bool)
+                # npz payload can be loaded as read-only arrays; use writable copies.
+                open_ = np.array(data['open'], dtype=np.float64, copy=True)
+                high = np.array(data['high'], dtype=np.float64, copy=True)
+                low = np.array(data['low'], dtype=np.float64, copy=True)
+                close = np.array(data['close'], dtype=np.float64, copy=True)
+                volume = np.array(data['volume'], dtype=np.float64, copy=True)
+                valid_mask = np.array(data['valid_mask'], dtype=bool, copy=True)
             expected_shape = (len(dates), len(symbols))
             if (
                 open_.shape != expected_shape
