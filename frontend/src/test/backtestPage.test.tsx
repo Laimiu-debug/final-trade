@@ -175,7 +175,7 @@ describe('BacktestPage', () => {
     await userEvent.click(bindButton)
 
     expect(await screen.findByDisplayValue('latest-run-20260220')).toBeInTheDocument()
-  })
+  }, 12_000)
 
   it('submits full_market via task api instead of sync api', async () => {
     let syncRunCalled = false

@@ -499,6 +499,25 @@ class BacktestPlateauResponse(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class BacktestPlateauTaskProgress(BaseModel):
+    sampling_mode: Literal["grid", "lhs"] = "lhs"
+    processed_points: int = 0
+    total_points: int = 0
+    percent: float = 0.0
+    message: str = ""
+    started_at: str = ""
+    updated_at: str = ""
+
+
+class BacktestPlateauTaskStatusResponse(BaseModel):
+    task_id: str
+    status: Literal["pending", "running", "paused", "succeeded", "failed", "cancelled"]
+    progress: BacktestPlateauTaskProgress
+    result: BacktestPlateauResponse | None = None
+    error: str | None = None
+    error_code: str | None = None
+
+
 class ReviewTag(BaseModel):
     id: str
     name: str

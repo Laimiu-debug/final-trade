@@ -25,17 +25,21 @@ import ReactECharts from 'echarts-for-react'
 import { Link } from 'react-router-dom'
 import { ApiError } from '@/shared/api/client'
 import {
+  cancelBacktestPlateauTask,
   cancelBacktestTask,
+  pauseBacktestPlateauTask,
   pauseBacktestTask,
-  runBacktestPlateau,
+  resumeBacktestPlateauTask,
   resumeBacktestTask,
+  startBacktestPlateauTask,
   startBacktestTask,
 } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
+import { useBacktestPlateauTaskStore } from '@/state/backtestPlateauTaskStore'
 import { useBacktestTaskStore } from '@/state/backtestTaskStore'
 import type {
   BacktestPlateauPoint,
-  BacktestPlateauResponse,
+  BacktestPlateauTaskStatusResponse,
   BacktestPoolRollMode,
   BacktestPriorityMode,
   BacktestTaskStatusResponse,
@@ -73,6 +77,7 @@ const TRADE_BACKTEST_DEFAULTS = {
 
 const SCREENER_CACHE_KEY = 'tdx-trend-screener-cache-v4'
 const BACKTEST_FORM_CACHE_KEY = 'tdx-trend-backtest-form-v2'
+const BACKTEST_PLATEAU_FORM_CACHE_KEY = 'tdx-trend-backtest-plateau-form-v1'
 const BACKTEST_PLATEAU_PRESETS_KEY = 'tdx-trend-backtest-plateau-presets-v1'
 const WY_EVENTS = ['PS', 'SC', 'AR', 'ST', 'TSO', 'Spring', 'SOS', 'JOC', 'LPS', 'UTAD', 'SOW', 'LPSY']
 const BACKTEST_DEFAULT_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star']
@@ -141,6 +146,25 @@ type BacktestFormDraft = {
   enforce_t1: boolean
   max_symbols: number
   trades_page_size: number
+}
+
+type BacktestPlateauFormDraft = {
+  sampling_mode: 'grid' | 'lhs'
+  sample_points: number
+  random_seed: number | null
+  window_days_list_raw: string
+  min_score_list_raw: string
+  stop_loss_pct_list_raw: string
+  take_profit_pct_list_raw: string
+  max_positions_list_raw: string
+  position_pct_list_raw: string
+  max_symbols_list_raw: string
+  topk_list_raw: string
+  heatmap_x_axis: PlateauAxisKey
+  heatmap_y_axis: PlateauAxisKey
+  heatmap_metric: PlateauMetricKey
+  heatmap_show_best_path: boolean
+  heatmap_show_cell_label: boolean
 }
 
 function formatApiError(error: unknown) {
@@ -342,6 +366,59 @@ function persistBacktestDraft(draft: BacktestFormDraft) {
   }
 }
 
+function buildDefaultPlateauDraft(): BacktestPlateauFormDraft {
+  return {
+    sampling_mode: 'lhs',
+    sample_points: 120,
+    random_seed: 20260221,
+    window_days_list_raw: '',
+    min_score_list_raw: '',
+    stop_loss_pct_list_raw: '',
+    take_profit_pct_list_raw: '',
+    max_positions_list_raw: '',
+    position_pct_list_raw: '',
+    max_symbols_list_raw: '',
+    topk_list_raw: '',
+    heatmap_x_axis: 'window_days',
+    heatmap_y_axis: 'min_score',
+    heatmap_metric: 'score',
+    heatmap_show_best_path: true,
+    heatmap_show_cell_label: false,
+  }
+}
+
+function loadBacktestPlateauDraft(): BacktestPlateauFormDraft {
+  const defaults = buildDefaultPlateauDraft()
+  if (typeof window === 'undefined') return defaults
+  try {
+    const raw = window.localStorage.getItem(BACKTEST_PLATEAU_FORM_CACHE_KEY)
+    if (!raw) return defaults
+    const parsed = JSON.parse(raw) as Partial<BacktestPlateauFormDraft>
+    const merged = { ...defaults, ...parsed }
+    if (!['grid', 'lhs'].includes(String(merged.sampling_mode))) merged.sampling_mode = defaults.sampling_mode
+    if (!Number.isFinite(merged.sample_points) || Number(merged.sample_points) <= 0) merged.sample_points = defaults.sample_points
+    const randomSeedRaw = merged.random_seed
+    merged.random_seed = randomSeedRaw === null ? null : (Number.isFinite(Number(randomSeedRaw)) ? Number(randomSeedRaw) : defaults.random_seed)
+    if (!PLATEAU_AXIS_OPTIONS.some((item) => item.value === merged.heatmap_x_axis)) merged.heatmap_x_axis = defaults.heatmap_x_axis
+    if (!PLATEAU_AXIS_OPTIONS.some((item) => item.value === merged.heatmap_y_axis)) merged.heatmap_y_axis = defaults.heatmap_y_axis
+    if (!PLATEAU_METRIC_OPTIONS.some((item) => item.value === merged.heatmap_metric)) merged.heatmap_metric = defaults.heatmap_metric
+    merged.heatmap_show_best_path = Boolean(merged.heatmap_show_best_path)
+    merged.heatmap_show_cell_label = Boolean(merged.heatmap_show_cell_label)
+    return merged
+  } catch {
+    return defaults
+  }
+}
+
+function persistBacktestPlateauDraft(draft: BacktestPlateauFormDraft) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(BACKTEST_PLATEAU_FORM_CACHE_KEY, JSON.stringify(draft))
+  } catch {
+    // ignore local storage errors
+  }
+}
+
 function loadBacktestPlateauPresets(): BacktestPlateauPreset[] {
   if (typeof window === 'undefined') return []
   try {
@@ -422,6 +499,24 @@ function taskStatusLabel(status: BacktestTaskStatusResponse['status']) {
 }
 
 function taskStatusColor(status: BacktestTaskStatusResponse['status']) {
+  if (status === 'pending') return 'default'
+  if (status === 'running') return 'processing'
+  if (status === 'paused') return 'warning'
+  if (status === 'succeeded') return 'success'
+  if (status === 'cancelled') return 'default'
+  return 'error'
+}
+
+function plateauTaskStatusLabel(status: BacktestPlateauTaskStatusResponse['status']) {
+  if (status === 'pending') return '排队中'
+  if (status === 'running') return '运行中'
+  if (status === 'paused') return '已暂停'
+  if (status === 'succeeded') return '已完成'
+  if (status === 'cancelled') return '已停止'
+  return '失败'
+}
+
+function plateauTaskStatusColor(status: BacktestPlateauTaskStatusResponse['status']) {
   if (status === 'pending') return 'default'
   if (status === 'running') return 'processing'
   if (status === 'paused') return 'warning'
@@ -563,6 +658,7 @@ const plateauColumns: ColumnsType<BacktestPlateauTableRow> = [
 export function BacktestPage() {
   const { message } = AntdApp.useApp()
   const initialDraft = useMemo(() => loadBacktestDraft(), [])
+  const initialPlateauDraft = useMemo(() => loadBacktestPlateauDraft(), [])
 
   const [mode, setMode] = useState<SignalScanMode>(initialDraft.mode)
   const [trendStep, setTrendStep] = useState<TrendPoolStep>(initialDraft.trend_step)
@@ -591,25 +687,24 @@ export function BacktestPage() {
   const [priorityTopK, setPriorityTopK] = useState(initialDraft.priority_topk_per_day)
   const [enforceT1, setEnforceT1] = useState(initialDraft.enforce_t1)
   const [maxSymbols, setMaxSymbols] = useState(initialDraft.max_symbols)
-  const [plateauSamplingMode, setPlateauSamplingMode] = useState<'grid' | 'lhs'>('lhs')
-  const [plateauSamplePoints, setPlateauSamplePoints] = useState(120)
-  const [plateauRandomSeed, setPlateauRandomSeed] = useState<number | null>(20260221)
-  const [plateauWindowListRaw, setPlateauWindowListRaw] = useState('')
-  const [plateauMinScoreListRaw, setPlateauMinScoreListRaw] = useState('')
-  const [plateauStopLossPctListRaw, setPlateauStopLossPctListRaw] = useState('')
-  const [plateauTakeProfitPctListRaw, setPlateauTakeProfitPctListRaw] = useState('')
-  const [plateauMaxPositionsListRaw, setPlateauMaxPositionsListRaw] = useState('')
-  const [plateauPositionPctListRaw, setPlateauPositionPctListRaw] = useState('')
-  const [plateauMaxSymbolsListRaw, setPlateauMaxSymbolsListRaw] = useState('')
-  const [plateauTopKListRaw, setPlateauTopKListRaw] = useState('')
-  const [plateauResult, setPlateauResult] = useState<BacktestPlateauResponse | null>(null)
+  const [plateauSamplingMode, setPlateauSamplingMode] = useState<'grid' | 'lhs'>(initialPlateauDraft.sampling_mode)
+  const [plateauSamplePoints, setPlateauSamplePoints] = useState(initialPlateauDraft.sample_points)
+  const [plateauRandomSeed, setPlateauRandomSeed] = useState<number | null>(initialPlateauDraft.random_seed)
+  const [plateauWindowListRaw, setPlateauWindowListRaw] = useState(initialPlateauDraft.window_days_list_raw)
+  const [plateauMinScoreListRaw, setPlateauMinScoreListRaw] = useState(initialPlateauDraft.min_score_list_raw)
+  const [plateauStopLossPctListRaw, setPlateauStopLossPctListRaw] = useState(initialPlateauDraft.stop_loss_pct_list_raw)
+  const [plateauTakeProfitPctListRaw, setPlateauTakeProfitPctListRaw] = useState(initialPlateauDraft.take_profit_pct_list_raw)
+  const [plateauMaxPositionsListRaw, setPlateauMaxPositionsListRaw] = useState(initialPlateauDraft.max_positions_list_raw)
+  const [plateauPositionPctListRaw, setPlateauPositionPctListRaw] = useState(initialPlateauDraft.position_pct_list_raw)
+  const [plateauMaxSymbolsListRaw, setPlateauMaxSymbolsListRaw] = useState(initialPlateauDraft.max_symbols_list_raw)
+  const [plateauTopKListRaw, setPlateauTopKListRaw] = useState(initialPlateauDraft.topk_list_raw)
   const [plateauError, setPlateauError] = useState<string | null>(null)
   const [plateauApplyRank, setPlateauApplyRank] = useState(1)
-  const [plateauHeatmapXAxis, setPlateauHeatmapXAxis] = useState<PlateauAxisKey>('window_days')
-  const [plateauHeatmapYAxis, setPlateauHeatmapYAxis] = useState<PlateauAxisKey>('min_score')
-  const [plateauHeatmapMetric, setPlateauHeatmapMetric] = useState<PlateauMetricKey>('score')
-  const [plateauHeatmapShowBestPath, setPlateauHeatmapShowBestPath] = useState(true)
-  const [plateauHeatmapShowCellLabel, setPlateauHeatmapShowCellLabel] = useState(false)
+  const [plateauHeatmapXAxis, setPlateauHeatmapXAxis] = useState<PlateauAxisKey>(initialPlateauDraft.heatmap_x_axis)
+  const [plateauHeatmapYAxis, setPlateauHeatmapYAxis] = useState<PlateauAxisKey>(initialPlateauDraft.heatmap_y_axis)
+  const [plateauHeatmapMetric, setPlateauHeatmapMetric] = useState<PlateauMetricKey>(initialPlateauDraft.heatmap_metric)
+  const [plateauHeatmapShowBestPath, setPlateauHeatmapShowBestPath] = useState(initialPlateauDraft.heatmap_show_best_path)
+  const [plateauHeatmapShowCellLabel, setPlateauHeatmapShowCellLabel] = useState(initialPlateauDraft.heatmap_show_cell_label)
   const [plateauHeatmapSelectedCoord, setPlateauHeatmapSelectedCoord] = useState<[string, string] | null>(null)
   const [plateauBrushSelectedKeys, setPlateauBrushSelectedKeys] = useState<string[]>([])
   const [plateauCandidatePoints, setPlateauCandidatePoints] = useState<BacktestPlateauPoint[]>([])
@@ -625,6 +720,12 @@ export function BacktestPage() {
   const enqueueTask = useBacktestTaskStore((state) => state.enqueueTask)
   const upsertTaskStatus = useBacktestTaskStore((state) => state.upsertTaskStatus)
   const setSelectedTask = useBacktestTaskStore((state) => state.setSelectedTask)
+  const plateauTasksById = useBacktestPlateauTaskStore((state) => state.tasksById)
+  const plateauActiveTaskIds = useBacktestPlateauTaskStore((state) => state.activeTaskIds)
+  const plateauSelectedTaskId = useBacktestPlateauTaskStore((state) => state.selectedTaskId)
+  const enqueuePlateauTask = useBacktestPlateauTaskStore((state) => state.enqueueTask)
+  const upsertPlateauTaskStatus = useBacktestPlateauTaskStore((state) => state.upsertTaskStatus)
+  const setSelectedPlateauTask = useBacktestPlateauTaskStore((state) => state.setSelectedTask)
 
   const taskOptions = useMemo(
     () =>
@@ -644,6 +745,24 @@ export function BacktestPage() {
   const taskProgress = taskStatus?.progress
   const result = taskStatus?.result ?? undefined
   const runningTaskCount = activeTaskIds.length
+  const plateauTaskOptions = useMemo(
+    () =>
+      Object.values(plateauTasksById)
+        .sort((left, right) => {
+          const leftTs = Date.parse(left.progress.updated_at || left.progress.started_at || '')
+          const rightTs = Date.parse(right.progress.updated_at || right.progress.started_at || '')
+          return rightTs - leftTs
+        })
+        .map((task) => ({
+          value: task.task_id,
+          label: `${plateauTaskStatusLabel(task.status)} | ${task.task_id.slice(0, 12)} | ${task.progress.updated_at}`,
+        })),
+    [plateauTasksById],
+  )
+  const plateauTaskStatus = plateauSelectedTaskId ? plateauTasksById[plateauSelectedTaskId] ?? null : null
+  const plateauTaskProgress = plateauTaskStatus?.progress
+  const plateauResult = plateauTaskStatus?.result ?? null
+  const plateauTaskRunningCount = plateauActiveTaskIds.length
 
   function applyRunMeta(nextRunId: string, asOfDate?: string) {
     setMode('trend_pool')
@@ -754,17 +873,39 @@ export function BacktestPage() {
     },
   })
 
-  const runPlateauMutation = useMutation({
-    mutationFn: runBacktestPlateau,
-    onSuccess: (payload) => {
-      setPlateauResult(payload)
+  const startPlateauTaskMutation = useMutation({
+    mutationFn: startBacktestPlateauTask,
+    onSuccess: (payload, variables) => {
+      enqueuePlateauTask(payload.task_id, variables.sampling_mode ?? 'lhs')
+      setSelectedPlateauTask(payload.task_id)
       setPlateauError(null)
-      message.success(`收益平原评估完成：${payload.evaluated_combinations} 组`)
+      message.info('收益平原任务已提交，正在后台评估参数组合...')
     },
     onError: (error) => {
       const text = formatApiError(error)
       setPlateauError(text)
       message.error(text)
+    },
+  })
+
+  const controlPlateauTaskMutation = useMutation({
+    mutationFn: async (payload: { action: 'pause' | 'resume' | 'cancel'; taskId: string }) => {
+      if (payload.action === 'pause') return pauseBacktestPlateauTask(payload.taskId)
+      if (payload.action === 'resume') return resumeBacktestPlateauTask(payload.taskId)
+      return cancelBacktestPlateauTask(payload.taskId)
+    },
+    onSuccess: (status, variables) => {
+      upsertPlateauTaskStatus(status)
+      if (variables.action === 'pause') {
+        message.info(`收益平原任务已暂停：${status.task_id}`)
+      } else if (variables.action === 'resume') {
+        message.success(`收益平原任务已继续：${status.task_id}`)
+      } else {
+        message.warning(`收益平原任务已停止：${status.task_id}`)
+      }
+    },
+    onError: (error) => {
+      message.error(formatApiError(error))
     },
   })
 
@@ -792,6 +933,45 @@ export function BacktestPage() {
   useEffect(() => {
     setTradePage(1)
   }, [result?.trades])
+
+  useEffect(() => {
+    const draft: BacktestPlateauFormDraft = {
+      sampling_mode: plateauSamplingMode,
+      sample_points: plateauSamplePoints,
+      random_seed: plateauRandomSeed,
+      window_days_list_raw: plateauWindowListRaw,
+      min_score_list_raw: plateauMinScoreListRaw,
+      stop_loss_pct_list_raw: plateauStopLossPctListRaw,
+      take_profit_pct_list_raw: plateauTakeProfitPctListRaw,
+      max_positions_list_raw: plateauMaxPositionsListRaw,
+      position_pct_list_raw: plateauPositionPctListRaw,
+      max_symbols_list_raw: plateauMaxSymbolsListRaw,
+      topk_list_raw: plateauTopKListRaw,
+      heatmap_x_axis: plateauHeatmapXAxis,
+      heatmap_y_axis: plateauHeatmapYAxis,
+      heatmap_metric: plateauHeatmapMetric,
+      heatmap_show_best_path: plateauHeatmapShowBestPath,
+      heatmap_show_cell_label: plateauHeatmapShowCellLabel,
+    }
+    persistBacktestPlateauDraft(draft)
+  }, [
+    plateauSamplingMode,
+    plateauSamplePoints,
+    plateauRandomSeed,
+    plateauWindowListRaw,
+    plateauMinScoreListRaw,
+    plateauStopLossPctListRaw,
+    plateauTakeProfitPctListRaw,
+    plateauMaxPositionsListRaw,
+    plateauPositionPctListRaw,
+    plateauMaxSymbolsListRaw,
+    plateauTopKListRaw,
+    plateauHeatmapXAxis,
+    plateauHeatmapYAxis,
+    plateauHeatmapMetric,
+    plateauHeatmapShowBestPath,
+    plateauHeatmapShowCellLabel,
+  ])
 
   useEffect(() => {
     setPlateauApplyRank(1)
@@ -833,6 +1013,14 @@ export function BacktestPage() {
     if (!firstTaskId) return
     setSelectedTask(firstTaskId)
   }, [selectedTaskId, setSelectedTask, taskOptions])
+
+  useEffect(() => {
+    if (plateauSelectedTaskId) return
+    if (plateauTaskOptions.length <= 0) return
+    const firstTaskId = String(plateauTaskOptions[0]?.value || '').trim()
+    if (!firstTaskId) return
+    setSelectedPlateauTask(firstTaskId)
+  }, [plateauSelectedTaskId, plateauTaskOptions, setSelectedPlateauTask])
 
   const equityOption = useMemo(() => {
     const curve = result?.equity_curve ?? []
@@ -940,7 +1128,7 @@ export function BacktestPage() {
   }
 
   function handleRunPlateau() {
-    if (runPlateauMutation.isPending) return
+    if (startPlateauTaskMutation.isPending) return
     if (entryEvents.length === 0 || exitEvents.length === 0) {
       message.warning('请至少选择一个入场事件和离场事件')
       return
@@ -1010,7 +1198,7 @@ export function BacktestPage() {
       max_points: samplePoints,
     }
     setPlateauError(null)
-    runPlateauMutation.mutate(payload)
+    startPlateauTaskMutation.mutate(payload)
   }
 
   function applyPlateauPointToForm(point: BacktestPlateauPoint, rankLabel?: string) {
@@ -1033,7 +1221,16 @@ export function BacktestPage() {
 
   const taskRunning = taskStatus?.status === 'running' || taskStatus?.status === 'pending' || taskStatus?.status === 'paused'
   const runLoading = startTaskMutation.isPending
-  const plateauLoading = runPlateauMutation.isPending
+  const plateauLoading = startPlateauTaskMutation.isPending
+  const plateauTaskRunning =
+    plateauTaskStatus?.status === 'running'
+    || plateauTaskStatus?.status === 'pending'
+    || plateauTaskStatus?.status === 'paused'
+  const effectivePlateauError =
+    plateauError
+    || (plateauTaskStatus?.status === 'failed'
+      ? (plateauTaskStatus.error?.trim() || '收益平原任务失败')
+      : null)
   const plateauBestPoint = plateauResult?.best_point ?? null
   const plateauValidPoints = useMemo(
     () => (plateauResult?.points ?? []).filter((row) => !row.error),
@@ -2230,6 +2427,46 @@ export function BacktestPage() {
             <Button type="primary" ghost loading={plateauLoading} onClick={handleRunPlateau}>
               开始平原扫描
             </Button>
+            {plateauTaskStatus && (plateauTaskStatus.status === 'running' || plateauTaskStatus.status === 'pending') ? (
+              <Button
+                loading={controlPlateauTaskMutation.isPending && controlPlateauTaskMutation.variables?.action === 'pause'}
+                onClick={() => controlPlateauTaskMutation.mutate({ action: 'pause', taskId: plateauTaskStatus.task_id })}
+              >
+                暂停平原任务
+              </Button>
+            ) : null}
+            {plateauTaskStatus && plateauTaskStatus.status === 'paused' ? (
+              <Button
+                type="primary"
+                ghost
+                loading={controlPlateauTaskMutation.isPending && controlPlateauTaskMutation.variables?.action === 'resume'}
+                onClick={() => controlPlateauTaskMutation.mutate({ action: 'resume', taskId: plateauTaskStatus.task_id })}
+              >
+                继续平原任务
+              </Button>
+            ) : null}
+            {plateauTaskStatus
+            && (plateauTaskStatus.status === 'running' || plateauTaskStatus.status === 'pending' || plateauTaskStatus.status === 'paused') ? (
+              <Button
+                danger
+                loading={controlPlateauTaskMutation.isPending && controlPlateauTaskMutation.variables?.action === 'cancel'}
+                onClick={() => controlPlateauTaskMutation.mutate({ action: 'cancel', taskId: plateauTaskStatus.task_id })}
+              >
+                停止平原任务
+              </Button>
+            ) : null}
+            {plateauTaskOptions.length > 0 ? (
+              <Select
+                style={{ minWidth: 280 }}
+                value={plateauSelectedTaskId}
+                options={plateauTaskOptions}
+                onChange={(value) => setSelectedPlateauTask(String(value))}
+              />
+            ) : null}
+            {plateauTaskStatus ? (
+              <Tag color={plateauTaskStatusColor(plateauTaskStatus.status)}>{plateauTaskStatusLabel(plateauTaskStatus.status)}</Tag>
+            ) : null}
+            {plateauTaskRunningCount > 0 ? <Tag color="processing">{`运行中 ${plateauTaskRunningCount}`}</Tag> : null}
             {plateauResult ? (
               <Tag color="green">
                 {`已评估 ${plateauResult.evaluated_combinations} / ${plateauResult.total_combinations}`}
@@ -2277,7 +2514,22 @@ export function BacktestPage() {
         </Space>
       </Card>
 
-      {plateauError ? <Alert type="error" title={plateauError} showIcon /> : null}
+      {effectivePlateauError ? <Alert type="error" title={effectivePlateauError} showIcon /> : null}
+
+      {plateauTaskStatus ? (
+        <Card title={plateauTaskRunning ? '收益平原进度' : '最近收益平原进度'}>
+          <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+            <Progress
+              percent={Math.max(0, Math.min(100, Number(plateauTaskProgress?.percent ?? 0)))}
+              status={plateauTaskRunning ? 'active' : (plateauTaskStatus.status === 'succeeded' ? 'success' : 'normal')}
+            />
+            <div>{plateauTaskProgress?.message || '任务执行中...'}</div>
+            <div>
+              进度：{plateauTaskProgress?.processed_points ?? 0} / {plateauTaskProgress?.total_points ?? 0}
+            </div>
+          </Space>
+        </Card>
+      ) : null}
 
       {plateauResult ? (
         <>

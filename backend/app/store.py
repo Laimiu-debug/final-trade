@@ -34,6 +34,8 @@ from .models import (
     BacktestPlateauResponse,
     BacktestPlateauPoint,
     BacktestPlateauParams,
+    BacktestPlateauTaskProgress,
+    BacktestPlateauTaskStatusResponse,
     BacktestPoolRollMode,
     BacktestResponse,
     BacktestTaskProgress,
@@ -180,6 +182,12 @@ class InMemoryStore:
         self._backtest_running_worker_ids: set[str] = set()
         self._backtest_task_state_path = self._resolve_backtest_task_state_path()
         self._backtest_task_state_last_persist_at = 0.0
+        self._backtest_plateau_tasks: dict[str, BacktestPlateauTaskStatusResponse] = {}
+        self._backtest_plateau_task_payloads: dict[str, BacktestPlateauRunRequest] = {}
+        self._backtest_plateau_task_lock = RLock()
+        self._backtest_plateau_running_worker_ids: set[str] = set()
+        self._backtest_plateau_task_state_path = self._resolve_backtest_plateau_task_state_path()
+        self._backtest_plateau_task_state_last_persist_at = 0.0
         self._backtest_matrix_engine = BacktestMatrixEngine()
         self._backtest_matrix_algo_version = os.getenv("TDX_TREND_BACKTEST_MATRIX_ALGO_VERSION", "").strip() or "matrix-v1"
         self._backtest_signal_matrix_runtime_cache: dict[str, tuple[float, BacktestSignalMatrix]] = {}
@@ -229,6 +237,8 @@ class InMemoryStore:
         )
         self._load_backtest_task_state()
         self._resume_backtest_tasks_after_boot()
+        self._load_backtest_plateau_task_state()
+        self._resume_backtest_plateau_tasks_after_boot()
 
     @staticmethod
     def _resolve_user_path(value: str) -> Path:
@@ -268,6 +278,13 @@ class InMemoryStore:
         if env_value:
             return cls._resolve_user_path(env_value)
         return Path.home() / ".tdx-trend" / "backtest_tasks.json"
+
+    @classmethod
+    def _resolve_backtest_plateau_task_state_path(cls) -> Path:
+        env_value = os.getenv("TDX_TREND_BACKTEST_PLATEAU_TASK_STATE_PATH", "").strip()
+        if env_value:
+            return cls._resolve_user_path(env_value)
+        return Path.home() / ".tdx-trend" / "backtest_plateau_tasks.json"
 
     @classmethod
     def _resolve_backtest_input_pool_cache_dir(cls) -> Path:
@@ -6419,7 +6436,13 @@ class InMemoryStore:
 
         return params[:point_count]
 
-    def run_backtest_plateau(self, payload: BacktestPlateauRunRequest) -> BacktestPlateauResponse:
+    def run_backtest_plateau(
+        self,
+        payload: BacktestPlateauRunRequest,
+        *,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+        control_callback: Callable[[], None] | None = None,
+    ) -> BacktestPlateauResponse:
         base = payload.base_payload.model_copy(deep=True)
         window_axis = self._normalize_plateau_axis_int(
             payload.window_days_list,
@@ -6546,7 +6569,10 @@ class InMemoryStore:
                     )
                 )
 
+        total_to_evaluate = max(1, len(params_to_evaluate))
         for params in params_to_evaluate:
+            if control_callback is not None:
+                control_callback()
             run_payload = base.model_copy(
                 update={
                     "window_days": params.window_days,
@@ -6562,7 +6588,10 @@ class InMemoryStore:
             )
             evaluated += 1
             try:
-                result = self.run_backtest(run_payload)
+                result = self.run_backtest(
+                    run_payload,
+                    control_callback=control_callback,
+                )
                 cache_hit = any("回测结果缓存命中" in str(note) for note in result.notes)
                 point = BacktestPlateauPoint(
                     params=params,
@@ -6598,6 +6627,12 @@ class InMemoryStore:
                     error=str(exc),
                 )
             points.append(point)
+            if progress_callback is not None:
+                progress_callback(
+                    int(evaluated),
+                    int(total_to_evaluate),
+                    f"收益平原评估中：{evaluated}/{total_to_evaluate}",
+                )
 
         points.sort(
             key=lambda row: (
@@ -7459,6 +7494,491 @@ class InMemoryStore:
             payload,
             resumed=False,
             run_precheck=async_precheck,
+        )
+        return task_id
+
+    def _estimate_backtest_plateau_total_points(self, payload: BacktestPlateauRunRequest) -> int:
+        sample_points = max(1, int(self._resolve_plateau_sample_points(payload)))
+        if payload.sampling_mode == "lhs":
+            return sample_points
+        base = payload.base_payload
+        axis_sizes = [
+            len(self._normalize_plateau_axis_int(payload.window_days_list, base=int(base.window_days), lower=20, upper=240)),
+            len(self._normalize_plateau_axis_float(payload.min_score_list, base=float(base.min_score), lower=0.0, upper=100.0, precision=4)),
+            len(self._normalize_plateau_axis_float(payload.stop_loss_list, base=float(base.stop_loss), lower=0.0, upper=0.5, precision=6)),
+            len(self._normalize_plateau_axis_float(payload.take_profit_list, base=float(base.take_profit), lower=0.0, upper=1.5, precision=6)),
+            len(self._normalize_plateau_axis_int(payload.max_positions_list, base=int(base.max_positions), lower=1, upper=100)),
+            len(self._normalize_plateau_axis_float(payload.position_pct_list, base=float(base.position_pct), lower=0.0001, upper=1.0, precision=6)),
+            len(self._normalize_plateau_axis_int(payload.max_symbols_list, base=int(base.max_symbols), lower=20, upper=2000)),
+            len(self._normalize_plateau_axis_int(payload.priority_topk_per_day_list, base=int(base.priority_topk_per_day), lower=0, upper=500)),
+        ]
+        grid_total = 1
+        for size in axis_sizes:
+            grid_total *= max(1, int(size))
+        return max(1, min(int(grid_total), sample_points))
+
+    def _build_backtest_plateau_task_state_payload(self) -> dict[str, object]:
+        with self._backtest_plateau_task_lock:
+            tasks = []
+            for task_id, task in self._backtest_plateau_tasks.items():
+                payload = self._backtest_plateau_task_payloads.get(task_id)
+                task_payload = task.model_dump(exclude_none=True, exclude={"result"})
+                tasks.append(
+                    {
+                        "task": task_payload,
+                        "payload": payload.model_dump(exclude_none=True) if payload is not None else None,
+                    }
+                )
+            return {
+                "schema_version": 1,
+                "updated_at": self._now_datetime(),
+                "tasks": tasks,
+            }
+
+    def _write_backtest_plateau_task_state_payload(self, payload: dict[str, object]) -> None:
+        self._backtest_plateau_task_state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self._backtest_plateau_task_state_path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self._backtest_plateau_task_state_path)
+
+    def _persist_backtest_plateau_task_state(self, *, force: bool = False) -> None:
+        now_ts = time.time()
+        if (not force) and (now_ts - self._backtest_plateau_task_state_last_persist_at < 1.5):
+            return
+        try:
+            payload = self._build_backtest_plateau_task_state_payload()
+            self._write_backtest_plateau_task_state_payload(payload)
+            self._backtest_plateau_task_state_last_persist_at = now_ts
+        except Exception:
+            pass
+
+    def _load_backtest_plateau_task_state(self) -> None:
+        if not self._backtest_plateau_task_state_path.exists():
+            return
+        try:
+            raw = json.loads(self._backtest_plateau_task_state_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return
+            items = raw.get("tasks")
+            if not isinstance(items, list):
+                return
+            restored_tasks: dict[str, BacktestPlateauTaskStatusResponse] = {}
+            restored_payloads: dict[str, BacktestPlateauRunRequest] = {}
+            for row in items:
+                if not isinstance(row, dict):
+                    continue
+                task_raw = row.get("task")
+                if not isinstance(task_raw, dict):
+                    continue
+                try:
+                    task = BacktestPlateauTaskStatusResponse(**task_raw)
+                except Exception:
+                    continue
+                restored_tasks[task.task_id] = task
+                payload_raw = row.get("payload")
+                if isinstance(payload_raw, dict):
+                    try:
+                        restored_payloads[task.task_id] = BacktestPlateauRunRequest(**payload_raw)
+                    except Exception:
+                        pass
+            with self._backtest_plateau_task_lock:
+                self._backtest_plateau_tasks = restored_tasks
+                self._backtest_plateau_task_payloads = restored_payloads
+        except Exception:
+            return
+
+    def _should_auto_resume_backtest_plateau_tasks(self) -> bool:
+        return self._env_flag("TDX_TREND_BACKTEST_PLATEAU_TASK_AUTO_RESUME", False)
+
+    def _resume_backtest_plateau_tasks_after_boot(self) -> None:
+        resumable: list[tuple[str, BacktestPlateauRunRequest]] = []
+        unrecoverable_task_ids: list[str] = []
+        auto_resume = self._should_auto_resume_backtest_plateau_tasks()
+        with self._backtest_plateau_task_lock:
+            for task_id, task in list(self._backtest_plateau_tasks.items()):
+                if task.status not in {"pending", "running"}:
+                    continue
+                payload = self._backtest_plateau_task_payloads.get(task_id)
+                if payload is None:
+                    unrecoverable_task_ids.append(task_id)
+                    continue
+                resumable.append((task_id, payload))
+
+        now_text = self._now_datetime()
+        for task_id in unrecoverable_task_ids:
+            task = self.get_backtest_plateau_task(task_id)
+            if task is None:
+                continue
+            failed_progress = task.progress.model_copy(
+                update={
+                    "message": "服务重启后无法恢复：缺少任务参数。",
+                    "updated_at": now_text,
+                }
+            )
+            self._upsert_backtest_plateau_task(
+                task.model_copy(
+                    update={
+                        "status": "failed",
+                        "progress": failed_progress,
+                        "error": "服务重启后无法恢复任务：缺少任务参数。",
+                        "error_code": "BACKTEST_PLATEAU_TASK_RESUME_PAYLOAD_MISSING",
+                    }
+                )
+            )
+
+        for task_id, payload in resumable:
+            task = self.get_backtest_plateau_task(task_id)
+            if task is None:
+                continue
+            if not auto_resume:
+                paused_progress = task.progress.model_copy(
+                    update={
+                        "message": "检测到服务重启，任务已自动暂停，请手动继续。",
+                        "updated_at": now_text,
+                    }
+                )
+                self._upsert_backtest_plateau_task(
+                    task.model_copy(
+                        update={
+                            "status": "paused",
+                            "progress": paused_progress,
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                )
+                continue
+            pending_progress = task.progress.model_copy(
+                update={
+                    "message": "检测到服务重启，任务已自动续跑。",
+                    "updated_at": now_text,
+                }
+            )
+            self._upsert_backtest_plateau_task(
+                task.model_copy(
+                    update={
+                        "status": "pending",
+                        "progress": pending_progress,
+                        "error": None,
+                        "error_code": None,
+                    }
+                )
+            )
+            self._start_backtest_plateau_task_worker(task_id, payload, resumed=True)
+
+    def _upsert_backtest_plateau_task(self, task: BacktestPlateauTaskStatusResponse) -> None:
+        force_persist = task.status in {"paused", "succeeded", "failed", "cancelled"}
+        with self._backtest_plateau_task_lock:
+            self._backtest_plateau_tasks[task.task_id] = task
+            if len(self._backtest_plateau_tasks) > 80:
+                sorted_items = sorted(
+                    self._backtest_plateau_tasks.items(),
+                    key=lambda item: item[1].progress.updated_at,
+                )
+                for old_task_id, _ in sorted_items[: max(0, len(sorted_items) - 80)]:
+                    self._backtest_plateau_tasks.pop(old_task_id, None)
+                    self._backtest_plateau_task_payloads.pop(old_task_id, None)
+        self._persist_backtest_plateau_task_state(force=force_persist)
+
+    def get_backtest_plateau_task(self, task_id: str) -> BacktestPlateauTaskStatusResponse | None:
+        with self._backtest_plateau_task_lock:
+            task = self._backtest_plateau_tasks.get(task_id)
+            if task is None:
+                return None
+            return task.model_copy(deep=True)
+
+    def _await_backtest_plateau_task_runnable(self, task_id: str) -> None:
+        while True:
+            task = self.get_backtest_plateau_task(task_id)
+            if task is None:
+                raise BacktestTaskCancelledError("任务不存在，无法继续执行。")
+            if task.status == "cancelled":
+                raise BacktestTaskCancelledError("任务已停止。")
+            if task.status in {"succeeded", "failed"}:
+                raise BacktestTaskCancelledError(f"任务状态已结束：{task.status}")
+            if task.status == "paused":
+                time.sleep(0.25)
+                continue
+            if task.status in {"pending", "running"}:
+                return
+            time.sleep(0.25)
+
+    def _control_backtest_plateau_task(
+        self,
+        task_id: str,
+        action: Literal["pause", "resume", "cancel"],
+    ) -> BacktestPlateauTaskStatusResponse:
+        payload_for_resume: BacktestPlateauRunRequest | None = None
+        now_text = self._now_datetime()
+        with self._backtest_plateau_task_lock:
+            task = self._backtest_plateau_tasks.get(task_id)
+            if task is None:
+                raise BacktestValidationError("BACKTEST_PLATEAU_TASK_NOT_FOUND", "收益平原任务不存在")
+            if action == "pause":
+                if task.status in {"succeeded", "failed", "cancelled"}:
+                    raise BacktestValidationError(
+                        "BACKTEST_PLATEAU_TASK_CONTROL_INVALID",
+                        f"任务当前状态为 {task.status}，无法暂停。",
+                    )
+                if task.status != "paused":
+                    task = task.model_copy(
+                        update={
+                            "status": "paused",
+                            "progress": task.progress.model_copy(
+                                update={
+                                    "message": "任务已暂停。",
+                                    "updated_at": now_text,
+                                }
+                            ),
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                    self._backtest_plateau_tasks[task_id] = task
+            elif action == "resume":
+                if task.status in {"succeeded", "failed", "cancelled"}:
+                    raise BacktestValidationError(
+                        "BACKTEST_PLATEAU_TASK_CONTROL_INVALID",
+                        f"任务当前状态为 {task.status}，无法继续执行。",
+                    )
+                if task.status == "paused":
+                    payload_for_resume = self._backtest_plateau_task_payloads.get(task_id)
+                    if payload_for_resume is None:
+                        raise BacktestValidationError(
+                            "BACKTEST_PLATEAU_TASK_RESUME_PAYLOAD_MISSING",
+                            "任务参数缺失，无法继续执行。",
+                        )
+                    task = task.model_copy(
+                        update={
+                            "status": "pending",
+                            "progress": task.progress.model_copy(
+                                update={
+                                    "message": "任务已恢复，等待继续执行。",
+                                    "updated_at": now_text,
+                                }
+                            ),
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                    self._backtest_plateau_tasks[task_id] = task
+            else:
+                if task.status not in {"succeeded", "failed", "cancelled"}:
+                    task = task.model_copy(
+                        update={
+                            "status": "cancelled",
+                            "progress": task.progress.model_copy(
+                                update={
+                                    "message": "任务已停止。",
+                                    "updated_at": now_text,
+                                }
+                            ),
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                    self._backtest_plateau_tasks[task_id] = task
+
+        current = self.get_backtest_plateau_task(task_id)
+        if current is None:
+            raise BacktestValidationError("BACKTEST_PLATEAU_TASK_NOT_FOUND", "收益平原任务不存在")
+        self._persist_backtest_plateau_task_state(force=current.status in {"paused", "cancelled"})
+        if action == "resume" and payload_for_resume is not None:
+            self._start_backtest_plateau_task_worker(task_id, payload_for_resume, resumed=True)
+        return current
+
+    def pause_backtest_plateau_task(self, task_id: str) -> BacktestPlateauTaskStatusResponse:
+        return self._control_backtest_plateau_task(task_id, "pause")
+
+    def resume_backtest_plateau_task(self, task_id: str) -> BacktestPlateauTaskStatusResponse:
+        return self._control_backtest_plateau_task(task_id, "resume")
+
+    def cancel_backtest_plateau_task(self, task_id: str) -> BacktestPlateauTaskStatusResponse:
+        return self._control_backtest_plateau_task(task_id, "cancel")
+
+    def _start_backtest_plateau_task_worker(
+        self,
+        task_id: str,
+        payload: BacktestPlateauRunRequest,
+        *,
+        resumed: bool = False,
+    ) -> None:
+        with self._backtest_plateau_task_lock:
+            if task_id in self._backtest_plateau_running_worker_ids:
+                return
+            self._backtest_plateau_running_worker_ids.add(task_id)
+
+        def _worker() -> None:
+            try:
+                task = self.get_backtest_plateau_task(task_id)
+                if task is None:
+                    return
+                self._await_backtest_plateau_task_runnable(task_id)
+                task = self.get_backtest_plateau_task(task_id)
+                if task is None:
+                    return
+                running_message = "收益平原任务执行中..." if not resumed else "服务重启后自动续跑中..."
+                running_progress = task.progress.model_copy(
+                    update={
+                        "message": running_message,
+                        "updated_at": self._now_datetime(),
+                    }
+                )
+                self._upsert_backtest_plateau_task(
+                    task.model_copy(
+                        update={
+                            "status": "running",
+                            "progress": running_progress,
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                )
+
+                def _progress(processed_points: int, total_points: int, message: str) -> None:
+                    self._await_backtest_plateau_task_runnable(task_id)
+                    current_task = self.get_backtest_plateau_task(task_id)
+                    if current_task is None:
+                        return
+                    total_safe = max(1, int(total_points), int(current_task.progress.total_points or 0))
+                    processed_safe = max(0, min(int(processed_points), total_safe))
+                    processed_safe = max(int(current_task.progress.processed_points or 0), processed_safe)
+                    percent = round((processed_safe / total_safe) * 100.0, 2)
+                    next_progress = current_task.progress.model_copy(
+                        update={
+                            "processed_points": processed_safe,
+                            "total_points": total_safe,
+                            "percent": percent,
+                            "message": message,
+                            "updated_at": self._now_datetime(),
+                        }
+                    )
+                    self._upsert_backtest_plateau_task(
+                        current_task.model_copy(update={"status": "running", "progress": next_progress})
+                    )
+
+                result = self.run_backtest_plateau(
+                    payload,
+                    progress_callback=_progress,
+                    control_callback=lambda: self._await_backtest_plateau_task_runnable(task_id),
+                )
+                finished_task = self.get_backtest_plateau_task(task_id)
+                if finished_task is None:
+                    return
+                done_progress = finished_task.progress.model_copy(
+                    update={
+                        "percent": 100.0,
+                        "processed_points": max(
+                            int(finished_task.progress.processed_points or 0),
+                            int(finished_task.progress.total_points or 0),
+                        ),
+                        "message": "收益平原评估完成。",
+                        "updated_at": self._now_datetime(),
+                    }
+                )
+                self._upsert_backtest_plateau_task(
+                    finished_task.model_copy(
+                        update={
+                            "status": "succeeded",
+                            "progress": done_progress,
+                            "result": result,
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                )
+            except BacktestTaskCancelledError:
+                cancelled_task = self.get_backtest_plateau_task(task_id)
+                if cancelled_task is None:
+                    return
+                if cancelled_task.status == "cancelled":
+                    return
+                cancelled_progress = cancelled_task.progress.model_copy(
+                    update={
+                        "message": "任务已停止。",
+                        "updated_at": self._now_datetime(),
+                    }
+                )
+                self._upsert_backtest_plateau_task(
+                    cancelled_task.model_copy(
+                        update={
+                            "status": "cancelled",
+                            "progress": cancelled_progress,
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                failed_task = self.get_backtest_plateau_task(task_id)
+                if failed_task is None:
+                    return
+                failed_progress = failed_task.progress.model_copy(
+                    update={
+                        "message": "收益平原任务失败。",
+                        "updated_at": self._now_datetime(),
+                    }
+                )
+                error_code = "BACKTEST_PLATEAU_TASK_FAILED"
+                if isinstance(exc, BacktestValidationError):
+                    error_code = exc.code
+                self._upsert_backtest_plateau_task(
+                    failed_task.model_copy(
+                        update={
+                            "status": "failed",
+                            "progress": failed_progress,
+                            "error": str(exc),
+                            "error_code": error_code,
+                        }
+                    )
+                )
+            finally:
+                with self._backtest_plateau_task_lock:
+                    self._backtest_plateau_running_worker_ids.discard(task_id)
+                self._persist_backtest_plateau_task_state(force=True)
+
+        Thread(target=_worker, daemon=True).start()
+
+    def start_backtest_plateau_task(self, payload: BacktestPlateauRunRequest) -> str:
+        task_id = f"bp_{uuid4().hex[:16]}"
+        now_text = self._now_datetime()
+        total_points = self._estimate_backtest_plateau_total_points(payload)
+        warning: str | None = None
+        if total_points >= 150:
+            warning = "收益平原评估参数较多，耗时可能较久，请耐心等待。"
+
+        initial_progress = BacktestPlateauTaskProgress(
+            sampling_mode=payload.sampling_mode,
+            processed_points=0,
+            total_points=total_points,
+            percent=0.0,
+            message="任务已创建，等待执行。",
+            started_at=now_text,
+            updated_at=now_text,
+        )
+        if warning:
+            initial_progress = initial_progress.model_copy(
+                update={"message": warning},
+            )
+        with self._backtest_plateau_task_lock:
+            self._backtest_plateau_task_payloads[task_id] = payload.model_copy(deep=True)
+        self._upsert_backtest_plateau_task(
+            BacktestPlateauTaskStatusResponse(
+                task_id=task_id,
+                status="pending",
+                progress=initial_progress,
+                result=None,
+                error=None,
+                error_code=None,
+            )
+        )
+        self._start_backtest_plateau_task_worker(
+            task_id,
+            payload,
+            resumed=False,
         )
         return task_id
 

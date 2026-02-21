@@ -16,6 +16,7 @@ from .models import (
     BacktestRunRequest,
     BacktestPlateauRunRequest,
     BacktestPlateauResponse,
+    BacktestPlateauTaskStatusResponse,
     BacktestTaskStartResponse,
     BacktestTaskStatusResponse,
     BoardFilter,
@@ -208,6 +209,66 @@ def post_backtest_plateau(payload: BacktestPlateauRunRequest) -> BacktestPlateau
         return store.run_backtest_plateau(payload)
     except BacktestValidationError as exc:
         return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.post("/api/backtest/plateau/tasks", response_model=BacktestTaskStartResponse)
+def post_backtest_plateau_task(payload: BacktestPlateauRunRequest) -> BacktestTaskStartResponse | JSONResponse:
+    try:
+        task_id = store.start_backtest_plateau_task(payload)
+        return BacktestTaskStartResponse(task_id=task_id)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.get("/api/backtest/plateau/tasks/{task_id}", response_model=BacktestPlateauTaskStatusResponse)
+def get_backtest_plateau_task(
+    task_id: str = Path(min_length=8, max_length=64),
+) -> BacktestPlateauTaskStatusResponse | JSONResponse:
+    task = store.get_backtest_plateau_task(task_id)
+    if task is None:
+        return error_response(404, "BACKTEST_PLATEAU_TASK_NOT_FOUND", "收益平原任务不存在")
+    return task
+
+
+@app.post("/api/backtest/plateau/tasks/{task_id}/pause", response_model=BacktestPlateauTaskStatusResponse)
+def post_backtest_plateau_task_pause(
+    task_id: str = Path(min_length=8, max_length=64),
+) -> BacktestPlateauTaskStatusResponse | JSONResponse:
+    try:
+        return store.pause_backtest_plateau_task(task_id)
+    except BacktestValidationError as exc:
+        status_code = 404 if exc.code == "BACKTEST_PLATEAU_TASK_NOT_FOUND" else 400
+        return error_response(status_code, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.post("/api/backtest/plateau/tasks/{task_id}/resume", response_model=BacktestPlateauTaskStatusResponse)
+def post_backtest_plateau_task_resume(
+    task_id: str = Path(min_length=8, max_length=64),
+) -> BacktestPlateauTaskStatusResponse | JSONResponse:
+    try:
+        return store.resume_backtest_plateau_task(task_id)
+    except BacktestValidationError as exc:
+        status_code = 404 if exc.code == "BACKTEST_PLATEAU_TASK_NOT_FOUND" else 400
+        return error_response(status_code, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.post("/api/backtest/plateau/tasks/{task_id}/cancel", response_model=BacktestPlateauTaskStatusResponse)
+def post_backtest_plateau_task_cancel(
+    task_id: str = Path(min_length=8, max_length=64),
+) -> BacktestPlateauTaskStatusResponse | JSONResponse:
+    try:
+        return store.cancel_backtest_plateau_task(task_id)
+    except BacktestValidationError as exc:
+        status_code = 404 if exc.code == "BACKTEST_PLATEAU_TASK_NOT_FOUND" else 400
+        return error_response(status_code, exc.code, str(exc))
     except ValueError as exc:
         return error_response(400, "BACKTEST_INVALID", str(exc))
 

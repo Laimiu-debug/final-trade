@@ -58,6 +58,36 @@ def _wait_backtest_task_status(task_id: str, expected: set[str], timeout_sec: fl
     raise AssertionError(f"task status wait timeout: task_id={task_id}, expected={expected}, last={last_payload}")
 
 
+def _wait_backtest_plateau_task(task_id: str, timeout_sec: float = 180.0) -> dict:
+    deadline = time.time() + timeout_sec
+    last_payload: dict | None = None
+    while time.time() < deadline:
+        resp = client.get(f"/api/backtest/plateau/tasks/{task_id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert isinstance(body, dict)
+        last_payload = body
+        if body.get("status") in {"succeeded", "failed", "cancelled"}:
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"task timeout: task_id={task_id}, last={last_payload}")
+
+
+def _wait_backtest_plateau_task_status(task_id: str, expected: set[str], timeout_sec: float = 30.0) -> dict:
+    deadline = time.time() + timeout_sec
+    last_payload: dict | None = None
+    while time.time() < deadline:
+        resp = client.get(f"/api/backtest/plateau/tasks/{task_id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert isinstance(body, dict)
+        last_payload = body
+        if body.get("status") in expected:
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"task status wait timeout: task_id={task_id}, expected={expected}, last={last_payload}")
+
+
 def _load_symbol_dates(symbol: str) -> list[str]:
     resp = client.get(f"/api/stocks/{symbol}/candles")
     assert resp.status_code == 200
@@ -307,6 +337,106 @@ def test_backtest_plateau_endpoint_lhs_sampling_is_repeatable(monkeypatch: pytes
     assert body1["points"] == body2["points"]
     assert any("参数采样模式: lhs" in note for note in body1["notes"])
     assert any("LHS 随机种子: 20260221" in note for note in body1["notes"])
+
+
+def test_backtest_plateau_task_supports_pause_resume_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None):  # noqa: ANN001
+        _ = progress_callback
+        if control_callback is not None:
+            control_callback()
+        time.sleep(0.03)
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.5,
+                total_return=0.1,
+                max_drawdown=-0.08,
+                avg_pnl_ratio=0.02,
+                trade_count=5,
+                win_count=3,
+                loss_count=2,
+                profit_factor=1.2,
+            ),
+            trades=[],
+            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+            notes=[],
+            candidate_count=12,
+            skipped_count=2,
+            fill_rate=0.8,
+            max_concurrent_positions=int(payload.max_positions),
+        )
+
+    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
+
+    base_payload = {
+        "mode": "full_market",
+        "run_id": "",
+        "trend_step": "auto",
+        "pool_roll_mode": "daily",
+        "board_filters": [],
+        "date_from": "2025-01-02",
+        "date_to": "2025-02-28",
+        "window_days": 60,
+        "min_score": 55,
+        "require_sequence": False,
+        "min_event_count": 1,
+        "entry_events": ["Spring", "SOS", "JOC", "LPS"],
+        "exit_events": ["UTAD", "SOW", "LPSY"],
+        "initial_capital": 1_000_000,
+        "position_pct": 0.2,
+        "max_positions": 5,
+        "stop_loss": 0.05,
+        "take_profit": 0.2,
+        "max_hold_days": 30,
+        "fee_bps": 8.0,
+        "prioritize_signals": True,
+        "priority_mode": "balanced",
+        "priority_topk_per_day": 10,
+        "enforce_t1": True,
+        "max_symbols": 100,
+    }
+    payload = {
+        "base_payload": base_payload,
+        "sampling_mode": "lhs",
+        "sample_points": 80,
+        "random_seed": 20260221,
+        "window_days_list": [40, 120],
+        "min_score_list": [50, 70],
+        "stop_loss_list": [0.03, 0.08],
+        "take_profit_list": [0.1, 0.4],
+        "max_positions_list": [3, 10],
+        "position_pct_list": [0.1, 0.4],
+        "max_symbols_list": [80, 300],
+        "priority_topk_per_day_list": [0, 20],
+    }
+
+    start_resp = client.post("/api/backtest/plateau/tasks", json=payload)
+    assert start_resp.status_code == 200
+    task_id = str(start_resp.json()["task_id"])
+    assert task_id.startswith("bp_")
+
+    running = _wait_backtest_plateau_task_status(task_id, {"running"})
+    assert running["status"] == "running"
+
+    pause_resp = client.post(f"/api/backtest/plateau/tasks/{task_id}/pause")
+    assert pause_resp.status_code == 200
+    paused = pause_resp.json()
+    assert paused["status"] == "paused"
+
+    paused_after = client.get(f"/api/backtest/plateau/tasks/{task_id}").json()
+    assert paused_after["status"] == "paused"
+
+    resume_resp = client.post(f"/api/backtest/plateau/tasks/{task_id}/resume")
+    assert resume_resp.status_code == 200
+    resumed = resume_resp.json()
+    assert resumed["status"] in {"pending", "running"}
+
+    cancel_resp = client.post(f"/api/backtest/plateau/tasks/{task_id}/cancel")
+    assert cancel_resp.status_code == 200
+    cancelled = cancel_resp.json()
+    assert cancelled["status"] == "cancelled"
+
+    final_task = _wait_backtest_plateau_task(task_id)
+    assert final_task["status"] == "cancelled"
 
 
 def test_backtest_run_falls_back_when_run_missing() -> None:

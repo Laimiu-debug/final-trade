@@ -501,6 +501,25 @@ export interface BacktestPlateauResponse {
   notes: string[]
 }
 
+export interface BacktestPlateauTaskProgress {
+  sampling_mode: 'grid' | 'lhs'
+  processed_points: number
+  total_points: number
+  percent: number
+  message: string
+  started_at: string
+  updated_at: string
+}
+
+export interface BacktestPlateauTaskStatusResponse {
+  task_id: string
+  status: 'pending' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled'
+  progress: BacktestPlateauTaskProgress
+  result?: BacktestPlateauResponse | null
+  error?: string | null
+  error_code?: string | null
+}
+
 export type ReviewTagType = 'emotion' | 'reason'
 
 export interface ReviewTag {

@@ -8,6 +8,7 @@ import type {
   BacktestTaskStatusResponse,
   BacktestResponse,
   BacktestPlateauResponse,
+  BacktestPlateauTaskStatusResponse,
   BacktestPlateauRunRequest,
   BacktestRunRequest,
   BoardFilter,
@@ -269,6 +270,42 @@ export function runBacktestPlateau(payload: BacktestPlateauRunRequest) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     timeoutMs: 600_000,
+  })
+}
+
+export function startBacktestPlateauTask(payload: BacktestPlateauRunRequest) {
+  return apiRequest<BacktestTaskStartResponse>('/api/backtest/plateau/tasks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 60_000,
+  })
+}
+
+export function getBacktestPlateauTask(taskId: string) {
+  return apiRequest<BacktestPlateauTaskStatusResponse>(`/api/backtest/plateau/tasks/${taskId}`, {
+    timeoutMs: 60_000,
+  })
+}
+
+export function pauseBacktestPlateauTask(taskId: string) {
+  return apiRequest<BacktestPlateauTaskStatusResponse>(`/api/backtest/plateau/tasks/${taskId}/pause`, {
+    method: 'POST',
+    timeoutMs: 30_000,
+  })
+}
+
+export function resumeBacktestPlateauTask(taskId: string) {
+  return apiRequest<BacktestPlateauTaskStatusResponse>(`/api/backtest/plateau/tasks/${taskId}/resume`, {
+    method: 'POST',
+    timeoutMs: 30_000,
+  })
+}
+
+export function cancelBacktestPlateauTask(taskId: string) {
+  return apiRequest<BacktestPlateauTaskStatusResponse>(`/api/backtest/plateau/tasks/${taskId}/cancel`, {
+    method: 'POST',
+    timeoutMs: 30_000,
   })
 }
 
