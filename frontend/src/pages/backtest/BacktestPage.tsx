@@ -24,7 +24,13 @@ import type { ColumnsType } from 'antd/es/table'
 import ReactECharts from 'echarts-for-react'
 import { Link } from 'react-router-dom'
 import { ApiError } from '@/shared/api/client'
-import { getLatestScreenerRun, startBacktestTask } from '@/shared/api/endpoints'
+import {
+  cancelBacktestTask,
+  getLatestScreenerRun,
+  pauseBacktestTask,
+  resumeBacktestTask,
+  startBacktestTask,
+} from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { useBacktestTaskStore } from '@/state/backtestTaskStore'
 import type {
@@ -226,14 +232,18 @@ function buildChartPath(symbol: string, name?: string) {
 function taskStatusLabel(status: BacktestTaskStatusResponse['status']) {
   if (status === 'pending') return '排队中'
   if (status === 'running') return '运行中'
+  if (status === 'paused') return '已暂停'
   if (status === 'succeeded') return '已完成'
+  if (status === 'cancelled') return '已停止'
   return '失败'
 }
 
 function taskStatusColor(status: BacktestTaskStatusResponse['status']) {
   if (status === 'pending') return 'default'
   if (status === 'running') return 'processing'
+  if (status === 'paused') return 'warning'
   if (status === 'succeeded') return 'success'
+  if (status === 'cancelled') return 'default'
   return 'error'
 }
 
@@ -344,6 +354,7 @@ export function BacktestPage() {
   const activeTaskIds = useBacktestTaskStore((state) => state.activeTaskIds)
   const selectedTaskId = useBacktestTaskStore((state) => state.selectedTaskId)
   const enqueueTask = useBacktestTaskStore((state) => state.enqueueTask)
+  const upsertTaskStatus = useBacktestTaskStore((state) => state.upsertTaskStatus)
   const setSelectedTask = useBacktestTaskStore((state) => state.setSelectedTask)
 
   const taskOptions = useMemo(
@@ -483,6 +494,27 @@ export function BacktestPage() {
     onError: (error) => message.error(formatApiError(error)),
   })
 
+  const controlTaskMutation = useMutation({
+    mutationFn: async (payload: { action: 'pause' | 'resume' | 'cancel'; taskId: string }) => {
+      if (payload.action === 'pause') return pauseBacktestTask(payload.taskId)
+      if (payload.action === 'resume') return resumeBacktestTask(payload.taskId)
+      return cancelBacktestTask(payload.taskId)
+    },
+    onSuccess: (status, variables) => {
+      upsertTaskStatus(status)
+      if (variables.action === 'pause') {
+        message.info(`任务已暂停：${status.task_id}`)
+      } else if (variables.action === 'resume') {
+        message.success(`任务已继续：${status.task_id}`)
+      } else {
+        message.warning(`任务已停止：${status.task_id}`)
+      }
+    },
+    onError: (error) => {
+      message.error(formatApiError(error))
+    },
+  })
+
   useEffect(() => {
     setTradePage(1)
   }, [result?.trades])
@@ -597,7 +629,7 @@ export function BacktestPage() {
     bindLatestRunMutation.mutate()
   }
 
-  const taskRunning = taskStatus?.status === 'running' || taskStatus?.status === 'pending'
+  const taskRunning = taskStatus?.status === 'running' || taskStatus?.status === 'pending' || taskStatus?.status === 'paused'
   const runLoading = startTaskMutation.isPending
   const effectiveRunError =
     runError
@@ -957,6 +989,33 @@ export function BacktestPage() {
           <Button type="primary" loading={runLoading} onClick={handleRun}>
             开始回测
           </Button>
+          {taskStatus && (taskStatus.status === 'running' || taskStatus.status === 'pending') ? (
+            <Button
+              loading={controlTaskMutation.isPending && controlTaskMutation.variables?.action === 'pause'}
+              onClick={() => controlTaskMutation.mutate({ action: 'pause', taskId: taskStatus.task_id })}
+            >
+              暂停
+            </Button>
+          ) : null}
+          {taskStatus && taskStatus.status === 'paused' ? (
+            <Button
+              type="default"
+              loading={controlTaskMutation.isPending && controlTaskMutation.variables?.action === 'resume'}
+              onClick={() => controlTaskMutation.mutate({ action: 'resume', taskId: taskStatus.task_id })}
+            >
+              继续
+            </Button>
+          ) : null}
+          {taskStatus
+          && (taskStatus.status === 'running' || taskStatus.status === 'pending' || taskStatus.status === 'paused') ? (
+            <Button
+              danger
+              loading={controlTaskMutation.isPending && controlTaskMutation.variables?.action === 'cancel'}
+              onClick={() => controlTaskMutation.mutate({ action: 'cancel', taskId: taskStatus.task_id })}
+            >
+              停止
+            </Button>
+            ) : null}
           {taskOptions.length > 0 ? (
             <Select
               style={{ minWidth: 320 }}

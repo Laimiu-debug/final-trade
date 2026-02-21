@@ -177,7 +177,9 @@ export const useBacktestTaskStore = create<BacktestTaskStoreState>()(
         }),
       clearFinishedTasks: () =>
         set((state) => {
-          const keptEntries = Object.entries(state.tasksById).filter(([, task]) => task.status === 'pending' || task.status === 'running')
+          const keptEntries = Object.entries(state.tasksById).filter(
+            ([, task]) => task.status === 'pending' || task.status === 'running' || task.status === 'paused',
+          )
           const tasksById = Object.fromEntries(keptEntries)
           const sorted = sortTasksByUpdatedAtDesc(tasksById)
           return {

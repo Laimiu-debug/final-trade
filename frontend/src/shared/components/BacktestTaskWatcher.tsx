@@ -58,6 +58,11 @@ export function BacktestTaskWatcher() {
             message.success(`回测任务已完成：${row.taskId}`)
             continue
           }
+          if (row.status.status === 'cancelled') {
+            notifiedTaskStateRef.current[row.taskId] = statusText
+            message.info(`回测任务已停止：${row.taskId}`)
+            continue
+          }
           if (row.status.status === 'failed') {
             notifiedTaskStateRef.current[row.taskId] = statusText
             message.error(row.status.error?.trim() || `回测任务失败：${row.taskId}`)

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import sys
@@ -21,7 +21,7 @@ os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_ENABLED", "1")
 os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_READ_ONLY", "0")
 
 from app.main import app
-from app.models import ScreenerParams
+from app.models import BacktestResponse, ReviewRange, ReviewStats, ScreenerParams
 from app.store import store
 
 client = TestClient(app)
@@ -36,10 +36,25 @@ def _wait_backtest_task(task_id: str, timeout_sec: float = 180.0) -> dict:
         body = resp.json()
         assert isinstance(body, dict)
         last_payload = body
-        if body.get("status") in {"succeeded", "failed"}:
+        if body.get("status") in {"succeeded", "failed", "cancelled"}:
             return body
         time.sleep(0.05)
-    raise AssertionError(f"回测任务超时未结束: task_id={task_id}, last={last_payload}")
+    raise AssertionError(f"task timeout: task_id={task_id}, last={last_payload}")
+
+
+def _wait_backtest_task_status(task_id: str, expected: set[str], timeout_sec: float = 30.0) -> dict:
+    deadline = time.time() + timeout_sec
+    last_payload: dict | None = None
+    while time.time() < deadline:
+        resp = client.get(f"/api/backtest/tasks/{task_id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert isinstance(body, dict)
+        last_payload = body
+        if body.get("status") in expected:
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"task status wait timeout: task_id={task_id}, expected={expected}, last={last_payload}")
 
 
 def _load_symbol_dates(symbol: str) -> list[str]:
@@ -243,6 +258,88 @@ def test_backtest_task_full_market_daily_smoke() -> None:
     assert result["range"]["date_from"] == date_from
     assert result["range"]["date_to"] == date_to
     assert any("全市场候选池构建" in note for note in result["notes"])
+
+
+def test_backtest_task_supports_pause_resume_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_precheck(payload):  # noqa: ANN001
+        return None
+
+    def _fake_total_dates(payload):  # noqa: ANN001
+        return 120
+
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None):  # noqa: ANN001
+        total = 120
+        for idx in range(total):
+            if control_callback is not None:
+                control_callback()
+            if progress_callback is not None:
+                progress_callback(
+                    f"2025-01-{(idx % 28) + 1:02d}",
+                    idx + 1,
+                    total,
+                    f"fake progress {idx + 1}/{total}",
+                )
+            time.sleep(0.01)
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.0,
+                total_return=0.0,
+                max_drawdown=0.0,
+                avg_pnl_ratio=0.0,
+                trade_count=0,
+                win_count=0,
+                loss_count=0,
+                profit_factor=0.0,
+            ),
+            trades=[],
+            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+        )
+
+    monkeypatch.setattr(store, "_precheck_backtest_data_coverage_before_task", _fake_precheck)
+    monkeypatch.setattr(store, "_estimate_backtest_progress_total_dates", _fake_total_dates)
+    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "daily",
+        "date_from": "2025-01-01",
+        "date_to": "2025-12-31",
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+    }
+
+    start_resp = client.post("/api/backtest/tasks", json=payload)
+    assert start_resp.status_code == 200
+    task_id = str(start_resp.json()["task_id"])
+
+    running = _wait_backtest_task_status(task_id, {"running"})
+    assert running["status"] == "running"
+
+    pause_resp = client.post(f"/api/backtest/tasks/{task_id}/pause")
+    assert pause_resp.status_code == 200
+    paused = pause_resp.json()
+    assert paused["status"] == "paused"
+    paused_processed = int(paused["progress"]["processed_dates"])
+    time.sleep(0.15)
+    paused_after = client.get(f"/api/backtest/tasks/{task_id}").json()
+    assert paused_after["status"] == "paused"
+    assert int(paused_after["progress"]["processed_dates"]) <= paused_processed + 1
+
+    resume_resp = client.post(f"/api/backtest/tasks/{task_id}/resume")
+    assert resume_resp.status_code == 200
+    resumed = resume_resp.json()
+    assert resumed["status"] in {"pending", "running"}
+
+    _wait_backtest_task_status(task_id, {"running"})
+
+    cancel_resp = client.post(f"/api/backtest/tasks/{task_id}/cancel")
+    assert cancel_resp.status_code == 200
+    cancelled = cancel_resp.json()
+    assert cancelled["status"] == "cancelled"
+
+    final = _wait_backtest_task_status(task_id, {"cancelled"})
+    assert final["status"] == "cancelled"
 
 
 def test_backtest_task_full_market_weekly_smoke() -> None:
@@ -501,3 +598,4 @@ def test_backtest_run_trend_pool_weekly_matrix_path(monkeypatch: pytest.MonkeyPa
     assert body["range"]["date_to"] == date_to
     assert any("矩阵引擎已启用" in note for note in body["notes"])
     assert any("使用筛选任务: mock-run" in note for note in body["notes"])
+

@@ -275,6 +275,27 @@ export function getBacktestTask(taskId: string) {
   })
 }
 
+export function pauseBacktestTask(taskId: string) {
+  return apiRequest<BacktestTaskStatusResponse>(`/api/backtest/tasks/${taskId}/pause`, {
+    method: 'POST',
+    timeoutMs: 30_000,
+  })
+}
+
+export function resumeBacktestTask(taskId: string) {
+  return apiRequest<BacktestTaskStatusResponse>(`/api/backtest/tasks/${taskId}/resume`, {
+    method: 'POST',
+    timeoutMs: 30_000,
+  })
+}
+
+export function cancelBacktestTask(taskId: string) {
+  return apiRequest<BacktestTaskStatusResponse>(`/api/backtest/tasks/${taskId}/cancel`, {
+    method: 'POST',
+    timeoutMs: 30_000,
+  })
+}
+
 export function getDailyReviews(params?: { date_from?: string; date_to?: string }) {
   const query = new URLSearchParams()
   if (params?.date_from) query.set('date_from', params.date_from)

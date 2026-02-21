@@ -438,7 +438,7 @@ export interface BacktestTaskProgress {
 
 export interface BacktestTaskStatusResponse {
   task_id: string
-  status: 'pending' | 'running' | 'succeeded' | 'failed'
+  status: 'pending' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled'
   progress: BacktestTaskProgress
   result?: BacktestResponse | null
   error?: string | null

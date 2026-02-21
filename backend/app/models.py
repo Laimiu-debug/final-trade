@@ -436,7 +436,7 @@ class BacktestTaskProgress(BaseModel):
 
 class BacktestTaskStatusResponse(BaseModel):
     task_id: str
-    status: Literal["pending", "running", "succeeded", "failed"]
+    status: Literal["pending", "running", "paused", "succeeded", "failed", "cancelled"]
     progress: BacktestTaskProgress
     result: BacktestResponse | None = None
     error: str | None = None

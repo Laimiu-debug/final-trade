@@ -219,6 +219,39 @@ def get_backtest_task(task_id: str = Path(min_length=8, max_length=64)) -> Backt
     return task
 
 
+@app.post("/api/backtest/tasks/{task_id}/pause", response_model=BacktestTaskStatusResponse)
+def post_backtest_task_pause(task_id: str = Path(min_length=8, max_length=64)) -> BacktestTaskStatusResponse | JSONResponse:
+    try:
+        return store.pause_backtest_task(task_id)
+    except BacktestValidationError as exc:
+        status_code = 404 if exc.code == "BACKTEST_TASK_NOT_FOUND" else 400
+        return error_response(status_code, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.post("/api/backtest/tasks/{task_id}/resume", response_model=BacktestTaskStatusResponse)
+def post_backtest_task_resume(task_id: str = Path(min_length=8, max_length=64)) -> BacktestTaskStatusResponse | JSONResponse:
+    try:
+        return store.resume_backtest_task(task_id)
+    except BacktestValidationError as exc:
+        status_code = 404 if exc.code == "BACKTEST_TASK_NOT_FOUND" else 400
+        return error_response(status_code, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.post("/api/backtest/tasks/{task_id}/cancel", response_model=BacktestTaskStatusResponse)
+def post_backtest_task_cancel(task_id: str = Path(min_length=8, max_length=64)) -> BacktestTaskStatusResponse | JSONResponse:
+    try:
+        return store.cancel_backtest_task(task_id)
+    except BacktestValidationError as exc:
+        status_code = 404 if exc.code == "BACKTEST_TASK_NOT_FOUND" else 400
+        return error_response(status_code, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
 @app.post("/api/sim/orders", response_model=CreateOrderResponse)
 def post_order(payload: CreateOrderRequest) -> CreateOrderResponse:
     return store.create_order(payload)

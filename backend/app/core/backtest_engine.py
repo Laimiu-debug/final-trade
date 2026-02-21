@@ -274,6 +274,7 @@ class BacktestEngine:
         matrix_bundle: MatrixBundle,
         matrix_signals: BacktestSignalMatrix,
         allowed_symbols_by_date: dict[str, set[str]] | None = None,
+        control_callback: Callable[[], None] | None = None,
     ) -> tuple[list[CandidateTrade], int]:
         dates = list(matrix_bundle.dates)
         if not dates:
@@ -303,6 +304,8 @@ class BacktestEngine:
         t1_no_sellable_skips = 0
 
         for raw_symbol in symbols:
+            if control_callback is not None:
+                control_callback()
             symbol = str(raw_symbol).strip().lower()
             col = symbol_to_col.get(symbol)
             if col is None:
@@ -320,6 +323,8 @@ class BacktestEngine:
 
             cursor = 0
             while cursor < len(in_range_indexes) - 1:
+                if control_callback is not None:
+                    control_callback()
                 signal_index = in_range_indexes[cursor]
                 signal_day = dates[signal_index]
                 if not bool(valid_col[signal_index]):
@@ -407,6 +412,7 @@ class BacktestEngine:
         start_date: str,
         end_date: str,
         allowed_symbols_by_date: dict[str, set[str]] | None = None,
+        control_callback: Callable[[], None] | None = None,
     ) -> tuple[list[CandidateTrade], int]:
         candles = self._get_candles(symbol)
         if len(candles) < 30:
@@ -425,6 +431,8 @@ class BacktestEngine:
         t1_no_sellable_skips = 0
 
         for idx in in_range_indexes:
+            if control_callback is not None:
+                control_callback()
             as_of_date = candles[idx].time
             if allowed_symbols_by_date is not None:
                 allowed_today = allowed_symbols_by_date.get(as_of_date, set())
@@ -533,7 +541,10 @@ class BacktestEngine:
         allowed_symbols_by_date: dict[str, set[str]] | None = None,
         matrix_bundle: MatrixBundle | None = None,
         matrix_signals: BacktestSignalMatrix | None = None,
+        control_callback: Callable[[], None] | None = None,
     ) -> BacktestResponse:
+        if control_callback is not None:
+            control_callback()
         start_dt = self._parse_date(payload.date_from)
         end_dt = self._parse_date(payload.date_to)
         if start_dt is None or end_dt is None:
@@ -553,18 +564,22 @@ class BacktestEngine:
                 matrix_bundle=matrix_bundle,
                 matrix_signals=matrix_signals,
                 allowed_symbols_by_date=allowed_symbols_by_date,
+                control_callback=control_callback,
             )
             notes.append("鐭╅樀淇″彿寮曟搸: 浣跨敤 (T,N) 淇″彿鍒囩墖璺緞锛岃烦杩囬€愯偂閫愭棩 snapshot 閲嶇畻銆?")
         else:
             candidates = []
             total_t1_skips = 0
             for symbol in symbols:
+                if control_callback is not None:
+                    control_callback()
                 rows, t1_skips = self._build_candidates_for_symbol(
                     symbol,
                     payload,
                     start_date,
                     end_date,
                     allowed_symbols_by_date=allowed_symbols_by_date,
+                    control_callback=control_callback,
                 )
                 candidates.extend(rows)
                 total_t1_skips += t1_skips
@@ -625,6 +640,8 @@ class BacktestEngine:
             active_positions = remaining_positions
 
         for row in candidates:
+            if control_callback is not None:
+                control_callback()
             release_until(row.entry_date)
 
             if len(active_positions) >= payload.max_positions:
@@ -773,6 +790,8 @@ class BacktestEngine:
 
         equity_curve: list[EquityPoint] = []
         for day in trading_dates:
+            if control_callback is not None:
+                control_callback()
             for idx, trade in entries_by_date.get(day, []):
                 entry_exec = float(trade.entry_price) * (1 + fee_rate)
                 invested = float(trade.quantity) * entry_exec

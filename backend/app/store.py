@@ -129,6 +129,10 @@ class BacktestValidationError(ValueError):
         self.code = str(code or "BACKTEST_INVALID")
 
 
+class BacktestTaskCancelledError(RuntimeError):
+    pass
+
+
 class InMemoryStore:
     _APP_STATE_SCHEMA_VERSION = 2
     _FULL_MARKET_SYSTEM_PROTECT_LIMIT = 6000
@@ -4291,7 +4295,10 @@ class InMemoryStore:
         allowed_symbols_by_date: dict[str, set[str]] | None,
         progress_callback: Callable[[str, int, int, str], None] | None = None,
         progress_total_dates: int | None = None,
+        control_callback: Callable[[], None] | None = None,
     ) -> tuple[BacktestResponse, str]:
+        if control_callback is not None:
+            control_callback()
         self._validate_backtest_data_coverage(
             payload,
             symbols,
@@ -4320,6 +4327,8 @@ class InMemoryStore:
             cache_key=cache_key,
             use_cache=True,
         )
+        if control_callback is not None:
+            control_callback()
         if not bundle.dates or not bundle.symbols:
             raise ValueError("矩阵引擎未构建出有效数据，请检查K线覆盖范围。")
 
@@ -4327,6 +4336,8 @@ class InMemoryStore:
             bundle,
             top_n=max(50, min(2000, int(self._config.top_n))),
         )
+        if control_callback is not None:
+            control_callback()
         if progress_callback is not None and progress_total_dates is not None:
             total_safe = max(1, int(progress_total_dates))
             progress_callback(
@@ -4343,6 +4354,7 @@ class InMemoryStore:
             allowed_symbols_by_date=allowed_symbols_by_date,
             matrix_bundle=bundle,
             matrix_signals=signal_matrix,
+            control_callback=control_callback,
         )
 
         shape_t, shape_n = bundle.shape()
@@ -4360,7 +4372,10 @@ class InMemoryStore:
         board_filters: list[BoardFilter],
         trend_pool_params: ScreenerParams | None,
         progress_callback: Callable[[str, int, int, str], None] | None,
+        control_callback: Callable[[], None] | None,
     ) -> tuple[list[str], dict[str, set[str]], list[str], list[str]]:
+        if control_callback is not None:
+            control_callback()
         scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
         if not scan_dates:
             raise ValueError("回测区间内无可扫描交易日。")
@@ -4408,6 +4423,7 @@ class InMemoryStore:
                 allowed_symbols_by_date=seed_allowed_by_date,
                 progress_callback=None,
                 progress_total_dates=None,
+                control_callback=control_callback,
             )
             refresh_date_set: set[str] = {scan_dates[0]}
             for trade in probe_result.trades:
@@ -4441,6 +4457,7 @@ class InMemoryStore:
         payload: BacktestRunRequest,
         board_filters: list[BoardFilter],
         progress_callback: Callable[[str, int, int, str], None] | None = None,
+        control_callback: Callable[[], None] | None = None,
     ) -> BacktestResponse:
         degraded_reason: str | None = None
         resolved_run_id: str | None = None
@@ -4463,6 +4480,7 @@ class InMemoryStore:
             board_filters=board_filters,
             trend_pool_params=trend_pool_params,
             progress_callback=progress_callback,
+            control_callback=control_callback,
         )
         pool_notes = [*pool_notes, *rolling_notes]
         if not rolling_symbols:
@@ -4475,6 +4493,7 @@ class InMemoryStore:
             allowed_symbols_by_date=rolling_allowed_by_date,
             progress_callback=progress_callback,
             progress_total_dates=max(1, len(scan_dates)),
+            control_callback=control_callback,
         )
 
         notes = [matrix_note, *pool_notes, *list(result.notes)]
@@ -4626,8 +4645,21 @@ class InMemoryStore:
         payload: BacktestRunRequest,
         *,
         progress_callback: Callable[[str, int, int, str], None] | None = None,
+        control_callback: Callable[[], None] | None = None,
     ) -> BacktestResponse:
         board_filters = [item for item in payload.board_filters if item in {"main", "gem", "star", "beijing", "st"}]
+        if control_callback is not None:
+            control_callback()
+        effective_progress_callback = progress_callback
+        if control_callback is not None:
+
+            def _progress_with_control(current_date: str, processed_dates: int, total: int, message: str) -> None:
+                control_callback()
+                if progress_callback is not None:
+                    progress_callback(current_date, processed_dates, total, message)
+
+            effective_progress_callback = _progress_with_control
+
         matrix_fallback_note: str | None = None
         matrix_supported = (
             payload.mode in {"full_market", "trend_pool"}
@@ -4638,8 +4670,11 @@ class InMemoryStore:
                 return self._run_backtest_matrix(
                     payload=payload,
                     board_filters=board_filters,
-                    progress_callback=progress_callback,
+                    progress_callback=effective_progress_callback,
+                    control_callback=control_callback,
                 )
+            except BacktestTaskCancelledError:
+                raise
             except Exception as exc:
                 matrix_fallback_note = f"矩阵引擎执行失败，已回退旧路径：{exc}"
 
@@ -4696,14 +4731,15 @@ class InMemoryStore:
                     payload=payload,
                     symbols=seed_symbols,
                     allowed_symbols_by_date=seed_allowed_by_date,
+                    control_callback=control_callback,
                 )
                 refresh_date_set: set[str] = {scan_dates[0]}
                 for trade in probe_result.trades:
                     next_day = self._next_scan_date(scan_dates, trade.exit_date)
                     if next_day:
                         refresh_date_set.add(next_day)
-                if progress_callback is not None:
-                    progress_callback(
+                if effective_progress_callback is not None:
+                    effective_progress_callback(
                         scan_dates[0],
                         0,
                         max(1, len(refresh_date_set)),
@@ -4715,7 +4751,7 @@ class InMemoryStore:
                         screener_params=trend_pool_params,
                         board_filters=board_filters,
                         refresh_dates=sorted(refresh_date_set),
-                        progress_callback=progress_callback,
+                        progress_callback=effective_progress_callback,
                     )
                 )
                 pool_notes = [
@@ -4729,7 +4765,7 @@ class InMemoryStore:
                     screener_params=trend_pool_params,
                     board_filters=board_filters,
                     refresh_dates=None,
-                    progress_callback=progress_callback,
+                    progress_callback=effective_progress_callback,
                 )
                 pool_notes = [*pool_notes, *notes]
             if not rolling_symbols:
@@ -4754,14 +4790,15 @@ class InMemoryStore:
                     payload=payload,
                     symbols=seed_symbols,
                     allowed_symbols_by_date=seed_allowed_by_date,
+                    control_callback=control_callback,
                 )
                 refresh_date_set: set[str] = {scan_dates[0]}
                 for trade in probe_result.trades:
                     next_day = self._next_scan_date(scan_dates, trade.exit_date)
                     if next_day:
                         refresh_date_set.add(next_day)
-                if progress_callback is not None:
-                    progress_callback(
+                if effective_progress_callback is not None:
+                    effective_progress_callback(
                         scan_dates[0],
                         0,
                         max(1, len(refresh_date_set)),
@@ -4772,7 +4809,7 @@ class InMemoryStore:
                         payload=payload,
                         board_filters=board_filters,
                         refresh_dates=sorted(refresh_date_set),
-                        progress_callback=progress_callback,
+                        progress_callback=effective_progress_callback,
                     )
                 )
                 pool_notes = [
@@ -4785,7 +4822,7 @@ class InMemoryStore:
                     payload=payload,
                     board_filters=board_filters,
                     refresh_dates=None,
-                    progress_callback=progress_callback,
+                    progress_callback=effective_progress_callback,
                 )
                 pool_notes = [*pool_notes, *notes]
             if not rolling_symbols:
@@ -4809,6 +4846,7 @@ class InMemoryStore:
             payload=payload,
             symbols=symbols,
             allowed_symbols_by_date=allowed_symbols_by_date,
+            control_callback=control_callback,
         )
 
         notes = list(result.notes)
@@ -4978,7 +5016,7 @@ class InMemoryStore:
             self._start_backtest_task_worker(task_id, payload, resumed=True)
 
     def _upsert_backtest_task(self, task: BacktestTaskStatusResponse) -> None:
-        force_persist = task.status in {"succeeded", "failed"}
+        force_persist = task.status in {"paused", "succeeded", "failed", "cancelled"}
         with self._backtest_task_lock:
             self._backtest_tasks[task.task_id] = task
             if len(self._backtest_tasks) > 80:
@@ -4998,6 +5036,115 @@ class InMemoryStore:
                 return None
             return task.model_copy(deep=True)
 
+    def _await_backtest_task_runnable(self, task_id: str) -> None:
+        while True:
+            task = self.get_backtest_task(task_id)
+            if task is None:
+                raise BacktestTaskCancelledError("任务不存在，无法继续执行。")
+            if task.status == "cancelled":
+                raise BacktestTaskCancelledError("任务已停止。")
+            if task.status in {"succeeded", "failed"}:
+                raise BacktestTaskCancelledError(f"任务状态已结束：{task.status}")
+            if task.status == "paused":
+                time.sleep(0.25)
+                continue
+            if task.status in {"pending", "running"}:
+                return
+            time.sleep(0.25)
+
+    def _control_backtest_task(
+        self,
+        task_id: str,
+        action: Literal["pause", "resume", "cancel"],
+    ) -> BacktestTaskStatusResponse:
+        payload_for_resume: BacktestRunRequest | None = None
+        now_text = self._now_datetime()
+        with self._backtest_task_lock:
+            task = self._backtest_tasks.get(task_id)
+            if task is None:
+                raise BacktestValidationError("BACKTEST_TASK_NOT_FOUND", "回测任务不存在")
+            if action == "pause":
+                if task.status in {"succeeded", "failed", "cancelled"}:
+                    raise BacktestValidationError(
+                        "BACKTEST_TASK_CONTROL_INVALID",
+                        f"任务当前状态为 {task.status}，无法暂停。",
+                    )
+                if task.status != "paused":
+                    task = task.model_copy(
+                        update={
+                            "status": "paused",
+                            "progress": task.progress.model_copy(
+                                update={
+                                    "message": "任务已暂停。",
+                                    "updated_at": now_text,
+                                }
+                            ),
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                    self._backtest_tasks[task_id] = task
+            elif action == "resume":
+                if task.status in {"succeeded", "failed", "cancelled"}:
+                    raise BacktestValidationError(
+                        "BACKTEST_TASK_CONTROL_INVALID",
+                        f"任务当前状态为 {task.status}，无法继续执行。",
+                    )
+                if task.status == "paused":
+                    payload_for_resume = self._backtest_task_payloads.get(task_id)
+                    if payload_for_resume is None:
+                        raise BacktestValidationError(
+                            "BACKTEST_TASK_RESUME_PAYLOAD_MISSING",
+                            "任务参数缺失，无法继续执行。",
+                        )
+                    task = task.model_copy(
+                        update={
+                            "status": "pending",
+                            "progress": task.progress.model_copy(
+                                update={
+                                    "message": "任务已恢复，等待继续执行。",
+                                    "updated_at": now_text,
+                                }
+                            ),
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                    self._backtest_tasks[task_id] = task
+            else:
+                if task.status not in {"succeeded", "failed", "cancelled"}:
+                    task = task.model_copy(
+                        update={
+                            "status": "cancelled",
+                            "progress": task.progress.model_copy(
+                                update={
+                                    "message": "任务已停止。",
+                                    "updated_at": now_text,
+                                }
+                            ),
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                    self._backtest_tasks[task_id] = task
+
+        current = self.get_backtest_task(task_id)
+        if current is None:
+            raise BacktestValidationError("BACKTEST_TASK_NOT_FOUND", "回测任务不存在")
+        self._persist_backtest_task_state(force=current.status in {"paused", "cancelled"})
+        if action == "resume" and payload_for_resume is not None:
+            self._start_backtest_task_worker(task_id, payload_for_resume, resumed=True)
+        return current
+
+    def pause_backtest_task(self, task_id: str) -> BacktestTaskStatusResponse:
+        return self._control_backtest_task(task_id, "pause")
+
+    def resume_backtest_task(self, task_id: str) -> BacktestTaskStatusResponse:
+        return self._control_backtest_task(task_id, "resume")
+
+    def cancel_backtest_task(self, task_id: str) -> BacktestTaskStatusResponse:
+        return self._control_backtest_task(task_id, "cancel")
+
     def _start_backtest_task_worker(
         self,
         task_id: str,
@@ -5012,6 +5159,10 @@ class InMemoryStore:
 
         def _worker() -> None:
             try:
+                task = self.get_backtest_task(task_id)
+                if task is None:
+                    return
+                self._await_backtest_task_runnable(task_id)
                 task = self.get_backtest_task(task_id)
                 if task is None:
                     return
@@ -5034,6 +5185,7 @@ class InMemoryStore:
                 )
 
                 def _progress(current_date: str, processed_dates: int, total: int, message: str) -> None:
+                    self._await_backtest_task_runnable(task_id)
                     current_task = self.get_backtest_task(task_id)
                     if current_task is None:
                         return
@@ -5054,7 +5206,11 @@ class InMemoryStore:
                         current_task.model_copy(update={"status": "running", "progress": next_progress})
                     )
 
-                result = self.run_backtest(payload, progress_callback=_progress)
+                result = self.run_backtest(
+                    payload,
+                    progress_callback=_progress,
+                    control_callback=lambda: self._await_backtest_task_runnable(task_id),
+                )
                 finished_task = self.get_backtest_task(task_id)
                 if finished_task is None:
                     return
@@ -5072,6 +5228,28 @@ class InMemoryStore:
                             "status": "succeeded",
                             "progress": done_progress,
                             "result": result,
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                )
+            except BacktestTaskCancelledError:
+                cancelled_task = self.get_backtest_task(task_id)
+                if cancelled_task is None:
+                    return
+                if cancelled_task.status == "cancelled":
+                    return
+                cancelled_progress = cancelled_task.progress.model_copy(
+                    update={
+                        "message": "任务已停止。",
+                        "updated_at": self._now_datetime(),
+                    }
+                )
+                self._upsert_backtest_task(
+                    cancelled_task.model_copy(
+                        update={
+                            "status": "cancelled",
+                            "progress": cancelled_progress,
                             "error": None,
                             "error_code": None,
                         }
