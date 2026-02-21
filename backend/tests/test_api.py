@@ -230,6 +230,77 @@ def test_screener_result_cache_reuses_persisted_payload(
     assert call_counter["count"] == 1
 
 
+def test_screener_result_cache_reuses_payload_without_as_of_date(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TDX_TREND_SCREENER_RESULT_CACHE", "1")
+    monkeypatch.setenv("TDX_TREND_SCREENER_RESULT_CACHE_TTL_SEC", "3600")
+    monkeypatch.setenv("TDX_TREND_SCREENER_RESULT_CACHE_DIR", str(tmp_path / "screener-result-cache-no-date"))
+
+    call_counter = {"count": 0}
+
+    def _fake_load_input_pool_rows(
+        *,
+        markets: list[str],
+        return_window_days: int,
+        as_of_date: str | None,
+    ) -> tuple[list[ScreenerResult], str | None, bool]:
+        _ = (markets, return_window_days, as_of_date)
+        call_counter["count"] += 1
+        row = ScreenerResult(
+            symbol="sz300750",
+            name="宁德时代",
+            latest_price=10.0,
+            day_change=0.1,
+            day_change_pct=0.01,
+            score=80,
+            ret40=0.25,
+            turnover20=0.08,
+            amount20=8e8,
+            amplitude20=0.05,
+            retrace20=0.03,
+            pullback_days=3,
+            ma10_above_ma20_days=8,
+            ma5_above_ma10_days=6,
+            price_vs_ma20=0.06,
+            vol_slope20=0.1,
+            up_down_volume_ratio=1.4,
+            pullback_volume_ratio=0.7,
+            has_blowoff_top=False,
+            has_divergence_5d=False,
+            has_upper_shadow_risk=False,
+            ai_confidence=0.7,
+            theme_stage="发酵中",
+            trend_class="A",
+            stage="Mid",
+            labels=["latest"],
+            reject_reasons=[],
+            degraded=False,
+            degraded_reason=None,
+        )
+        return [row], None, False
+
+    monkeypatch.setattr(store, "_load_input_pool_rows", _fake_load_input_pool_rows)
+
+    payload = {
+        "markets": ["sh", "sz"],
+        "mode": "strict",
+        "return_window_days": 40,
+        "top_n": 500,
+        "turnover_threshold": 0.05,
+        "amount_threshold": 500000000,
+        "amplitude_threshold": 0.03,
+    }
+
+    run1 = client.post("/api/screener/run", json=payload)
+    assert run1.status_code == 200
+    run2 = client.post("/api/screener/run", json=payload)
+    assert run2.status_code == 200
+    assert run2.json()["run_id"] != run1.json()["run_id"]
+    assert call_counter["count"] == 1
+
+
 def test_annotation_roundtrip() -> None:
     decision_keep = chr(0x4FDD) + chr(0x7559)
     payload = {

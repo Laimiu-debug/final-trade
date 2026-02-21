@@ -3211,6 +3211,19 @@ class InMemoryStore:
         return self._env_flag("TDX_TREND_SCREENER_RESULT_CACHE", True)
 
     @staticmethod
+    def _screener_input_pool_load_timeout_sec() -> float | None:
+        raw = os.getenv("TDX_TREND_SCREENER_INPUT_POOL_LOAD_TIMEOUT_SEC", "").strip()
+        if not raw:
+            return 120.0
+        try:
+            parsed = float(raw)
+        except Exception:
+            return 120.0
+        if parsed <= 0:
+            return None
+        return parsed
+
+    @staticmethod
     def _screener_result_cache_ttl_sec() -> float:
         raw = os.getenv("TDX_TREND_SCREENER_RESULT_CACHE_TTL_SEC", "").strip()
         if not raw:
@@ -3222,12 +3235,16 @@ class InMemoryStore:
 
     @staticmethod
     def _is_screener_result_cache_eligible(params: ScreenerParams) -> bool:
-        return bool(str(params.as_of_date or "").strip())
+        _ = params
+        return True
 
     def _build_screener_result_cache_key(self, params: ScreenerParams) -> str:
+        normalized_as_of_date = str(params.as_of_date or "").strip() or "__latest__"
+        params_raw = params.model_dump(exclude_none=True)
+        params_raw["as_of_date"] = normalized_as_of_date
         payload = {
             "version": self._SCREENER_RESULT_CACHE_VERSION,
-            "params": params.model_dump(exclude_none=True),
+            "params": params_raw,
             "config": {
                 "tdx_root": str(self._resolve_user_path(self._config.tdx_data_path)),
                 "market_data_source": str(self._config.market_data_source).strip(),
@@ -4468,6 +4485,7 @@ class InMemoryStore:
             markets=markets,
             return_window_days=return_window_days,
             as_of_date=as_of_date,
+            load_timeout_sec=self._screener_input_pool_load_timeout_sec(),
         )
         typed_rows = [row for row in rows if isinstance(row, ScreenerResult)]
         if cache_enabled:

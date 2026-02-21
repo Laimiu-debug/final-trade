@@ -59,7 +59,7 @@ export function runScreener(params: ScreenerParams) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
-    timeoutMs: 240_000,
+    timeoutMs: 420_000,
   })
 }
 

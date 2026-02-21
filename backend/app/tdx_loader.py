@@ -748,6 +748,21 @@ def _input_pool_runtime_cache_ttl_sec() -> float:
         return 1800.0
 
 
+def _normalize_input_pool_load_timeout_sec(raw_value: object) -> float | None:
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    try:
+        parsed = float(text)
+    except Exception:
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
 def _input_pool_runtime_cache_key(
     *,
     tdx_root: str,
@@ -809,6 +824,7 @@ def load_input_pool_from_tdx(
     markets: list[str],
     return_window_days: int,
     as_of_date: str | None = None,
+    load_timeout_sec: float | None = None,
 ) -> tuple[list[ScreenerResult], str | None]:
     normalized_markets = [str(market).strip().lower() for market in markets if str(market).strip()]
     cache_key = _input_pool_runtime_cache_key(
@@ -832,12 +848,21 @@ def load_input_pool_from_tdx(
     rows: list[ScreenerResult] = []
     missing_float_shares = 0
     parse_bars = _resolve_day_parse_bars(return_window_days, as_of_date)
+    timeout_sec = _normalize_input_pool_load_timeout_sec(load_timeout_sec)
+    deadline_ts = (time.perf_counter() + timeout_sec) if timeout_sec is not None else None
+    timed_out = False
     for market in markets_key:
+        if deadline_ts is not None and time.perf_counter() >= deadline_ts:
+            timed_out = True
+            break
         market_dir = root / market / "lday"
         if not market_dir.exists():
             continue
 
         for file_path in market_dir.glob("*.day"):
+            if deadline_ts is not None and time.perf_counter() >= deadline_ts:
+                timed_out = True
+                break
             symbol = _normalize_symbol(file_path.stem, market)
             if not symbol or not _is_a_share_symbol(symbol):
                 continue
@@ -862,8 +887,12 @@ def load_input_pool_from_tdx(
                 if row.degraded:
                     missing_float_shares += 1
                 rows.append(row)
+        if timed_out:
+            break
 
     if not rows:
+        if timed_out:
+            return [], "INPUT_POOL_LOAD_TIMEOUT"
         return [], "TDX_VALID_SERIES_NOT_FOUND"
 
     rows.sort(key=lambda item: item.ret40, reverse=True)
@@ -873,6 +902,9 @@ def load_input_pool_from_tdx(
         result_error = float_shares_error or "FLOAT_SHARES_NOT_FOUND"
     elif missing_float_shares > 0:
         result_error = "PARTIAL_FLOAT_SHARES_MISSING"
+    if timed_out:
+        timeout_error = "INPUT_POOL_LOAD_TIMEOUT_PARTIAL"
+        result_error = f"{result_error}|{timeout_error}" if result_error else timeout_error
 
     if _input_pool_runtime_cache_enabled():
         _save_input_pool_runtime_cache(cache_key, rows, result_error)
