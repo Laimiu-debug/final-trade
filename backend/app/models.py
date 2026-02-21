@@ -422,6 +422,12 @@ class BacktestTaskStartResponse(BaseModel):
     task_id: str
 
 
+class BacktestTaskStageTiming(BaseModel):
+    stage_key: str
+    label: str
+    elapsed_ms: int = Field(default=0, ge=0)
+
+
 class BacktestTaskProgress(BaseModel):
     mode: BacktestPoolRollMode = "daily"
     current_date: str | None = None
@@ -430,6 +436,7 @@ class BacktestTaskProgress(BaseModel):
     percent: float = 0.0
     message: str = ""
     warning: str | None = None
+    stage_timings: list[BacktestTaskStageTiming] = Field(default_factory=list)
     started_at: str = ""
     updated_at: str = ""
 

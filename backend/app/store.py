@@ -37,6 +37,7 @@ from .models import (
     BacktestPoolRollMode,
     BacktestResponse,
     BacktestTaskProgress,
+    BacktestTaskStageTiming,
     BacktestTaskStatusResponse,
     BoardFilter,
     Market,
@@ -150,6 +151,9 @@ class InMemoryStore:
     _BACKTEST_RESULT_CACHE_VERSION = "backtest-result-v1"
     _BACKTEST_SIGNAL_MATRIX_CACHE_VERSION = "signal-matrix-v1"
     _BACKTEST_PRECHECK_CACHE_VERSION = "precheck-v1"
+    _BACKTEST_MATRIX_TIMING_RE = re.compile(
+        r"耗时\[建矩阵=(?P<matrix>[\d.]+)s,\s*算信号=(?P<signal>[\d.]+)s,\s*撮合=(?P<match>[\d.]+)s,\s*总计=(?P<total>[\d.]+)s\]"
+    )
 
     def __init__(self, app_state_path: str | None = None, sim_state_path: str | None = None) -> None:
         self._lock = RLock()
@@ -5751,11 +5755,16 @@ class InMemoryStore:
                 ),
             )
 
+        covered_from_ratio = covered_from_count / checked_count
+        covered_to_ratio = covered_to_count / checked_count
+        min_coverage_ratio = self._backtest_precheck_min_symbol_coverage_ratio()
         coverage_insufficient = (
             effective_start is None
             or effective_end is None
             or covered_from_count <= 0
             or covered_to_count <= 0
+            or covered_from_ratio < min_coverage_ratio
+            or covered_to_ratio < min_coverage_ratio
             or effective_start > payload.date_from
             or effective_end < payload.date_to
         )
@@ -5770,6 +5779,8 @@ class InMemoryStore:
                 f"有效覆盖约 {effective_start or 'N/A'} ~ {effective_end or 'N/A'}；"
                 f"可覆盖起始日标的 {covered_from_count}/{checked_count}，"
                 f"可覆盖结束日标的 {covered_to_count}/{checked_count}。"
+                f"覆盖比例(起始/结束)={covered_from_ratio:.1%}/{covered_to_ratio:.1%}，"
+                f"最低要求={min_coverage_ratio:.1%}。"
                 "请增大K线窗口或缩短回测区间。"
             ),
         )
@@ -5816,6 +5827,18 @@ class InMemoryStore:
         scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
         if not scan_dates:
             raise BacktestValidationError("BACKTEST_INVALID", "回测区间内无可扫描交易日。")
+        required_bars = max(1, len(scan_dates)) + max(20, int(payload.window_days)) + 5
+        configured_bars = int(self._config.candles_window_bars or 0)
+        if configured_bars > 0 and configured_bars < required_bars:
+            raise BacktestValidationError(
+                "BACKTEST_CANDLES_WINDOW_TOO_SHORT",
+                (
+                    f"回测K线窗口不足：请求区间 {payload.date_from} ~ {payload.date_to} "
+                    f"共 {len(scan_dates)} 个交易日，signal_window={int(payload.window_days)}；"
+                    f"估算至少需要 {required_bars} 根K线，当前 candles_window_bars={configured_bars}。"
+                    "请在设置中提高K线数后重试。"
+                ),
+            )
         first_refresh_date = [scan_dates[0]]
         board_filters = [item for item in payload.board_filters if item in {"main", "gem", "star", "beijing", "st"}]
 
@@ -5858,6 +5881,88 @@ class InMemoryStore:
             return max(0.0, float(raw))
         except Exception:
             return 10 * 60.0
+
+    @staticmethod
+    def _backtest_precheck_min_symbol_coverage_ratio() -> float:
+        raw = os.getenv("TDX_TREND_BACKTEST_PRECHECK_MIN_SYMBOL_COVERAGE", "").strip()
+        if not raw:
+            return 0.08
+        try:
+            parsed = float(raw)
+        except Exception:
+            return 0.08
+        return max(0.0, min(1.0, parsed))
+
+    @staticmethod
+    def _build_backtest_task_stage_timing(
+        stage_key: str,
+        label: str,
+        elapsed_sec: float,
+    ) -> BacktestTaskStageTiming:
+        elapsed_ms = max(0, int(round(float(max(0.0, elapsed_sec)) * 1000.0)))
+        return BacktestTaskStageTiming(
+            stage_key=str(stage_key or "").strip() or "unknown",
+            label=str(label or "").strip() or "未命名阶段",
+            elapsed_ms=elapsed_ms,
+        )
+
+    def _extract_backtest_stage_timings(
+        self,
+        result: BacktestResponse,
+        *,
+        run_elapsed_sec: float,
+    ) -> list[BacktestTaskStageTiming]:
+        notes = list(result.notes)
+        matrix_match: re.Match[str] | None = None
+        for note in notes:
+            if not note:
+                continue
+            matrix_match = self._BACKTEST_MATRIX_TIMING_RE.search(str(note))
+            if matrix_match:
+                break
+
+        if matrix_match is None:
+            return [
+                self._build_backtest_task_stage_timing(
+                    "run_total",
+                    "回测执行",
+                    run_elapsed_sec,
+                )
+            ]
+
+        try:
+            matrix_build = float(matrix_match.group("matrix"))
+            signal_compute = float(matrix_match.group("signal"))
+            execute_match = float(matrix_match.group("match"))
+            matrix_total = float(matrix_match.group("total"))
+        except Exception:
+            return [
+                self._build_backtest_task_stage_timing(
+                    "run_total",
+                    "回测执行",
+                    run_elapsed_sec,
+                )
+            ]
+
+        stage_rows: list[BacktestTaskStageTiming] = []
+        pool_overhead = max(0.0, float(run_elapsed_sec) - float(matrix_total))
+        if pool_overhead >= 0.02:
+            stage_rows.append(
+                self._build_backtest_task_stage_timing(
+                    "rolling_universe",
+                    "候选池构建",
+                    pool_overhead,
+                )
+            )
+        stage_rows.extend(
+            [
+                self._build_backtest_task_stage_timing("matrix_build", "矩阵构建", matrix_build),
+                self._build_backtest_task_stage_timing("signal_compute", "信号计算", signal_compute),
+                self._build_backtest_task_stage_timing("execution_match", "撮合执行", execute_match),
+                self._build_backtest_task_stage_timing("run_total", "回测总耗时", max(run_elapsed_sec, matrix_total)),
+            ]
+        )
+        return stage_rows
 
     def _build_backtest_precheck_cache_key(self, payload: BacktestRunRequest) -> str:
         payload_raw = payload.model_dump(exclude_none=True)
@@ -7037,6 +7142,35 @@ class InMemoryStore:
                 task = self.get_backtest_task(task_id)
                 if task is None:
                     return
+                task_stage_timings: list[BacktestTaskStageTiming] = list(task.progress.stage_timings)
+
+                def _upsert_stage_timing(stage_timing: BacktestTaskStageTiming) -> None:
+                    nonlocal task_stage_timings
+                    stage_key = str(stage_timing.stage_key or "").strip()
+                    if not stage_key:
+                        return
+                    updated = False
+                    next_rows: list[BacktestTaskStageTiming] = []
+                    for row in task_stage_timings:
+                        if str(row.stage_key) == stage_key:
+                            next_rows.append(stage_timing)
+                            updated = True
+                        else:
+                            next_rows.append(row)
+                    if not updated:
+                        next_rows.append(stage_timing)
+                    task_stage_timings = next_rows
+                    current_task = self.get_backtest_task(task_id)
+                    if current_task is None:
+                        return
+                    next_progress = current_task.progress.model_copy(
+                        update={
+                            "stage_timings": list(task_stage_timings),
+                            "updated_at": self._now_datetime(),
+                        }
+                    )
+                    self._upsert_backtest_task(current_task.model_copy(update={"progress": next_progress}))
+
                 self._await_backtest_task_runnable(task_id)
                 task = self.get_backtest_task(task_id)
                 if task is None:
@@ -7045,6 +7179,7 @@ class InMemoryStore:
                 running_progress = task.progress.model_copy(
                     update={
                         "message": running_message,
+                        "stage_timings": list(task_stage_timings),
                         "updated_at": self._now_datetime(),
                     }
                 )
@@ -7077,12 +7212,22 @@ class InMemoryStore:
                                 }
                             )
                         )
+                    precheck_start_ts = time.perf_counter()
                     self._run_backtest_precheck_with_cache(payload)
+                    precheck_elapsed = time.perf_counter() - precheck_start_ts
+                    _upsert_stage_timing(
+                        self._build_backtest_task_stage_timing(
+                            "precheck",
+                            "前置校验",
+                            precheck_elapsed,
+                        )
+                    )
                     post_precheck_task = self.get_backtest_task(task_id)
                     if post_precheck_task is not None:
                         post_precheck_progress = post_precheck_task.progress.model_copy(
                             update={
                                 "message": "任务预检完成，开始回测...",
+                                "stage_timings": list(task_stage_timings),
                                 "updated_at": self._now_datetime(),
                             }
                         )
@@ -7111,6 +7256,7 @@ class InMemoryStore:
                             "total_dates": total_safe,
                             "percent": percent,
                             "message": message,
+                            "stage_timings": list(task_stage_timings),
                             "updated_at": self._now_datetime(),
                         }
                     )
@@ -7118,11 +7264,15 @@ class InMemoryStore:
                         current_task.model_copy(update={"status": "running", "progress": next_progress})
                     )
 
+                run_start_ts = time.perf_counter()
                 result = self.run_backtest(
                     payload,
                     progress_callback=_progress,
                     control_callback=lambda: self._await_backtest_task_runnable(task_id),
                 )
+                run_elapsed = time.perf_counter() - run_start_ts
+                for stage_timing in self._extract_backtest_stage_timings(result, run_elapsed_sec=run_elapsed):
+                    _upsert_stage_timing(stage_timing)
                 finished_task = self.get_backtest_task(task_id)
                 if finished_task is None:
                     return
@@ -7131,6 +7281,7 @@ class InMemoryStore:
                         "percent": 100.0,
                         "processed_dates": max(finished_task.progress.processed_dates, finished_task.progress.total_dates),
                         "message": "回测完成。",
+                        "stage_timings": list(task_stage_timings),
                         "updated_at": self._now_datetime(),
                     }
                 )
@@ -7154,6 +7305,7 @@ class InMemoryStore:
                 cancelled_progress = cancelled_task.progress.model_copy(
                     update={
                         "message": "任务已停止。",
+                        "stage_timings": list(task_stage_timings),
                         "updated_at": self._now_datetime(),
                     }
                 )
@@ -7174,6 +7326,7 @@ class InMemoryStore:
                 failed_progress = failed_task.progress.model_copy(
                     update={
                         "message": "回测失败。",
+                        "stage_timings": list(task_stage_timings),
                         "updated_at": self._now_datetime(),
                     }
                 )
@@ -7199,8 +7352,15 @@ class InMemoryStore:
 
     def start_backtest_task(self, payload: BacktestRunRequest) -> str:
         async_precheck = self._is_backtest_task_precheck_async_enabled()
+        sync_precheck_stage: BacktestTaskStageTiming | None = None
         if not async_precheck:
+            precheck_start_ts = time.perf_counter()
             self._run_backtest_precheck_with_cache(payload)
+            sync_precheck_stage = self._build_backtest_task_stage_timing(
+                "precheck",
+                "前置校验",
+                time.perf_counter() - precheck_start_ts,
+            )
 
         task_id = f"bt_{uuid4().hex[:16]}"
         now_text = self._now_datetime()
@@ -7217,6 +7377,7 @@ class InMemoryStore:
             percent=0.0,
             message=("任务已创建，等待预检。" if async_precheck else "任务已创建，等待执行。"),
             warning=warning,
+            stage_timings=([sync_precheck_stage] if sync_precheck_stage is not None else []),
             started_at=now_text,
             updated_at=now_text,
         )

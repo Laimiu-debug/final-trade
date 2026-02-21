@@ -1672,6 +1672,25 @@ export function BacktestPage() {
   const effectiveRunError =
     runError
     || (taskStatus?.status === 'failed' ? (taskStatus.error?.trim() || '回测任务失败') : null)
+  const taskStageRows = useMemo(() => {
+    const rows = Array.isArray(taskProgress?.stage_timings) ? taskProgress.stage_timings : []
+    const normalized = rows
+      .map((row) => ({
+        stageKey: String(row?.stage_key || '').trim(),
+        label: String(row?.label || '').trim() || '未命名阶段',
+        elapsedMs: Math.max(0, Number(row?.elapsed_ms || 0)),
+      }))
+      .filter((row) => Boolean(row.stageKey))
+    const totalMs = normalized.reduce((acc, row) => acc + row.elapsedMs, 0)
+    return {
+      totalMs,
+      rows: normalized.map((row) => ({
+        ...row,
+        elapsedSecText: `${(row.elapsedMs / 1000).toFixed(2)}s`,
+        shareText: totalMs > 0 ? `${((row.elapsedMs / totalMs) * 100).toFixed(1)}%` : '0.0%',
+      })),
+    }
+  }, [taskProgress?.stage_timings])
 
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
@@ -2466,10 +2485,13 @@ export function BacktestPage() {
 
       {effectiveRunError ? <Alert type="error" title={effectiveRunError} showIcon /> : null}
 
-      {taskRunning ? (
-        <Card title="回测进度">
+      {taskStatus ? (
+        <Card title={taskRunning ? '回测进度' : '最近任务进度'}>
           <Space orientation="vertical" size={8} style={{ width: '100%' }}>
-            <Progress percent={Math.max(0, Math.min(100, Number(taskProgress?.percent ?? 0)))} status="active" />
+            <Progress
+              percent={Math.max(0, Math.min(100, Number(taskProgress?.percent ?? 0)))}
+              status={taskRunning ? 'active' : (taskStatus.status === 'succeeded' ? 'success' : 'normal')}
+            />
             <div>{taskProgress?.message || '任务执行中...'}</div>
             {taskProgress?.current_date ? (
               <div>当前日期：{taskProgress.current_date}</div>
@@ -2480,6 +2502,21 @@ export function BacktestPage() {
               进度：{taskProgress?.processed_dates ?? 0} / {taskProgress?.total_dates ?? 0}
             </div>
             {taskProgress?.warning ? <Alert type="warning" showIcon title={taskProgress.warning} /> : null}
+            {taskStageRows.rows.length > 0 ? (
+              <Card size="small" title={`阶段耗时（累计 ${(taskStageRows.totalMs / 1000).toFixed(2)}s）`}>
+                <Space orientation="vertical" size={6} style={{ width: '100%' }}>
+                  {taskStageRows.rows.map((row) => (
+                    <Space key={row.stageKey} wrap style={{ justifyContent: 'space-between', width: '100%' }}>
+                      <span>{row.label}</span>
+                      <Space wrap size={6}>
+                        <Tag color="geekblue">{row.elapsedSecText}</Tag>
+                        <Tag>{row.shareText}</Tag>
+                      </Space>
+                    </Space>
+                  ))}
+                </Space>
+              </Card>
+            ) : null}
           </Space>
         </Card>
       ) : null}

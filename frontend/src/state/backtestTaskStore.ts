@@ -34,6 +34,7 @@ function buildPendingTask(taskId: string, mode: BacktestPoolRollMode): BacktestT
       percent: 0,
       message: '任务已提交，等待后台执行。',
       warning: null,
+      stage_timings: [],
       started_at: timestamp,
       updated_at: timestamp,
     },

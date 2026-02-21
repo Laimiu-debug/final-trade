@@ -1,4 +1,4 @@
-import { delay, http, HttpResponse } from 'msw'
+﻿import { delay, http, HttpResponse } from 'msw'
 import {
   analyzeStockWithAI,
   cancelOrder,
@@ -86,7 +86,7 @@ export const handlers = [
       return HttpResponse.json(
         {
           code: 'RUN_NOT_FOUND',
-          message: '筛选任务不存在',
+          message: '绛涢€変换鍔′笉瀛樺湪',
           trace_id: `${Date.now()}`,
         },
         { status: 404 },
@@ -243,6 +243,7 @@ export const handlers = [
           percent: 50,
           message: '滚动筛选进度 1/2',
           warning: null,
+          stage_timings: [],
           started_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         },
@@ -259,6 +260,7 @@ export const handlers = [
         percent: 100,
         message: '回测完成。',
         warning: null,
+        stage_timings: [],
         started_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       },
@@ -391,7 +393,7 @@ export const handlers = [
       return HttpResponse.json(
         {
           code: 'REVIEW_DAILY_NOT_FOUND',
-          message: '日复盘不存在',
+          message: '鏃ュ鐩樹笉瀛樺湪',
           trace_id: `${Date.now()}`,
         },
         { status: 404 },
@@ -426,7 +428,7 @@ export const handlers = [
       return HttpResponse.json(
         {
           code: 'REVIEW_WEEKLY_NOT_FOUND',
-          message: '周复盘不存在',
+          message: '鍛ㄥ鐩樹笉瀛樺湪',
           trace_id: `${Date.now()}`,
         },
         { status: 404 },

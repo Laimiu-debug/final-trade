@@ -424,6 +424,12 @@ export interface BacktestTaskStartResponse {
   task_id: string
 }
 
+export interface BacktestTaskStageTiming {
+  stage_key: string
+  label: string
+  elapsed_ms: number
+}
+
 export interface BacktestTaskProgress {
   mode: BacktestPoolRollMode
   current_date?: string | null
@@ -432,6 +438,7 @@ export interface BacktestTaskProgress {
   percent: number
   message: string
   warning?: string | null
+  stage_timings: BacktestTaskStageTiming[]
   started_at: string
   updated_at: string
 }

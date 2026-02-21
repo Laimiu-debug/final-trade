@@ -615,6 +615,93 @@ def test_backtest_task_rejects_when_candle_coverage_insufficient(monkeypatch: py
     assert "2025-11-03" in body["message"]
 
 
+def test_backtest_task_rejects_when_candles_window_too_short(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_scan_dates(_: str, __: str) -> list[str]:
+        return [f"2025-01-{(idx % 28) + 1:02d}" for idx in range(140)]
+
+    monkeypatch.setattr(store, "_build_backtest_scan_dates", _fake_scan_dates)
+    monkeypatch.setattr(store._config, "candles_window_bars", 120)
+    store._clear_backtest_precheck_cache()
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "daily",
+        "date_from": "2025-01-01",
+        "date_to": "2025-12-31",
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 120,
+    }
+
+    resp = client.post("/api/backtest/tasks", json=payload)
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["code"] == "BACKTEST_CANDLES_WINDOW_TOO_SHORT"
+    assert "candles_window_bars=120" in body["message"]
+
+
+def test_backtest_task_records_stage_timings(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_precheck(payload):  # noqa: ANN001
+        _ = payload
+        return None
+
+    def _fake_total_dates(payload):  # noqa: ANN001
+        _ = payload
+        return 3
+
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None):  # noqa: ANN001
+        if progress_callback is not None:
+            progress_callback(payload.date_from, 1, 3, "mock progress")
+            progress_callback(payload.date_to, 3, 3, "mock done")
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.0,
+                total_return=0.0,
+                max_drawdown=0.0,
+                avg_pnl_ratio=0.0,
+                trade_count=0,
+                win_count=0,
+                loss_count=0,
+                profit_factor=0.0,
+            ),
+            trades=[],
+            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+            notes=[
+                (
+                    "矩阵引擎已启用：shape=12x3，windows=[20, 60]，cache=miss，signal_cache=miss，key=mock...；"
+                    "耗时[建矩阵=0.11s, 算信号=0.22s, 撮合=0.33s, 总计=0.66s]"
+                )
+            ],
+        )
+
+    monkeypatch.setattr(store, "_run_backtest_precheck_with_cache", _fake_precheck)
+    monkeypatch.setattr(store, "_estimate_backtest_progress_total_dates", _fake_total_dates)
+    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "daily",
+        "date_from": "2025-01-01",
+        "date_to": "2025-01-03",
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+    }
+
+    start_resp = client.post("/api/backtest/tasks", json=payload)
+    assert start_resp.status_code == 200
+    task_id = str(start_resp.json()["task_id"])
+    final = _wait_backtest_task(task_id, timeout_sec=20.0)
+    assert final["status"] == "succeeded"
+    stage_timings = final["progress"].get("stage_timings") or []
+    stage_keys = {str(row.get("stage_key")) for row in stage_timings if isinstance(row, dict)}
+    assert "precheck" in stage_keys
+    assert "matrix_build" in stage_keys
+    assert "signal_compute" in stage_keys
+    assert "execution_match" in stage_keys
+    assert "run_total" in stage_keys
+
+
 def test_backtest_task_async_precheck_fails_in_worker(monkeypatch: pytest.MonkeyPatch) -> None:
     call_counter = {"precheck": 0, "run": 0}
 
