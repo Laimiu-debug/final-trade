@@ -14,6 +14,15 @@
 后端：FastAPI  
 前端：React + Vite + Ant Design + React Query
 
+## 最近更新（2026-02-21）
+
+- 回测收益平原页面紧凑化：
+  - 热力图设置与候选参数操作合并为右侧栏。
+  - 热力图高度改为自适应封顶，评分图高度下调，减少页面占用。
+- 热力图交互增强：
+  - 增加图内缩放与纵向滑条，便于查看高密度参数网格。
+  - 保留点击方块回填参数、框选加入候选参数集流程。
+
 ## 最近更新（2026-02-19）
 
 - 复盘工作台升级：
@@ -220,6 +229,15 @@ npm run typecheck
 npm run test
 npm run build
 ```
+
+### 打包 EXE（Windows）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build-exe.ps1
+```
+
+输出：
+- `dist/FinalTrade.exe`
 
 ## 首次使用检查清单
 

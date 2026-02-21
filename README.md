@@ -14,6 +14,15 @@ Integrated stock workflow:
 Backend: FastAPI  
 Frontend: React + Vite + Ant Design + React Query
 
+## Recent Updates (2026-02-21)
+
+- Backtest plateau UX compaction:
+  - Merged heatmap settings and candidate actions into a right-side panel.
+  - Reduced chart footprint with adaptive heatmap height cap and compact score chart.
+- Heatmap interaction improvements:
+  - Added inside zoom and a vertical slider for dense parameter grids.
+  - Kept click-to-apply and brush-to-candidates workflow in the compact layout.
+
 ## Recent Updates (2026-02-19)
 
 - Review workspace upgrades:
@@ -220,6 +229,15 @@ npm run typecheck
 npm run test
 npm run build
 ```
+
+### Package EXE (Windows)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build-exe.ps1
+```
+
+Output:
+- `dist/FinalTrade.exe`
 
 ## First Run Checklist
 
