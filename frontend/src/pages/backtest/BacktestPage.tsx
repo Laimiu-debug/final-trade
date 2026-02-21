@@ -1238,7 +1238,7 @@ export function BacktestPage() {
 
     const visualMin = Number.isFinite(minMetricValue) ? Number(minMetricValue.toFixed(6)) : 0
     const visualMax = Number.isFinite(maxMetricValue) ? Number(maxMetricValue.toFixed(6)) : 1
-    const chartHeight = Math.max(320, yAxisCategories.length * 34 + 180)
+    const chartHeight = Math.max(260, Math.min(480, yAxisCategories.length * 24 + 110))
     const selectedKey = plateauHeatmapSelectedCoord
       ? `${plateauHeatmapSelectedCoord[0]}|${plateauHeatmapSelectedCoord[1]}`
       : ''
@@ -1263,25 +1263,56 @@ export function BacktestPage() {
         },
       },
       grid: {
-        left: 96,
-        right: 28,
-        top: 30,
-        bottom: 92,
+        left: 88,
+        right: 64,
+        top: 24,
+        bottom: 84,
       },
       xAxis: {
         type: 'category',
         data: xAxisCategories,
         name: xAxisLabel,
         nameLocation: 'middle',
-        nameGap: 38,
+        nameGap: 34,
+        axisLabel: {
+          interval: 0,
+          hideOverlap: true,
+          rotate: xAxisCategories.length > 8 ? 26 : 0,
+          fontSize: 11,
+        },
       },
       yAxis: {
         type: 'category',
         data: yAxisCategories,
         name: yAxisLabel,
         nameLocation: 'middle',
-        nameGap: 62,
+        nameGap: 56,
+        axisLabel: {
+          hideOverlap: true,
+          fontSize: 11,
+        },
       },
+      dataZoom: [
+        {
+          type: 'inside',
+          xAxisIndex: 0,
+          filterMode: 'none',
+        },
+        {
+          type: 'inside',
+          yAxisIndex: 0,
+          filterMode: 'none',
+        },
+        {
+          type: 'slider',
+          yAxisIndex: 0,
+          right: 18,
+          top: 36,
+          bottom: 78,
+          width: 12,
+          filterMode: 'none',
+        },
+      ],
       visualMap: {
         min: visualMin,
         max: visualMax,
@@ -2261,99 +2292,100 @@ export function BacktestPage() {
 
           {plateauScoreBarOption ? (
             <Card title="评分可视化（Top 30）">
-              <ReactECharts option={plateauScoreBarOption} style={{ height: 280 }} />
+              <ReactECharts option={plateauScoreBarOption} style={{ height: 220 }} />
             </Card>
           ) : null}
 
-          <Card title="热力图设置">
-            <Row gutter={[12, 12]}>
-              <Col xs={24} md={6}>
-                <Space orientation="vertical" style={{ width: '100%' }}>
-                  <span>横轴参数</span>
-                  <Select
-                    value={plateauHeatmapXAxis}
-                    options={PLATEAU_AXIS_OPTIONS.filter((item) => item.value !== plateauHeatmapYAxis)}
-                    onChange={(value) => setPlateauHeatmapXAxis(value as PlateauAxisKey)}
-                  />
-                </Space>
-              </Col>
-              <Col xs={24} md={6}>
-                <Space orientation="vertical" style={{ width: '100%' }}>
-                  <span>纵轴参数</span>
-                  <Select
-                    value={plateauHeatmapYAxis}
-                    options={PLATEAU_AXIS_OPTIONS.filter((item) => item.value !== plateauHeatmapXAxis)}
-                    onChange={(value) => setPlateauHeatmapYAxis(value as PlateauAxisKey)}
-                  />
-                </Space>
-              </Col>
-              <Col xs={24} md={6}>
-                <Space orientation="vertical" style={{ width: '100%' }}>
-                  <span>颜色映射指标</span>
-                  <Select
-                    value={plateauHeatmapMetric}
-                    options={PLATEAU_METRIC_OPTIONS}
-                    onChange={(value) => setPlateauHeatmapMetric(value as PlateauMetricKey)}
-                  />
-                </Space>
-              </Col>
-              <Col xs={24} md={3}>
-                <Space orientation="vertical" style={{ width: '100%' }}>
-                  <span>显示方块值</span>
-                  <Switch checked={plateauHeatmapShowCellLabel} onChange={setPlateauHeatmapShowCellLabel} />
-                </Space>
-              </Col>
-              <Col xs={24} md={3}>
-                <Space orientation="vertical" style={{ width: '100%' }}>
-                  <span>最佳点连线</span>
-                  <Switch checked={plateauHeatmapShowBestPath} onChange={setPlateauHeatmapShowBestPath} />
-                </Space>
-              </Col>
-            </Row>
-          </Card>
-
           {plateauHeatmapOption ? (
             <Card title={plateauHeatmapTitle}>
-              <Space orientation="vertical" size={8} style={{ width: '100%' }}>
-                <Alert
-                  type="info"
-                  showIcon
-                  title="交互说明"
-                  description="点击任意方块可直接回填对应参数组；也可框选多个方块后加入候选参数集。橙色连线表示每个横轴取值下的最优纵轴点。"
-                />
-                <Space wrap>
-                  <Tag color="blue">{`框选方块: ${plateauBrushSelectedKeys.length}`}</Tag>
-                  <Button disabled={plateauBrushSelectedKeys.length <= 0} onClick={handleAddBrushSelectionToCandidates}>
-                    加入候选参数集
-                  </Button>
-                  <Button
-                    disabled={plateauBrushSelectedKeys.length <= 0}
-                    onClick={() => setPlateauBrushSelectedKeys([])}
-                  >
-                    清空框选
-                  </Button>
-                  <Tag color="geekblue">{`候选参数: ${plateauCandidatePoints.length}`}</Tag>
-                  {plateauCandidateOptions.length > 0 ? (
-                    <Select
-                      style={{ minWidth: 320 }}
-                      value={plateauCandidatePickRank}
-                      options={plateauCandidateOptions}
-                      onChange={(value) => setPlateauCandidatePickRank(Number(value))}
+              <Row gutter={[12, 12]}>
+                <Col xs={24} lg={16} xl={17}>
+                  <ReactECharts
+                    option={plateauHeatmapOption}
+                    style={{ height: plateauHeatmapChartHeight, width: '100%' }}
+                    onEvents={plateauHeatmapOnEvents}
+                  />
+                </Col>
+                <Col xs={24} lg={8} xl={7}>
+                  <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+                    <Alert
+                      type="info"
+                      showIcon
+                      title="交互说明"
+                      description="点击方块回填参数；框选后可加入候选参数集。橙线表示每个横轴取值下的最优纵轴点。"
                     />
-                  ) : null}
-                  <Button disabled={!selectedCandidatePoint} onClick={handleApplySelectedCandidatePoint}>
-                    回填候选参数
-                  </Button>
-                  <Button disabled={plateauCandidatePoints.length <= 0} onClick={handleClearCandidatePoints}>
-                    清空候选
-                  </Button>
-                </Space>
-                <ReactECharts
-                  option={plateauHeatmapOption}
-                  style={{ height: plateauHeatmapChartHeight }}
-                  onEvents={plateauHeatmapOnEvents}
-                />
-              </Space>
+                    <Card size="small" title="热力图设置">
+                      <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+                        <span>横轴参数</span>
+                        <Select
+                          value={plateauHeatmapXAxis}
+                          options={PLATEAU_AXIS_OPTIONS.filter((item) => item.value !== plateauHeatmapYAxis)}
+                          onChange={(value) => setPlateauHeatmapXAxis(value as PlateauAxisKey)}
+                          size="small"
+                        />
+                        <span>纵轴参数</span>
+                        <Select
+                          value={plateauHeatmapYAxis}
+                          options={PLATEAU_AXIS_OPTIONS.filter((item) => item.value !== plateauHeatmapXAxis)}
+                          onChange={(value) => setPlateauHeatmapYAxis(value as PlateauAxisKey)}
+                          size="small"
+                        />
+                        <span>颜色映射指标</span>
+                        <Select
+                          value={plateauHeatmapMetric}
+                          options={PLATEAU_METRIC_OPTIONS}
+                          onChange={(value) => setPlateauHeatmapMetric(value as PlateauMetricKey)}
+                          size="small"
+                        />
+                        <Space wrap>
+                          <Tag color="processing">显示方块值</Tag>
+                          <Switch checked={plateauHeatmapShowCellLabel} onChange={setPlateauHeatmapShowCellLabel} />
+                        </Space>
+                        <Space wrap>
+                          <Tag color="orange">最佳点连线</Tag>
+                          <Switch checked={plateauHeatmapShowBestPath} onChange={setPlateauHeatmapShowBestPath} />
+                        </Space>
+                      </Space>
+                    </Card>
+                    <Card size="small" title="候选参数集">
+                      <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+                        <Space wrap>
+                          <Tag color="blue">{`框选方块: ${plateauBrushSelectedKeys.length}`}</Tag>
+                          <Tag color="geekblue">{`候选参数: ${plateauCandidatePoints.length}`}</Tag>
+                        </Space>
+                        <Space wrap>
+                          <Button size="small" disabled={plateauBrushSelectedKeys.length <= 0} onClick={handleAddBrushSelectionToCandidates}>
+                            加入候选
+                          </Button>
+                          <Button
+                            size="small"
+                            disabled={plateauBrushSelectedKeys.length <= 0}
+                            onClick={() => setPlateauBrushSelectedKeys([])}
+                          >
+                            清空框选
+                          </Button>
+                        </Space>
+                        {plateauCandidateOptions.length > 0 ? (
+                          <Select
+                            value={plateauCandidatePickRank}
+                            options={plateauCandidateOptions}
+                            onChange={(value) => setPlateauCandidatePickRank(Number(value))}
+                            size="small"
+                          />
+                        ) : null}
+                        <Space wrap>
+                          <Button size="small" disabled={!selectedCandidatePoint} onClick={handleApplySelectedCandidatePoint}>
+                            回填候选
+                          </Button>
+                          <Button size="small" disabled={plateauCandidatePoints.length <= 0} onClick={handleClearCandidatePoints}>
+                            清空候选
+                          </Button>
+                        </Space>
+                      </Space>
+                    </Card>
+                  </Space>
+                </Col>
+              </Row>
             </Card>
           ) : (
             <Alert
