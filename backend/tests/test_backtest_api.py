@@ -670,7 +670,8 @@ def test_backtest_task_records_stage_timings(monkeypatch: pytest.MonkeyPatch) ->
                 (
                     "矩阵引擎已启用：shape=12x3，windows=[20, 60]，cache=miss，signal_cache=miss，key=mock...；"
                     "耗时[建矩阵=0.11s, 算信号=0.22s, 撮合=0.33s, 总计=0.66s]"
-                )
+                ),
+                "执行细分耗时[候选=0.05s, 撮合=0.21s, 曲线=0.07s]",
             ],
         )
 
@@ -698,7 +699,9 @@ def test_backtest_task_records_stage_timings(monkeypatch: pytest.MonkeyPatch) ->
     assert "precheck" in stage_keys
     assert "matrix_build" in stage_keys
     assert "signal_compute" in stage_keys
+    assert "candidate_build" in stage_keys
     assert "execution_match" in stage_keys
+    assert "equity_curve" in stage_keys
     assert "run_total" in stage_keys
 
 

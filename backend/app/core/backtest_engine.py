@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -71,6 +72,24 @@ class CandidateTrade:
     exit_price: float
     holding_days: int
     exit_reason: str
+
+
+@dataclass
+class MatrixEntryIntent:
+    symbol: str
+    signal_index: int
+    entry_index: int
+    signal_date: str
+    entry_date: str
+    entry_signal: str
+    entry_phase: str
+    entry_quality_score: float
+    entry_phase_score: float
+    entry_events_weight: float
+    entry_structure_score: int
+    entry_trend_score: float
+    entry_volatility_score: float
+    entry_price: float
 
 
 class BacktestEngine:
@@ -536,6 +555,295 @@ class BacktestEngine:
 
         return out, t1_no_sellable_skips
 
+    @staticmethod
+    def _matrix_intent_sort_key(
+        row: MatrixEntryIntent,
+        *,
+        priority_mode: str,
+    ) -> tuple[Any, ...]:
+        if priority_mode == "phase_first":
+            return (
+                row.entry_date,
+                -row.entry_phase_score,
+                -row.entry_quality_score,
+                -row.entry_events_weight,
+                -row.entry_structure_score,
+                row.symbol,
+                row.signal_date,
+            )
+        if priority_mode == "momentum":
+            return (
+                row.entry_date,
+                -row.entry_trend_score,
+                -row.entry_quality_score,
+                -row.entry_events_weight,
+                -row.entry_structure_score,
+                row.symbol,
+                row.signal_date,
+            )
+        return (
+            row.entry_date,
+            -row.entry_quality_score,
+            -row.entry_phase_score,
+            -row.entry_events_weight,
+            -row.entry_structure_score,
+            row.symbol,
+            row.signal_date,
+        )
+
+    def _build_matrix_entry_intents(
+        self,
+        *,
+        payload: BacktestRunRequest,
+        symbols: list[str],
+        start_date: str,
+        end_date: str,
+        matrix_bundle: MatrixBundle,
+        matrix_signals: BacktestSignalMatrix,
+        allowed_symbols_by_date: dict[str, set[str]] | None = None,
+        control_callback: Callable[[], None] | None = None,
+    ) -> list[MatrixEntryIntent]:
+        dates = list(matrix_bundle.dates)
+        if not dates:
+            return []
+
+        total_shape = (len(dates), len(matrix_bundle.symbols))
+        if (
+            matrix_bundle.open.shape != total_shape
+            or matrix_bundle.valid_mask.shape != total_shape
+            or matrix_signals.buy_signal.shape != total_shape
+            or matrix_signals.score.shape != total_shape
+        ):
+            raise ValueError("matrix bundle / signals shape mismatch")
+
+        in_range_mask = np.fromiter(
+            (start_date <= day <= end_date for day in dates),
+            dtype=bool,
+            count=len(dates),
+        )
+        if int(np.count_nonzero(in_range_mask)) < 2:
+            return []
+
+        symbol_to_col = matrix_bundle.symbol_to_index()
+        in_range_valid_buy = matrix_signals.buy_signal & matrix_bundle.valid_mask & in_range_mask[:, np.newaxis]
+        buy_any_by_col = np.any(in_range_valid_buy, axis=0)
+        out: list[MatrixEntryIntent] = []
+
+        for raw_symbol in symbols:
+            if control_callback is not None:
+                control_callback()
+            symbol = str(raw_symbol).strip().lower()
+            col = symbol_to_col.get(symbol)
+            if col is None:
+                continue
+            if not bool(buy_any_by_col[col]):
+                continue
+
+            open_col = matrix_bundle.open[:, col]
+            valid_col = matrix_bundle.valid_mask[:, col]
+            score_col = matrix_signals.score[:, col]
+            buy_indexes = np.flatnonzero(in_range_valid_buy[:, col])
+            if buy_indexes.size <= 0:
+                continue
+            if allowed_symbols_by_date is not None:
+                filtered_indexes = [
+                    int(idx)
+                    for idx in buy_indexes.tolist()
+                    if symbol in allowed_symbols_by_date.get(dates[int(idx)], set())
+                ]
+                if not filtered_indexes:
+                    continue
+                buy_indexes = np.asarray(filtered_indexes, dtype=np.int64)
+
+            for signal_index in buy_indexes.tolist():
+                if control_callback is not None:
+                    control_callback()
+                entry_index = int(signal_index) + 1
+                if entry_index >= len(dates):
+                    continue
+                if not bool(valid_col[entry_index]):
+                    continue
+
+                entry_price = float(open_col[entry_index])
+                if (not math.isfinite(entry_price)) or entry_price <= 0:
+                    continue
+
+                entry_tags: list[str] = []
+                if bool(matrix_signals.s5[signal_index, col]):
+                    entry_tags.append("M5")
+                if bool(matrix_signals.s6[signal_index, col]):
+                    entry_tags.append("M6")
+                if not entry_tags:
+                    entry_tags.append("MATRIX")
+                entry_phase = "吸筹D" if bool(matrix_signals.s7[signal_index, col]) else "阶段未明"
+                raw_quality = float(score_col[signal_index]) if math.isfinite(float(score_col[signal_index])) else 0.0
+                entry_quality_score = max(0.0, min(100.0, raw_quality))
+
+                out.append(
+                    MatrixEntryIntent(
+                        symbol=symbol,
+                        signal_index=int(signal_index),
+                        entry_index=entry_index,
+                        signal_date=dates[signal_index],
+                        entry_date=dates[entry_index],
+                        entry_signal=" / ".join(entry_tags),
+                        entry_phase=entry_phase,
+                        entry_quality_score=entry_quality_score,
+                        entry_phase_score=float(PHASE_PRIORITY_SCORE.get(entry_phase, 0.0)),
+                        entry_events_weight=float(len(entry_tags)),
+                        entry_structure_score=int(bool(matrix_signals.in_pool[signal_index, col])),
+                        entry_trend_score=entry_quality_score,
+                        entry_volatility_score=entry_quality_score,
+                        entry_price=entry_price,
+                    )
+                )
+        return out
+
+    def _execute_matrix_position_intents(
+        self,
+        *,
+        payload: BacktestRunRequest,
+        intents: list[MatrixEntryIntent],
+        matrix_bundle: MatrixBundle,
+        matrix_signals: BacktestSignalMatrix,
+        control_callback: Callable[[], None] | None = None,
+    ) -> tuple[list[BacktestTrade], int, dict[str, int], int]:
+        intent_fee_rate = max(0.0, float(payload.fee_bps)) / 10000.0
+        dates = list(matrix_bundle.dates)
+        symbol_to_col = matrix_bundle.symbol_to_index()
+
+        cash = float(payload.initial_capital)
+        equity = float(payload.initial_capital)
+        max_concurrent_positions = 0
+        active_positions: list[dict[str, float | str]] = []
+        active_symbols: set[str] = set()
+        executed: list[BacktestTrade] = []
+        t1_no_sellable_skips = 0
+        skip_reasons: dict[str, int] = {
+            "max_positions": 0,
+            "insufficient_cash": 0,
+            "invalid_price": 0,
+            "duplicate_symbol": 0,
+        }
+
+        def release_until(current_entry_date: str) -> None:
+            nonlocal cash, equity, active_positions, active_symbols
+            if not active_positions:
+                return
+            remaining_positions: list[dict[str, float | str]] = []
+            for item in active_positions:
+                exit_date = str(item.get("exit_date", ""))
+                if exit_date < current_entry_date:
+                    cash += float(item.get("exit_amount", 0.0))
+                    equity += float(item.get("pnl_amount", 0.0))
+                    symbol_text = str(item.get("symbol", "")).strip().lower()
+                    if symbol_text:
+                        active_symbols.discard(symbol_text)
+                else:
+                    remaining_positions.append(item)
+            active_positions = remaining_positions
+
+        for row in intents:
+            if control_callback is not None:
+                control_callback()
+            release_until(row.entry_date)
+
+            if row.symbol in active_symbols:
+                skip_reasons["duplicate_symbol"] += 1
+                continue
+            if len(active_positions) >= payload.max_positions:
+                skip_reasons["max_positions"] += 1
+                continue
+
+            entry_exec = float(row.entry_price) * (1 + intent_fee_rate)
+            if (not math.isfinite(entry_exec)) or entry_exec <= 0:
+                skip_reasons["invalid_price"] += 1
+                continue
+
+            allocation = min(cash, max(0.0, equity * payload.position_pct))
+            shares = int(math.floor(allocation / entry_exec / 100.0)) * 100
+            if shares <= 0:
+                skip_reasons["insufficient_cash"] += 1
+                continue
+            invested = shares * entry_exec
+            if invested <= 0 or invested > cash + 1e-9:
+                skip_reasons["insufficient_cash"] += 1
+                continue
+
+            col = symbol_to_col.get(row.symbol)
+            if col is None:
+                skip_reasons["invalid_price"] += 1
+                continue
+
+            exit_resolved = self._resolve_exit_matrix(
+                entry_index=row.entry_index,
+                entry_price=float(row.entry_price),
+                high_col=matrix_bundle.high[:, col],
+                low_col=matrix_bundle.low[:, col],
+                close_col=matrix_bundle.close[:, col],
+                valid_col=matrix_bundle.valid_mask[:, col],
+                sell_col=matrix_signals.sell_signal[:, col],
+                payload=payload,
+            )
+            if exit_resolved is None:
+                t1_no_sellable_skips += 1
+                continue
+            exit_index, raw_exit_price, exit_reason = exit_resolved
+            exit_price = float(raw_exit_price)
+            if not math.isfinite(exit_price) or exit_price <= 0:
+                skip_reasons["invalid_price"] += 1
+                continue
+
+            exit_exec = exit_price * (1 - intent_fee_rate)
+            if (not math.isfinite(exit_exec)) or exit_exec <= 0:
+                skip_reasons["invalid_price"] += 1
+                continue
+
+            exit_amount = shares * exit_exec
+            pnl_amount = exit_amount - invested
+            pnl_ratio = pnl_amount / invested if invested > 0 else 0.0
+            cash -= invested
+
+            exit_date = dates[int(exit_index)] if 0 <= int(exit_index) < len(dates) else row.entry_date
+            holding_days = max(0, int(exit_index) - int(row.entry_index) + 1)
+            active_positions.append(
+                {
+                    "symbol": row.symbol,
+                    "exit_date": exit_date,
+                    "exit_amount": float(exit_amount),
+                    "pnl_amount": float(pnl_amount),
+                }
+            )
+            active_symbols.add(row.symbol)
+            max_concurrent_positions = max(max_concurrent_positions, len(active_positions))
+
+            executed.append(
+                BacktestTrade(
+                    symbol=row.symbol,
+                    name=self._resolve_symbol_name(row.symbol),
+                    signal_date=row.signal_date,
+                    entry_date=row.entry_date,
+                    exit_date=exit_date,
+                    entry_signal=row.entry_signal,
+                    entry_phase=row.entry_phase,
+                    entry_quality_score=round(row.entry_quality_score, 2),
+                    exit_reason=exit_reason,
+                    quantity=shares,
+                    entry_price=round(row.entry_price, 4),
+                    exit_price=round(exit_price, 4),
+                    holding_days=holding_days,
+                    pnl_amount=round(pnl_amount, 4),
+                    pnl_ratio=round(pnl_ratio, 6),
+                )
+            )
+
+        if active_positions:
+            for item in sorted(active_positions, key=lambda row: str(row.get("exit_date", ""))):
+                cash += float(item.get("exit_amount", 0.0))
+                equity += float(item.get("pnl_amount", 0.0))
+
+        return executed, max_concurrent_positions, skip_reasons, t1_no_sellable_skips
+
     def run(
         self,
         *,
@@ -557,20 +865,41 @@ class BacktestEngine:
         start_date = start_dt.strftime("%Y-%m-%d")
         end_date = end_dt.strftime("%Y-%m-%d")
         allow_reentry_after_skipped = payload.pool_roll_mode == "position"
+        use_matrix_position_intents = (
+            allow_reentry_after_skipped
+            and matrix_bundle is not None
+            and matrix_signals is not None
+        )
 
         notes: list[str] = []
+        intents: list[MatrixEntryIntent] = []
+        candidate_stage_start = time.perf_counter()
         if matrix_bundle is not None and matrix_signals is not None:
-            candidates, total_t1_skips = self._build_candidates_from_matrix(
-                payload=payload,
-                symbols=symbols,
-                start_date=start_date,
-                end_date=end_date,
-                matrix_bundle=matrix_bundle,
-                matrix_signals=matrix_signals,
-                allowed_symbols_by_date=allowed_symbols_by_date,
-                allow_reentry_after_skipped=allow_reentry_after_skipped,
-                control_callback=control_callback,
-            )
+            if use_matrix_position_intents:
+                candidates = []
+                total_t1_skips = 0
+                intents = self._build_matrix_entry_intents(
+                    payload=payload,
+                    symbols=symbols,
+                    start_date=start_date,
+                    end_date=end_date,
+                    matrix_bundle=matrix_bundle,
+                    matrix_signals=matrix_signals,
+                    allowed_symbols_by_date=allowed_symbols_by_date,
+                    control_callback=control_callback,
+                )
+            else:
+                candidates, total_t1_skips = self._build_candidates_from_matrix(
+                    payload=payload,
+                    symbols=symbols,
+                    start_date=start_date,
+                    end_date=end_date,
+                    matrix_bundle=matrix_bundle,
+                    matrix_signals=matrix_signals,
+                    allowed_symbols_by_date=allowed_symbols_by_date,
+                    allow_reentry_after_skipped=allow_reentry_after_skipped,
+                    control_callback=control_callback,
+                )
             notes.append("矩阵信号引擎: 使用 (T,N) 信号切片路径，跳过逐股逐日 snapshot 重算。")
         else:
             candidates = []
@@ -594,7 +923,15 @@ class BacktestEngine:
         if allow_reentry_after_skipped:
             notes.append("持仓触发滚动：未成交信号不会阻断同一标的后续信号。")
 
-        if payload.prioritize_signals:
+        if use_matrix_position_intents:
+            if payload.prioritize_signals:
+                intents.sort(key=lambda row: self._matrix_intent_sort_key(row, priority_mode=payload.priority_mode))
+                notes.append(f"同日信号按优先级执行（模式: {payload.priority_mode}）。")
+            else:
+                intents.sort(key=lambda row: (row.entry_date, row.symbol, row.signal_date))
+                if payload.priority_topk_per_day > 0:
+                    notes.append("未启用优先级排序，priority_topk_per_day 配置未生效。")
+        elif payload.prioritize_signals:
             candidates.sort(key=lambda row: self._candidate_sort_key(row, priority_mode=payload.priority_mode))
             notes.append(f"同日信号按优先级执行（模式: {payload.priority_mode}）。")
         else:
@@ -602,7 +939,23 @@ class BacktestEngine:
             if payload.priority_topk_per_day > 0:
                 notes.append("未启用优先级排序，priority_topk_per_day 配置未生效。")
 
-        if payload.prioritize_signals and payload.priority_topk_per_day > 0:
+        if use_matrix_position_intents and payload.prioritize_signals and payload.priority_topk_per_day > 0:
+            before_count = len(intents)
+            kept_intents: list[MatrixEntryIntent] = []
+            day_counter: dict[str, int] = defaultdict(int)
+            for row in intents:
+                if day_counter[row.signal_date] >= payload.priority_topk_per_day:
+                    continue
+                kept_intents.append(row)
+                day_counter[row.signal_date] += 1
+            intents = kept_intents
+            dropped = before_count - len(intents)
+            if dropped > 0:
+                notes.append(
+                    f"同日 TopK 限流已生效：每日保留前 {payload.priority_topk_per_day} 笔候选，共过滤 {dropped} 笔。"
+                )
+
+        if (not use_matrix_position_intents) and payload.prioritize_signals and payload.priority_topk_per_day > 0:
             before_count = len(candidates)
             kept: list[CandidateTrade] = []
             day_counter: dict[str, int] = defaultdict(int)
@@ -618,112 +971,128 @@ class BacktestEngine:
                     f"同日 TopK 限流已生效：每日保留前 {payload.priority_topk_per_day} 笔候选，共过滤 {dropped} 笔。"
                 )
 
+        candidate_count = len(intents) if use_matrix_position_intents else len(candidates)
+        candidate_stage_elapsed = time.perf_counter() - candidate_stage_start
+
         fee_rate = max(0.0, float(payload.fee_bps)) / 10000.0
         if fee_rate > 0.01:
             notes.append("fee_bps 超过 100 时，cost_snapshot 仅展示截断后的 commission_rate=1%。")
 
-        cash = float(payload.initial_capital)
-        equity = float(payload.initial_capital)
-        max_concurrent_positions = 0
-        active_positions: list[dict[str, float | str]] = []
-        executed: list[BacktestTrade] = []
-        skip_reasons: dict[str, int] = {
-            "max_positions": 0,
-            "insufficient_cash": 0,
-            "invalid_price": 0,
-            "duplicate_symbol": 0,
-        }
-        active_symbols: set[str] = set()
+        match_stage_start = time.perf_counter()
+        if use_matrix_position_intents and matrix_bundle is not None and matrix_signals is not None:
+            executed, max_concurrent_positions, skip_reasons, t1_skips_exec = self._execute_matrix_position_intents(
+                payload=payload,
+                intents=intents,
+                matrix_bundle=matrix_bundle,
+                matrix_signals=matrix_signals,
+                control_callback=control_callback,
+            )
+            total_t1_skips += t1_skips_exec
+            if t1_skips_exec > 0:
+                notes.append(f"T+1 约束下有 {t1_skips_exec} 笔持仓候选因无可卖出日被跳过。")
+        else:
+            cash = float(payload.initial_capital)
+            equity = float(payload.initial_capital)
+            max_concurrent_positions = 0
+            active_positions: list[dict[str, float | str]] = []
+            executed: list[BacktestTrade] = []
+            skip_reasons: dict[str, int] = {
+                "max_positions": 0,
+                "insufficient_cash": 0,
+                "invalid_price": 0,
+                "duplicate_symbol": 0,
+            }
+            active_symbols: set[str] = set()
 
-        def release_until(current_entry_date: str) -> None:
-            nonlocal cash, equity, active_positions, active_symbols
-            if not active_positions:
-                return
-            remaining_positions: list[dict[str, float | str]] = []
-            for item in active_positions:
-                exit_date = str(item.get("exit_date", ""))
-                if exit_date < current_entry_date:
+            def release_until(current_entry_date: str) -> None:
+                nonlocal cash, equity, active_positions, active_symbols
+                if not active_positions:
+                    return
+                remaining_positions: list[dict[str, float | str]] = []
+                for item in active_positions:
+                    exit_date = str(item.get("exit_date", ""))
+                    if exit_date < current_entry_date:
+                        cash += float(item.get("exit_amount", 0.0))
+                        equity += float(item.get("pnl_amount", 0.0))
+                        symbol_text = str(item.get("symbol", "")).strip().lower()
+                        if symbol_text:
+                            active_symbols.discard(symbol_text)
+                    else:
+                        remaining_positions.append(item)
+                active_positions = remaining_positions
+
+            for row in candidates:
+                if control_callback is not None:
+                    control_callback()
+                release_until(row.entry_date)
+
+                if row.symbol in active_symbols:
+                    skip_reasons["duplicate_symbol"] += 1
+                    continue
+
+                if len(active_positions) >= payload.max_positions:
+                    skip_reasons["max_positions"] += 1
+                    continue
+
+                entry_exec = float(row.entry_price) * (1 + fee_rate)
+                exit_exec = float(row.exit_price) * (1 - fee_rate)
+                if not math.isfinite(entry_exec) or not math.isfinite(exit_exec) or entry_exec <= 0:
+                    skip_reasons["invalid_price"] += 1
+                    continue
+
+                allocation = min(cash, max(0.0, equity * payload.position_pct))
+                shares = int(math.floor(allocation / entry_exec / 100.0)) * 100
+                if shares <= 0:
+                    skip_reasons["insufficient_cash"] += 1
+                    continue
+
+                invested = shares * entry_exec
+                if invested <= 0 or invested > cash + 1e-9:
+                    skip_reasons["insufficient_cash"] += 1
+                    continue
+
+                exit_amount = shares * exit_exec
+                pnl_amount = exit_amount - invested
+                pnl_ratio = pnl_amount / invested if invested > 0 else 0.0
+                cash -= invested
+
+                active_positions.append(
+                    {
+                        "symbol": row.symbol,
+                        "exit_date": row.exit_date,
+                        "exit_amount": float(exit_amount),
+                        "pnl_amount": float(pnl_amount),
+                    }
+                )
+                active_symbols.add(row.symbol)
+                max_concurrent_positions = max(max_concurrent_positions, len(active_positions))
+
+                executed.append(
+                    BacktestTrade(
+                        symbol=row.symbol,
+                        name=self._resolve_symbol_name(row.symbol),
+                        signal_date=row.signal_date,
+                        entry_date=row.entry_date,
+                        exit_date=row.exit_date,
+                        entry_signal=row.entry_signal,
+                        entry_phase=row.entry_phase,
+                        entry_quality_score=round(row.entry_quality_score, 2),
+                        exit_reason=row.exit_reason,
+                        quantity=shares,
+                        entry_price=round(row.entry_price, 4),
+                        exit_price=round(row.exit_price, 4),
+                        holding_days=row.holding_days,
+                        pnl_amount=round(pnl_amount, 4),
+                        pnl_ratio=round(pnl_ratio, 6),
+                    )
+                )
+
+            if active_positions:
+                for item in sorted(active_positions, key=lambda row: str(row.get("exit_date", ""))):
                     cash += float(item.get("exit_amount", 0.0))
                     equity += float(item.get("pnl_amount", 0.0))
-                    symbol_text = str(item.get("symbol", "")).strip().lower()
-                    if symbol_text:
-                        active_symbols.discard(symbol_text)
-                else:
-                    remaining_positions.append(item)
-            active_positions = remaining_positions
 
-        for row in candidates:
-            if control_callback is not None:
-                control_callback()
-            release_until(row.entry_date)
-
-            if row.symbol in active_symbols:
-                skip_reasons["duplicate_symbol"] += 1
-                continue
-
-            if len(active_positions) >= payload.max_positions:
-                skip_reasons["max_positions"] += 1
-                continue
-
-            entry_exec = float(row.entry_price) * (1 + fee_rate)
-            exit_exec = float(row.exit_price) * (1 - fee_rate)
-            if not math.isfinite(entry_exec) or not math.isfinite(exit_exec) or entry_exec <= 0:
-                skip_reasons["invalid_price"] += 1
-                continue
-
-            allocation = min(cash, max(0.0, equity * payload.position_pct))
-            shares = int(math.floor(allocation / entry_exec / 100.0)) * 100
-            if shares <= 0:
-                skip_reasons["insufficient_cash"] += 1
-                continue
-
-            invested = shares * entry_exec
-            if invested <= 0 or invested > cash + 1e-9:
-                skip_reasons["insufficient_cash"] += 1
-                continue
-
-            exit_amount = shares * exit_exec
-            pnl_amount = exit_amount - invested
-            pnl_ratio = pnl_amount / invested if invested > 0 else 0.0
-            cash -= invested
-
-            active_positions.append(
-                {
-                    "symbol": row.symbol,
-                    "exit_date": row.exit_date,
-                    "exit_amount": float(exit_amount),
-                    "pnl_amount": float(pnl_amount),
-                }
-            )
-            active_symbols.add(row.symbol)
-            max_concurrent_positions = max(max_concurrent_positions, len(active_positions))
-
-            executed.append(
-                BacktestTrade(
-                    symbol=row.symbol,
-                    name=self._resolve_symbol_name(row.symbol),
-                    signal_date=row.signal_date,
-                    entry_date=row.entry_date,
-                    exit_date=row.exit_date,
-                    entry_signal=row.entry_signal,
-                    entry_phase=row.entry_phase,
-                    entry_quality_score=round(row.entry_quality_score, 2),
-                    exit_reason=row.exit_reason,
-                    quantity=shares,
-                    entry_price=round(row.entry_price, 4),
-                    exit_price=round(row.exit_price, 4),
-                    holding_days=row.holding_days,
-                    pnl_amount=round(pnl_amount, 4),
-                    pnl_ratio=round(pnl_ratio, 6),
-                )
-            )
-
-        if active_positions:
-            for item in sorted(active_positions, key=lambda row: str(row.get("exit_date", ""))):
-                cash += float(item.get("exit_amount", 0.0))
-                equity += float(item.get("pnl_amount", 0.0))
-
-        candidate_count = len(candidates)
+        execution_match_elapsed = time.perf_counter() - match_stage_start
         skipped_count = int(sum(skip_reasons.values()))
         fill_rate = (len(executed) / candidate_count) if candidate_count > 0 else 0.0
         if skipped_count > 0:
@@ -752,6 +1121,7 @@ class BacktestEngine:
         else:
             profit_factor = 0.0
 
+        curve_stage_start = time.perf_counter()
         entries_by_date: dict[str, list[tuple[int, BacktestTrade]]] = defaultdict(list)
         exits_by_date: dict[str, list[tuple[int, BacktestTrade]]] = defaultdict(list)
         for idx, trade in enumerate(executed):
@@ -887,6 +1257,11 @@ class BacktestEngine:
         notes.append(
             f"并发持仓峰值: {max_concurrent_positions}/{payload.max_positions}；"
             f"持仓覆盖交易日: {days_with_positions}/{len(trading_dates)}。"
+        )
+
+        curve_elapsed = time.perf_counter() - curve_stage_start
+        notes.append(
+            f"执行细分耗时[候选={candidate_stage_elapsed:.2f}s, 撮合={execution_match_elapsed:.2f}s, 曲线={curve_elapsed:.2f}s]"
         )
 
         drawdown_curve: list[DrawdownPoint] = []

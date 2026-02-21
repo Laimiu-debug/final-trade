@@ -154,6 +154,9 @@ class InMemoryStore:
     _BACKTEST_MATRIX_TIMING_RE = re.compile(
         r"耗时\[建矩阵=(?P<matrix>[\d.]+)s,\s*算信号=(?P<signal>[\d.]+)s,\s*撮合=(?P<match>[\d.]+)s,\s*总计=(?P<total>[\d.]+)s\]"
     )
+    _BACKTEST_EXEC_DETAIL_TIMING_RE = re.compile(
+        r"执行细分耗时\[候选=(?P<candidate>[\d.]+)s,\s*撮合=(?P<match>[\d.]+)s,\s*曲线=(?P<curve>[\d.]+)s\]"
+    )
 
     def __init__(self, app_state_path: str | None = None, sim_state_path: str | None = None) -> None:
         self._lock = RLock()
@@ -5932,11 +5935,16 @@ class InMemoryStore:
     ) -> list[BacktestTaskStageTiming]:
         notes = list(result.notes)
         matrix_match: re.Match[str] | None = None
+        exec_detail_match: re.Match[str] | None = None
         for note in notes:
             if not note:
                 continue
-            matrix_match = self._BACKTEST_MATRIX_TIMING_RE.search(str(note))
-            if matrix_match:
+            text = str(note)
+            if matrix_match is None:
+                matrix_match = self._BACKTEST_MATRIX_TIMING_RE.search(text)
+            if exec_detail_match is None:
+                exec_detail_match = self._BACKTEST_EXEC_DETAIL_TIMING_RE.search(text)
+            if matrix_match is not None and exec_detail_match is not None:
                 break
 
         if matrix_match is None:
@@ -5972,13 +5980,28 @@ class InMemoryStore:
                     pool_overhead,
                 )
             )
-        stage_rows.extend(
-            [
-                self._build_backtest_task_stage_timing("matrix_build", "矩阵构建", matrix_build),
-                self._build_backtest_task_stage_timing("signal_compute", "信号计算", signal_compute),
-                self._build_backtest_task_stage_timing("execution_match", "撮合执行", execute_match),
-                self._build_backtest_task_stage_timing("run_total", "回测总耗时", max(run_elapsed_sec, matrix_total)),
-            ]
+        stage_rows.append(self._build_backtest_task_stage_timing("matrix_build", "矩阵构建", matrix_build))
+        stage_rows.append(self._build_backtest_task_stage_timing("signal_compute", "信号计算", signal_compute))
+        if exec_detail_match is not None:
+            try:
+                candidate_elapsed = float(exec_detail_match.group("candidate"))
+                execution_elapsed = float(exec_detail_match.group("match"))
+                curve_elapsed = float(exec_detail_match.group("curve"))
+            except Exception:
+                candidate_elapsed = 0.0
+                execution_elapsed = float(execute_match)
+                curve_elapsed = 0.0
+            stage_rows.extend(
+                [
+                    self._build_backtest_task_stage_timing("candidate_build", "候选生成", candidate_elapsed),
+                    self._build_backtest_task_stage_timing("execution_match", "撮合执行", execution_elapsed),
+                    self._build_backtest_task_stage_timing("equity_curve", "权益曲线", curve_elapsed),
+                ]
+            )
+        else:
+            stage_rows.append(self._build_backtest_task_stage_timing("execution_match", "撮合执行", execute_match))
+        stage_rows.append(
+            self._build_backtest_task_stage_timing("run_total", "回测总耗时", max(run_elapsed_sec, matrix_total))
         )
         return stage_rows
 
