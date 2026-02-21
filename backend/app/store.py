@@ -4958,9 +4958,13 @@ class InMemoryStore:
         except Exception:
             return
 
+    def _should_auto_resume_backtest_tasks(self) -> bool:
+        return self._env_flag("TDX_TREND_BACKTEST_TASK_AUTO_RESUME", False)
+
     def _resume_backtest_tasks_after_boot(self) -> None:
         resumable: list[tuple[str, BacktestRunRequest]] = []
         unrecoverable_task_ids: list[str] = []
+        auto_resume = self._should_auto_resume_backtest_tasks()
         with self._backtest_task_lock:
             for task_id, task in list(self._backtest_tasks.items()):
                 if task.status not in {"pending", "running"}:
@@ -4996,6 +5000,24 @@ class InMemoryStore:
         for task_id, payload in resumable:
             task = self.get_backtest_task(task_id)
             if task is None:
+                continue
+            if not auto_resume:
+                paused_progress = task.progress.model_copy(
+                    update={
+                        "message": "检测到服务重启，任务已自动暂停，请手动继续。",
+                        "updated_at": now_text,
+                    }
+                )
+                self._upsert_backtest_task(
+                    task.model_copy(
+                        update={
+                            "status": "paused",
+                            "progress": paused_progress,
+                            "error": None,
+                            "error_code": None,
+                        }
+                    )
+                )
                 continue
             pending_progress = task.progress.model_copy(
                 update={
