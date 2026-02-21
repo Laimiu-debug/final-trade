@@ -768,6 +768,7 @@ def test_backtest_run_full_market_daily_matrix_path(monkeypatch: pytest.MonkeyPa
         return ["sz300750"], allowed, ["mock matrix universe"], scan_dates, scan_dates
 
     monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_ENGINE", "1")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_RESULT_CACHE", "0")
     monkeypatch.setattr(store, "_build_full_market_rolling_universe", _fake_universe)
 
     payload = {
@@ -903,6 +904,7 @@ def test_backtest_run_full_market_position_matrix_path(monkeypatch: pytest.Monke
         return ["sz300750"], allowed, ["mock position matrix universe"], scan_dates, refresh_used
 
     monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_ENGINE", "1")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_RESULT_CACHE", "0")
     monkeypatch.setattr(store, "_build_full_market_rolling_universe", _fake_universe)
 
     payload = {
@@ -921,6 +923,7 @@ def test_backtest_run_full_market_position_matrix_path(monkeypatch: pytest.Monke
     assert body["range"]["date_from"] == date_from
     assert body["range"]["date_to"] == date_to
     assert any("矩阵引擎已启用" in note for note in body["notes"])
+    assert any("持仓触发滚动预演(轻量)" in note for note in body["notes"])
 
 
 def test_backtest_run_full_market_weekly_matrix_path(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -852,6 +852,7 @@ class BacktestEngine:
         allowed_symbols_by_date: dict[str, set[str]] | None = None,
         matrix_bundle: MatrixBundle | None = None,
         matrix_signals: BacktestSignalMatrix | None = None,
+        build_equity_curve: bool = True,
         control_callback: Callable[[], None] | None = None,
     ) -> BacktestResponse:
         if control_callback is not None:
@@ -1120,6 +1121,65 @@ class BacktestEngine:
             profit_factor = math.inf
         else:
             profit_factor = 0.0
+
+        if not build_equity_curve:
+            notes.append(
+                f"并发持仓峰值: {max_concurrent_positions}/{payload.max_positions}；"
+                "轻量预演模式：跳过资金曲线与回撤计算。"
+            )
+            notes.append(
+                f"执行细分耗时[候选={candidate_stage_elapsed:.2f}s, 撮合={execution_match_elapsed:.2f}s, 曲线=0.00s]"
+            )
+            monthly_agg: dict[str, dict[str, float]] = defaultdict(lambda: {"pnl": 0.0, "count": 0.0})
+            for row in executed:
+                month = row.exit_date[:7]
+                monthly_agg[month]["pnl"] += row.pnl_amount
+                monthly_agg[month]["count"] += 1.0
+            monthly_returns = [
+                MonthlyReturnPoint(
+                    month=month,
+                    return_ratio=round(values["pnl"] / payload.initial_capital, 6) if payload.initial_capital > 0 else 0.0,
+                    pnl_amount=round(values["pnl"], 4),
+                    trade_count=int(values["count"]),
+                )
+                for month, values in sorted(monthly_agg.items())
+            ]
+            top_trades = sorted(executed, key=lambda row: row.pnl_amount, reverse=True)[:10]
+            bottom_trades = sorted(executed, key=lambda row: row.pnl_amount)[:10]
+            stats = ReviewStats(
+                win_rate=round(win_rate, 6),
+                total_return=round(total_return, 6),
+                max_drawdown=0.0,
+                avg_pnl_ratio=round(avg_pnl_ratio, 6),
+                trade_count=trade_count,
+                win_count=win_count,
+                loss_count=loss_count,
+                profit_factor=round(profit_factor, 6) if math.isfinite(profit_factor) else 999.0,
+            )
+            cost_snapshot = SimTradingConfig(
+                initial_capital=float(payload.initial_capital),
+                commission_rate=min(0.01, fee_rate),
+                min_commission=0.0,
+                stamp_tax_rate=0.0,
+                transfer_fee_rate=0.0,
+                slippage_rate=0.0,
+            )
+            return BacktestResponse(
+                stats=stats,
+                trades=executed,
+                equity_curve=[],
+                drawdown_curve=[],
+                monthly_returns=monthly_returns,
+                top_trades=top_trades,
+                bottom_trades=bottom_trades,
+                cost_snapshot=cost_snapshot,
+                range=ReviewRange(date_from=start_date, date_to=end_date, date_axis="sell"),
+                notes=notes,
+                candidate_count=candidate_count,
+                skipped_count=skipped_count,
+                fill_rate=round(fill_rate, 6),
+                max_concurrent_positions=max_concurrent_positions,
+            )
 
         curve_stage_start = time.perf_counter()
         entries_by_date: dict[str, list[tuple[int, BacktestTrade]]] = defaultdict(list)

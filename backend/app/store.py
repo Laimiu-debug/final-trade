@@ -5403,6 +5403,7 @@ class InMemoryStore:
         allowed_symbols_by_date: dict[str, set[str]] | None,
         progress_callback: Callable[[str, int, int, str], None] | None = None,
         progress_total_dates: int | None = None,
+        lightweight_probe: bool = False,
         control_callback: Callable[[], None] | None = None,
     ) -> tuple[BacktestResponse, str]:
         if control_callback is not None:
@@ -5496,6 +5497,7 @@ class InMemoryStore:
             allowed_symbols_by_date=allowed_symbols_by_date,
             matrix_bundle=bundle,
             matrix_signals=signal_matrix,
+            build_equity_curve=not lightweight_probe,
             control_callback=control_callback,
         )
         execute_elapsed = time.perf_counter() - execute_start_ts
@@ -5506,7 +5508,7 @@ class InMemoryStore:
             "矩阵引擎已启用："
             f"shape={shape_t}x{shape_n}，windows={list(matrix_windows)}，"
             f"cache={'hit' if cache_hit else 'miss'}，signal_cache={signal_cache_source}，"
-            f"key={cache_key[:12]}...；"
+            f"key={cache_key[:12]}...，probe={'light' if lightweight_probe else 'full'}；"
             f"耗时[建矩阵={bundle_elapsed:.2f}s, 算信号={signal_elapsed:.2f}s, 撮合={execute_elapsed:.2f}s, 总计={total_elapsed:.2f}s]"
         )
         return result, matrix_note
@@ -5569,6 +5571,7 @@ class InMemoryStore:
                 allowed_symbols_by_date=seed_allowed_by_date,
                 progress_callback=None,
                 progress_total_dates=None,
+                lightweight_probe=True,
                 control_callback=control_callback,
             )
             refresh_date_set: set[str] = {scan_dates[0]}
@@ -5590,7 +5593,7 @@ class InMemoryStore:
             merged_notes = [
                 *notes,
                 f"持仓触发滚动：首日+卖出后下一交易日刷新，共 {len(refresh_dates_used)} 次。",
-                f"持仓触发滚动预演: {probe_matrix_note}",
+                f"持仓触发滚动预演(轻量): {probe_matrix_note}",
             ]
             return rolling_symbols, rolling_allowed_by_date, merged_notes, scan_dates
 
