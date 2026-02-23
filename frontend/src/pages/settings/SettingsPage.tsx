@@ -69,6 +69,8 @@ const schema = z.object({
   markets: z.array(z.enum(['sh', 'sz', 'bj'])).min(1),
   return_window_days: z.number().min(5).max(120),
   candles_window_bars: z.number().int().min(120).max(5000),
+  backtest_matrix_engine_enabled: z.boolean(),
+  backtest_plateau_workers: z.number().int().min(1).max(32),
   top_n: z.number().min(100).max(2000),
   turnover_threshold: z.number().min(0.01).max(0.2),
   amount_threshold: z.number().min(5e7).max(5e9),
@@ -85,14 +87,99 @@ const schema = z.object({
 
 type FormValues = z.infer<typeof schema>
 
-function newProvider(nextIndex: number): FormValues['ai_providers'][number] {
-  return {
-    id: `custom-${nextIndex}`,
-    label: `自定义Provider-${nextIndex}`,
-    base_url: 'https://your-provider.example.com/v1',
+type ProviderPresetKey = 'openai' | 'deepseek' | 'qwen' | 'anthropic' | 'gemini' | 'custom'
+
+type ProviderPreset = {
+  key: ProviderPresetKey
+  label: string
+  idBase: string
+  nameBase: string
+  baseUrl: string
+  model: string
+}
+
+const AI_PROVIDER_PRESETS: ProviderPreset[] = [
+  {
+    key: 'openai',
+    label: 'OpenAI',
+    idBase: 'openai',
+    nameBase: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini',
+  },
+  {
+    key: 'deepseek',
+    label: 'DeepSeek',
+    idBase: 'deepseek',
+    nameBase: 'DeepSeek',
+    baseUrl: 'https://api.deepseek.com/v1',
+    model: 'deepseek-chat',
+  },
+  {
+    key: 'qwen',
+    label: 'Qwen',
+    idBase: 'qwen',
+    nameBase: 'Qwen',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'qwen-plus',
+  },
+  {
+    key: 'anthropic',
+    label: 'Anthropic',
+    idBase: 'anthropic',
+    nameBase: 'Anthropic',
+    baseUrl: 'https://api.anthropic.com/v1',
+    model: 'claude-3-5-sonnet-20241022',
+  },
+  {
+    key: 'gemini',
+    label: 'Google Gemini',
+    idBase: 'gemini',
+    nameBase: 'Google Gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    model: 'gemini-2.0-flash',
+  },
+  {
+    key: 'custom',
+    label: '自定义',
+    idBase: 'custom',
+    nameBase: '自定义Provider',
+    baseUrl: 'https://your-provider.example.com/v1',
     model: 'custom-model',
+  },
+]
+
+const AI_PROVIDER_PRESET_OPTIONS = AI_PROVIDER_PRESETS.map((item) => ({
+  label: item.label,
+  value: item.key,
+}))
+
+function pickUniqueValue(base: string, existing: Set<string>): string {
+  const normalized = base.trim()
+  if (!existing.has(normalized)) return normalized
+  let idx = 2
+  while (existing.has(`${normalized}-${idx}`)) {
+    idx += 1
+  }
+  return `${normalized}-${idx}`
+}
+
+function buildProviderFromPreset(
+  presetKey: ProviderPresetKey,
+  existingProviders: FormValues['ai_providers'],
+): FormValues['ai_providers'][number] {
+  const preset = AI_PROVIDER_PRESETS.find((item) => item.key === presetKey) ?? AI_PROVIDER_PRESETS[0]
+  const existingIds = new Set(existingProviders.map((item) => item.id.trim()).filter(Boolean))
+  const existingLabels = new Set(existingProviders.map((item) => item.label.trim()).filter(Boolean))
+  const id = pickUniqueValue(preset.idBase, existingIds)
+  const label = pickUniqueValue(preset.nameBase, existingLabels)
+  return {
+    id,
+    label,
+    base_url: preset.baseUrl,
+    model: preset.model,
     api_key: '',
-    api_key_path: '%USERPROFILE%\\.tdx-trend\\custom.key',
+    api_key_path: `%USERPROFILE%\\.tdx-trend\\${id}.key`,
     enabled: true,
   }
 }
@@ -106,6 +193,15 @@ function newSource(nextIndex: number): FormValues['ai_sources'][number] {
   }
 }
 
+function defaultPrimarySource(): FormValues['ai_sources'][number] {
+  return {
+    id: 'eastmoney',
+    name: '东方财富新闻',
+    url: 'https://finance.eastmoney.com/',
+    enabled: true,
+  }
+}
+
 const DEFAULT_FORM_VALUES: FormValues = {
   tdx_data_path: 'D:\\new_tdx\\vipdoc',
   market_data_source: 'tdx_then_akshare',
@@ -113,6 +209,8 @@ const DEFAULT_FORM_VALUES: FormValues = {
   markets: ['sh', 'sz'],
   return_window_days: 40,
   candles_window_bars: 120,
+  backtest_matrix_engine_enabled: true,
+  backtest_plateau_workers: 4,
   top_n: 500,
   turnover_threshold: 0.05,
   amount_threshold: 5e8,
@@ -123,8 +221,8 @@ const DEFAULT_FORM_VALUES: FormValues = {
   ai_retry_count: 2,
   api_key: '',
   api_key_path: '',
-  ai_providers: [newProvider(1)],
-  ai_sources: [newSource(1)],
+  ai_providers: [buildProviderFromPreset('openai', [])],
+  ai_sources: [defaultPrimarySource()],
 }
 
 export function SettingsPage() {
@@ -155,6 +253,7 @@ export function SettingsPage() {
     defaultValues: DEFAULT_FORM_VALUES,
   })
   const [testingProviderId, setTestingProviderId] = useState<string | null>(null)
+  const [providerPresetToAdd, setProviderPresetToAdd] = useState<ProviderPresetKey>('openai')
 
   const providerArray = useFieldArray({
     control,
@@ -271,6 +370,16 @@ export function SettingsPage() {
       message.error(`[${provider.id}] 测试失败，请检查网络与配置`)
     } finally {
       setTestingProviderId(null)
+    }
+  }
+
+  function handleAppendProviderFromPreset() {
+    const values = getValues()
+    const currentProviders = values.ai_providers ?? []
+    const created = buildProviderFromPreset(providerPresetToAdd, currentProviders)
+    providerArray.append(created)
+    if (!values.ai_provider?.trim()) {
+      setValue('ai_provider', created.id)
     }
   }
 
@@ -491,9 +600,46 @@ export function SettingsPage() {
                 />
               </Form.Item>
             </Col>
+            <Col xs={12} md={6}>
+              <Form.Item label="矩阵回测引擎">
+                <Controller
+                  name="backtest_matrix_engine_enabled"
+                  control={control}
+                  render={({ field }) => (
+                    <Switch
+                      checked={Boolean(field.value)}
+                      onChange={field.onChange}
+                      checkedChildren="开启"
+                      unCheckedChildren="关闭"
+                    />
+                  )}
+                />
+              </Form.Item>
+            </Col>
+            <Col xs={12} md={6}>
+              <Form.Item label="收益平原并行线程">
+                <Controller
+                  name="backtest_plateau_workers"
+                  control={control}
+                  render={({ field }) => (
+                    <InputNumber
+                      min={1}
+                      max={32}
+                      value={field.value}
+                      onChange={(v) => field.onChange(v ?? 4)}
+                      style={{ width: '100%' }}
+                    />
+                  )}
+                />
+              </Form.Item>
+            </Col>
             <Col xs={24}>
               <Typography.Text type="secondary">
                 行情数据源可选 TDX 或本地行情目录回退（可由 AkShare/Baostock 生成 CSV）。漏斗参数（涨幅窗口、TopN、20日阈值）已统一在选股漏斗页面配置，此处仅保留系统级参数。
+              </Typography.Text>
+              <br />
+              <Typography.Text type="secondary">
+                矩阵回测引擎用于加速回测；收益平原并行线程用于控制参数点评估并发度（环境变量可覆盖该值）。
               </Typography.Text>
               <br />
               <Typography.Text type="secondary">
@@ -690,12 +836,20 @@ export function SettingsPage() {
               </Card>
             ))}
 
-            <Button
-              icon={<PlusOutlined />}
-              onClick={() => providerArray.append(newProvider(providerArray.fields.length + 1))}
-            >
-              新增 Provider
-            </Button>
+            <Space wrap>
+              <Select
+                style={{ minWidth: 220 }}
+                value={providerPresetToAdd}
+                options={AI_PROVIDER_PRESET_OPTIONS}
+                onChange={(value) => setProviderPresetToAdd(value as ProviderPresetKey)}
+              />
+              <Button
+                icon={<PlusOutlined />}
+                onClick={handleAppendProviderFromPreset}
+              >
+                按预设新增 Provider
+              </Button>
+            </Space>
           </Space>
 
           <Divider titlePlacement="start">AI 信息源网站</Divider>

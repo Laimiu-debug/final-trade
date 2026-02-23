@@ -844,6 +844,8 @@ export interface AppConfig {
   markets: Market[]
   return_window_days: number
   candles_window_bars: number
+  backtest_matrix_engine_enabled: boolean
+  backtest_plateau_workers: number
   top_n: number
   turnover_threshold: number
   amount_threshold: number

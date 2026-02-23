@@ -857,6 +857,8 @@ class AppConfig(BaseModel):
     markets: list[Market]
     return_window_days: int
     candles_window_bars: int = Field(default=120, ge=120, le=5000)
+    backtest_matrix_engine_enabled: bool = True
+    backtest_plateau_workers: int = Field(default=4, ge=1, le=32)
     top_n: int
     turnover_threshold: float
     amount_threshold: float

@@ -4,6 +4,7 @@ import base64
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -351,6 +352,94 @@ def test_backtest_plateau_endpoint_lhs_sampling_is_repeatable(monkeypatch: pytes
     assert any("参数采样模式: lhs" in note for note in body1["notes"])
     assert any("LHS 随机种子: 20260221" in note for note in body1["notes"])
     assert any("低胜率惩罚" in note for note in body1["notes"])
+
+
+def test_backtest_plateau_endpoint_parallel_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TDX_TREND_BACKTEST_PLATEAU_WORKERS", "4")
+    lock = threading.Lock()
+    active_workers = 0
+    max_active_workers = 0
+
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None):  # noqa: ANN001
+        nonlocal active_workers, max_active_workers
+        _ = progress_callback
+        if control_callback is not None:
+            control_callback()
+        with lock:
+            active_workers += 1
+            max_active_workers = max(max_active_workers, active_workers)
+        try:
+            time.sleep(0.03)
+            return BacktestResponse(
+                stats=ReviewStats(
+                    win_rate=0.55,
+                    total_return=float(payload.min_score) / 100.0,
+                    max_drawdown=-0.1,
+                    avg_pnl_ratio=0.03,
+                    trade_count=10,
+                    win_count=6,
+                    loss_count=4,
+                    profit_factor=1.3,
+                ),
+                trades=[],
+                range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+                notes=[],
+                candidate_count=40,
+                skipped_count=3,
+                fill_rate=0.75,
+                max_concurrent_positions=int(payload.max_positions),
+            )
+        finally:
+            with lock:
+                active_workers -= 1
+
+    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
+
+    base_payload = {
+        "mode": "full_market",
+        "run_id": "",
+        "trend_step": "auto",
+        "pool_roll_mode": "daily",
+        "board_filters": [],
+        "date_from": "2025-01-02",
+        "date_to": "2025-02-28",
+        "window_days": 60,
+        "min_score": 55,
+        "require_sequence": False,
+        "min_event_count": 1,
+        "entry_events": ["Spring", "SOS", "JOC", "LPS"],
+        "exit_events": ["UTAD", "SOW", "LPSY"],
+        "initial_capital": 1_000_000,
+        "position_pct": 0.2,
+        "max_positions": 5,
+        "stop_loss": 0.05,
+        "take_profit": 0.2,
+        "max_hold_days": 30,
+        "fee_bps": 8.0,
+        "prioritize_signals": True,
+        "priority_mode": "balanced",
+        "priority_topk_per_day": 10,
+        "enforce_t1": True,
+        "max_symbols": 100,
+    }
+    payload = {
+        "base_payload": base_payload,
+        "sampling_mode": "grid",
+        "window_days_list": [40, 60],
+        "min_score_list": [50, 60],
+        "stop_loss_list": [0.03, 0.05],
+        "take_profit_list": [0.2],
+        "max_positions_list": [5],
+        "position_pct_list": [0.2],
+        "max_symbols_list": [100],
+        "priority_topk_per_day_list": [10],
+        "max_points": 8,
+    }
+    resp = client.post("/api/backtest/plateau", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["evaluated_combinations"] == 8
+    assert max_active_workers >= 2
 
 
 def test_backtest_plateau_task_supports_pause_resume_cancel(monkeypatch: pytest.MonkeyPatch) -> None:

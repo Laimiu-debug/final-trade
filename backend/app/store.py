@@ -500,6 +500,8 @@ class InMemoryStore:
             markets=["sh", "sz"],
             return_window_days=40,
             candles_window_bars=120,
+            backtest_matrix_engine_enabled=True,
+            backtest_plateau_workers=4,
             top_n=500,
             turnover_threshold=0.05,
             amount_threshold=5e8,
@@ -520,42 +522,6 @@ class InMemoryStore:
                     api_key_path=r"%USERPROFILE%\.tdx-trend\openai.key",
                     enabled=True,
                 ),
-                AIProviderConfig(
-                    id="qwen",
-                    label="Qwen",
-                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-                    model="qwen-plus",
-                    api_key="",
-                    api_key_path=r"%USERPROFILE%\.tdx-trend\qwen.key",
-                    enabled=True,
-                ),
-                AIProviderConfig(
-                    id="deepseek",
-                    label="DeepSeek",
-                    base_url="https://api.deepseek.com/v1",
-                    model="deepseek-chat",
-                    api_key="",
-                    api_key_path=r"%USERPROFILE%\.tdx-trend\deepseek.key",
-                    enabled=True,
-                ),
-                AIProviderConfig(
-                    id="ernie",
-                    label="ERNIE",
-                    base_url="https://qianfan.baidubce.com/v2",
-                    model="ernie-4.0-turbo",
-                    api_key="",
-                    api_key_path=r"%USERPROFILE%\.tdx-trend\ernie.key",
-                    enabled=False,
-                ),
-                AIProviderConfig(
-                    id="custom-1",
-                    label="自定义Provider",
-                    base_url="https://your-provider.example.com/v1",
-                    model="custom-model",
-                    api_key="",
-                    api_key_path=r"%USERPROFILE%\.tdx-trend\custom.key",
-                    enabled=False,
-                ),
             ],
             ai_sources=[
                 AISourceConfig(
@@ -564,14 +530,6 @@ class InMemoryStore:
                     url="https://finance.eastmoney.com/",
                     enabled=True,
                 ),
-                AISourceConfig(
-                    id="juchao",
-                    name="巨潮资讯",
-                    url="http://www.cninfo.com.cn/",
-                    enabled=True,
-                ),
-                AISourceConfig(id="cls", name="财联社", url="https://www.cls.cn/", enabled=True),
-                AISourceConfig(id="xueqiu", name="雪球", url="https://xueqiu.com/", enabled=False),
             ],
         )
 
@@ -5247,7 +5205,8 @@ class InMemoryStore:
         return sorted(symbols_union), allowed_symbols_by_date, notes, scan_dates, refresh_dates_used
 
     def _is_backtest_matrix_engine_enabled(self) -> bool:
-        return self._env_flag("TDX_TREND_BACKTEST_MATRIX_ENGINE", False)
+        configured = bool(getattr(self._config, "backtest_matrix_engine_enabled", False))
+        return self._env_flag("TDX_TREND_BACKTEST_MATRIX_ENGINE", configured)
 
     @staticmethod
     def _build_backtest_matrix_windows(payload: BacktestRunRequest) -> tuple[int, ...]:
@@ -6557,6 +6516,22 @@ class InMemoryStore:
             return max(1, int(payload.sample_points))
         return max(1, int(payload.max_points))
 
+    def _backtest_plateau_eval_workers(self) -> int:
+        configured_default_raw = getattr(self._config, "backtest_plateau_workers", 4)
+        try:
+            configured_default = int(configured_default_raw)
+        except Exception:
+            configured_default = 4
+        configured_default = max(1, min(32, configured_default))
+
+        raw = os.getenv("TDX_TREND_BACKTEST_PLATEAU_WORKERS", "").strip()
+        if raw:
+            try:
+                return max(1, min(32, int(raw)))
+            except Exception:
+                return configured_default
+        return configured_default
+
     @staticmethod
     def _lhs_unit_matrix(point_count: int, dim_count: int, rng: random.Random) -> list[list[float]]:
         if point_count <= 0:
@@ -6776,9 +6751,6 @@ class InMemoryStore:
         for size in axis_lengths:
             grid_total_combinations *= max(1, int(size))
 
-        points: list[BacktestPlateauPoint] = []
-        failure_count = 0
-        evaluated = 0
         sampling_mode = payload.sampling_mode
         sample_points = self._resolve_plateau_sample_points(payload)
 
@@ -6835,7 +6807,38 @@ class InMemoryStore:
                 )
 
         total_to_evaluate = max(1, len(params_to_evaluate))
-        for params in params_to_evaluate:
+        worker_count = max(1, min(self._backtest_plateau_eval_workers(), total_to_evaluate))
+        evaluation_lock = RLock()
+        points_slots: list[BacktestPlateauPoint | None] = [None] * len(params_to_evaluate)
+        failure_count = 0
+        evaluated = 0
+
+        def _build_failed_point(params: BacktestPlateauParams, exc: Exception) -> BacktestPlateauPoint:
+            return BacktestPlateauPoint(
+                params=params,
+                stats=ReviewStats(
+                    win_rate=0.0,
+                    total_return=0.0,
+                    max_drawdown=0.0,
+                    avg_pnl_ratio=0.0,
+                    trade_count=0,
+                    win_count=0,
+                    loss_count=0,
+                    profit_factor=0.0,
+                ),
+                candidate_count=0,
+                skipped_count=0,
+                fill_rate=0.0,
+                max_concurrent_positions=0,
+                score=-9999.0,
+                cache_hit=False,
+                error=str(exc),
+            )
+
+        def _evaluate_single_point(
+            index: int,
+            params: BacktestPlateauParams,
+        ) -> tuple[int, BacktestPlateauPoint, bool]:
             if control_callback is not None:
                 control_callback()
             run_payload = base.model_copy(
@@ -6852,53 +6855,89 @@ class InMemoryStore:
                 },
                 deep=True,
             )
-            evaluated += 1
             try:
                 result = self.run_backtest(
                     run_payload,
                     control_callback=control_callback,
                 )
                 cache_hit = any("回测结果缓存命中" in str(note) for note in result.notes)
-                point = BacktestPlateauPoint(
-                    params=params,
-                    stats=result.stats,
-                    candidate_count=int(result.candidate_count),
-                    skipped_count=int(result.skipped_count),
-                    fill_rate=float(result.fill_rate),
-                    max_concurrent_positions=int(result.max_concurrent_positions),
-                    score=self._backtest_plateau_score(result),
-                    cache_hit=cache_hit,
-                    error=None,
-                )
-            except Exception as exc:  # noqa: BLE001
-                failure_count += 1
-                point = BacktestPlateauPoint(
-                    params=params,
-                    stats=ReviewStats(
-                        win_rate=0.0,
-                        total_return=0.0,
-                        max_drawdown=0.0,
-                        avg_pnl_ratio=0.0,
-                        trade_count=0,
-                        win_count=0,
-                        loss_count=0,
-                        profit_factor=0.0,
+                return (
+                    index,
+                    BacktestPlateauPoint(
+                        params=params,
+                        stats=result.stats,
+                        candidate_count=int(result.candidate_count),
+                        skipped_count=int(result.skipped_count),
+                        fill_rate=float(result.fill_rate),
+                        max_concurrent_positions=int(result.max_concurrent_positions),
+                        score=self._backtest_plateau_score(result),
+                        cache_hit=cache_hit,
+                        error=None,
                     ),
-                    candidate_count=0,
-                    skipped_count=0,
-                    fill_rate=0.0,
-                    max_concurrent_positions=0,
-                    score=-9999.0,
-                    cache_hit=False,
-                    error=str(exc),
+                    False,
                 )
-            points.append(point)
+            except BacktestTaskCancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                return index, _build_failed_point(params, exc), True
+
+        def _record_eval_result(index: int, point: BacktestPlateauPoint, failed: bool) -> None:
+            nonlocal evaluated, failure_count
+            with evaluation_lock:
+                points_slots[index] = point
+                evaluated += 1
+                if failed:
+                    failure_count += 1
+                evaluated_now = int(evaluated)
             if progress_callback is not None:
                 progress_callback(
-                    int(evaluated),
+                    evaluated_now,
                     int(total_to_evaluate),
-                    f"收益平原评估中：{evaluated}/{total_to_evaluate}",
+                    f"收益平原评估中：{evaluated_now}/{total_to_evaluate}",
                 )
+
+        cancelled_exc: BacktestTaskCancelledError | None = None
+        if worker_count <= 1 or len(params_to_evaluate) <= 1:
+            for idx, params in enumerate(params_to_evaluate):
+                idx_out, point, failed = _evaluate_single_point(idx, params)
+                _record_eval_result(idx_out, point, failed)
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_to_index: dict[Any, int] = {}
+                pending = iter(enumerate(params_to_evaluate))
+
+                def _submit_next() -> None:
+                    try:
+                        idx, params = next(pending)
+                    except StopIteration:
+                        return
+                    future = executor.submit(_evaluate_single_point, idx, params)
+                    future_to_index[future] = idx
+
+                for _ in range(worker_count):
+                    _submit_next()
+
+                while future_to_index:
+                    done_future = next(as_completed(list(future_to_index.keys())))
+                    fallback_index = future_to_index.pop(done_future)
+                    try:
+                        idx_out, point, failed = done_future.result()
+                    except BacktestTaskCancelledError as exc:
+                        cancelled_exc = exc
+                        for pending_future in list(future_to_index.keys()):
+                            pending_future.cancel()
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        idx_out = int(fallback_index)
+                        point = _build_failed_point(params_to_evaluate[idx_out], exc)
+                        failed = True
+                    _record_eval_result(idx_out, point, failed)
+                    _submit_next()
+
+        if cancelled_exc is not None:
+            raise cancelled_exc
+
+        points = [point for point in points_slots if point is not None]
 
         self._apply_plateau_neighborhood_consistency(points)
         points.sort(
@@ -6926,6 +6965,7 @@ class InMemoryStore:
                     f"LHS 去重后仅生成 {len(params_to_evaluate)} 组有效参数（目标 {sample_points} 组）。"
                 )
             notes.append(f"参考网格组合规模（按列表离散值估算）: {grid_total_combinations}。")
+        notes.append(f"收益平原并行评估线程数: {worker_count}。")
         if failure_count > 0:
             notes.append(f"有 {failure_count} 组参数评估失败，详情见 points.error。")
         notes.append("评分规则已加入低胜率惩罚：胜率低于45%将额外扣分。")
