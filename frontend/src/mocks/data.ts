@@ -4,6 +4,7 @@ import type {
   AIProviderTestRequest,
   AIProviderTestResponse,
   AppConfig,
+  BacktestPlateauCorrelationRow,
   BacktestPlateauPoint,
   BacktestPlateauResponse,
   BacktestPlateauRunRequest,
@@ -1336,6 +1337,135 @@ export function runBacktestStore(payload: BacktestRunRequest): BacktestResponse 
   const sortedTrades = trades.slice().sort((a, b) => b.pnl_amount - a.pnl_amount)
   const topTrades = sortedTrades.slice(0, 10)
   const bottomTrades = sortedTrades.slice(-10).reverse()
+  const dailyReturns: number[] = []
+  for (let idx = 1; idx < equityCurve.length; idx += 1) {
+    const prev = Number(equityCurve[idx - 1]?.equity ?? 0)
+    const curr = Number(equityCurve[idx]?.equity ?? 0)
+    if (prev > 0 && Number.isFinite(prev) && Number.isFinite(curr)) {
+      dailyReturns.push(curr / prev - 1)
+    }
+  }
+  const meanDaily = dailyReturns.length > 0 ? dailyReturns.reduce((sum, item) => sum + item, 0) / dailyReturns.length : 0
+  const stdDaily = dailyReturns.length > 1
+    ? Math.sqrt(dailyReturns.reduce((sum, item) => sum + (item - meanDaily) ** 2, 0) / dailyReturns.length)
+    : 0
+  const downside = dailyReturns.filter((item) => item < 0)
+  const downsideStd = downside.length > 1
+    ? Math.sqrt(downside.reduce((sum, item) => sum + (item - (downside.reduce((s, v) => s + v, 0) / downside.length)) ** 2, 0) / downside.length)
+    : 0
+  const avgWinRatio = winCount > 0 ? trades.filter((row) => row.pnl_ratio > 0).reduce((sum, row) => sum + row.pnl_ratio, 0) / winCount : 0
+  const avgLossRatio = lossCount > 0 ? trades.filter((row) => row.pnl_ratio < 0).reduce((sum, row) => sum + row.pnl_ratio, 0) / lossCount : 0
+  let lossStreak = 0
+  let maxLossStreak = 0
+  trades.forEach((row) => {
+    if (row.pnl_ratio < 0) {
+      lossStreak += 1
+      maxLossStreak = Math.max(maxLossStreak, lossStreak)
+    } else {
+      lossStreak = 0
+    }
+  })
+  const troughIndex = drawdownCurve.reduce((bestIdx, row, idx, arr) => (row.drawdown < arr[bestIdx]!.drawdown ? idx : bestIdx), 0)
+  const recoveryIndex = drawdownCurve.findIndex((row, idx) => idx > troughIndex && row.drawdown >= -1e-6)
+  const recoveryDays = recoveryIndex > troughIndex ? recoveryIndex - troughIndex : Math.max(0, drawdownCurve.length - troughIndex - 1)
+  const monthlyStd = monthlyReturns.length > 1
+    ? Math.sqrt(monthlyReturns.reduce((sum, item) => sum + (item.return_ratio - (monthlyReturns.reduce((s, v) => s + v.return_ratio, 0) / monthlyReturns.length)) ** 2, 0) / monthlyReturns.length)
+    : 0
+  const tradePenalty = tradeCount < 20 ? Math.min(1, (20 - tradeCount) / 20) * 0.35 : 0
+  const variancePenalty = Math.min(0.35, monthlyStd * 3)
+  const stabilityScore = Math.max(0, Math.min(1, 0.5 * 0.6 + 0.3 * (1 - tradePenalty) + 0.2 * (1 - variancePenalty)))
+  const regimeBreakdown = [
+    {
+      regime: 'bull' as const,
+      label: '牛市代理',
+      trade_count: Math.floor(tradeCount * 0.35),
+      win_rate: tradeCount > 0 ? Math.min(1, (winCount / Math.max(1, tradeCount)) + 0.06) : 0,
+      total_return: payload.initial_capital > 0 ? Number((totalPnl / payload.initial_capital * 0.45).toFixed(6)) : 0,
+      avg_pnl_ratio: Number((avgPnlRatio * 1.2).toFixed(6)),
+      max_drawdown: Number((maxDrawdown * 0.8).toFixed(6)),
+    },
+    {
+      regime: 'range' as const,
+      label: '震荡代理',
+      trade_count: Math.floor(tradeCount * 0.4),
+      win_rate: tradeCount > 0 ? winCount / Math.max(1, tradeCount) : 0,
+      total_return: payload.initial_capital > 0 ? Number((totalPnl / payload.initial_capital * 0.35).toFixed(6)) : 0,
+      avg_pnl_ratio: Number((avgPnlRatio).toFixed(6)),
+      max_drawdown: Number((maxDrawdown).toFixed(6)),
+    },
+    {
+      regime: 'bear' as const,
+      label: '熊市代理',
+      trade_count: Math.max(0, tradeCount - Math.floor(tradeCount * 0.35) - Math.floor(tradeCount * 0.4)),
+      win_rate: tradeCount > 0 ? Math.max(0, (winCount / Math.max(1, tradeCount)) - 0.08) : 0,
+      total_return: payload.initial_capital > 0 ? Number((totalPnl / payload.initial_capital * 0.2).toFixed(6)) : 0,
+      avg_pnl_ratio: Number((avgPnlRatio * 0.8).toFixed(6)),
+      max_drawdown: Number((Math.min(1, maxDrawdown * 1.25)).toFixed(6)),
+    },
+  ]
+  const monteCarlo = {
+    simulations: 400,
+    seed: 20260223,
+    total_return_p5: Number(((payload.initial_capital > 0 ? totalPnl / payload.initial_capital : 0) * 0.45).toFixed(6)),
+    total_return_p50: Number(((payload.initial_capital > 0 ? totalPnl / payload.initial_capital : 0) * 0.9).toFixed(6)),
+    total_return_p95: Number(((payload.initial_capital > 0 ? totalPnl / payload.initial_capital : 0) * 1.25).toFixed(6)),
+    max_drawdown_p5: Number((maxDrawdown * 0.8).toFixed(6)),
+    max_drawdown_p50: Number((maxDrawdown).toFixed(6)),
+    max_drawdown_p95: Number((Math.min(1, maxDrawdown * 1.2)).toFixed(6)),
+    ruin_probability: tradeCount > 0 ? Number((Math.max(0, 0.22 - tradeCount * 0.002)).toFixed(6)) : 0.3,
+  }
+  const walkForward =
+    payload.enable_advanced_analysis !== false
+      ? {
+          fold_count: 2,
+          candidate_count: 4,
+          oos_pass_rate: tradeCount > 0 ? Number((Math.min(1, Math.max(0, (winCount / Math.max(1, tradeCount)) + 0.1))).toFixed(6)) : 0,
+          avg_test_return: payload.initial_capital > 0 ? Number((totalPnl / payload.initial_capital * 0.7).toFixed(6)) : 0,
+          avg_test_win_rate: tradeCount > 0 ? Number((Math.max(0, Math.min(1, winCount / Math.max(1, tradeCount) - 0.03))).toFixed(6)) : 0,
+          folds: [
+            {
+              fold_index: 1,
+              train_date_from: rangeFrom,
+              train_date_to: rangeFrom,
+              test_date_from: rangeFrom,
+              test_date_to: rangeTo,
+              selected_params: {
+                window_days: payload.window_days,
+                min_score: payload.min_score,
+                stop_loss: payload.stop_loss,
+                take_profit: payload.take_profit,
+                max_positions: payload.max_positions,
+                position_pct: payload.position_pct,
+                max_symbols: payload.max_symbols,
+                priority_topk_per_day: payload.priority_topk_per_day,
+              },
+              train_score: Number((payload.min_score / 100).toFixed(6)),
+              test_score: Number((payload.min_score / 120).toFixed(6)),
+              train_stats: {
+                win_rate: tradeCount > 0 ? winCount / tradeCount : 0,
+                total_return: payload.initial_capital > 0 ? totalPnl / payload.initial_capital : 0,
+                max_drawdown: maxDrawdown,
+                avg_pnl_ratio: Number(avgPnlRatio.toFixed(6)),
+                trade_count: tradeCount,
+                win_count: winCount,
+                loss_count: lossCount,
+                profit_factor: grossLoss < 0 ? Number((grossProfit / Math.abs(grossLoss)).toFixed(6)) : grossProfit > 0 ? 999 : 0,
+              },
+              test_stats: {
+                win_rate: tradeCount > 0 ? Math.max(0, winCount / tradeCount - 0.04) : 0,
+                total_return: payload.initial_capital > 0 ? Number((totalPnl / payload.initial_capital * 0.72).toFixed(6)) : 0,
+                max_drawdown: Number((maxDrawdown * 1.05).toFixed(6)),
+                avg_pnl_ratio: Number((avgPnlRatio * 0.9).toFixed(6)),
+                trade_count: Math.max(1, Math.floor(tradeCount * 0.6)),
+                win_count: Math.max(0, Math.floor(winCount * 0.55)),
+                loss_count: Math.max(0, Math.floor(lossCount * 0.65)),
+                profit_factor: grossLoss < 0 ? Number((grossProfit / Math.abs(grossLoss) * 0.92).toFixed(6)) : grossProfit > 0 ? 999 : 0,
+              },
+            },
+          ],
+          notes: ['mock walk-forward 结果，演示用途。'],
+        }
+      : null
 
   return {
     stats: {
@@ -1372,6 +1502,28 @@ export function runBacktestStore(payload: BacktestRunRequest): BacktestResponse 
     skipped_count: skippedCount,
     fill_rate: Number(fillRate.toFixed(6)),
     max_concurrent_positions: maxConcurrentPositions,
+    risk_metrics: {
+      sharpe: stdDaily > 1e-9 ? Number(((meanDaily / stdDaily) * Math.sqrt(252)).toFixed(6)) : 0,
+      sortino: downsideStd > 1e-9 ? Number(((meanDaily / downsideStd) * Math.sqrt(252)).toFixed(6)) : 0,
+      calmar: maxDrawdown > 1e-9 ? Number(((payload.initial_capital > 0 ? totalPnl / payload.initial_capital : 0) / maxDrawdown).toFixed(6)) : 0,
+      expectancy: Number(((tradeCount > 0 ? winCount / tradeCount : 0) * avgWinRatio + (1 - (tradeCount > 0 ? winCount / tradeCount : 0)) * avgLossRatio).toFixed(6)),
+      avg_win_pnl_ratio: Number(avgWinRatio.toFixed(6)),
+      avg_loss_pnl_ratio: Number(avgLossRatio.toFixed(6)),
+      max_consecutive_losses: maxLossStreak,
+      recovery_days: recoveryDays,
+    },
+    stability_diagnostics: {
+      stability_score: Number(stabilityScore.toFixed(6)),
+      min_trade_count_threshold: 20,
+      trade_count_penalty: Number(tradePenalty.toFixed(6)),
+      neighborhood_consistency: 0.5,
+      return_variance_penalty: Number(variancePenalty.toFixed(6)),
+      monthly_return_std: Number(monthlyStd.toFixed(6)),
+      notes: ['mock 稳定性评分，演示用途。'],
+    },
+    regime_breakdown: regimeBreakdown,
+    monte_carlo: monteCarlo,
+    walk_forward: walkForward,
   }
 }
 
@@ -1469,7 +1621,9 @@ export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): Bac
     const winRate = Math.max(0, Math.min(1, Number(result.stats.win_rate)))
     const profitFactorRaw = Number(result.stats.profit_factor)
     const profitFactor = Number.isFinite(profitFactorRaw) ? Math.max(0, Math.min(5, profitFactorRaw)) : 5
-    const score = Number((totalReturn - maxDrawdown * 0.6 + winRate * 0.1 + profitFactor * 0.02).toFixed(6))
+    const winRateTerm = (winRate - 0.5) * 0.2
+    const lowWinPenalty = Math.max(0, 0.45 - winRate) * 0.9
+    const score = Number((totalReturn - maxDrawdown * 0.6 + profitFactor * 0.02 + winRateTerm - lowWinPenalty).toFixed(6))
     points.push({
       params: candidate,
       stats: result.stats,
@@ -1540,8 +1694,88 @@ export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): Bac
     notes.push(`参考网格组合规模（按列表离散值估算）: ${gridTotal}。`)
   }
 
+  const safePearson = (xValues: number[], yValues: number[]) => {
+    const count = Math.min(xValues.length, yValues.length)
+    if (count < 2) return 0
+    const xs = xValues.slice(0, count)
+    const ys = yValues.slice(0, count)
+    const meanX = xs.reduce((sum, value) => sum + value, 0) / count
+    const meanY = ys.reduce((sum, value) => sum + value, 0) / count
+    const varX = xs.reduce((sum, value) => sum + (value - meanX) ** 2, 0)
+    const varY = ys.reduce((sum, value) => sum + (value - meanY) ** 2, 0)
+    if (varX <= 1e-12 || varY <= 1e-12) return 0
+    const cov = xs.reduce((sum, value, index) => sum + (value - meanX) * (ys[index]! - meanY), 0)
+    const corr = cov / Math.sqrt(varX * varY)
+    if (!Number.isFinite(corr)) return 0
+    return Math.max(-1, Math.min(1, corr))
+  }
+
+  const buildCorrelationSummary = (
+    rows: BacktestPlateauCorrelationRow[],
+    metricLabel: string,
+    key: 'score_corr' | 'total_return_corr' | 'win_rate_corr',
+  ) => {
+    if (rows.length <= 0) return null
+    const sorted = rows.slice()
+    sorted.sort((left, right) => Number(right[key]) - Number(left[key]))
+    const positive = sorted[0]
+    const negative = sorted[sorted.length - 1]
+    const parts: string[] = []
+    if (positive && Number(positive[key]) > 0.05) {
+      parts.push(`${positive.parameter_label}正相关 ${Number(positive[key]).toFixed(3)}`)
+    }
+    if (negative && Number(negative[key]) < -0.05 && negative.parameter !== positive?.parameter) {
+      parts.push(`${negative.parameter_label}负相关 ${Number(negative[key]).toFixed(3)}`)
+    }
+    if (parts.length <= 0) return null
+    return `${metricLabel}相关性：${parts.join('；')}。`
+  }
+
   points.sort((left, right) => right.score - left.score)
   const bestPoint = points[0] ?? null
+  const validPoints = points.filter((row) => !row.error)
+  const correlations: BacktestPlateauCorrelationRow[] = []
+  if (validPoints.length >= 2) {
+    const scoreValues = validPoints.map((row) => Number(row.score))
+    const totalReturnValues = validPoints.map((row) => Number(row.stats.total_return))
+    const winRateValues = validPoints.map((row) => Number(row.stats.win_rate))
+    const paramExtractors: Array<{
+      key: string
+      label: string
+      pick: (row: BacktestPlateauPoint) => number
+    }> = [
+      { key: 'window_days', label: '信号窗口天数', pick: (row) => Number(row.params.window_days) },
+      { key: 'min_score', label: '最低评分', pick: (row) => Number(row.params.min_score) },
+      { key: 'stop_loss', label: '止损比例', pick: (row) => Number(row.params.stop_loss) },
+      { key: 'take_profit', label: '止盈比例', pick: (row) => Number(row.params.take_profit) },
+      { key: 'max_positions', label: '最大并发持仓', pick: (row) => Number(row.params.max_positions) },
+      { key: 'position_pct', label: '单笔仓位占比', pick: (row) => Number(row.params.position_pct) },
+      { key: 'max_symbols', label: '最大股票数', pick: (row) => Number(row.params.max_symbols) },
+      { key: 'priority_topk_per_day', label: '同日TopK', pick: (row) => Number(row.params.priority_topk_per_day) },
+    ]
+    paramExtractors.forEach((item) => {
+      const xValues = validPoints.map(item.pick)
+      correlations.push({
+        parameter: item.key,
+        parameter_label: item.label,
+        score_corr: Number(safePearson(xValues, scoreValues).toFixed(6)),
+        total_return_corr: Number(safePearson(xValues, totalReturnValues).toFixed(6)),
+        win_rate_corr: Number(safePearson(xValues, winRateValues).toFixed(6)),
+      })
+    })
+    correlations.sort((left, right) => {
+      const leftStrength = Math.max(Math.abs(left.score_corr), Math.abs(left.total_return_corr), Math.abs(left.win_rate_corr))
+      const rightStrength = Math.max(Math.abs(right.score_corr), Math.abs(right.total_return_corr), Math.abs(right.win_rate_corr))
+      return rightStrength - leftStrength
+    })
+  }
+  notes.push('评分规则已加入低胜率惩罚：胜率低于45%将额外扣分。')
+  const scoreCorrNote = buildCorrelationSummary(correlations, '评分', 'score_corr')
+  const returnCorrNote = buildCorrelationSummary(correlations, '收益', 'total_return_corr')
+  const winRateCorrNote = buildCorrelationSummary(correlations, '胜率', 'win_rate_corr')
+  if (scoreCorrNote) notes.push(scoreCorrNote)
+  if (returnCorrNote) notes.push(returnCorrNote)
+  if (winRateCorrNote) notes.push(winRateCorrNote)
   notes.push(`收益平原评估完成：总组合 ${samplingMode === 'lhs' ? targetEvaluate : gridTotal}，实际评估 ${points.length}。`)
   return {
     base_payload: base,
@@ -1549,6 +1783,7 @@ export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): Bac
     evaluated_combinations: points.length,
     points,
     best_point: bestPoint,
+    correlations,
     generated_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
     notes,
   }

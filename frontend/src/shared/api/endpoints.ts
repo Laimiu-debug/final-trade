@@ -6,6 +6,12 @@ import type {
   AppConfig,
   BacktestTaskStartResponse,
   BacktestTaskStatusResponse,
+  BacktestReportBuildRequest,
+  BacktestReportBuildResponse,
+  BacktestReportDeleteResponse,
+  BacktestReportDetail,
+  BacktestReportImportResponse,
+  BacktestReportListResponse,
   BacktestResponse,
   BacktestPlateauResponse,
   BacktestPlateauTaskStatusResponse,
@@ -379,6 +385,44 @@ export function resumeBacktestTask(taskId: string) {
 export function cancelBacktestTask(taskId: string) {
   return apiRequest<BacktestTaskStatusResponse>(`/api/backtest/tasks/${taskId}/cancel`, {
     method: 'POST',
+    timeoutMs: 30_000,
+  })
+}
+
+export function buildBacktestReportPackage(payload: BacktestReportBuildRequest) {
+  return apiRequest<BacktestReportBuildResponse>('/api/backtest/reports/build', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 120_000,
+  })
+}
+
+export function importBacktestReportPackage(file: File) {
+  const formData = new FormData()
+  formData.append('file', file)
+  return apiRequest<BacktestReportImportResponse>('/api/backtest/reports/import', {
+    method: 'POST',
+    body: formData,
+    timeoutMs: 120_000,
+  })
+}
+
+export function listBacktestReports() {
+  return apiRequest<BacktestReportListResponse>('/api/backtest/reports', {
+    timeoutMs: 30_000,
+  })
+}
+
+export function getBacktestReport(reportId: string) {
+  return apiRequest<BacktestReportDetail>(`/api/backtest/reports/${reportId}`, {
+    timeoutMs: 45_000,
+  })
+}
+
+export function deleteBacktestReport(reportId: string) {
+  return apiRequest<BacktestReportDeleteResponse>(`/api/backtest/reports/${reportId}`, {
+    method: 'DELETE',
     timeoutMs: 30_000,
   })
 }

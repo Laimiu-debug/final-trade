@@ -1,19 +1,24 @@
 ﻿from __future__ import annotations
 
+import base64
+import io
 import math
 import hashlib
 import json
 import os
 import random
 import re
+import shutil
 import time
 import html
+import zipfile
+from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from itertools import product
 from pathlib import Path
-from threading import RLock, Thread
+from threading import RLock, Thread, local
 from typing import Any, Callable, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -34,13 +39,29 @@ from .models import (
     BacktestPlateauResponse,
     BacktestPlateauPoint,
     BacktestPlateauParams,
+    BacktestPlateauCorrelationRow,
     BacktestPlateauTaskProgress,
     BacktestPlateauTaskStatusResponse,
     BacktestPoolRollMode,
     BacktestResponse,
+    BacktestRiskMetrics,
+    BacktestStabilityDiagnostics,
+    BacktestRegimeBucket,
+    BacktestMonteCarloSummary,
+    BacktestWalkForwardFold,
+    BacktestWalkForwardReport,
     BacktestTaskProgress,
     BacktestTaskStageTiming,
     BacktestTaskStatusResponse,
+    BacktestReportBuildRequest,
+    BacktestReportBuildResponse,
+    BacktestReportDetail,
+    BacktestReportImportResponse,
+    BacktestReportListResponse,
+    BacktestReportManifest,
+    BacktestReportManifestApp,
+    BacktestReportManifestFile,
+    BacktestReportSummary,
     BoardFilter,
     Market,
     CreateOrderRequest,
@@ -153,6 +174,16 @@ class InMemoryStore:
     _BACKTEST_RESULT_CACHE_VERSION = "backtest-result-v1"
     _BACKTEST_SIGNAL_MATRIX_CACHE_VERSION = "signal-matrix-v1"
     _BACKTEST_PRECHECK_CACHE_VERSION = "precheck-v1"
+    _BACKTEST_REPORT_SCHEMA_VERSION = "ftbt-1.0"
+    _BACKTEST_REPORT_PACKAGE_TYPE = "backtest_report"
+    _BACKTEST_REPORT_REQUIRED_FILES = (
+        "run_request.json",
+        "run_result.json",
+        "report.xlsx",
+        "report.html",
+    )
+    _BACKTEST_REPORT_META_SCHEMA_VERSION = 1
+    _BACKTEST_REPORT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{4,96}$")
     _BACKTEST_MATRIX_TIMING_RE = re.compile(
         r"耗时\[建矩阵=(?P<matrix>[\d.]+)s,\s*算信号=(?P<signal>[\d.]+)s,\s*撮合=(?P<match>[\d.]+)s,\s*总计=(?P<total>[\d.]+)s\]"
     )
@@ -180,6 +211,7 @@ class InMemoryStore:
         self._backtest_task_payloads: dict[str, BacktestRunRequest] = {}
         self._backtest_task_lock = RLock()
         self._backtest_running_worker_ids: set[str] = set()
+        self._backtest_runtime_context = local()
         self._backtest_task_state_path = self._resolve_backtest_task_state_path()
         self._backtest_task_state_last_persist_at = 0.0
         self._backtest_plateau_tasks: dict[str, BacktestPlateauTaskStatusResponse] = {}
@@ -327,6 +359,13 @@ class InMemoryStore:
         if env_value:
             return cls._resolve_user_path(env_value)
         return Path.home() / ".tdx-trend" / "backtest-signal-matrix-cache"
+
+    @classmethod
+    def _resolve_backtest_report_store_dir(cls) -> Path:
+        env_value = os.getenv("TDX_TREND_BACKTEST_REPORT_STORE_DIR", "").strip()
+        if env_value:
+            return cls._resolve_user_path(env_value)
+        return Path.home() / ".tdx-trend" / "backtest-reports"
 
     def _build_app_state_payload(self) -> dict[str, object]:
         return {
@@ -5461,6 +5500,8 @@ class InMemoryStore:
             use_cache=True,
         )
         bundle_elapsed = time.perf_counter() - bundle_start_ts
+        if not lightweight_probe:
+            self._emit_backtest_runtime_stage_timing("matrix_build", "矩阵构建", bundle_elapsed)
         bundle_meta = self._backtest_matrix_engine.get_build_meta(cache_key) or {}
         bundle_mode = str(bundle_meta.get("mode") or ("cache_hit" if cache_hit else "full_build")).strip()
         bundle_append_rows = int(bundle_meta.get("append_rows") or 0)
@@ -5509,14 +5550,18 @@ class InMemoryStore:
                     matrix=signal_matrix,
                 )
         signal_elapsed = time.perf_counter() - signal_start_ts
+        if not lightweight_probe:
+            self._emit_backtest_runtime_stage_timing("signal_compute", "信号计算", signal_elapsed)
         if control_callback is not None:
             control_callback()
+        total_safe = max(1, int(progress_total_dates)) if progress_total_dates is not None else None
         if progress_callback is not None and progress_total_dates is not None:
-            total_safe = max(1, int(progress_total_dates))
+            # Keep one progress slot for the post-scan execution stage,
+            # so long-running matching/analysis does not appear as 100% stalled.
             progress_callback(
                 payload.date_to,
                 total_safe,
-                total_safe,
+                total_safe + 1,
                 "矩阵信号计算完成，开始执行回测撮合...",
             )
 
@@ -5532,6 +5577,15 @@ class InMemoryStore:
             control_callback=control_callback,
         )
         execute_elapsed = time.perf_counter() - execute_start_ts
+        if not lightweight_probe:
+            self._emit_backtest_runtime_stage_timing("execution_match", "撮合执行", execute_elapsed)
+        if progress_callback is not None and total_safe is not None:
+            progress_callback(
+                payload.date_to,
+                total_safe + 1,
+                total_safe + 1,
+                "主回测撮合完成，正在整理结果...",
+            )
         total_elapsed = time.perf_counter() - total_start_ts
 
         shape_t, shape_n = bundle.shape()
@@ -5658,12 +5712,18 @@ class InMemoryStore:
         if trend_pool_fallback_note:
             pool_notes.append(trend_pool_fallback_note)
 
+        rolling_start_ts = time.perf_counter()
         rolling_symbols, rolling_allowed_by_date, rolling_notes, scan_dates = self._resolve_matrix_rolling_universe(
             payload=payload,
             board_filters=board_filters,
             trend_pool_params=trend_pool_params,
             progress_callback=progress_callback,
             control_callback=control_callback,
+        )
+        self._emit_backtest_runtime_stage_timing(
+            "rolling_universe",
+            "候选池构建",
+            time.perf_counter() - rolling_start_ts,
         )
         pool_notes = [*pool_notes, *rolling_notes]
         if not rolling_symbols:
@@ -5963,6 +6023,55 @@ class InMemoryStore:
             label=str(label or "").strip() or "未命名阶段",
             elapsed_ms=elapsed_ms,
         )
+
+    @staticmethod
+    def _estimate_backtest_advanced_progress_slots(payload: BacktestRunRequest) -> int:
+        if not bool(payload.enable_advanced_analysis):
+            return 0
+        # 高级分析固定拆成 7 个里程碑，避免主回测结束后进度长期停滞。
+        return 7
+
+    def _estimate_backtest_scan_progress_total_dates(self, payload: BacktestRunRequest) -> int:
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        if not scan_dates:
+            return 1
+        if payload.pool_roll_mode == "weekly":
+            return max(1, len(self._build_weekly_refresh_dates(scan_dates)))
+        if payload.pool_roll_mode == "position":
+            return max(1, len(scan_dates))
+        return max(1, len(scan_dates))
+
+    def _set_backtest_runtime_stage_timing_callback(
+        self,
+        callback: Callable[[str, str, float], None] | None,
+    ) -> None:
+        setattr(self._backtest_runtime_context, "stage_timing_callback", callback)
+
+    def _get_backtest_runtime_stage_timing_callback(self) -> Callable[[str, str, float], None] | None:
+        callback = getattr(self._backtest_runtime_context, "stage_timing_callback", None)
+        return callback if callable(callback) else None
+
+    def _clear_backtest_runtime_stage_timing_callback(self) -> None:
+        if hasattr(self._backtest_runtime_context, "stage_timing_callback"):
+            delattr(self._backtest_runtime_context, "stage_timing_callback")
+
+    def _emit_backtest_runtime_stage_timing(
+        self,
+        stage_key: str,
+        label: str,
+        elapsed_sec: float,
+    ) -> None:
+        callback = getattr(self._backtest_runtime_context, "stage_timing_callback", None)
+        if callback is None:
+            return
+        try:
+            callback(
+                str(stage_key or "").strip(),
+                str(label or "").strip(),
+                float(max(0.0, elapsed_sec)),
+            )
+        except Exception:
+            return
 
     def _extract_backtest_stage_timings(
         self,
@@ -6280,11 +6389,167 @@ class InMemoryStore:
         total_return = float(result.stats.total_return)
         max_drawdown = abs(min(0.0, float(result.stats.max_drawdown)))
         win_rate = max(0.0, min(1.0, float(result.stats.win_rate)))
+        trade_count = max(0, int(result.stats.trade_count))
         profit_factor = float(result.stats.profit_factor)
         if not math.isfinite(profit_factor):
             profit_factor = 5.0
         profit_factor = max(0.0, min(profit_factor, 5.0))
-        return round(total_return - max_drawdown * 0.6 + win_rate * 0.1 + profit_factor * 0.02, 6)
+        monthly_returns = [
+            float(row.return_ratio)
+            for row in result.monthly_returns
+            if math.isfinite(float(row.return_ratio))
+        ]
+        monthly_std = float(np.std(monthly_returns)) if len(monthly_returns) >= 2 else 0.0
+        # Penalize low win-rate parameter sets so "small loss / large gain" tails do not dominate ranking.
+        win_rate_term = (win_rate - 0.5) * 0.2
+        low_win_penalty = max(0.0, 0.45 - win_rate) * 0.9
+        low_trade_penalty = max(0.0, float(20 - trade_count) / 20.0) * 0.25 if trade_count < 20 else 0.0
+        variance_penalty = min(0.25, max(0.0, monthly_std) * 2.5)
+        return round(
+            total_return
+            - max_drawdown * 0.6
+            + profit_factor * 0.02
+            + win_rate_term
+            - low_win_penalty
+            - low_trade_penalty
+            - variance_penalty,
+            6,
+        )
+
+    @staticmethod
+    def _plateau_param_vector(point: BacktestPlateauPoint) -> tuple[float, ...]:
+        return (
+            float(point.params.window_days),
+            float(point.params.min_score),
+            float(point.params.stop_loss),
+            float(point.params.take_profit),
+            float(point.params.max_positions),
+            float(point.params.position_pct),
+            float(point.params.max_symbols),
+            float(point.params.priority_topk_per_day),
+        )
+
+    def _apply_plateau_neighborhood_consistency(self, points: list[BacktestPlateauPoint]) -> None:
+        valid_points = [row for row in points if row.error is None]
+        if len(valid_points) < 3:
+            return
+
+        vectors = [self._plateau_param_vector(row) for row in valid_points]
+        dim_count = len(vectors[0])
+        ranges: list[float] = []
+        for dim in range(dim_count):
+            values = [vector[dim] for vector in vectors]
+            span = max(values) - min(values)
+            ranges.append(span if span > 1e-9 else 1.0)
+
+        for idx, row in enumerate(valid_points):
+            base_vector = vectors[idx]
+            distance_items: list[tuple[float, int]] = []
+            for other_idx, other_vector in enumerate(vectors):
+                if other_idx == idx:
+                    continue
+                diff_sq = 0.0
+                for dim in range(dim_count):
+                    normalized = (base_vector[dim] - other_vector[dim]) / ranges[dim]
+                    diff_sq += normalized * normalized
+                distance_items.append((math.sqrt(diff_sq), other_idx))
+            if not distance_items:
+                continue
+            distance_items.sort(key=lambda item: item[0])
+            neighbor_count = min(6, len(distance_items))
+            neighbor_scores = [float(valid_points[item[1]].score) for item in distance_items[:neighbor_count]]
+            if not neighbor_scores:
+                continue
+            close_band = max(0.08, abs(float(row.score)) * 0.3)
+            close_ratio = sum(1 for value in neighbor_scores if abs(value - float(row.score)) <= close_band) / neighbor_count
+            positive_ratio = sum(1 for value in neighbor_scores if value > 0.0) / neighbor_count
+            consistency = (close_ratio + positive_ratio) / 2.0
+            adjustment = (consistency - 0.5) * 0.2
+            row.score = round(float(row.score) + adjustment, 6)
+
+    @staticmethod
+    def _safe_pearson_correlation(x_values: list[float], y_values: list[float]) -> float:
+        count = min(len(x_values), len(y_values))
+        if count < 2:
+            return 0.0
+        xs = [float(x_values[idx]) for idx in range(count)]
+        ys = [float(y_values[idx]) for idx in range(count)]
+        mean_x = sum(xs) / float(count)
+        mean_y = sum(ys) / float(count)
+        var_x = sum((value - mean_x) ** 2 for value in xs)
+        var_y = sum((value - mean_y) ** 2 for value in ys)
+        if var_x <= 1e-12 or var_y <= 1e-12:
+            return 0.0
+        cov = sum((xs[idx] - mean_x) * (ys[idx] - mean_y) for idx in range(count))
+        corr = cov / math.sqrt(var_x * var_y)
+        if not math.isfinite(corr):
+            return 0.0
+        return max(-1.0, min(1.0, float(corr)))
+
+    def _build_backtest_plateau_correlations(
+        self,
+        points: list[BacktestPlateauPoint],
+    ) -> list[BacktestPlateauCorrelationRow]:
+        valid_points = [row for row in points if row.error is None]
+        if len(valid_points) < 2:
+            return []
+
+        score_values = [float(row.score) for row in valid_points]
+        total_return_values = [float(row.stats.total_return) for row in valid_points]
+        win_rate_values = [float(row.stats.win_rate) for row in valid_points]
+        parameter_extractors: list[tuple[str, str, Callable[[BacktestPlateauPoint], float]]] = [
+            ("window_days", "信号窗口天数", lambda row: float(row.params.window_days)),
+            ("min_score", "最低评分", lambda row: float(row.params.min_score)),
+            ("stop_loss", "止损比例", lambda row: float(row.params.stop_loss)),
+            ("take_profit", "止盈比例", lambda row: float(row.params.take_profit)),
+            ("max_positions", "最大并发持仓", lambda row: float(row.params.max_positions)),
+            ("position_pct", "单笔仓位占比", lambda row: float(row.params.position_pct)),
+            ("max_symbols", "最大股票数", lambda row: float(row.params.max_symbols)),
+            ("priority_topk_per_day", "同日TopK", lambda row: float(row.params.priority_topk_per_day)),
+        ]
+        rows: list[BacktestPlateauCorrelationRow] = []
+        for key, label, extractor in parameter_extractors:
+            x_values = [extractor(row) for row in valid_points]
+            rows.append(
+                BacktestPlateauCorrelationRow(
+                    parameter=key,
+                    parameter_label=label,
+                    score_corr=round(self._safe_pearson_correlation(x_values, score_values), 6),
+                    total_return_corr=round(self._safe_pearson_correlation(x_values, total_return_values), 6),
+                    win_rate_corr=round(self._safe_pearson_correlation(x_values, win_rate_values), 6),
+                )
+            )
+        rows.sort(
+            key=lambda row: max(
+                abs(float(row.score_corr)),
+                abs(float(row.total_return_corr)),
+                abs(float(row.win_rate_corr)),
+            ),
+            reverse=True,
+        )
+        return rows
+
+    @staticmethod
+    def _build_plateau_correlation_summary_note(
+        correlations: list[BacktestPlateauCorrelationRow],
+        *,
+        metric_label: str,
+        corr_field: Literal["score_corr", "total_return_corr", "win_rate_corr"],
+    ) -> str | None:
+        if len(correlations) <= 0:
+            return None
+        positive = max(correlations, key=lambda row: float(getattr(row, corr_field)))
+        negative = min(correlations, key=lambda row: float(getattr(row, corr_field)))
+        positive_value = float(getattr(positive, corr_field))
+        negative_value = float(getattr(negative, corr_field))
+        parts: list[str] = []
+        if positive_value > 0.05:
+            parts.append(f"{positive.parameter_label}正相关 {positive_value:+.3f}")
+        if negative_value < -0.05 and negative.parameter != positive.parameter:
+            parts.append(f"{negative.parameter_label}负相关 {negative_value:+.3f}")
+        if len(parts) <= 0:
+            return None
+        return f"{metric_label}相关性：{'；'.join(parts)}。"
 
     @staticmethod
     def _resolve_plateau_sample_points(payload: BacktestPlateauRunRequest) -> int:
@@ -6583,6 +6848,7 @@ class InMemoryStore:
                     "position_pct": params.position_pct,
                     "max_symbols": params.max_symbols,
                     "priority_topk_per_day": params.priority_topk_per_day,
+                    "enable_advanced_analysis": False,
                 },
                 deep=True,
             )
@@ -6634,6 +6900,7 @@ class InMemoryStore:
                     f"收益平原评估中：{evaluated}/{total_to_evaluate}",
                 )
 
+        self._apply_plateau_neighborhood_consistency(points)
         points.sort(
             key=lambda row: (
                 row.error is None,
@@ -6644,6 +6911,7 @@ class InMemoryStore:
             reverse=True,
         )
         best_point = next((row for row in points if row.error is None), None)
+        correlations = self._build_backtest_plateau_correlations(points)
         notes: list[str] = []
         if sampling_mode == "grid" and grid_total_combinations > sample_points:
             notes.append(
@@ -6660,6 +6928,29 @@ class InMemoryStore:
             notes.append(f"参考网格组合规模（按列表离散值估算）: {grid_total_combinations}。")
         if failure_count > 0:
             notes.append(f"有 {failure_count} 组参数评估失败，详情见 points.error。")
+        notes.append("评分规则已加入低胜率惩罚：胜率低于45%将额外扣分。")
+        notes.append("评分规则已加入稳定性约束：低交易数惩罚、月度收益方差惩罚、邻域一致性加权。")
+        score_corr_note = self._build_plateau_correlation_summary_note(
+            correlations,
+            metric_label="评分",
+            corr_field="score_corr",
+        )
+        if score_corr_note:
+            notes.append(score_corr_note)
+        return_corr_note = self._build_plateau_correlation_summary_note(
+            correlations,
+            metric_label="收益",
+            corr_field="total_return_corr",
+        )
+        if return_corr_note:
+            notes.append(return_corr_note)
+        win_rate_corr_note = self._build_plateau_correlation_summary_note(
+            correlations,
+            metric_label="胜率",
+            corr_field="win_rate_corr",
+        )
+        if win_rate_corr_note:
+            notes.append(win_rate_corr_note)
         notes.append(
             f"收益平原评估完成：总组合 {total_combinations}，实际评估 {evaluated}。"
         )
@@ -6669,8 +6960,659 @@ class InMemoryStore:
             evaluated_combinations=int(evaluated),
             points=points,
             best_point=best_point,
+            correlations=correlations,
             generated_at=self._now_datetime(),
             notes=notes,
+        )
+
+    @staticmethod
+    def _quantile(values: list[float], ratio: float) -> float:
+        if not values:
+            return 0.0
+        clipped = max(0.0, min(1.0, float(ratio)))
+        sorted_values = sorted(float(item) for item in values)
+        if len(sorted_values) == 1:
+            return float(sorted_values[0])
+        pos = clipped * float(len(sorted_values) - 1)
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return float(sorted_values[lo])
+        weight = pos - float(lo)
+        return float(sorted_values[lo] * (1.0 - weight) + sorted_values[hi] * weight)
+
+    @staticmethod
+    def _plateau_params_from_payload(payload: BacktestRunRequest) -> BacktestPlateauParams:
+        return BacktestPlateauParams(
+            window_days=int(payload.window_days),
+            min_score=float(payload.min_score),
+            stop_loss=float(payload.stop_loss),
+            take_profit=float(payload.take_profit),
+            max_positions=int(payload.max_positions),
+            position_pct=float(payload.position_pct),
+            max_symbols=int(payload.max_symbols),
+            priority_topk_per_day=int(payload.priority_topk_per_day),
+        )
+
+    def _compute_backtest_risk_metrics(
+        self,
+        payload: BacktestRunRequest,
+        result: BacktestResponse,
+    ) -> BacktestRiskMetrics:
+        _ = payload
+        trades = sorted(
+            list(result.trades),
+            key=lambda row: (str(row.exit_date), str(row.entry_date), str(row.symbol)),
+        )
+        pnl_ratios = [float(row.pnl_ratio) for row in trades if math.isfinite(float(row.pnl_ratio))]
+        win_ratios = [value for value in pnl_ratios if value > 0.0]
+        loss_ratios = [value for value in pnl_ratios if value < 0.0]
+        avg_win_ratio = self._safe_mean(win_ratios)
+        avg_loss_ratio = self._safe_mean(loss_ratios)
+        win_rate = float(result.stats.win_rate)
+        expectancy = win_rate * avg_win_ratio + (1.0 - win_rate) * avg_loss_ratio
+
+        max_consecutive_losses = 0
+        current_losses = 0
+        for value in pnl_ratios:
+            if value < 0.0:
+                current_losses += 1
+                max_consecutive_losses = max(max_consecutive_losses, current_losses)
+            else:
+                current_losses = 0
+
+        daily_returns: list[float] = []
+        equity_curve = list(result.equity_curve)
+        for idx in range(1, len(equity_curve)):
+            prev_equity = float(equity_curve[idx - 1].equity)
+            curr_equity = float(equity_curve[idx].equity)
+            if not (math.isfinite(prev_equity) and math.isfinite(curr_equity)):
+                continue
+            if prev_equity <= 0:
+                continue
+            daily_returns.append(curr_equity / prev_equity - 1.0)
+
+        sharpe = 0.0
+        sortino = 0.0
+        if daily_returns:
+            mean_daily = float(np.mean(daily_returns))
+            std_daily = float(np.std(daily_returns))
+            if std_daily > 1e-12:
+                sharpe = mean_daily / std_daily * math.sqrt(252.0)
+            downside_returns = [item for item in daily_returns if item < 0.0]
+            downside_std = float(np.std(downside_returns)) if downside_returns else 0.0
+            if downside_std > 1e-12:
+                sortino = mean_daily / downside_std * math.sqrt(252.0)
+
+        max_drawdown = float(result.stats.max_drawdown)
+        calmar = 0.0
+        if max_drawdown > 1e-9:
+            calmar = float(result.stats.total_return) / max_drawdown
+
+        recovery_days = 0
+        drawdowns = list(result.drawdown_curve)
+        if drawdowns:
+            trough_idx = min(range(len(drawdowns)), key=lambda idx: float(drawdowns[idx].drawdown))
+            trough_value = float(drawdowns[trough_idx].drawdown)
+            if trough_value < -1e-9:
+                recovery_idx = next(
+                    (idx for idx in range(trough_idx + 1, len(drawdowns)) if float(drawdowns[idx].drawdown) >= -1e-6),
+                    None,
+                )
+                start_dt = self._parse_date(drawdowns[trough_idx].date)
+                end_dt = self._parse_date(drawdowns[recovery_idx].date) if recovery_idx is not None else self._parse_date(drawdowns[-1].date)
+                if start_dt is not None and end_dt is not None:
+                    recovery_days = max(0, int((end_dt - start_dt).days))
+                elif recovery_idx is not None:
+                    recovery_days = max(0, recovery_idx - trough_idx)
+                else:
+                    recovery_days = max(0, len(drawdowns) - 1 - trough_idx)
+
+        return BacktestRiskMetrics(
+            sharpe=round(float(sharpe), 6),
+            sortino=round(float(sortino), 6),
+            calmar=round(float(calmar), 6),
+            expectancy=round(float(expectancy), 6),
+            avg_win_pnl_ratio=round(float(avg_win_ratio), 6),
+            avg_loss_pnl_ratio=round(float(avg_loss_ratio), 6),
+            max_consecutive_losses=int(max_consecutive_losses),
+            recovery_days=int(recovery_days),
+        )
+
+    def _compute_backtest_regime_breakdown(
+        self,
+        payload: BacktestRunRequest,
+        result: BacktestResponse,
+    ) -> list[BacktestRegimeBucket]:
+        equity_curve = list(result.equity_curve)
+        drawdown_curve = list(result.drawdown_curve)
+        if not equity_curve:
+            return [
+                BacktestRegimeBucket(regime="bull", label="牛市代理"),
+                BacktestRegimeBucket(regime="range", label="震荡代理"),
+                BacktestRegimeBucket(regime="bear", label="熊市代理"),
+            ]
+
+        date_axis = [str(item.date) for item in equity_curve]
+        equity_values = [float(item.equity) for item in equity_curve]
+        drawdown_by_date = {str(item.date): float(item.drawdown) for item in drawdown_curve}
+        regime_by_date: dict[str, Literal["bull", "range", "bear"]] = {}
+        regime_window = min(20, max(5, len(date_axis) // 3))
+        for idx, day in enumerate(date_axis):
+            if idx < regime_window:
+                regime_by_date[day] = "range"
+                continue
+            prev = float(equity_values[idx - regime_window])
+            curr = float(equity_values[idx])
+            rolling_return = (curr / prev - 1.0) if prev > 0 else 0.0
+            drawdown = float(drawdown_by_date.get(day, 0.0))
+            if rolling_return >= 0.03 and drawdown >= -0.08:
+                regime_by_date[day] = "bull"
+            elif rolling_return <= -0.03 or drawdown <= -0.15:
+                regime_by_date[day] = "bear"
+            else:
+                regime_by_date[day] = "range"
+
+        bucket_data: dict[str, dict[str, float]] = {
+            "bull": {"trade_count": 0.0, "win_count": 0.0, "pnl_sum": 0.0, "pnl_ratio_sum": 0.0},
+            "range": {"trade_count": 0.0, "win_count": 0.0, "pnl_sum": 0.0, "pnl_ratio_sum": 0.0},
+            "bear": {"trade_count": 0.0, "win_count": 0.0, "pnl_sum": 0.0, "pnl_ratio_sum": 0.0},
+        }
+        regime_drawdowns: dict[str, list[float]] = {"bull": [], "range": [], "bear": []}
+        for day, regime in regime_by_date.items():
+            regime_drawdowns[regime].append(abs(min(0.0, float(drawdown_by_date.get(day, 0.0)))))
+
+        for trade in result.trades:
+            entry_date = str(trade.entry_date)
+            idx = bisect_right(date_axis, entry_date) - 1
+            if idx < 0:
+                regime = "range"
+            else:
+                regime = regime_by_date.get(date_axis[idx], "range")
+            target = bucket_data[regime]
+            target["trade_count"] += 1.0
+            if float(trade.pnl_ratio) > 0.0:
+                target["win_count"] += 1.0
+            target["pnl_sum"] += float(trade.pnl_amount)
+            target["pnl_ratio_sum"] += float(trade.pnl_ratio)
+
+        out: list[BacktestRegimeBucket] = []
+        for regime, label in (("bull", "牛市代理"), ("range", "震荡代理"), ("bear", "熊市代理")):
+            data = bucket_data[regime]
+            trade_count = int(data["trade_count"])
+            win_rate = (data["win_count"] / data["trade_count"]) if data["trade_count"] > 0 else 0.0
+            avg_ratio = (data["pnl_ratio_sum"] / data["trade_count"]) if data["trade_count"] > 0 else 0.0
+            out.append(
+                BacktestRegimeBucket(
+                    regime=regime,  # type: ignore[arg-type]
+                    label=label,
+                    trade_count=trade_count,
+                    win_rate=round(float(win_rate), 6),
+                    total_return=round(float(data["pnl_sum"] / payload.initial_capital), 6) if payload.initial_capital > 0 else 0.0,
+                    avg_pnl_ratio=round(float(avg_ratio), 6),
+                    max_drawdown=round(float(max(regime_drawdowns[regime]) if regime_drawdowns[regime] else 0.0), 6),
+                )
+            )
+        return out
+
+    def _compute_backtest_monte_carlo(
+        self,
+        result: BacktestResponse,
+        *,
+        simulations: int = 400,
+        seed: int = 20260223,
+    ) -> BacktestMonteCarloSummary:
+        trade_returns = [
+            float(row.pnl_ratio)
+            for row in result.trades
+            if math.isfinite(float(row.pnl_ratio))
+        ]
+        if len(trade_returns) < 2:
+            return BacktestMonteCarloSummary(simulations=0, seed=int(seed))
+
+        rng = random.Random(int(seed))
+        total_returns: list[float] = []
+        drawdowns: list[float] = []
+        sim_count = max(1, int(simulations))
+        for _ in range(sim_count):
+            shuffled = list(trade_returns)
+            rng.shuffle(shuffled)
+            equity = 1.0
+            peak = 1.0
+            max_drawdown_raw = 0.0
+            for trade_ret in shuffled:
+                stress = rng.uniform(-0.003, 0.001)
+                effective_ret = max(-0.95, float(trade_ret) + stress)
+                equity *= (1.0 + effective_ret)
+                peak = max(peak, equity)
+                drawdown = equity / peak - 1.0 if peak > 0 else 0.0
+                max_drawdown_raw = min(max_drawdown_raw, drawdown)
+            total_returns.append(equity - 1.0)
+            drawdowns.append(abs(max_drawdown_raw))
+
+        ruin_probability = sum(1 for item in total_returns if item <= -0.2) / float(sim_count)
+        return BacktestMonteCarloSummary(
+            simulations=sim_count,
+            seed=int(seed),
+            total_return_p5=round(self._quantile(total_returns, 0.05), 6),
+            total_return_p50=round(self._quantile(total_returns, 0.50), 6),
+            total_return_p95=round(self._quantile(total_returns, 0.95), 6),
+            max_drawdown_p5=round(self._quantile(drawdowns, 0.05), 6),
+            max_drawdown_p50=round(self._quantile(drawdowns, 0.50), 6),
+            max_drawdown_p95=round(self._quantile(drawdowns, 0.95), 6),
+            ruin_probability=round(float(ruin_probability), 6),
+        )
+
+    @staticmethod
+    def _clone_payload_with_updates(payload: BacktestRunRequest, *, updates: dict[str, Any]) -> BacktestRunRequest:
+        return payload.model_copy(update=updates, deep=True)
+
+    def _build_backtest_neighbor_payloads(self, payload: BacktestRunRequest) -> list[BacktestRunRequest]:
+        def _clamp(value: float, lower: float, upper: float, precision: int = 6) -> float:
+            return round(max(lower, min(upper, float(value))), int(precision))
+
+        def _clamp_int(value: int, lower: int, upper: int) -> int:
+            return max(int(lower), min(int(upper), int(value)))
+
+        updates_list = [
+            {"min_score": _clamp(payload.min_score - 5.0, 0.0, 100.0, 4)},
+            {"min_score": _clamp(payload.min_score + 5.0, 0.0, 100.0, 4)},
+            {"window_days": _clamp_int(payload.window_days - 20, 20, 240)},
+            {"window_days": _clamp_int(payload.window_days + 20, 20, 240)},
+            {
+                "stop_loss": _clamp(payload.stop_loss + 0.01, 0.0, 0.5, 6),
+                "take_profit": _clamp(payload.take_profit + 0.03, 0.0, 1.5, 6),
+            },
+            {
+                "stop_loss": _clamp(payload.stop_loss - 0.01, 0.0, 0.5, 6),
+                "take_profit": _clamp(payload.take_profit - 0.03, 0.0, 1.5, 6),
+            },
+        ]
+        seen: set[tuple[float, ...]] = set()
+        out: list[BacktestRunRequest] = []
+        base_key = (
+            float(payload.window_days),
+            float(payload.min_score),
+            float(payload.stop_loss),
+            float(payload.take_profit),
+            float(payload.max_positions),
+            float(payload.position_pct),
+            float(payload.max_symbols),
+            float(payload.priority_topk_per_day),
+        )
+        for updates in updates_list:
+            merged_updates = {"enable_advanced_analysis": False, **updates}
+            candidate = self._clone_payload_with_updates(payload, updates=merged_updates)
+            key = (
+                float(candidate.window_days),
+                float(candidate.min_score),
+                float(candidate.stop_loss),
+                float(candidate.take_profit),
+                float(candidate.max_positions),
+                float(candidate.position_pct),
+                float(candidate.max_symbols),
+                float(candidate.priority_topk_per_day),
+            )
+            if key in seen or key == base_key:
+                continue
+            seen.add(key)
+            out.append(candidate)
+            if len(out) >= 6:
+                break
+        return out
+
+    def _run_backtest_neighborhood_probe(
+        self,
+        payload: BacktestRunRequest,
+        *,
+        control_callback: Callable[[], None] | None = None,
+    ) -> list[BacktestResponse]:
+        out: list[BacktestResponse] = []
+        runtime_stage_callback = self._get_backtest_runtime_stage_timing_callback()
+        self._set_backtest_runtime_stage_timing_callback(None)
+        try:
+            for probe_payload in self._build_backtest_neighbor_payloads(payload):
+                try:
+                    if control_callback is not None:
+                        control_callback()
+                    probe_result = self.run_backtest(
+                        probe_payload,
+                        control_callback=control_callback,
+                    )
+                    out.append(probe_result)
+                except Exception:
+                    continue
+        finally:
+            self._set_backtest_runtime_stage_timing_callback(runtime_stage_callback)
+        return out
+
+    def _compute_backtest_stability_diagnostics(
+        self,
+        result: BacktestResponse,
+        *,
+        neighbor_results: list[BacktestResponse],
+    ) -> BacktestStabilityDiagnostics:
+        trade_count = int(result.stats.trade_count)
+        threshold = 20
+        trade_count_penalty = 0.0
+        if trade_count < threshold:
+            trade_count_penalty = min(1.0, float(threshold - trade_count) / float(threshold)) * 0.35
+
+        monthly_returns = [
+            float(row.return_ratio)
+            for row in result.monthly_returns
+            if math.isfinite(float(row.return_ratio))
+        ]
+        monthly_std = float(np.std(monthly_returns)) if len(monthly_returns) >= 2 else 0.0
+        return_variance_penalty = min(0.35, max(0.0, monthly_std) * 3.0)
+
+        neighborhood_consistency = 0.5
+        if neighbor_results:
+            base_score = float(self._backtest_plateau_score(result))
+            neighbor_scores = [float(self._backtest_plateau_score(item)) for item in neighbor_results]
+            close_band = max(0.08, abs(base_score) * 0.25)
+            close_ratio = sum(1 for item in neighbor_scores if abs(item - base_score) <= close_band) / len(neighbor_scores)
+            positive_ratio = sum(1 for item in neighbor_scores if item > 0.0) / len(neighbor_scores)
+            neighborhood_consistency = (close_ratio + positive_ratio) / 2.0
+
+        stability_score = (
+            0.45 * neighborhood_consistency
+            + 0.30 * (1.0 - trade_count_penalty)
+            + 0.25 * (1.0 - return_variance_penalty)
+        )
+        stability_score = max(0.0, min(1.0, stability_score))
+
+        notes: list[str] = []
+        if trade_count < threshold:
+            notes.append(f"交易数 {trade_count} 低于稳定性阈值 {threshold}，已施加惩罚。")
+        if return_variance_penalty > 0.0:
+            notes.append(f"月度收益标准差 {monthly_std:.4f}，已施加波动惩罚。")
+        if neighbor_results:
+            notes.append(f"邻域一致性 {neighborhood_consistency:.3f}（基于 {len(neighbor_results)} 组邻域参数）。")
+        else:
+            notes.append("邻域一致性未执行，使用中性评分。")
+
+        return BacktestStabilityDiagnostics(
+            stability_score=round(float(stability_score), 6),
+            min_trade_count_threshold=int(threshold),
+            trade_count_penalty=round(float(trade_count_penalty), 6),
+            neighborhood_consistency=round(float(neighborhood_consistency), 6),
+            return_variance_penalty=round(float(return_variance_penalty), 6),
+            monthly_return_std=round(float(monthly_std), 6),
+            notes=notes,
+        )
+
+    def _build_walk_forward_fold_ranges(
+        self,
+        payload: BacktestRunRequest,
+    ) -> list[tuple[str, str, str, str]]:
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        if len(scan_dates) < 90:
+            return []
+        split1 = len(scan_dates) // 3
+        split2 = (len(scan_dates) * 2) // 3
+        seg1 = scan_dates[:split1]
+        seg2 = scan_dates[split1:split2]
+        seg3 = scan_dates[split2:]
+        if len(seg1) < 20 or len(seg2) < 20 or len(seg3) < 20:
+            return []
+        return [
+            (seg1[0], seg1[-1], seg2[0], seg2[-1]),
+            (seg1[0], seg2[-1], seg3[0], seg3[-1]),
+        ]
+
+    def _build_walk_forward_candidate_payloads(self, payload: BacktestRunRequest) -> list[BacktestRunRequest]:
+        base = payload.model_copy(update={"enable_advanced_analysis": False}, deep=True)
+        neighbors = self._build_backtest_neighbor_payloads(payload)
+        out = [base]
+        out.extend(neighbors[:3])
+        deduped: list[BacktestRunRequest] = []
+        seen: set[tuple[float, ...]] = set()
+        for item in out:
+            key = (
+                float(item.window_days),
+                float(item.min_score),
+                float(item.stop_loss),
+                float(item.take_profit),
+                float(item.max_positions),
+                float(item.position_pct),
+                float(item.max_symbols),
+                float(item.priority_topk_per_day),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def _run_backtest_walk_forward(
+        self,
+        payload: BacktestRunRequest,
+        *,
+        control_callback: Callable[[], None] | None = None,
+    ) -> BacktestWalkForwardReport:
+        fold_ranges = self._build_walk_forward_fold_ranges(payload)
+        candidates = self._build_walk_forward_candidate_payloads(payload)
+        if not fold_ranges:
+            return BacktestWalkForwardReport(
+                fold_count=0,
+                candidate_count=len(candidates),
+                notes=["walk-forward 未执行：区间过短，至少需要约 90 个交易日。"],
+            )
+        if len(candidates) <= 0:
+            return BacktestWalkForwardReport(
+                fold_count=0,
+                candidate_count=0,
+                notes=["walk-forward 未执行：候选参数为空。"],
+            )
+
+        folds: list[BacktestWalkForwardFold] = []
+        notes: list[str] = []
+        runtime_stage_callback = self._get_backtest_runtime_stage_timing_callback()
+        self._set_backtest_runtime_stage_timing_callback(None)
+        try:
+            for fold_idx, (train_from, train_to, test_from, test_to) in enumerate(fold_ranges, start=1):
+                best_payload: BacktestRunRequest | None = None
+                best_train_result: BacktestResponse | None = None
+                best_train_score = -float("inf")
+                for candidate in candidates:
+                    train_payload = candidate.model_copy(
+                        update={
+                            "date_from": train_from,
+                            "date_to": train_to,
+                            "enable_advanced_analysis": False,
+                        },
+                        deep=True,
+                    )
+                    try:
+                        if control_callback is not None:
+                            control_callback()
+                        train_result = self.run_backtest(
+                            train_payload,
+                            control_callback=control_callback,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        notes.append(f"walk-forward fold#{fold_idx} 训练候选失败：{exc}")
+                        continue
+                    train_score = float(self._backtest_plateau_score(train_result))
+                    if train_score > best_train_score:
+                        best_train_score = train_score
+                        best_payload = train_payload
+                        best_train_result = train_result
+
+                if best_payload is None or best_train_result is None:
+                    notes.append(f"walk-forward fold#{fold_idx} 未找到可用训练参数。")
+                    continue
+
+                test_payload = best_payload.model_copy(
+                    update={
+                        "date_from": test_from,
+                        "date_to": test_to,
+                        "enable_advanced_analysis": False,
+                    },
+                    deep=True,
+                )
+                try:
+                    if control_callback is not None:
+                        control_callback()
+                    test_result = self.run_backtest(
+                        test_payload,
+                        control_callback=control_callback,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    notes.append(f"walk-forward fold#{fold_idx} 测试阶段失败：{exc}")
+                    continue
+
+                folds.append(
+                    BacktestWalkForwardFold(
+                        fold_index=int(fold_idx),
+                        train_date_from=str(train_from),
+                        train_date_to=str(train_to),
+                        test_date_from=str(test_from),
+                        test_date_to=str(test_to),
+                        selected_params=self._plateau_params_from_payload(best_payload),
+                        train_score=round(float(best_train_score), 6),
+                        test_score=round(float(self._backtest_plateau_score(test_result)), 6),
+                        train_stats=best_train_result.stats,
+                        test_stats=test_result.stats,
+                    )
+                )
+
+            if not folds:
+                return BacktestWalkForwardReport(
+                    fold_count=0,
+                    candidate_count=len(candidates),
+                    notes=notes or ["walk-forward 未生成有效折叠。"],
+                )
+
+            pass_count = sum(
+                1
+                for fold in folds
+                if float(fold.test_stats.total_return) > 0.0 and float(fold.test_stats.win_rate) >= 0.45
+            )
+            avg_test_return = self._safe_mean([float(fold.test_stats.total_return) for fold in folds])
+            avg_test_win_rate = self._safe_mean([float(fold.test_stats.win_rate) for fold in folds])
+            return BacktestWalkForwardReport(
+                fold_count=len(folds),
+                candidate_count=len(candidates),
+                oos_pass_rate=round(float(pass_count / len(folds)), 6),
+                avg_test_return=round(float(avg_test_return), 6),
+                avg_test_win_rate=round(float(avg_test_win_rate), 6),
+                folds=folds,
+                notes=notes,
+            )
+        finally:
+            self._set_backtest_runtime_stage_timing_callback(runtime_stage_callback)
+
+    def _enrich_backtest_advanced_analysis(
+        self,
+        *,
+        payload: BacktestRunRequest,
+        result: BacktestResponse,
+        control_callback: Callable[[], None] | None = None,
+        analysis_progress_callback: Callable[[str], None] | None = None,
+    ) -> BacktestResponse:
+        advanced_start_ts = time.perf_counter()
+
+        def _mark_progress(message: str) -> None:
+            if analysis_progress_callback is None:
+                return
+            analysis_progress_callback(message)
+
+        risk_start_ts = time.perf_counter()
+        risk_metrics = self._compute_backtest_risk_metrics(payload, result)
+        self._emit_backtest_runtime_stage_timing(
+            "advanced_risk_metrics",
+            "高级分析-风险指标",
+            time.perf_counter() - risk_start_ts,
+        )
+        _mark_progress("高级分析：风险指标计算完成。")
+
+        regime_start_ts = time.perf_counter()
+        regime_breakdown = self._compute_backtest_regime_breakdown(payload, result)
+        self._emit_backtest_runtime_stage_timing(
+            "advanced_regime_breakdown",
+            "高级分析-市场状态拆分",
+            time.perf_counter() - regime_start_ts,
+        )
+        _mark_progress("高级分析：市场状态拆分完成。")
+
+        monte_start_ts = time.perf_counter()
+        monte_carlo = self._compute_backtest_monte_carlo(result)
+        self._emit_backtest_runtime_stage_timing(
+            "advanced_monte_carlo",
+            "高级分析-蒙特卡洛",
+            time.perf_counter() - monte_start_ts,
+        )
+        _mark_progress("高级分析：蒙特卡洛压力测试完成。")
+
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        neighbor_results: list[BacktestResponse] = []
+        walk_forward: BacktestWalkForwardReport | None = None
+        extra_notes: list[str] = []
+        if len(scan_dates) >= 120 and int(result.stats.trade_count) >= 12:
+            neighbor_start_ts = time.perf_counter()
+            neighbor_results = self._run_backtest_neighborhood_probe(payload, control_callback=control_callback)
+            self._emit_backtest_runtime_stage_timing(
+                "advanced_neighbor_probe",
+                "高级分析-邻域稳定性探测",
+                time.perf_counter() - neighbor_start_ts,
+            )
+            _mark_progress("高级分析：邻域稳定性探测完成。")
+
+            walk_forward_start_ts = time.perf_counter()
+            walk_forward = self._run_backtest_walk_forward(payload, control_callback=control_callback)
+            self._emit_backtest_runtime_stage_timing(
+                "advanced_walk_forward",
+                "高级分析-Walk-forward",
+                time.perf_counter() - walk_forward_start_ts,
+            )
+            _mark_progress("高级分析：Walk-forward 验证完成。")
+        else:
+            extra_notes.append("高级分析已降级：区间或交易数不足，未执行 walk-forward 与邻域稳定性探测。")
+            _mark_progress("高级分析：邻域稳定性探测已跳过（样本不足）。")
+            _mark_progress("高级分析：Walk-forward 已跳过（样本不足）。")
+
+        stability_start_ts = time.perf_counter()
+        stability = self._compute_backtest_stability_diagnostics(
+            result,
+            neighbor_results=neighbor_results,
+        )
+        self._emit_backtest_runtime_stage_timing(
+            "advanced_stability",
+            "高级分析-稳定性评分",
+            time.perf_counter() - stability_start_ts,
+        )
+        _mark_progress("高级分析：稳定性评分完成。")
+        notes = list(result.notes)
+        notes.append(
+            f"风险指标: Sharpe={risk_metrics.sharpe:.3f}, Sortino={risk_metrics.sortino:.3f}, Calmar={risk_metrics.calmar:.3f}。"
+        )
+        notes.append(
+            f"稳定性评分={stability.stability_score:.3f}（邻域一致性={stability.neighborhood_consistency:.3f}，交易数惩罚={stability.trade_count_penalty:.3f}，方差惩罚={stability.return_variance_penalty:.3f}）。"
+        )
+        if walk_forward is not None and walk_forward.fold_count > 0:
+            notes.append(
+                f"Walk-forward: folds={walk_forward.fold_count}, 候选参数={walk_forward.candidate_count}, OOS通过率={walk_forward.oos_pass_rate:.1%}。"
+            )
+        for item in extra_notes:
+            notes.append(item)
+        _mark_progress("高级分析：汇总完成。")
+        self._emit_backtest_runtime_stage_timing(
+            "advanced_total",
+            "高级分析总耗时",
+            time.perf_counter() - advanced_start_ts,
+        )
+
+        return result.model_copy(
+            update={
+                "risk_metrics": risk_metrics,
+                "stability_diagnostics": stability,
+                "regime_breakdown": regime_breakdown,
+                "monte_carlo": monte_carlo,
+                "walk_forward": walk_forward,
+                "notes": notes,
+            }
         )
 
     def run_backtest(
@@ -6693,21 +7635,86 @@ class InMemoryStore:
 
             effective_progress_callback = _progress_with_control
 
+        progress_state = {"processed": 0, "total": 0}
+
+        def _emit_progress(current_date: str, processed_dates: int, total: int, message: str) -> None:
+            processed_safe = max(0, int(processed_dates))
+            total_safe = max(1, int(total))
+            progress_state["processed"] = max(int(progress_state["processed"]), processed_safe)
+            progress_state["total"] = max(int(progress_state["total"]), total_safe)
+            if effective_progress_callback is not None:
+                effective_progress_callback(current_date, processed_safe, total_safe, message)
+
+        advanced_slots_total = self._estimate_backtest_advanced_progress_slots(payload)
+        advanced_base_processed = 0
+        advanced_done_slots = 0
+
+        def _start_advanced_progress() -> None:
+            nonlocal advanced_base_processed, advanced_done_slots
+            advanced_base_processed = max(int(progress_state["processed"]), 0)
+            advanced_done_slots = 0
+            target_total = max(int(progress_state["total"]), advanced_base_processed + advanced_slots_total)
+            _emit_progress(
+                payload.date_to,
+                advanced_base_processed,
+                max(1, target_total),
+                "主回测完成，正在生成高级分析报告...",
+            )
+
+        def _advance_advanced_progress(message: str) -> None:
+            nonlocal advanced_done_slots
+            if advanced_slots_total <= 0:
+                return
+            advanced_done_slots = min(advanced_slots_total, advanced_done_slots + 1)
+            target_total = max(int(progress_state["total"]), advanced_base_processed + advanced_slots_total)
+            _emit_progress(
+                payload.date_to,
+                advanced_base_processed + advanced_done_slots,
+                max(1, target_total),
+                message,
+            )
+
+        def _finish_advanced_progress() -> None:
+            remaining = max(0, advanced_slots_total - advanced_done_slots)
+            for _ in range(remaining):
+                _advance_advanced_progress("高级分析：正在汇总结果...")
+            _emit_progress(
+                payload.date_to,
+                max(int(progress_state["processed"]), advanced_base_processed + advanced_slots_total),
+                max(int(progress_state["total"]), advanced_base_processed + advanced_slots_total, 1),
+                "高级分析完成，正在汇总结果...",
+            )
+
         cached_result = self._load_backtest_result_cache(payload)
         if cached_result is not None:
-            if effective_progress_callback is not None:
-                effective_progress_callback(
-                    payload.date_to,
-                    1,
-                    1,
-                    "回测结果缓存命中，直接返回。",
-                )
+            _emit_progress(payload.date_to, 1, 1, "回测结果缓存命中，直接返回。")
             cached_notes = list(cached_result.notes)
             cache_note = "回测结果缓存命中：复用本地持久化结果。"
             if cache_note not in cached_notes:
                 cached_notes.insert(0, cache_note)
             if cached_notes != cached_result.notes:
-                return cached_result.model_copy(update={"notes": cached_notes})
+                cached_result = cached_result.model_copy(update={"notes": cached_notes})
+            if payload.enable_advanced_analysis and (
+                cached_result.risk_metrics is None
+                or cached_result.stability_diagnostics is None
+                or cached_result.monte_carlo is None
+            ):
+                try:
+                    _start_advanced_progress()
+                    cached_result = self._enrich_backtest_advanced_analysis(
+                        payload=payload,
+                        result=cached_result,
+                        control_callback=control_callback,
+                        analysis_progress_callback=(
+                            _advance_advanced_progress if advanced_slots_total > 0 else None
+                        ),
+                    )
+                    _finish_advanced_progress()
+                    self._save_backtest_result_cache(payload, cached_result)
+                except Exception as exc:  # noqa: BLE001
+                    notes = list(cached_result.notes)
+                    notes.append(f"高级分析失败，已返回主回测结果：{exc}")
+                    cached_result = cached_result.model_copy(update={"notes": notes})
             return cached_result
 
         matrix_fallback_note: str | None = None
@@ -6720,9 +7727,25 @@ class InMemoryStore:
                 matrix_result = self._run_backtest_matrix(
                     payload=payload,
                     board_filters=board_filters,
-                    progress_callback=effective_progress_callback,
+                    progress_callback=_emit_progress,
                     control_callback=control_callback,
                 )
+                if payload.enable_advanced_analysis:
+                    try:
+                        _start_advanced_progress()
+                        matrix_result = self._enrich_backtest_advanced_analysis(
+                            payload=payload,
+                            result=matrix_result,
+                            control_callback=control_callback,
+                            analysis_progress_callback=(
+                                _advance_advanced_progress if advanced_slots_total > 0 else None
+                            ),
+                        )
+                        _finish_advanced_progress()
+                    except Exception as exc:  # noqa: BLE001
+                        notes = list(matrix_result.notes)
+                        notes.append(f"高级分析失败，已返回主回测结果：{exc}")
+                        matrix_result = matrix_result.model_copy(update={"notes": notes})
                 self._save_backtest_result_cache(payload, matrix_result)
                 return matrix_result
             except BacktestTaskCancelledError:
@@ -6751,6 +7774,7 @@ class InMemoryStore:
         symbols: list[str] = []
         allowed_symbols_by_date: dict[str, set[str]] | None = None
         scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        rolling_start_ts = time.perf_counter()
 
         engine = BacktestEngine(
             get_candles=self._ensure_candles,
@@ -6790,20 +7814,19 @@ class InMemoryStore:
                     next_day = self._next_scan_date(scan_dates, trade.exit_date)
                     if next_day:
                         refresh_date_set.add(next_day)
-                if effective_progress_callback is not None:
-                    effective_progress_callback(
-                        scan_dates[0],
-                        0,
-                        max(1, len(refresh_date_set)),
-                        "持仓触发滚动：正在根据卖出日生成刷新计划...",
-                    )
+                _emit_progress(
+                    scan_dates[0],
+                    0,
+                    max(1, len(refresh_date_set)),
+                    "持仓触发滚动：正在根据卖出日生成刷新计划...",
+                )
                 rolling_symbols, rolling_allowed_by_date, notes, _, refresh_dates_used = (
                     self._build_trend_pool_rolling_universe(
                         payload=payload,
                         screener_params=trend_pool_params,
                         board_filters=board_filters,
                         refresh_dates=sorted(refresh_date_set),
-                        progress_callback=effective_progress_callback,
+                        progress_callback=_emit_progress,
                     )
                 )
                 pool_notes = [
@@ -6817,7 +7840,7 @@ class InMemoryStore:
                     screener_params=trend_pool_params,
                     board_filters=board_filters,
                     refresh_dates=None,
-                    progress_callback=effective_progress_callback,
+                    progress_callback=_emit_progress,
                 )
                 pool_notes = [*pool_notes, *notes]
             if not rolling_symbols:
@@ -6849,19 +7872,18 @@ class InMemoryStore:
                     next_day = self._next_scan_date(scan_dates, trade.exit_date)
                     if next_day:
                         refresh_date_set.add(next_day)
-                if effective_progress_callback is not None:
-                    effective_progress_callback(
-                        scan_dates[0],
-                        0,
-                        max(1, len(refresh_date_set)),
-                        "持仓触发滚动：正在根据卖出日生成刷新计划...",
-                    )
+                _emit_progress(
+                    scan_dates[0],
+                    0,
+                    max(1, len(refresh_date_set)),
+                    "持仓触发滚动：正在根据卖出日生成刷新计划...",
+                )
                 rolling_symbols, rolling_allowed_by_date, notes, _, refresh_dates_used = (
                     self._build_full_market_rolling_universe(
                         payload=payload,
                         board_filters=board_filters,
                         refresh_dates=sorted(refresh_date_set),
-                        progress_callback=effective_progress_callback,
+                        progress_callback=_emit_progress,
                     )
                 )
                 pool_notes = [
@@ -6874,7 +7896,7 @@ class InMemoryStore:
                     payload=payload,
                     board_filters=board_filters,
                     refresh_dates=None,
-                    progress_callback=effective_progress_callback,
+                    progress_callback=_emit_progress,
                 )
                 pool_notes = [*pool_notes, *notes]
             if not rolling_symbols:
@@ -6885,6 +7907,12 @@ class InMemoryStore:
         else:
             raise ValueError(f"不支持的回测模式: {payload.mode}")
 
+        self._emit_backtest_runtime_stage_timing(
+            "rolling_universe",
+            "候选池构建",
+            time.perf_counter() - rolling_start_ts,
+        )
+
         if not symbols:
             raise ValueError("回测股票池为空，请先执行筛选或调整回测模式")
 
@@ -6894,11 +7922,27 @@ class InMemoryStore:
             scope_label="滚动池并集",
         )
 
+        main_base_processed = max(int(progress_state["processed"]), 1)
+        _emit_progress(
+            payload.date_to,
+            main_base_processed,
+            main_base_processed + 1,
+            "候选池构建完成，开始执行主回测...",
+        )
+        execute_start_ts = time.perf_counter()
         result = engine.run(
             payload=payload,
             symbols=symbols,
             allowed_symbols_by_date=allowed_symbols_by_date,
             control_callback=control_callback,
+        )
+        execute_elapsed = time.perf_counter() - execute_start_ts
+        self._emit_backtest_runtime_stage_timing("execution_match", "主回测执行", execute_elapsed)
+        _emit_progress(
+            payload.date_to,
+            main_base_processed + 1,
+            main_base_processed + 1,
+            "主回测完成，正在汇总结果...",
         )
 
         notes = list(result.notes)
@@ -6925,18 +7969,31 @@ class InMemoryStore:
             notes.append(f"候选池降级原因: {degraded_reason}")
         if notes != result.notes:
             result = result.model_copy(update={"notes": notes})
+        if payload.enable_advanced_analysis:
+            try:
+                _start_advanced_progress()
+                result = self._enrich_backtest_advanced_analysis(
+                    payload=payload,
+                    result=result,
+                    control_callback=control_callback,
+                    analysis_progress_callback=(
+                        _advance_advanced_progress if advanced_slots_total > 0 else None
+                    ),
+                )
+                _finish_advanced_progress()
+            except Exception as exc:  # noqa: BLE001
+                notes = list(result.notes)
+                notes.append(f"高级分析失败，已返回主回测结果：{exc}")
+                result = result.model_copy(update={"notes": notes})
         self._save_backtest_result_cache(payload, result)
         return result
 
     def _estimate_backtest_progress_total_dates(self, payload: BacktestRunRequest) -> int:
-        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
-        if not scan_dates:
-            return 1
-        if payload.pool_roll_mode == "weekly":
-            return max(1, len(self._build_weekly_refresh_dates(scan_dates)))
-        if payload.pool_roll_mode == "position":
-            return max(1, len(scan_dates))
-        return max(1, len(scan_dates))
+        scan_total = self._estimate_backtest_scan_progress_total_dates(payload)
+        # 额外预留 1 格用于“主回测执行”阶段，避免滚动扫描结束即 100%。
+        post_scan_slots = 1
+        advanced_slots = self._estimate_backtest_advanced_progress_slots(payload)
+        return max(1, int(scan_total) + int(post_scan_slots) + int(advanced_slots))
 
     def _build_backtest_task_state_payload(self) -> dict[str, object]:
         with self._backtest_task_lock:
@@ -7267,6 +8324,12 @@ class InMemoryStore:
                     )
                     self._upsert_backtest_task(current_task.model_copy(update={"progress": next_progress}))
 
+                self._set_backtest_runtime_stage_timing_callback(
+                    lambda stage_key, label, elapsed_sec: _upsert_stage_timing(
+                        self._build_backtest_task_stage_timing(stage_key, label, elapsed_sec)
+                    )
+                )
+
                 self._await_backtest_task_runnable(task_id)
                 task = self.get_backtest_task(task_id)
                 if task is None:
@@ -7440,6 +8503,7 @@ class InMemoryStore:
                     )
                 )
             finally:
+                self._clear_backtest_runtime_stage_timing_callback()
                 with self._backtest_task_lock:
                     self._backtest_running_worker_ids.discard(task_id)
                 self._persist_backtest_task_state(force=True)
@@ -7460,9 +8524,10 @@ class InMemoryStore:
 
         task_id = f"bt_{uuid4().hex[:16]}"
         now_text = self._now_datetime()
+        scan_total_dates = self._estimate_backtest_scan_progress_total_dates(payload)
         total_dates = self._estimate_backtest_progress_total_dates(payload)
         warning: str | None = None
-        if payload.pool_roll_mode in {"daily", "weekly"} and total_dates >= 45:
+        if payload.pool_roll_mode in {"daily", "weekly"} and scan_total_dates >= 45:
             warning = "滚动回测日期较长，耗时可能较久，请耐心等待。"
 
         initial_progress = BacktestTaskProgress(
@@ -9230,6 +10295,434 @@ class InMemoryStore:
             warnings=warnings,
         )
 
+    @staticmethod
+    def _now_utc_iso() -> str:
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    @classmethod
+    def _validate_backtest_report_id(cls, report_id: str) -> str:
+        text = str(report_id or "").strip()
+        if not cls._BACKTEST_REPORT_ID_RE.fullmatch(text):
+            raise BacktestValidationError("BACKTEST_REPORT_INVALID_ID", "报告ID不合法，只允许字母、数字、点、下划线和中划线。")
+        return text
+
+    @classmethod
+    def _build_backtest_report_id(cls, candidate: str | None = None) -> str:
+        text = str(candidate or "").strip()
+        if text:
+            return cls._validate_backtest_report_id(text)
+        return f"bt_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
+
+    @staticmethod
+    def _sha256_bytes(raw: bytes) -> str:
+        return hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def _json_dumps_bytes(payload: object) -> bytes:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
+
+    def _decode_backtest_report_base64(self, text: str, *, field_name: str) -> bytes:
+        raw_text = str(text or "").strip()
+        if not raw_text:
+            raise BacktestValidationError("BACKTEST_REPORT_INVALID", f"{field_name} 不能为空。")
+        try:
+            return base64.b64decode(raw_text, validate=True)
+        except Exception as exc:
+            raise BacktestValidationError("BACKTEST_REPORT_INVALID", f"{field_name} 不是有效Base64。") from exc
+
+    def _build_backtest_report_manifest(
+        self,
+        *,
+        report_id: str,
+        created_at: str,
+        app_name: str,
+        app_version: str,
+        payload_files: dict[str, bytes],
+    ) -> BacktestReportManifest:
+        file_rows = [
+            BacktestReportManifestFile(
+                path=path,
+                sha256=self._sha256_bytes(content),
+                bytes=len(content),
+            )
+            for path, content in sorted(payload_files.items())
+        ]
+        return BacktestReportManifest(
+            schema_version=self._BACKTEST_REPORT_SCHEMA_VERSION,
+            package_type=self._BACKTEST_REPORT_PACKAGE_TYPE,
+            created_at=created_at,
+            report_id=report_id,
+            app=BacktestReportManifestApp(
+                name=str(app_name or "Final Trade").strip() or "Final Trade",
+                version=str(app_version or "unknown").strip() or "unknown",
+            ),
+            files=file_rows,
+        )
+
+    @staticmethod
+    def _zip_backtest_report_files(files: dict[str, bytes]) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path, content in sorted(files.items()):
+                archive.writestr(path, content)
+        return buffer.getvalue()
+
+    @staticmethod
+    def _normalize_backtest_report_file_name(file_name: str | None, *, fallback: str) -> str:
+        text = str(file_name or "").strip()
+        if not text:
+            return fallback
+        safe_name = Path(text).name.strip()
+        return safe_name or fallback
+
+    def _parse_backtest_report_package(
+        self,
+        package_bytes: bytes,
+    ) -> tuple[
+        BacktestReportManifest,
+        dict[str, bytes],
+        BacktestRunRequest,
+        BacktestResponse,
+        BacktestPlateauResponse | None,
+    ]:
+        try:
+            with zipfile.ZipFile(io.BytesIO(package_bytes), mode="r") as archive:
+                names = {
+                    str(name).strip().replace("\\", "/")
+                    for name in archive.namelist()
+                    if str(name).strip() and not str(name).endswith("/")
+                }
+                if "manifest.json" not in names:
+                    raise BacktestValidationError("BACKTEST_REPORT_INVALID", "缺少 manifest.json。")
+                manifest_raw = archive.read("manifest.json")
+                manifest_payload = json.loads(manifest_raw.decode("utf-8"))
+                manifest = BacktestReportManifest(**manifest_payload)
+
+                file_meta_by_path: dict[str, BacktestReportManifestFile] = {}
+                for row in manifest.files:
+                    normalized = str(row.path or "").strip().replace("\\", "/")
+                    if (
+                        not normalized
+                        or normalized in {".", "..", "manifest.json"}
+                        or "/" in normalized
+                    ):
+                        raise BacktestValidationError("BACKTEST_REPORT_INVALID", f"manifest.files.path 非法: {row.path}")
+                    if normalized in file_meta_by_path:
+                        raise BacktestValidationError("BACKTEST_REPORT_INVALID", f"manifest.files.path 重复: {normalized}")
+                    file_meta_by_path[normalized] = row.model_copy(update={"path": normalized})
+
+                missing_required = [
+                    item
+                    for item in self._BACKTEST_REPORT_REQUIRED_FILES
+                    if item not in file_meta_by_path
+                ]
+                if missing_required:
+                    raise BacktestValidationError(
+                        "BACKTEST_REPORT_INVALID",
+                        f"manifest 缺少必需文件: {', '.join(missing_required)}",
+                    )
+
+                for required in self._BACKTEST_REPORT_REQUIRED_FILES:
+                    if required not in names:
+                        raise BacktestValidationError("BACKTEST_REPORT_INVALID", f"压缩包缺少必需文件: {required}")
+
+                extra_files = sorted(
+                    name
+                    for name in names
+                    if name != "manifest.json" and name not in file_meta_by_path
+                )
+                if extra_files:
+                    raise BacktestValidationError(
+                        "BACKTEST_REPORT_INVALID",
+                        f"压缩包存在未登记文件: {', '.join(extra_files[:8])}",
+                    )
+
+                payload_files: dict[str, bytes] = {}
+                for path, meta in file_meta_by_path.items():
+                    if path not in names:
+                        raise BacktestValidationError("BACKTEST_REPORT_INVALID", f"压缩包缺少文件: {path}")
+                    content = archive.read(path)
+                    if len(content) != int(meta.bytes):
+                        raise BacktestValidationError("BACKTEST_REPORT_INVALID", f"文件字节数不匹配: {path}")
+                    actual_hash = self._sha256_bytes(content)
+                    if actual_hash != str(meta.sha256).strip().lower():
+                        raise BacktestValidationError("BACKTEST_REPORT_INVALID", f"文件哈希校验失败: {path}")
+                    payload_files[path] = content
+        except BacktestValidationError:
+            raise
+        except zipfile.BadZipFile as exc:
+            raise BacktestValidationError("BACKTEST_REPORT_INVALID", "文件不是有效的ftbt压缩包。") from exc
+        except Exception as exc:
+            raise BacktestValidationError("BACKTEST_REPORT_INVALID", f"解析ftbt失败: {exc}") from exc
+
+        self._validate_backtest_report_id(manifest.report_id)
+
+        try:
+            run_request = BacktestRunRequest(
+                **json.loads(payload_files["run_request.json"].decode("utf-8"))
+            )
+            run_result = BacktestResponse(
+                **json.loads(payload_files["run_result.json"].decode("utf-8"))
+            )
+        except BacktestValidationError:
+            raise
+        except Exception as exc:
+            raise BacktestValidationError("BACKTEST_REPORT_INVALID", f"run_request/run_result 校验失败: {exc}") from exc
+
+        plateau_result: BacktestPlateauResponse | None = None
+        if "plateau_result.json" in payload_files:
+            try:
+                plateau_result = BacktestPlateauResponse(
+                    **json.loads(payload_files["plateau_result.json"].decode("utf-8"))
+                )
+            except Exception as exc:
+                raise BacktestValidationError("BACKTEST_REPORT_INVALID", f"plateau_result 校验失败: {exc}") from exc
+
+        return manifest, payload_files, run_request, run_result, plateau_result
+
+    @staticmethod
+    def _backtest_report_meta_path(report_dir: Path) -> Path:
+        return report_dir / "meta.json"
+
+    def _read_backtest_report_meta(self, report_dir: Path) -> dict[str, Any]:
+        path = self._backtest_report_meta_path(report_dir)
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return raw
+            return {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _build_backtest_report_summary(
+        *,
+        report_id: str,
+        manifest: BacktestReportManifest,
+        run_result: BacktestResponse,
+        first_imported_at: str,
+        last_imported_at: str,
+        source_file_name: str,
+        package_size_bytes: int,
+        has_plateau_result: bool,
+    ) -> BacktestReportSummary:
+        return BacktestReportSummary(
+            report_id=report_id,
+            created_at=manifest.created_at,
+            first_imported_at=first_imported_at,
+            last_imported_at=last_imported_at,
+            source_file_name=source_file_name,
+            package_size_bytes=max(0, int(package_size_bytes)),
+            trade_count=int(run_result.stats.trade_count),
+            total_return=float(run_result.stats.total_return),
+            max_drawdown=float(run_result.stats.max_drawdown),
+            win_rate=float(run_result.stats.win_rate),
+            date_from=str(run_result.range.date_from),
+            date_to=str(run_result.range.date_to),
+            has_plateau_result=bool(has_plateau_result),
+        )
+
+    def _load_backtest_report_detail_from_dir(self, report_dir: Path) -> BacktestReportDetail | None:
+        try:
+            report_id = self._validate_backtest_report_id(report_dir.name)
+            manifest = BacktestReportManifest(
+                **json.loads((report_dir / "manifest.json").read_text(encoding="utf-8"))
+            )
+            run_request = BacktestRunRequest(
+                **json.loads((report_dir / "run_request.json").read_text(encoding="utf-8"))
+            )
+            run_result = BacktestResponse(
+                **json.loads((report_dir / "run_result.json").read_text(encoding="utf-8"))
+            )
+            plateau_result: BacktestPlateauResponse | None = None
+            plateau_path = report_dir / "plateau_result.json"
+            if plateau_path.exists():
+                plateau_result = BacktestPlateauResponse(
+                    **json.loads(plateau_path.read_text(encoding="utf-8"))
+                )
+            meta = self._read_backtest_report_meta(report_dir)
+            first_imported_at = str(meta.get("first_imported_at") or manifest.created_at)
+            last_imported_at = str(meta.get("last_imported_at") or first_imported_at)
+            source_file_name = str(meta.get("source_file_name") or f"{report_id}.ftbt")
+            package_size_bytes = int(meta.get("package_size_bytes") or 0)
+            summary = self._build_backtest_report_summary(
+                report_id=report_id,
+                manifest=manifest,
+                run_result=run_result,
+                first_imported_at=first_imported_at,
+                last_imported_at=last_imported_at,
+                source_file_name=source_file_name,
+                package_size_bytes=package_size_bytes,
+                has_plateau_result=plateau_result is not None,
+            )
+            return BacktestReportDetail(
+                summary=summary,
+                manifest=manifest,
+                run_request=run_request,
+                run_result=run_result,
+                plateau_result=plateau_result,
+            )
+        except Exception:
+            return None
+
+    def build_backtest_report_package(self, payload: BacktestReportBuildRequest) -> BacktestReportBuildResponse:
+        report_id = self._build_backtest_report_id(payload.report_id)
+        created_at = self._now_utc_iso()
+        report_html_text = str(payload.report_html or "")
+        if not report_html_text.strip():
+            raise BacktestValidationError("BACKTEST_REPORT_INVALID", "report_html 不能为空。")
+        report_xlsx_bytes = self._decode_backtest_report_base64(
+            payload.report_xlsx_base64,
+            field_name="report_xlsx_base64",
+        )
+        if len(report_xlsx_bytes) <= 0:
+            raise BacktestValidationError("BACKTEST_REPORT_INVALID", "report_xlsx_base64 解码后为空。")
+
+        payload_files: dict[str, bytes] = {
+            "run_request.json": self._json_dumps_bytes(payload.run_request.model_dump(exclude_none=True)),
+            "run_result.json": self._json_dumps_bytes(payload.run_result.model_dump(exclude_none=True)),
+            "report.xlsx": report_xlsx_bytes,
+            "report.html": report_html_text.encode("utf-8"),
+        }
+        if payload.plateau_result is not None:
+            payload_files["plateau_result.json"] = self._json_dumps_bytes(
+                payload.plateau_result.model_dump(exclude_none=True)
+            )
+
+        manifest = self._build_backtest_report_manifest(
+            report_id=report_id,
+            created_at=created_at,
+            app_name=payload.app_name,
+            app_version=payload.app_version,
+            payload_files=payload_files,
+        )
+
+        package_files: dict[str, bytes] = {
+            "manifest.json": self._json_dumps_bytes(manifest.model_dump(exclude_none=True)),
+            **payload_files,
+        }
+        package_bytes = self._zip_backtest_report_files(package_files)
+        package_base64 = base64.b64encode(package_bytes).decode("ascii")
+
+        return BacktestReportBuildResponse(
+            report_id=report_id,
+            file_name=f"{report_id}.ftbt",
+            file_base64=package_base64,
+            manifest=manifest,
+        )
+
+    def import_backtest_report_package(
+        self,
+        package_bytes: bytes,
+        *,
+        source_file_name: str | None = None,
+    ) -> BacktestReportImportResponse:
+        if len(package_bytes) <= 0:
+            raise BacktestValidationError("BACKTEST_REPORT_INVALID", "导入文件为空。")
+
+        manifest, payload_files, run_request, run_result, plateau_result = self._parse_backtest_report_package(package_bytes)
+        _ = run_request
+        report_id = self._validate_backtest_report_id(manifest.report_id)
+        now_text = self._now_datetime()
+        store_dir = self._resolve_backtest_report_store_dir()
+        store_dir.mkdir(parents=True, exist_ok=True)
+        target_dir = store_dir / report_id
+        existing_meta = self._read_backtest_report_meta(target_dir) if target_dir.exists() else {}
+        first_imported_at = str(existing_meta.get("first_imported_at") or now_text)
+        normalized_source_name = self._normalize_backtest_report_file_name(
+            source_file_name,
+            fallback=f"{report_id}.ftbt",
+        )
+        package_size_bytes = len(package_bytes)
+
+        tmp_dir = store_dir / f".{report_id}.tmp.{uuid4().hex[:8]}"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest_bytes = self._json_dumps_bytes(manifest.model_dump(exclude_none=True))
+        run_request_bytes = self._json_dumps_bytes(run_request.model_dump(exclude_none=True))
+        run_result_bytes = self._json_dumps_bytes(run_result.model_dump(exclude_none=True))
+        meta_payload = {
+            "schema_version": self._BACKTEST_REPORT_META_SCHEMA_VERSION,
+            "report_id": report_id,
+            "first_imported_at": first_imported_at,
+            "last_imported_at": now_text,
+            "source_file_name": normalized_source_name,
+            "package_size_bytes": package_size_bytes,
+            "updated_at": now_text,
+        }
+        try:
+            (tmp_dir / "manifest.json").write_bytes(manifest_bytes)
+            (tmp_dir / "run_request.json").write_bytes(run_request_bytes)
+            (tmp_dir / "run_result.json").write_bytes(run_result_bytes)
+            for path, content in payload_files.items():
+                (tmp_dir / path).write_bytes(content)
+            (tmp_dir / "meta.json").write_text(
+                json.dumps(meta_payload, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+            if target_dir.exists():
+                shutil.rmtree(target_dir, ignore_errors=True)
+            tmp_dir.replace(target_dir)
+        except Exception as exc:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise BacktestValidationError("BACKTEST_REPORT_IMPORT_FAILED", f"写入报告库失败: {exc}") from exc
+
+        summary = self._build_backtest_report_summary(
+            report_id=report_id,
+            manifest=manifest,
+            run_result=run_result,
+            first_imported_at=first_imported_at,
+            last_imported_at=now_text,
+            source_file_name=normalized_source_name,
+            package_size_bytes=package_size_bytes,
+            has_plateau_result=plateau_result is not None,
+        )
+        return BacktestReportImportResponse(summary=summary)
+
+    def list_backtest_reports(self) -> BacktestReportListResponse:
+        store_dir = self._resolve_backtest_report_store_dir()
+        if not store_dir.exists() or (not store_dir.is_dir()):
+            return BacktestReportListResponse(items=[])
+        items: list[BacktestReportSummary] = []
+        for path in store_dir.iterdir():
+            if not path.is_dir():
+                continue
+            detail = self._load_backtest_report_detail_from_dir(path)
+            if detail is None:
+                continue
+            items.append(detail.summary)
+        items.sort(
+            key=lambda row: (
+                str(row.last_imported_at),
+                str(row.created_at),
+                str(row.report_id),
+            ),
+            reverse=True,
+        )
+        return BacktestReportListResponse(items=items)
+
+    def get_backtest_report(self, report_id: str) -> BacktestReportDetail | None:
+        normalized = self._validate_backtest_report_id(report_id)
+        report_dir = self._resolve_backtest_report_store_dir() / normalized
+        if not report_dir.exists() or (not report_dir.is_dir()):
+            return None
+        return self._load_backtest_report_detail_from_dir(report_dir)
+
+    def delete_backtest_report(self, report_id: str) -> bool:
+        normalized = self._validate_backtest_report_id(report_id)
+        report_dir = self._resolve_backtest_report_store_dir() / normalized
+        if not report_dir.exists() or (not report_dir.is_dir()):
+            return False
+        try:
+            shutil.rmtree(report_dir)
+            return True
+        except Exception as exc:
+            raise BacktestValidationError("BACKTEST_REPORT_DELETE_FAILED", f"删除报告失败: {exc}") from exc
+
     def get_system_storage_status(self) -> SystemStorageStatus:
         configured = (self._config.akshare_cache_dir or "").strip()
         if configured:
@@ -9340,3 +10833,6 @@ class InMemoryStore:
 
 
 store = InMemoryStore()
+
+
+

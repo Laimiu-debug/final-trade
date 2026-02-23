@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState } from 'react'
+﻿import { useEffect, useMemo, useRef, useState } from 'react'
 import dayjs, { Dayjs } from 'dayjs'
 import { useMutation } from '@tanstack/react-query'
 import {
@@ -23,10 +23,16 @@ import {
 import type { ColumnsType } from 'antd/es/table'
 import ReactECharts from 'echarts-for-react'
 import { Link } from 'react-router-dom'
+import * as XLSX from 'xlsx'
 import { ApiError } from '@/shared/api/client'
 import {
+  buildBacktestReportPackage,
   cancelBacktestPlateauTask,
   cancelBacktestTask,
+  deleteBacktestReport,
+  getBacktestReport,
+  importBacktestReportPackage,
+  listBacktestReports,
   pauseBacktestPlateauTask,
   pauseBacktestTask,
   resumeBacktestPlateauTask,
@@ -38,12 +44,21 @@ import { PageHeader } from '@/shared/components/PageHeader'
 import { useBacktestPlateauTaskStore } from '@/state/backtestPlateauTaskStore'
 import { useBacktestTaskStore } from '@/state/backtestTaskStore'
 import type {
+  BacktestPlateauCorrelationRow,
   BacktestPlateauPoint,
+  BacktestPlateauResponse,
   BacktestPlateauTaskStatusResponse,
   BacktestPoolRollMode,
   BacktestPriorityMode,
+  BacktestMonteCarloSummary,
+  BacktestRegimeBucket,
+  BacktestReportSummary,
+  BacktestResponse,
+  BacktestRunRequest,
+  BacktestStabilityDiagnostics,
   BacktestTaskStatusResponse,
   BacktestTrade,
+  BacktestWalkForwardReport,
   BoardFilter,
   SignalScanMode,
   TrendPoolStep,
@@ -72,6 +87,7 @@ const TRADE_BACKTEST_DEFAULTS = {
   priorityTopK: 0,
   enforceT1: true,
   maxSymbols: 120,
+  enableAdvancedAnalysis: true,
   defaultLookbackDays: 180,
 }
 
@@ -145,6 +161,7 @@ type BacktestFormDraft = {
   priority_topk_per_day: number
   enforce_t1: boolean
   max_symbols: number
+  enable_advanced_analysis: boolean
   trades_page_size: number
 }
 
@@ -222,6 +239,553 @@ function parseNumericList(
     result.push(value)
   }
   return result
+}
+
+function bufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer)
+  const chunkSize = 0x8000
+  let out = ''
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.subarray(offset, Math.min(bytes.length, offset + chunkSize))
+    out += String.fromCharCode(...Array.from(chunk))
+  }
+  return btoa(out)
+}
+
+function base64ToUint8Array(raw: string): Uint8Array {
+  const text = String(raw || '').trim()
+  const binary = atob(text)
+  const out = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) {
+    out[i] = binary.charCodeAt(i)
+  }
+  return out
+}
+
+function downloadBlob(fileName: string, blob: Blob) {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = fileName
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
+
+function escapeHtml(raw: string): string {
+  return String(raw || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;')
+}
+
+function formatSigned(value: number): string {
+  const numeric = Number(value || 0)
+  const sign = numeric >= 0 ? '+' : ''
+  return `${sign}${numeric.toFixed(3)}`
+}
+
+function classifyCorrelationDirection(value: number): '正相关' | '负相关' | '弱相关' {
+  if (value > 0.05) return '正相关'
+  if (value < -0.05) return '负相关'
+  return '弱相关'
+}
+
+function correlationDirectionTagColor(direction: '正相关' | '负相关' | '弱相关'): string {
+  if (direction === '正相关') return 'success'
+  if (direction === '负相关') return 'error'
+  return 'default'
+}
+
+function safePearsonCorrelation(xValues: number[], yValues: number[]): number {
+  const count = Math.min(xValues.length, yValues.length)
+  if (count < 2) return 0
+  const xs = xValues.slice(0, count).map((item) => Number(item))
+  const ys = yValues.slice(0, count).map((item) => Number(item))
+  const meanX = xs.reduce((sum, value) => sum + value, 0) / count
+  const meanY = ys.reduce((sum, value) => sum + value, 0) / count
+  const varX = xs.reduce((sum, value) => sum + (value - meanX) ** 2, 0)
+  const varY = ys.reduce((sum, value) => sum + (value - meanY) ** 2, 0)
+  if (varX <= 1e-12 || varY <= 1e-12) return 0
+  const cov = xs.reduce((sum, value, index) => sum + (value - meanX) * (ys[index]! - meanY), 0)
+  const corr = cov / Math.sqrt(varX * varY)
+  if (!Number.isFinite(corr)) return 0
+  return Math.max(-1, Math.min(1, corr))
+}
+
+function buildPlateauCorrelationsFromPoints(points: BacktestPlateauPoint[]): BacktestPlateauCorrelationRow[] {
+  if (points.length < 2) return []
+  const scoreValues = points.map((row) => Number(row.score))
+  const totalReturnValues = points.map((row) => Number(row.stats.total_return))
+  const winRateValues = points.map((row) => Number(row.stats.win_rate))
+  const specs: Array<{
+    key: string
+    label: string
+    pick: (row: BacktestPlateauPoint) => number
+  }> = [
+    { key: 'window_days', label: '信号窗口天数', pick: (row) => Number(row.params.window_days) },
+    { key: 'min_score', label: '最低评分', pick: (row) => Number(row.params.min_score) },
+    { key: 'stop_loss', label: '止损比例', pick: (row) => Number(row.params.stop_loss) },
+    { key: 'take_profit', label: '止盈比例', pick: (row) => Number(row.params.take_profit) },
+    { key: 'max_positions', label: '最大并发持仓', pick: (row) => Number(row.params.max_positions) },
+    { key: 'position_pct', label: '单笔仓位占比', pick: (row) => Number(row.params.position_pct) },
+    { key: 'max_symbols', label: '最大股票数', pick: (row) => Number(row.params.max_symbols) },
+    { key: 'priority_topk_per_day', label: '同日TopK', pick: (row) => Number(row.params.priority_topk_per_day) },
+  ]
+  const rows = specs.map((item) => {
+    const xValues = points.map(item.pick)
+    return {
+      parameter: item.key,
+      parameter_label: item.label,
+      score_corr: Number(safePearsonCorrelation(xValues, scoreValues).toFixed(6)),
+      total_return_corr: Number(safePearsonCorrelation(xValues, totalReturnValues).toFixed(6)),
+      win_rate_corr: Number(safePearsonCorrelation(xValues, winRateValues).toFixed(6)),
+    } as BacktestPlateauCorrelationRow
+  })
+  rows.sort((left, right) => {
+    const leftStrength = Math.max(Math.abs(left.score_corr), Math.abs(left.total_return_corr), Math.abs(left.win_rate_corr))
+    const rightStrength = Math.max(Math.abs(right.score_corr), Math.abs(right.total_return_corr), Math.abs(right.win_rate_corr))
+    return rightStrength - leftStrength
+  })
+  return rows
+}
+
+function resolvePlateauCorrelations(plateauResult?: BacktestPlateauResponse | null): BacktestPlateauCorrelationRow[] {
+  if (!plateauResult) return []
+  const existingRows = Array.isArray(plateauResult.correlations) ? plateauResult.correlations : []
+  if (existingRows.length > 0) {
+    return existingRows
+  }
+  const validPoints = (plateauResult.points ?? []).filter((row) => !row.error)
+  return buildPlateauCorrelationsFromPoints(validPoints)
+}
+
+function buildBacktestReportWorkbookBuffer(
+  runRequest: BacktestRunRequest,
+  runResult: BacktestResponse,
+  plateauResult?: BacktestPlateauResponse | null,
+): ArrayBuffer {
+  const workbook = XLSX.utils.book_new()
+  const plateauCorrelations = resolvePlateauCorrelations(plateauResult)
+  const plateauBestPoint = plateauResult?.best_point ?? null
+  const riskMetrics = runResult.risk_metrics ?? null
+  const stability = runResult.stability_diagnostics ?? null
+  const regimeBreakdown = runResult.regime_breakdown ?? []
+  const monteCarlo = runResult.monte_carlo ?? null
+  const walkForward = runResult.walk_forward ?? null
+  const summaryRows = [
+    {
+      date_from: runResult.range.date_from,
+      date_to: runResult.range.date_to,
+      mode: runRequest.mode,
+      pool_roll_mode: runRequest.pool_roll_mode,
+      trade_count: runResult.stats.trade_count,
+      win_count: runResult.stats.win_count,
+      loss_count: runResult.stats.loss_count,
+      win_rate: runResult.stats.win_rate,
+      total_return: runResult.stats.total_return,
+      max_drawdown: runResult.stats.max_drawdown,
+      avg_pnl_ratio: runResult.stats.avg_pnl_ratio,
+      profit_factor: runResult.stats.profit_factor,
+      candidate_count: runResult.candidate_count,
+      skipped_count: runResult.skipped_count,
+      fill_rate: runResult.fill_rate,
+      max_concurrent_positions: runResult.max_concurrent_positions,
+      has_plateau_result: Boolean(plateauResult),
+      plateau_total_combinations: plateauResult?.total_combinations ?? null,
+      plateau_evaluated_combinations: plateauResult?.evaluated_combinations ?? null,
+      plateau_best_score: plateauBestPoint?.score ?? null,
+      plateau_best_total_return: plateauBestPoint?.stats.total_return ?? null,
+      plateau_best_win_rate: plateauBestPoint?.stats.win_rate ?? null,
+      sharpe: riskMetrics?.sharpe ?? null,
+      sortino: riskMetrics?.sortino ?? null,
+      calmar: riskMetrics?.calmar ?? null,
+      expectancy: riskMetrics?.expectancy ?? null,
+      stability_score: stability?.stability_score ?? null,
+      monte_carlo_ruin_probability: monteCarlo?.ruin_probability ?? null,
+      walk_forward_oos_pass_rate: walkForward?.oos_pass_rate ?? null,
+    },
+  ]
+  const paramRows = [runRequest]
+  const noteRows = runResult.notes.map((item, index) => ({ index: index + 1, note: item }))
+  const tradeRows = runResult.trades.map((row) => {
+    const parsedExit = parseExitReason(row.exit_reason)
+    return {
+      ...row,
+      entry_signal: formatEventSequence(row.entry_signal),
+      exit_reason: parsedExit.detail ? `${parsedExit.label}:${parsedExit.detail}` : parsedExit.label,
+    }
+  })
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(summaryRows), 'Summary')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(paramRows), 'Params')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(tradeRows), 'Trades')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(runResult.equity_curve), 'Equity')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(runResult.drawdown_curve), 'Drawdown')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(runResult.monthly_returns), 'Monthly')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(noteRows), 'Notes')
+  if (riskMetrics) {
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([riskMetrics]), 'RiskMetrics')
+  }
+  if (stability) {
+    const stabilityRows = [
+      {
+        stability_score: stability.stability_score,
+        min_trade_count_threshold: stability.min_trade_count_threshold,
+        trade_count_penalty: stability.trade_count_penalty,
+        neighborhood_consistency: stability.neighborhood_consistency,
+        return_variance_penalty: stability.return_variance_penalty,
+        monthly_return_std: stability.monthly_return_std,
+      },
+    ]
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(stabilityRows), 'Stability')
+    if (stability.notes.length > 0) {
+      XLSX.utils.book_append_sheet(
+        workbook,
+        XLSX.utils.json_to_sheet(stability.notes.map((note, index) => ({ index: index + 1, note }))),
+        'StabilityNotes',
+      )
+    }
+  }
+  if (regimeBreakdown.length > 0) {
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(regimeBreakdown), 'Regimes')
+  }
+  if (monteCarlo) {
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([monteCarlo]), 'MonteCarlo')
+  }
+  if (walkForward) {
+    const walkSummary = [
+      {
+        fold_count: walkForward.fold_count,
+        candidate_count: walkForward.candidate_count,
+        oos_pass_rate: walkForward.oos_pass_rate,
+        avg_test_return: walkForward.avg_test_return,
+        avg_test_win_rate: walkForward.avg_test_win_rate,
+      },
+    ]
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(walkSummary), 'WalkForward')
+    if (walkForward.folds.length > 0) {
+      const walkFoldRows = walkForward.folds.map((fold) => ({
+        fold_index: fold.fold_index,
+        train_date_from: fold.train_date_from,
+        train_date_to: fold.train_date_to,
+        test_date_from: fold.test_date_from,
+        test_date_to: fold.test_date_to,
+        train_score: fold.train_score,
+        test_score: fold.test_score,
+        train_total_return: fold.train_stats.total_return,
+        train_win_rate: fold.train_stats.win_rate,
+        test_total_return: fold.test_stats.total_return,
+        test_win_rate: fold.test_stats.win_rate,
+        window_days: fold.selected_params.window_days,
+        min_score: fold.selected_params.min_score,
+        stop_loss: fold.selected_params.stop_loss,
+        take_profit: fold.selected_params.take_profit,
+        max_positions: fold.selected_params.max_positions,
+        position_pct: fold.selected_params.position_pct,
+        max_symbols: fold.selected_params.max_symbols,
+        priority_topk_per_day: fold.selected_params.priority_topk_per_day,
+      }))
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(walkFoldRows), 'WalkForwardFolds')
+    }
+    if (walkForward.notes.length > 0) {
+      XLSX.utils.book_append_sheet(
+        workbook,
+        XLSX.utils.json_to_sheet(walkForward.notes.map((note, index) => ({ index: index + 1, note }))),
+        'WalkForwardNotes',
+      )
+    }
+  }
+  if (plateauResult) {
+    const plateauSummaryRows = [
+      {
+        total_combinations: plateauResult.total_combinations,
+        evaluated_combinations: plateauResult.evaluated_combinations,
+        generated_at: plateauResult.generated_at,
+        best_score: plateauBestPoint?.score ?? null,
+        best_total_return: plateauBestPoint?.stats.total_return ?? null,
+        best_win_rate: plateauBestPoint?.stats.win_rate ?? null,
+      },
+    ]
+    const plateauPointRows = (plateauResult.points ?? []).map((row, index) => ({
+      rank: index + 1,
+      score: row.score,
+      total_return: row.stats.total_return,
+      max_drawdown: row.stats.max_drawdown,
+      win_rate: row.stats.win_rate,
+      trade_count: row.stats.trade_count,
+      window_days: row.params.window_days,
+      min_score: row.params.min_score,
+      stop_loss: row.params.stop_loss,
+      take_profit: row.params.take_profit,
+      max_positions: row.params.max_positions,
+      position_pct: row.params.position_pct,
+      max_symbols: row.params.max_symbols,
+      priority_topk_per_day: row.params.priority_topk_per_day,
+      candidate_count: row.candidate_count,
+      skipped_count: row.skipped_count,
+      fill_rate: row.fill_rate,
+      max_concurrent_positions: row.max_concurrent_positions,
+      cache_hit: row.cache_hit,
+      error: row.error ?? '',
+    }))
+    const plateauCorrelationRows = plateauCorrelations.map((item) => ({
+      parameter: item.parameter,
+      parameter_label: item.parameter_label,
+      score_corr: item.score_corr,
+      score_direction: classifyCorrelationDirection(item.score_corr),
+      total_return_corr: item.total_return_corr,
+      total_return_direction: classifyCorrelationDirection(item.total_return_corr),
+      win_rate_corr: item.win_rate_corr,
+      win_rate_direction: classifyCorrelationDirection(item.win_rate_corr),
+    }))
+    const plateauNoteRows = (plateauResult.notes ?? []).map((item, index) => ({ index: index + 1, note: item }))
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(plateauSummaryRows), 'Plateau')
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(plateauPointRows), 'PlateauPoints')
+    if (plateauCorrelationRows.length > 0) {
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(plateauCorrelationRows), 'PlateauCorr')
+    }
+    if (plateauNoteRows.length > 0) {
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(plateauNoteRows), 'PlateauNotes')
+    }
+  }
+  return XLSX.write(workbook, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer
+}
+
+function buildBacktestReportHtml(
+  runRequest: BacktestRunRequest,
+  runResult: BacktestResponse,
+  plateauResult?: BacktestPlateauResponse | null,
+): string {
+  const rows = runResult.trades
+    .map((trade) => {
+      const parsedExit = parseExitReason(trade.exit_reason)
+      const exitDisplay = parsedExit.detail ? `${parsedExit.label}:${parsedExit.detail}` : parsedExit.label
+      return `<tr>
+        <td>${escapeHtml(trade.symbol)}</td>
+        <td>${escapeHtml(trade.name)}</td>
+        <td>${escapeHtml(trade.signal_date)}</td>
+        <td>${escapeHtml(trade.entry_date)}</td>
+        <td>${escapeHtml(trade.exit_date)}</td>
+        <td>${escapeHtml(formatEventSequence(trade.entry_signal))}</td>
+        <td>${escapeHtml(exitDisplay)}</td>
+        <td>${trade.quantity}</td>
+        <td>${trade.entry_price}</td>
+        <td>${trade.exit_price}</td>
+        <td>${trade.holding_days}</td>
+        <td>${trade.pnl_amount}</td>
+        <td>${trade.pnl_ratio}</td>
+      </tr>`
+    })
+    .join('\n')
+  const noteList = runResult.notes.map((note) => `<li>${escapeHtml(note)}</li>`).join('\n')
+  const plateauCorrelations = resolvePlateauCorrelations(plateauResult)
+  const plateauValidPoints = (plateauResult?.points ?? []).filter((row) => !row.error)
+  const plateauPointRows = plateauValidPoints
+    .slice(0, 100)
+    .map((row, index) => (
+      `<tr>
+        <td>${index + 1}</td>
+        <td>${row.score.toFixed(3)}</td>
+        <td>${(Number(row.stats.total_return) * 100).toFixed(2)}%</td>
+        <td>${(Number(row.stats.win_rate) * 100).toFixed(2)}%</td>
+        <td>${row.params.window_days}</td>
+        <td>${Number(row.params.min_score).toFixed(2)}</td>
+        <td>${(Number(row.params.stop_loss) * 100).toFixed(2)}%</td>
+        <td>${(Number(row.params.take_profit) * 100).toFixed(2)}%</td>
+      </tr>`
+    ))
+    .join('\n')
+  const plateauCorrelationRows = plateauCorrelations
+    .map((item) => (
+      `<tr>
+        <td>${escapeHtml(item.parameter_label)}</td>
+        <td>${formatSigned(item.score_corr)} (${classifyCorrelationDirection(item.score_corr)})</td>
+        <td>${formatSigned(item.total_return_corr)} (${classifyCorrelationDirection(item.total_return_corr)})</td>
+        <td>${formatSigned(item.win_rate_corr)} (${classifyCorrelationDirection(item.win_rate_corr)})</td>
+      </tr>`
+    ))
+    .join('\n')
+  const plateauNoteList = (plateauResult?.notes ?? []).map((note) => `<li>${escapeHtml(note)}</li>`).join('\n')
+  const riskMetrics = runResult.risk_metrics ?? null
+  const stability = runResult.stability_diagnostics ?? null
+  const regimeRows = (runResult.regime_breakdown ?? [])
+    .map((item) => (
+      `<tr>
+        <td>${escapeHtml(item.label)}</td>
+        <td>${item.trade_count}</td>
+        <td>${(Number(item.win_rate) * 100).toFixed(2)}%</td>
+        <td>${(Number(item.total_return) * 100).toFixed(2)}%</td>
+        <td>${(Number(item.avg_pnl_ratio) * 100).toFixed(2)}%</td>
+        <td>${(Number(item.max_drawdown) * 100).toFixed(2)}%</td>
+      </tr>`
+    ))
+    .join('\n')
+  const monteCarlo = runResult.monte_carlo ?? null
+  const walkForward = runResult.walk_forward ?? null
+  const walkForwardRows = (walkForward?.folds ?? [])
+    .map((fold) => (
+      `<tr>
+        <td>${fold.fold_index}</td>
+        <td>${escapeHtml(fold.train_date_from)}~${escapeHtml(fold.train_date_to)}</td>
+        <td>${escapeHtml(fold.test_date_from)}~${escapeHtml(fold.test_date_to)}</td>
+        <td>${formatSigned(fold.train_score)}</td>
+        <td>${formatSigned(fold.test_score)}</td>
+        <td>${(Number(fold.test_stats.total_return) * 100).toFixed(2)}%</td>
+        <td>${(Number(fold.test_stats.win_rate) * 100).toFixed(2)}%</td>
+      </tr>`
+    ))
+    .join('\n')
+  const walkForwardNotes = (walkForward?.notes ?? []).map((note) => `<li>${escapeHtml(note)}</li>`).join('\n')
+  const generatedAt = dayjs().format('YYYY-MM-DD HH:mm:ss')
+  const advancedSection = `
+  <h2>高级分析</h2>
+  ${riskMetrics
+    ? `<div class="meta">
+    <div>Sharpe：${Number(riskMetrics.sharpe).toFixed(3)}</div>
+    <div>Sortino：${Number(riskMetrics.sortino).toFixed(3)}</div>
+    <div>Calmar：${Number(riskMetrics.calmar).toFixed(3)}</div>
+    <div>Expectancy：${(Number(riskMetrics.expectancy) * 100).toFixed(2)}%</div>
+    <div>最大连续亏损：${riskMetrics.max_consecutive_losses}</div>
+    <div>回撤恢复天数：${riskMetrics.recovery_days}</div>
+  </div>`
+    : '<div>无风险指标。</div>'}
+  ${stability
+    ? `<h2>稳定性评分</h2>
+  <div class="meta">
+    <div>稳定性评分：${Number(stability.stability_score).toFixed(3)}</div>
+    <div>邻域一致性：${Number(stability.neighborhood_consistency).toFixed(3)}</div>
+    <div>交易数惩罚：${Number(stability.trade_count_penalty).toFixed(3)}</div>
+    <div>方差惩罚：${Number(stability.return_variance_penalty).toFixed(3)}</div>
+    <div>月度收益标准差：${Number(stability.monthly_return_std).toFixed(4)}</div>
+  </div>`
+    : ''}
+  ${(stability?.notes?.length ?? 0) > 0 ? `<ul>${(stability?.notes ?? []).map((note) => `<li>${escapeHtml(note)}</li>`).join('\n')}</ul>` : ''}
+  <h2>状态拆分（代理）</h2>
+  ${regimeRows
+    ? `<table>
+    <thead>
+      <tr>
+        <th>状态</th><th>交易数</th><th>胜率</th><th>总收益</th><th>平均单笔</th><th>最大回撤</th>
+      </tr>
+    </thead>
+    <tbody>${regimeRows}</tbody>
+  </table>`
+    : '<div>无状态拆分数据。</div>'}
+  <h2>蒙特卡洛压力测试</h2>
+  ${monteCarlo
+    ? `<div class="meta">
+    <div>模拟次数：${monteCarlo.simulations}</div>
+    <div>收益 P5/P50/P95：${(Number(monteCarlo.total_return_p5) * 100).toFixed(2)}% / ${(Number(monteCarlo.total_return_p50) * 100).toFixed(2)}% / ${(Number(monteCarlo.total_return_p95) * 100).toFixed(2)}%</div>
+    <div>回撤 P5/P50/P95：${(Number(monteCarlo.max_drawdown_p5) * 100).toFixed(2)}% / ${(Number(monteCarlo.max_drawdown_p50) * 100).toFixed(2)}% / ${(Number(monteCarlo.max_drawdown_p95) * 100).toFixed(2)}%</div>
+    <div>极端亏损概率：${(Number(monteCarlo.ruin_probability) * 100).toFixed(2)}%</div>
+  </div>`
+    : '<div>无蒙特卡洛数据。</div>'}
+  <h2>Walk-forward</h2>
+  ${walkForward
+    ? `<div class="meta">
+    <div>折叠数：${walkForward.fold_count}</div>
+    <div>候选参数数：${walkForward.candidate_count}</div>
+    <div>OOS 通过率：${(Number(walkForward.oos_pass_rate) * 100).toFixed(2)}%</div>
+    <div>测试平均收益：${(Number(walkForward.avg_test_return) * 100).toFixed(2)}%</div>
+    <div>测试平均胜率：${(Number(walkForward.avg_test_win_rate) * 100).toFixed(2)}%</div>
+  </div>`
+    : '<div>无 walk-forward 数据。</div>'}
+  ${walkForwardRows
+    ? `<table>
+    <thead>
+      <tr>
+        <th>fold</th><th>train</th><th>test</th><th>train_score</th><th>test_score</th><th>test_return</th><th>test_win_rate</th>
+      </tr>
+    </thead>
+    <tbody>${walkForwardRows}</tbody>
+  </table>`
+    : ''}
+  ${(walkForward?.notes?.length ?? 0) > 0 ? `<ul>${walkForwardNotes || '<li>无</li>'}</ul>` : ''}`
+  const plateauSection = plateauResult
+    ? `
+  <h2>收益平原概览</h2>
+  <div class="meta">
+    <div>总组合：${plateauResult.total_combinations}</div>
+    <div>评估组数：${plateauResult.evaluated_combinations}</div>
+    <div>最佳评分：${plateauResult.best_point ? plateauResult.best_point.score.toFixed(3) : '--'}</div>
+    <div>最佳收益：${plateauResult.best_point ? `${(Number(plateauResult.best_point.stats.total_return) * 100).toFixed(2)}%` : '--'}</div>
+    <div>最佳胜率：${plateauResult.best_point ? `${(Number(plateauResult.best_point.stats.win_rate) * 100).toFixed(2)}%` : '--'}</div>
+    <div>生成时间：${escapeHtml(plateauResult.generated_at)}</div>
+  </div>
+  <h2>参数相关性分析</h2>
+  ${plateauCorrelationRows
+    ? `<table>
+    <thead>
+      <tr>
+        <th>参数</th><th>与评分相关</th><th>与收益相关</th><th>与胜率相关</th>
+      </tr>
+    </thead>
+    <tbody>${plateauCorrelationRows}</tbody>
+  </table>`
+    : '<div>有效参数组不足，暂无相关性分析。</div>'}
+  <h2>收益平原说明</h2>
+  <ul>${plateauNoteList || '<li>无</li>'}</ul>
+  <h2>收益平原Top100（成功参数）</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>rank</th><th>score</th><th>total_return</th><th>win_rate</th><th>window_days</th>
+        <th>min_score</th><th>stop_loss</th><th>take_profit</th>
+      </tr>
+    </thead>
+    <tbody>${plateauPointRows || '<tr><td colspan="8">无</td></tr>'}</tbody>
+  </table>
+  <div class="block">注：仅展示成功参数的前100名，完整数据见 report.xlsx 的 PlateauPoints 工作表。</div>`
+    : ''
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Backtest Report ${escapeHtml(runResult.range.date_from)} - ${escapeHtml(runResult.range.date_to)}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; margin: 24px; color: #0f172a; }
+    h1, h2 { margin: 8px 0; }
+    .meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 16px; margin-bottom: 16px; }
+    .block { margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { border: 1px solid #cbd5e1; padding: 6px 8px; text-align: left; }
+    th { background: #f8fafc; }
+  </style>
+</head>
+<body>
+  <h1>策略回测报告</h1>
+  <div class="block">生成时间：${escapeHtml(generatedAt)}</div>
+  <div class="meta">
+    <div>区间：${escapeHtml(runResult.range.date_from)} ~ ${escapeHtml(runResult.range.date_to)}</div>
+    <div>模式：${escapeHtml(runRequest.mode)} / ${escapeHtml(runRequest.pool_roll_mode)}</div>
+    <div>交易数：${runResult.stats.trade_count}</div>
+    <div>胜率：${runResult.stats.win_rate}</div>
+    <div>总收益：${runResult.stats.total_return}</div>
+    <div>最大回撤：${runResult.stats.max_drawdown}</div>
+    <div>成交率：${runResult.fill_rate}</div>
+    <div>候选信号：${runResult.candidate_count}</div>
+  </div>
+  <h2>运行说明</h2>
+  <ul>${noteList || '<li>无</li>'}</ul>
+  ${advancedSection}
+  ${plateauSection}
+  <h2>交易明细</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>symbol</th><th>name</th><th>signal_date</th><th>entry_date</th><th>exit_date</th>
+        <th>entry_signal</th><th>exit_reason</th><th>quantity</th><th>entry_price</th><th>exit_price</th>
+        <th>holding_days</th><th>pnl_amount</th><th>pnl_ratio</th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table>
+</body>
+</html>`
 }
 
 function buildPlateauRowKey(row: BacktestPlateauPoint, index: number) {
@@ -323,6 +887,7 @@ function buildDefaultDraft(): BacktestFormDraft {
     priority_topk_per_day: TRADE_BACKTEST_DEFAULTS.priorityTopK,
     enforce_t1: TRADE_BACKTEST_DEFAULTS.enforceT1,
     max_symbols: TRADE_BACKTEST_DEFAULTS.maxSymbols,
+    enable_advanced_analysis: TRADE_BACKTEST_DEFAULTS.enableAdvancedAnalysis,
     trades_page_size: 25,
   }
 }
@@ -348,6 +913,7 @@ function loadBacktestDraft(): BacktestFormDraft {
     if (!['daily', 'weekly', 'position'].includes(String(merged.pool_roll_mode))) {
       merged.pool_roll_mode = defaults.pool_roll_mode
     }
+    merged.enable_advanced_analysis = merged.enable_advanced_analysis !== false
     if (!Number.isFinite(merged.trades_page_size) || (merged.trades_page_size ?? 0) <= 0) {
       merged.trades_page_size = defaults.trades_page_size
     }
@@ -465,11 +1031,41 @@ type ExitReasonView = {
   detail?: string
 }
 
+type AnalysisAdvice = {
+  level: 'success' | 'warning' | 'error' | 'info'
+  title: string
+  tips: string[]
+}
+
+function normalizeEventToken(raw: string): string {
+  const token = String(raw || '').trim()
+  if (!token) return ''
+  const mapped = {
+    M5: 'SOS',
+    M6: 'LPS',
+    MATRIX: '矩阵入场',
+    MATRIX_SELL: '矩阵卖出',
+  }[token]
+  return mapped || token
+}
+
+function formatEventSequence(raw: string): string {
+  const text = String(raw || '').trim()
+  if (!text) return ''
+  const parts = text
+    .split('/')
+    .map((item) => normalizeEventToken(item))
+    .filter(Boolean)
+  if (parts.length <= 0) return text
+  return parts.join(' / ')
+}
+
 function parseExitReason(value: string): ExitReasonView {
   const text = String(value || '').trim()
   if (text.startsWith('event_exit')) {
     const detail = text.includes(':') ? text.split(':').slice(1).join(':').trim() : ''
-    return { label: '事件', color: 'blue', detail: detail || undefined }
+    const detailText = formatEventSequence(detail)
+    return { label: '事件', color: 'blue', detail: detailText || undefined }
   }
   if (text === 'stop_loss') return { label: '止损', color: 'red' }
   if (text === 'take_profit') return { label: '止盈', color: 'green' }
@@ -477,6 +1073,179 @@ function parseExitReason(value: string): ExitReasonView {
   if (text === 'eod_exit') return { label: '收盘', color: 'purple' }
   if (!text) return { label: '未知' }
   return { label: text }
+}
+
+function buildStabilityAdvice(stability: BacktestStabilityDiagnostics | null): AnalysisAdvice | null {
+  if (!stability) return null
+  const score = Number(stability.stability_score || 0)
+  const neighborhood = Number(stability.neighborhood_consistency || 0)
+  const variancePenalty = Number(stability.return_variance_penalty || 0)
+  const tradePenalty = Number(stability.trade_count_penalty || 0)
+  if (score >= 0.78 && neighborhood >= 0.6 && variancePenalty <= 0.15) {
+    return {
+      level: 'success',
+      title: '稳定性较好：参数在邻域变化下仍保持一致，当前组合更适合继续验证。',
+      tips: [
+        '先做小样本实盘/模拟跟踪，确认滑点和手续费后再放大仓位。',
+        '保持参数微调幅度，避免一次性大改导致策略漂移。',
+      ],
+    }
+  }
+  if (score >= 0.6) {
+    const tips = [
+      '参数可用但仍偏敏感，建议先控制仓位并观察至少 1~2 个月。',
+    ]
+    if (variancePenalty >= 0.18) {
+      tips.push('方差惩罚较高：优先收敛止盈止损、降低单笔仓位和并发持仓。')
+    }
+    if (neighborhood < 0.5) {
+      tips.push('邻域一致性偏弱：在收益平原中选择更“平台区”的参数，少选尖峰点。')
+    }
+    if (tradePenalty > 0) {
+      tips.push('交易样本偏少：扩展回测区间或放宽筛选条件，先提升样本量再定参数。')
+    }
+    return {
+      level: 'warning',
+      title: '稳定性中等：可用，但参数和行情切换时可能出现性能波动。',
+      tips,
+    }
+  }
+  return {
+    level: 'error',
+    title: '稳定性偏弱：当前参数对市场或参数扰动较敏感，实盘容易形变。',
+    tips: [
+      '优先在收益平原里选择胜率更高、回撤更低的“钝化参数”。',
+      '降低仓位与并发持仓，先把极端亏损控制住，再追求收益。',
+      '缩短单次持仓周期或收紧出场，减少尾部波动对净值的冲击。',
+    ],
+  }
+}
+
+function buildRegimeAdvice(regimes: BacktestRegimeBucket[]): AnalysisAdvice | null {
+  if (!Array.isArray(regimes) || regimes.length <= 0) return null
+  const totalTrades = regimes.reduce((sum, row) => sum + Number(row.trade_count || 0), 0)
+  if (totalTrades <= 0) {
+    return {
+      level: 'info',
+      title: '市场状态拆分暂无交易样本，暂时无法判断策略在不同环境下的适配性。',
+      tips: ['补充样本后再观察牛/震荡/熊三类状态的收益差异。'],
+    }
+  }
+  const dominant = [...regimes].sort((a, b) => Number(b.trade_count || 0) - Number(a.trade_count || 0))[0]!
+  const dominantShare = Number(dominant.trade_count || 0) / totalTrades
+  const bull = regimes.find((row) => row.regime === 'bull')
+  const bear = regimes.find((row) => row.regime === 'bear')
+  const allNonPositive = regimes.every((row) => Number(row.total_return || 0) <= 0)
+  if (allNonPositive) {
+    return {
+      level: 'error',
+      title: '三种市场状态下收益均不理想，策略当前缺乏可交易优势。',
+      tips: [
+        '先回到信号层重审入场条件，提升入场质量分阈值。',
+        '减少参数自由度，避免过拟合后在所有状态都失效。',
+      ],
+    }
+  }
+  if (dominant.regime === 'bear' && dominantShare >= 0.45 && Number(dominant.total_return || 0) < 0) {
+    return {
+      level: 'warning',
+      title: '交易主要集中在熊市代理且表现偏弱，回撤压力会显著放大。',
+      tips: [
+        '加入趋势过滤或市场风险开关，在弱势状态下降低出手频率。',
+        '优先提高止损纪律，减少逆势持仓时间。',
+      ],
+    }
+  }
+  if ((bull?.total_return ?? 0) > 0 && (bear?.total_return ?? 0) < 0) {
+    return {
+      level: 'warning',
+      title: '策略呈现“顺势有效、逆势偏弱”特征，择时过滤会明显提升稳定性。',
+      tips: [
+        '在熊市代理阶段降低仓位上限或直接切换防守参数。',
+        '针对震荡/熊市单独做参数组，避免同一套参数全时段硬跑。',
+      ],
+    }
+  }
+  return {
+    level: 'success',
+    title: '不同市场状态下表现相对均衡，策略具备一定环境适应性。',
+    tips: ['继续关注状态切换时的回撤变化，避免在单一状态下过度优化。'],
+  }
+}
+
+function buildMonteCarloAdvice(monteCarlo: BacktestMonteCarloSummary | null): AnalysisAdvice | null {
+  if (!monteCarlo || Number(monteCarlo.simulations || 0) <= 0) {
+    return {
+      level: 'info',
+      title: '交易样本不足，暂未生成有效的蒙特卡洛压力测试。',
+      tips: ['建议至少积累更多成交样本后再看尾部风险。'],
+    }
+  }
+  const ruin = Number(monteCarlo.ruin_probability || 0)
+  const p50 = Number(monteCarlo.total_return_p50 || 0)
+  const p5 = Number(monteCarlo.total_return_p5 || 0)
+  if (ruin >= 0.4 || p50 < -0.1) {
+    return {
+      level: 'error',
+      title: '压力测试结果偏弱：中位收益或极端亏损概率都处于高风险区间。',
+      tips: [
+        '优先降低单笔仓位和最大并发持仓，先把尾部亏损压下来。',
+        '收紧止损并降低持仓天数，避免单笔亏损拖垮整体权益。',
+      ],
+    }
+  }
+  if (ruin >= 0.2 || p5 < -0.25) {
+    return {
+      level: 'warning',
+      title: '存在明显尾部风险：常规表现可接受，但坏场景下回撤仍偏大。',
+      tips: [
+        '建议先做“保守参数”版本（更低仓位、更紧止损）作为实盘基线。',
+        '对高波动标的减少配置，降低组合回撤耦合。',
+      ],
+    }
+  }
+  return {
+    level: 'success',
+    title: '压力测试可接受：尾部风险相对受控，参数具备一定抗扰动能力。',
+    tips: ['继续用滚动窗口复测，确认不同年份下压力结果一致。'],
+  }
+}
+
+function buildWalkForwardAdvice(walkForward: BacktestWalkForwardReport | null): AnalysisAdvice | null {
+  if (!walkForward || Number(walkForward.fold_count || 0) <= 0) {
+    return {
+      level: 'info',
+      title: 'Walk-forward 未执行或无有效折叠，暂无法判断样本外泛化能力。',
+      tips: ['扩大回测区间并确保交易样本充足后再评估 OOS 通过率。'],
+    }
+  }
+  const passRate = Number(walkForward.oos_pass_rate || 0)
+  const avgReturn = Number(walkForward.avg_test_return || 0)
+  if (passRate >= 0.67 && avgReturn > 0) {
+    return {
+      level: 'success',
+      title: '样本外验证较好：多数折叠通过，策略具备一定泛化能力。',
+      tips: ['保持当前参数区间，优先做执行层优化（滑点、成交约束、风控细节）。'],
+    }
+  }
+  if (passRate > 0) {
+    return {
+      level: 'warning',
+      title: '样本外通过率一般：参数有效性不够稳定，存在阶段性失效风险。',
+      tips: [
+        '缩小参数搜索空间，优先选择在多折叠中表现更均衡的参数。',
+        '将训练目标从“高收益”转为“低回撤+可接受收益”。',
+      ],
+    }
+  }
+  return {
+    level: 'error',
+    title: '样本外通过率为 0：当前参数在新样本下不可用，过拟合风险较高。',
+    tips: [
+      '重新设计入场/出场约束，先追求可复制性再追求收益峰值。',
+      '增加稳健性约束（最低胜率、最大回撤上限）后再进行参数搜索。',
+    ],
+  }
 }
 
 function buildChartPath(symbol: string, name?: string) {
@@ -552,7 +1321,12 @@ const tradeColumns: ColumnsType<BacktestTrade> = [
   { title: '信号日', dataIndex: 'signal_date', width: 110 },
   { title: '买入日', dataIndex: 'entry_date', width: 110 },
   { title: '卖出日', dataIndex: 'exit_date', width: 110 },
-  { title: '入场事件', dataIndex: 'entry_signal', width: 130 },
+  {
+    title: '入场事件',
+    dataIndex: 'entry_signal',
+    width: 130,
+    render: (value: string) => formatEventSequence(value) || '--',
+  },
   {
     title: '质量分',
     dataIndex: 'entry_quality_score',
@@ -687,6 +1461,7 @@ export function BacktestPage() {
   const [priorityTopK, setPriorityTopK] = useState(initialDraft.priority_topk_per_day)
   const [enforceT1, setEnforceT1] = useState(initialDraft.enforce_t1)
   const [maxSymbols, setMaxSymbols] = useState(initialDraft.max_symbols)
+  const [enableAdvancedAnalysis, setEnableAdvancedAnalysis] = useState(initialDraft.enable_advanced_analysis)
   const [plateauSamplingMode, setPlateauSamplingMode] = useState<'grid' | 'lhs'>(initialPlateauDraft.sampling_mode)
   const [plateauSamplePoints, setPlateauSamplePoints] = useState(initialPlateauDraft.sample_points)
   const [plateauRandomSeed, setPlateauRandomSeed] = useState<number | null>(initialPlateauDraft.random_seed)
@@ -714,10 +1489,16 @@ export function BacktestPage() {
   const [tradePage, setTradePage] = useState(1)
   const [tradePageSize, setTradePageSize] = useState(initialDraft.trades_page_size)
   const [runError, setRunError] = useState<string | null>(null)
+  const [reportLibrary, setReportLibrary] = useState<BacktestReportSummary[]>([])
+  const [reportLibraryLoading, setReportLibraryLoading] = useState(false)
+  const [selectedReportId, setSelectedReportId] = useState<string | null>(null)
+  const importReportFileRef = useRef<HTMLInputElement | null>(null)
   const tasksById = useBacktestTaskStore((state) => state.tasksById)
+  const payloadById = useBacktestTaskStore((state) => state.payloadById)
   const activeTaskIds = useBacktestTaskStore((state) => state.activeTaskIds)
   const selectedTaskId = useBacktestTaskStore((state) => state.selectedTaskId)
   const enqueueTask = useBacktestTaskStore((state) => state.enqueueTask)
+  const upsertTaskPayload = useBacktestTaskStore((state) => state.upsertTaskPayload)
   const upsertTaskStatus = useBacktestTaskStore((state) => state.upsertTaskStatus)
   const setSelectedTask = useBacktestTaskStore((state) => state.setSelectedTask)
   const plateauTasksById = useBacktestPlateauTaskStore((state) => state.tasksById)
@@ -744,6 +1525,16 @@ export function BacktestPage() {
   const taskStatus = selectedTaskId ? tasksById[selectedTaskId] ?? null : null
   const taskProgress = taskStatus?.progress
   const result = taskStatus?.result ?? undefined
+  const riskMetrics = result?.risk_metrics ?? null
+  const stabilityDiagnostics = result?.stability_diagnostics ?? null
+  const regimeBreakdown = result?.regime_breakdown ?? []
+  const monteCarlo = result?.monte_carlo ?? null
+  const walkForward = result?.walk_forward ?? null
+  const stabilityAdvice = useMemo(() => buildStabilityAdvice(stabilityDiagnostics), [stabilityDiagnostics])
+  const regimeAdvice = useMemo(() => buildRegimeAdvice(regimeBreakdown), [regimeBreakdown])
+  const monteCarloAdvice = useMemo(() => buildMonteCarloAdvice(monteCarlo), [monteCarlo])
+  const walkForwardAdvice = useMemo(() => buildWalkForwardAdvice(walkForward), [walkForward])
+  const selectedTaskPayload = selectedTaskId ? payloadById[selectedTaskId] ?? null : null
   const runningTaskCount = activeTaskIds.length
   const plateauTaskOptions = useMemo(
     () =>
@@ -827,6 +1618,7 @@ export function BacktestPage() {
       priority_topk_per_day: priorityTopK,
       enforce_t1: enforceT1,
       max_symbols: maxSymbols,
+      enable_advanced_analysis: enableAdvancedAnalysis,
       trades_page_size: tradePageSize,
     }
     persistBacktestDraft(draft)
@@ -855,13 +1647,14 @@ export function BacktestPage() {
     priorityTopK,
     enforceT1,
     maxSymbols,
+    enableAdvancedAnalysis,
     tradePageSize,
   ])
 
   const startTaskMutation = useMutation({
     mutationFn: startBacktestTask,
-    onSuccess: (payload) => {
-      enqueueTask(payload.task_id, poolRollMode)
+    onSuccess: (payload, variables) => {
+      enqueueTask(payload.task_id, variables.pool_roll_mode, variables)
       setSelectedTask(payload.task_id)
       setRunError(null)
       message.info('回测任务已提交，正在按日期滚动计算...')
@@ -929,6 +1722,226 @@ export function BacktestPage() {
       message.error(formatApiError(error))
     },
   })
+
+  async function refreshReportLibrary(preferredReportId?: string | null) {
+    setReportLibraryLoading(true)
+    try {
+      const response = await listBacktestReports()
+      const rows = response.items
+      setReportLibrary(rows)
+      setSelectedReportId((current) => {
+        const preferred = preferredReportId === undefined ? current : preferredReportId
+        if (preferred && rows.some((item) => item.report_id === preferred)) return preferred
+        return rows[0]?.report_id ?? null
+      })
+    } catch (error) {
+      message.error(formatApiError(error))
+    } finally {
+      setReportLibraryLoading(false)
+    }
+  }
+
+  const exportReportMutation = useMutation({
+    mutationFn: buildBacktestReportPackage,
+    onSuccess: (payload) => {
+      const bytes = base64ToUint8Array(payload.file_base64)
+      const safeBytes = new Uint8Array(bytes.byteLength)
+      safeBytes.set(bytes)
+      const blob = new Blob([safeBytes], { type: 'application/octet-stream' })
+      downloadBlob(payload.file_name, blob)
+      message.success(`回测报告已导出：${payload.file_name}`)
+    },
+    onError: (error) => {
+      message.error(formatApiError(error))
+    },
+  })
+
+  const importReportMutation = useMutation({
+    mutationFn: importBacktestReportPackage,
+    onSuccess: (payload) => {
+      message.success(`报告导入成功：${payload.summary.report_id}`)
+      void refreshReportLibrary(payload.summary.report_id)
+    },
+    onError: (error) => {
+      message.error(formatApiError(error))
+    },
+  })
+
+  const loadReportMutation = useMutation({
+    mutationFn: getBacktestReport,
+    onSuccess: (payload) => {
+      const taskId = `imp_${payload.summary.report_id}`
+      const status: BacktestTaskStatusResponse = {
+        task_id: taskId,
+        status: 'succeeded',
+        progress: {
+          mode: payload.run_request.pool_roll_mode,
+          current_date: payload.run_result.range.date_to,
+          processed_dates: 1,
+          total_dates: 1,
+          percent: 100,
+          message: `已加载导入报告（${payload.summary.report_id}）`,
+          warning: null,
+          stage_timings: [],
+          started_at: payload.summary.first_imported_at,
+          updated_at: payload.summary.last_imported_at,
+        },
+        result: payload.run_result,
+        error: null,
+        error_code: null,
+      }
+      upsertTaskStatus(status)
+      upsertTaskPayload(taskId, payload.run_request)
+      setSelectedTask(taskId)
+      if (payload.plateau_result) {
+        const plateauTaskId = `imp_plateau_${payload.summary.report_id}`
+        const normalizedPlateauResult: BacktestPlateauResponse = {
+          ...payload.plateau_result,
+          correlations: resolvePlateauCorrelations(payload.plateau_result),
+        }
+        const plateauStatus: BacktestPlateauTaskStatusResponse = {
+          task_id: plateauTaskId,
+          status: 'succeeded',
+          progress: {
+            sampling_mode: 'lhs',
+            processed_points: Number(normalizedPlateauResult.evaluated_combinations || 0),
+            total_points: Number(normalizedPlateauResult.total_combinations || 0),
+            percent: 100,
+            message: `已加载导入平原结果（${payload.summary.report_id}）`,
+            started_at: payload.summary.first_imported_at,
+            updated_at: payload.summary.last_imported_at,
+          },
+          result: normalizedPlateauResult,
+          error: null,
+          error_code: null,
+        }
+        upsertPlateauTaskStatus(plateauStatus)
+        setSelectedPlateauTask(plateauTaskId)
+      }
+      message.success(`已加载导入报告：${payload.summary.report_id}`)
+    },
+    onError: (error) => {
+      message.error(formatApiError(error))
+    },
+  })
+
+  const deleteReportMutation = useMutation({
+    mutationFn: deleteBacktestReport,
+    onSuccess: (payload) => {
+      message.success(`已删除报告：${payload.report_id}`)
+      void refreshReportLibrary()
+    },
+    onError: (error) => {
+      message.error(formatApiError(error))
+    },
+  })
+
+  function buildReportExportPayload() {
+    if (!result) {
+      message.warning('暂无可导出的回测结果')
+      return null
+    }
+    if (!selectedTaskPayload) {
+      message.warning('当前任务缺少参数快照（旧任务），请重新运行一次后再导出')
+      return null
+    }
+    try {
+      const exportPlateauResult: BacktestPlateauResponse | null = plateauResult
+        ? {
+            ...plateauResult,
+            correlations: resolvePlateauCorrelations(plateauResult),
+          }
+        : null
+      const workbookBuffer = buildBacktestReportWorkbookBuffer(selectedTaskPayload, result, exportPlateauResult)
+      const reportHtml = buildBacktestReportHtml(selectedTaskPayload, result, exportPlateauResult)
+      const dateFrom = String(result.range.date_from || '').replaceAll('-', '')
+      const dateTo = String(result.range.date_to || '').replaceAll('-', '')
+      const fileBaseName = [
+        'backtest_report',
+        String(selectedTaskPayload.mode || 'backtest'),
+        dateFrom || 'from',
+        dateTo || 'to',
+        dayjs().format('YYYYMMDD_HHmmss'),
+      ]
+        .join('_')
+        .replace(/[^0-9A-Za-z_.-]/g, '_')
+      return {
+        runRequest: selectedTaskPayload,
+        runResult: result,
+        exportPlateauResult,
+        workbookBuffer,
+        reportHtml,
+        fileBaseName,
+      }
+    } catch (error) {
+      message.error(formatApiError(error))
+      return null
+    }
+  }
+
+  function handleExportFtbt() {
+    const payload = buildReportExportPayload()
+    if (!payload) return
+    const reportXlsxBase64 = bufferToBase64(payload.workbookBuffer)
+    exportReportMutation.mutate({
+      run_request: payload.runRequest,
+      run_result: payload.runResult,
+      report_html: payload.reportHtml,
+      report_xlsx_base64: reportXlsxBase64,
+      plateau_result: payload.exportPlateauResult,
+      app_name: 'Final Trade',
+      app_version: String(import.meta.env.VITE_APP_VERSION || 'frontend'),
+    })
+  }
+
+  function handleExportXlsxReport() {
+    const payload = buildReportExportPayload()
+    if (!payload) return
+    const blob = new Blob([payload.workbookBuffer], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    })
+    const fileName = `${payload.fileBaseName}.xlsx`
+    downloadBlob(fileName, blob)
+    message.success(`已导出 Excel 报告：${fileName}`)
+  }
+
+  function handleExportHtmlReport() {
+    const payload = buildReportExportPayload()
+    if (!payload) return
+    const blob = new Blob([payload.reportHtml], { type: 'text/html;charset=utf-8' })
+    const fileName = `${payload.fileBaseName}.html`
+    downloadBlob(fileName, blob)
+    message.success(`已导出 HTML 报告：${fileName}`)
+  }
+
+  function handleImportFtbt(file: File | null | undefined) {
+    if (!file) return
+    if (!String(file.name || '').toLowerCase().endsWith('.ftbt')) {
+      message.warning('仅支持导入 .ftbt 文件')
+      return
+    }
+    importReportMutation.mutate(file)
+  }
+
+  function handleLoadSelectedReport() {
+    if (!selectedReportId) {
+      message.warning('请先选择报告')
+      return
+    }
+    loadReportMutation.mutate(selectedReportId)
+  }
+
+  function handleDeleteSelectedReport() {
+    if (!selectedReportId) {
+      message.warning('请先选择报告')
+      return
+    }
+    deleteReportMutation.mutate(selectedReportId)
+  }
+
+  useEffect(() => {
+    void refreshReportLibrary()
+  }, [])
 
   useEffect(() => {
     setTradePage(1)
@@ -1090,6 +2103,7 @@ export function BacktestPage() {
       priority_topk_per_day: priorityTopK,
       enforce_t1: enforceT1,
       max_symbols: maxSymbols,
+      enable_advanced_analysis: enableAdvancedAnalysis,
     }
   }
 
@@ -1236,6 +2250,148 @@ export function BacktestPage() {
     () => (plateauResult?.points ?? []).filter((row) => !row.error),
     [plateauResult?.points],
   )
+  const plateauCorrelationRows = useMemo(
+    () => resolvePlateauCorrelations(plateauResult),
+    [plateauResult],
+  )
+  const plateauCorrelationColumns = useMemo<ColumnsType<BacktestPlateauCorrelationRow>>(
+    () => [
+      {
+        title: '参数',
+        dataIndex: 'parameter_label',
+        width: 180,
+      },
+      {
+        title: '与评分相关',
+        width: 160,
+        render: (_value, row) => {
+          const direction = classifyCorrelationDirection(row.score_corr)
+          return (
+            <Space size={6}>
+              <span>{formatSigned(row.score_corr)}</span>
+              <Tag color={correlationDirectionTagColor(direction)}>{direction}</Tag>
+            </Space>
+          )
+        },
+      },
+      {
+        title: '与收益相关',
+        width: 160,
+        render: (_value, row) => {
+          const direction = classifyCorrelationDirection(row.total_return_corr)
+          return (
+            <Space size={6}>
+              <span>{formatSigned(row.total_return_corr)}</span>
+              <Tag color={correlationDirectionTagColor(direction)}>{direction}</Tag>
+            </Space>
+          )
+        },
+      },
+      {
+        title: '与胜率相关',
+        width: 160,
+        render: (_value, row) => {
+          const direction = classifyCorrelationDirection(row.win_rate_corr)
+          return (
+            <Space size={6}>
+              <span>{formatSigned(row.win_rate_corr)}</span>
+              <Tag color={correlationDirectionTagColor(direction)}>{direction}</Tag>
+            </Space>
+          )
+        },
+      },
+    ],
+    [],
+  )
+  const regimeColumns = useMemo<ColumnsType<BacktestRegimeBucket>>(
+    () => [
+      {
+        title: '状态',
+        dataIndex: 'label',
+        width: 120,
+      },
+      {
+        title: '交易数',
+        dataIndex: 'trade_count',
+        width: 90,
+      },
+      {
+        title: '胜率',
+        dataIndex: 'win_rate',
+        width: 100,
+        render: (value: number) => formatPct(Number(value)),
+      },
+      {
+        title: '总收益',
+        dataIndex: 'total_return',
+        width: 110,
+        render: (value: number) => formatPct(Number(value)),
+      },
+      {
+        title: '平均单笔',
+        dataIndex: 'avg_pnl_ratio',
+        width: 110,
+        render: (value: number) => formatPct(Number(value)),
+      },
+      {
+        title: '最大回撤',
+        dataIndex: 'max_drawdown',
+        width: 110,
+        render: (value: number) => formatPct(Number(value)),
+      },
+    ],
+    [],
+  )
+  const walkForwardColumns = useMemo<ColumnsType<BacktestWalkForwardReport['folds'][number]>>(
+    () => [
+      {
+        title: 'Fold',
+        dataIndex: 'fold_index',
+        width: 70,
+      },
+      {
+        title: '训练区间',
+        width: 220,
+        render: (_value, row) => `${row.train_date_from} ~ ${row.train_date_to}`,
+      },
+      {
+        title: '测试区间',
+        width: 220,
+        render: (_value, row) => `${row.test_date_from} ~ ${row.test_date_to}`,
+      },
+      {
+        title: '训练评分',
+        dataIndex: 'train_score',
+        width: 100,
+        render: (value: number) => Number(value).toFixed(3),
+      },
+      {
+        title: '测试评分',
+        dataIndex: 'test_score',
+        width: 100,
+        render: (value: number) => Number(value).toFixed(3),
+      },
+      {
+        title: '测试收益',
+        width: 110,
+        render: (_value, row) => formatPct(Number(row.test_stats.total_return)),
+      },
+      {
+        title: '测试胜率',
+        width: 110,
+        render: (_value, row) => formatPct(Number(row.test_stats.win_rate)),
+      },
+      {
+        title: '入选参数',
+        width: 320,
+        render: (_value, row) => {
+          const p = row.selected_params
+          return `window=${p.window_days}, min=${Number(p.min_score).toFixed(2)}, sl=${(Number(p.stop_loss) * 100).toFixed(2)}%, tp=${(Number(p.take_profit) * 100).toFixed(2)}%`
+        },
+      },
+    ],
+    [],
+  )
   const plateauTopRankOptions = useMemo(
     () =>
       plateauValidPoints.slice(0, 20).map((row, idx) => ({
@@ -1259,15 +2415,24 @@ export function BacktestPage() {
     {
       title: '操作',
       key: 'action',
-      width: 90,
+      width: 150,
       render: (_value, row) => (
-        <Button
-          size="small"
-          disabled={Boolean(row.error)}
-          onClick={() => applyPlateauPointToForm(row, `第${row.__rank}名`)}
-        >
-          回填
-        </Button>
+        <Space size={6}>
+          <Button
+            size="small"
+            disabled={Boolean(row.error)}
+            onClick={() => applyPlateauPointToForm(row, `第${row.__rank}名`)}
+          >
+            回填
+          </Button>
+          <Button
+            size="small"
+            disabled={Boolean(row.error)}
+            onClick={() => savePlateauPreset(row, `第${row.__rank}名`)}
+          >
+            保存
+          </Button>
+        </Space>
       ),
     },
   ]
@@ -1878,13 +3043,17 @@ export function BacktestPage() {
         elapsedMs: Math.max(0, Number(row?.elapsed_ms || 0)),
       }))
       .filter((row) => Boolean(row.stageKey))
-    const totalMs = normalized.reduce((acc, row) => acc + row.elapsedMs, 0)
+    const rowsForShare = normalized.filter((row) => !(row.stageKey === 'run_total' || row.stageKey.endsWith('_total')))
+    const totalMs = (rowsForShare.length > 0 ? rowsForShare : normalized).reduce((acc, row) => acc + row.elapsedMs, 0)
     return {
       totalMs,
       rows: normalized.map((row) => ({
         ...row,
         elapsedSecText: `${(row.elapsedMs / 1000).toFixed(2)}s`,
-        shareText: totalMs > 0 ? `${((row.elapsedMs / totalMs) * 100).toFixed(1)}%` : '0.0%',
+        shareText:
+          row.stageKey === 'run_total' || row.stageKey.endsWith('_total')
+            ? '--'
+            : (totalMs > 0 ? `${((row.elapsedMs / totalMs) * 100).toFixed(1)}%` : '0.0%'),
       })),
     }
   }, [taskProgress?.stage_timings])
@@ -2195,6 +3364,24 @@ export function BacktestPage() {
               <Switch checked={enforceT1} onChange={setEnforceT1} />
             </Space>
           </Col>
+          <Col xs={24} md={6}>
+            <Space orientation="vertical">
+              <span>高级分析</span>
+              <Switch checked={enableAdvancedAnalysis} onChange={setEnableAdvancedAnalysis} />
+            </Space>
+          </Col>
+          <Col xs={24} md={18}>
+            <Alert
+              type={enableAdvancedAnalysis ? 'info' : 'warning'}
+              showIcon
+              title={enableAdvancedAnalysis ? '已启用高级分析' : '已关闭高级分析'}
+              description={
+                enableAdvancedAnalysis
+                  ? '将额外计算稳定性评分、市场状态拆分、蒙特卡洛压力测试和 Walk-forward 验证，耗时会增加。'
+                  : '仅执行主回测，速度更快但不生成稳定性/压力测试/样本外验证。'
+              }
+            />
+          </Col>
 
           <Col xs={24} md={12}>
             <Space orientation="vertical" style={{ width: '100%' }}>
@@ -2284,6 +3471,81 @@ export function BacktestPage() {
             <Tag color={taskStatusColor(taskStatus.status)}>{taskStatusLabel(taskStatus.status)}</Tag>
           ) : null}
           {result ? <Tag color="green">{`${result.range.date_from} ~ ${result.range.date_to}`}</Tag> : null}
+        </Space>
+      </Card>
+
+      <Card title="回测报告导出与共享">
+        <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+          <Space wrap>
+            <Button
+              type="primary"
+              ghost
+              onClick={handleExportFtbt}
+              disabled={!result}
+              loading={exportReportMutation.isPending}
+            >
+              导出 ftbt
+            </Button>
+            <Button onClick={handleExportXlsxReport} disabled={!result}>
+              导出 Excel
+            </Button>
+            <Button onClick={handleExportHtmlReport} disabled={!result}>
+              导出 HTML
+            </Button>
+            <Button
+              onClick={() => importReportFileRef.current?.click()}
+              loading={importReportMutation.isPending}
+            >
+              导入 ftbt
+            </Button>
+            <input
+              ref={importReportFileRef}
+              type="file"
+              accept=".ftbt"
+              style={{ display: 'none' }}
+              onChange={(event) => {
+                const file = event.target.files?.[0]
+                handleImportFtbt(file)
+                event.target.value = ''
+              }}
+            />
+            <Tag color="blue">{`已导入 ${reportLibrary.length}`}</Tag>
+          </Space>
+          <Space wrap style={{ width: '100%' }}>
+            <Select
+              style={{ minWidth: 440 }}
+              placeholder={reportLibraryLoading ? '加载报告列表中...' : '选择导入报告'}
+              value={selectedReportId ?? undefined}
+              onChange={(value) => setSelectedReportId(String(value))}
+              loading={reportLibraryLoading}
+              options={reportLibrary.map((item) => ({
+                value: item.report_id,
+                label: `${item.report_id} | ${item.date_from}~${item.date_to} | 收益 ${formatPct(item.total_return)}`,
+              }))}
+            />
+            <Button
+              type="primary"
+              onClick={handleLoadSelectedReport}
+              disabled={!selectedReportId}
+              loading={loadReportMutation.isPending}
+            >
+              加载报告
+            </Button>
+            <Button
+              danger
+              onClick={handleDeleteSelectedReport}
+              disabled={!selectedReportId}
+              loading={deleteReportMutation.isPending}
+            >
+              删除报告
+            </Button>
+          </Space>
+          <Alert
+            type="info"
+            showIcon
+            title="导入说明"
+            description="可直接导出 Excel/HTML；.ftbt 用于跨设备共享（内含报告HTML、Excel与回测数据）。重复导入同一 report_id 将覆盖旧报告并保留导入时间。"
+          />
         </Space>
       </Card>
 
@@ -2567,6 +3829,21 @@ export function BacktestPage() {
             </Card>
           ) : null}
 
+          {plateauCorrelationRows.length > 0 ? (
+            <Card title="参数相关性分析（皮尔逊）">
+              <Table
+                size="small"
+                columns={plateauCorrelationColumns}
+                dataSource={plateauCorrelationRows}
+                rowKey={(row) => row.parameter}
+                pagination={false}
+                scroll={{ x: 760 }}
+              />
+            </Card>
+          ) : (
+            <Alert type="info" showIcon title="参数相关性分析暂不可用" description="至少需要 2 组成功参数，才能计算相关性。" />
+          )}
+
           {plateauHeatmapOption ? (
             <Card title={plateauHeatmapTitle}>
               <Row gutter={[12, 12]}>
@@ -2818,6 +4095,176 @@ export function BacktestPage() {
             </Col>
           </Row>
 
+          {riskMetrics ? (
+            <Row gutter={[12, 12]}>
+              <Col xs={12} md={6}>
+                <Card>
+                  <Statistic title="Sharpe" value={riskMetrics.sharpe} precision={3} />
+                </Card>
+              </Col>
+              <Col xs={12} md={6}>
+                <Card>
+                  <Statistic title="Sortino" value={riskMetrics.sortino} precision={3} />
+                </Card>
+              </Col>
+              <Col xs={12} md={6}>
+                <Card>
+                  <Statistic title="Calmar" value={riskMetrics.calmar} precision={3} />
+                </Card>
+              </Col>
+              <Col xs={12} md={6}>
+                <Card>
+                  <Statistic title="Expectancy" value={riskMetrics.expectancy * 100} precision={2} suffix="%" />
+                </Card>
+              </Col>
+            </Row>
+          ) : (
+            <Alert type="info" showIcon title="当前结果未包含风险指标。" />
+          )}
+
+          {stabilityDiagnostics ? (
+            <Card title="稳定性评分">
+              <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+                <Space wrap>
+                  <Tag color="processing">{`评分 ${stabilityDiagnostics.stability_score.toFixed(3)}`}</Tag>
+                  <Tag color="default">{`邻域一致性 ${stabilityDiagnostics.neighborhood_consistency.toFixed(3)}`}</Tag>
+                  <Tag color="warning">{`交易数惩罚 ${stabilityDiagnostics.trade_count_penalty.toFixed(3)}`}</Tag>
+                  <Tag color="warning">{`方差惩罚 ${stabilityDiagnostics.return_variance_penalty.toFixed(3)}`}</Tag>
+                </Space>
+                {stabilityDiagnostics.notes.length > 0 ? (
+                  <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+                    {stabilityDiagnostics.notes.map((note, idx) => (
+                      <li key={`${idx}-${note}`}>{note}</li>
+                    ))}
+                  </ul>
+                ) : null}
+                {stabilityAdvice ? (
+                  <Alert
+                    type={stabilityAdvice.level}
+                    showIcon
+                    title={stabilityAdvice.title}
+                    description={
+                      stabilityAdvice.tips.length > 0 ? (
+                        <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+                          {stabilityAdvice.tips.map((tip, index) => (
+                            <li key={`${index}-${tip}`}>{tip}</li>
+                          ))}
+                        </ul>
+                      ) : undefined
+                    }
+                  />
+                ) : null}
+              </Space>
+            </Card>
+          ) : null}
+
+          {regimeBreakdown.length > 0 ? (
+            <Card title="市场状态拆分（代理）">
+              <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+                <Table
+                  size="small"
+                  columns={regimeColumns}
+                  dataSource={regimeBreakdown}
+                  rowKey={(row) => row.regime}
+                  pagination={false}
+                  scroll={{ x: 760 }}
+                />
+                {regimeAdvice ? (
+                  <Alert
+                    type={regimeAdvice.level}
+                    showIcon
+                    title={regimeAdvice.title}
+                    description={
+                      regimeAdvice.tips.length > 0 ? (
+                        <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+                          {regimeAdvice.tips.map((tip, index) => (
+                            <li key={`${index}-${tip}`}>{tip}</li>
+                          ))}
+                        </ul>
+                      ) : undefined
+                    }
+                  />
+                ) : null}
+              </Space>
+            </Card>
+          ) : null}
+
+          {monteCarlo ? (
+            <Card title="蒙特卡洛压力测试">
+              <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+                <Space wrap>
+                  <Tag color="geekblue">{`模拟次数 ${monteCarlo.simulations}`}</Tag>
+                  <Tag>{`收益 P5/P50/P95 ${formatPct(monteCarlo.total_return_p5)} / ${formatPct(monteCarlo.total_return_p50)} / ${formatPct(monteCarlo.total_return_p95)}`}</Tag>
+                  <Tag>{`回撤 P5/P50/P95 ${formatPct(monteCarlo.max_drawdown_p5)} / ${formatPct(monteCarlo.max_drawdown_p50)} / ${formatPct(monteCarlo.max_drawdown_p95)}`}</Tag>
+                  <Tag color="red">{`极端亏损概率 ${(monteCarlo.ruin_probability * 100).toFixed(2)}%`}</Tag>
+                </Space>
+                {monteCarloAdvice ? (
+                  <Alert
+                    type={monteCarloAdvice.level}
+                    showIcon
+                    title={monteCarloAdvice.title}
+                    description={
+                      monteCarloAdvice.tips.length > 0 ? (
+                        <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+                          {monteCarloAdvice.tips.map((tip, index) => (
+                            <li key={`${index}-${tip}`}>{tip}</li>
+                          ))}
+                        </ul>
+                      ) : undefined
+                    }
+                  />
+                ) : null}
+              </Space>
+            </Card>
+          ) : null}
+
+          {walkForward ? (
+            <Card title="Walk-forward 验证">
+              <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+                <Space wrap>
+                  <Tag color="processing">{`folds ${walkForward.fold_count}`}</Tag>
+                  <Tag>{`候选参数 ${walkForward.candidate_count}`}</Tag>
+                  <Tag color="green">{`OOS通过率 ${(walkForward.oos_pass_rate * 100).toFixed(2)}%`}</Tag>
+                  <Tag>{`测试均值收益 ${formatPct(walkForward.avg_test_return)}`}</Tag>
+                  <Tag>{`测试均值胜率 ${formatPct(walkForward.avg_test_win_rate)}`}</Tag>
+                </Space>
+                {walkForward.folds.length > 0 ? (
+                  <Table
+                    size="small"
+                    columns={walkForwardColumns}
+                    dataSource={walkForward.folds}
+                    rowKey={(row) => `${row.fold_index}-${row.train_date_from}-${row.test_date_from}`}
+                    pagination={false}
+                    scroll={{ x: 1400 }}
+                  />
+                ) : null}
+                {walkForward.notes.length > 0 ? (
+                  <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+                    {walkForward.notes.map((note, idx) => (
+                      <li key={`${idx}-${note}`}>{note}</li>
+                    ))}
+                  </ul>
+                ) : null}
+                {walkForwardAdvice ? (
+                  <Alert
+                    type={walkForwardAdvice.level}
+                    showIcon
+                    title={walkForwardAdvice.title}
+                    description={
+                      walkForwardAdvice.tips.length > 0 ? (
+                        <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+                          {walkForwardAdvice.tips.map((tip, index) => (
+                            <li key={`${index}-${tip}`}>{tip}</li>
+                          ))}
+                        </ul>
+                      ) : undefined
+                    }
+                  />
+                ) : null}
+              </Space>
+            </Card>
+          ) : null}
+
           <Row gutter={[12, 12]}>
             <Col xs={24} lg={12}>
               <Card title="资金曲线">
@@ -2874,4 +4321,3 @@ export function BacktestPage() {
     </Space>
   )
 }
-

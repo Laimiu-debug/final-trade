@@ -1,15 +1,17 @@
 ﻿import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import type { BacktestPoolRollMode, BacktestTaskStatusResponse } from '@/types/contracts'
+import type { BacktestPoolRollMode, BacktestRunRequest, BacktestTaskStatusResponse } from '@/types/contracts'
 
 const BACKTEST_TASKS_STORE_KEY = 'tdx-trend-backtest-tasks-v1'
 const BACKTEST_TASKS_MAX_COUNT = 120
 
 interface BacktestTaskStoreState {
   tasksById: Record<string, BacktestTaskStatusResponse>
+  payloadById: Record<string, BacktestRunRequest>
   activeTaskIds: string[]
   selectedTaskId?: string
-  enqueueTask: (taskId: string, mode: BacktestPoolRollMode) => void
+  enqueueTask: (taskId: string, mode: BacktestPoolRollMode, payload?: BacktestRunRequest) => void
+  upsertTaskPayload: (taskId: string, payload: BacktestRunRequest) => void
   upsertTaskStatus: (status: BacktestTaskStatusResponse) => void
   markTaskFailed: (taskId: string, error: string, errorCode?: string) => void
   setSelectedTask: (taskId?: string) => void
@@ -62,13 +64,27 @@ function trimTaskMap(tasksById: Record<string, BacktestTaskStatusResponse>) {
   return next
 }
 
+function pickPayloadByTask(
+  payloadById: Record<string, BacktestRunRequest>,
+  tasksById: Record<string, BacktestTaskStatusResponse>,
+) {
+  const next: Record<string, BacktestRunRequest> = {}
+  for (const taskId of Object.keys(tasksById)) {
+    const payload = payloadById[taskId]
+    if (!payload) continue
+    next[taskId] = payload
+  }
+  return next
+}
+
 export const useBacktestTaskStore = create<BacktestTaskStoreState>()(
   persist(
     (set) => ({
       tasksById: {},
+      payloadById: {},
       activeTaskIds: [],
       selectedTaskId: undefined,
-      enqueueTask: (taskId, mode) =>
+      enqueueTask: (taskId, mode, payload) =>
         set((state) => {
           const existing = state.tasksById[taskId]
           const merged = {
@@ -76,13 +92,31 @@ export const useBacktestTaskStore = create<BacktestTaskStoreState>()(
             [taskId]: existing ?? buildPendingTask(taskId, mode),
           }
           const trimmed = trimTaskMap(merged)
+          const payloadById = pickPayloadByTask(
+            {
+              ...state.payloadById,
+              ...(payload ? { [taskId]: payload } : {}),
+            },
+            trimmed,
+          )
           const activeTaskIds = [taskId, ...state.activeTaskIds.filter((id) => id !== taskId)].filter(
             (id) => Boolean(trimmed[id]),
           )
           return {
             tasksById: trimmed,
+            payloadById,
             activeTaskIds,
             selectedTaskId: taskId,
+          }
+        }),
+      upsertTaskPayload: (taskId, payload) =>
+        set((state) => {
+          if (!state.tasksById[taskId]) return state
+          return {
+            payloadById: {
+              ...state.payloadById,
+              [taskId]: payload,
+            },
           }
         }),
       upsertTaskStatus: (status) =>
@@ -92,6 +126,7 @@ export const useBacktestTaskStore = create<BacktestTaskStoreState>()(
             [status.task_id]: status,
           }
           const trimmed = trimTaskMap(merged)
+          const payloadById = pickPayloadByTask(state.payloadById, trimmed)
           const taskActive = status.status === 'pending' || status.status === 'running'
           const baseActive = state.activeTaskIds.filter((id) => id !== status.task_id)
           const activeTaskIds = (taskActive ? [status.task_id, ...baseActive] : baseActive).filter((id) => Boolean(trimmed[id]))
@@ -101,6 +136,7 @@ export const useBacktestTaskStore = create<BacktestTaskStoreState>()(
               : status.task_id
           return {
             tasksById: trimmed,
+            payloadById,
             activeTaskIds,
             selectedTaskId,
           }
@@ -137,6 +173,7 @@ export const useBacktestTaskStore = create<BacktestTaskStoreState>()(
             [taskId]: nextStatus,
           }
           const trimmed = trimTaskMap(merged)
+          const payloadById = pickPayloadByTask(state.payloadById, trimmed)
           const activeTaskIds = state.activeTaskIds.filter((id) => id !== taskId && Boolean(trimmed[id]))
           const selectedTaskId =
             state.selectedTaskId && trimmed[state.selectedTaskId]
@@ -144,6 +181,7 @@ export const useBacktestTaskStore = create<BacktestTaskStoreState>()(
               : taskId
           return {
             tasksById: trimmed,
+            payloadById,
             activeTaskIds,
             selectedTaskId,
           }
@@ -167,11 +205,13 @@ export const useBacktestTaskStore = create<BacktestTaskStoreState>()(
         set((state) => {
           if (!state.tasksById[taskId]) return state
           const { [taskId]: _, ...rest } = state.tasksById
+          const { [taskId]: __, ...restPayload } = state.payloadById
           const sorted = sortTasksByUpdatedAtDesc(rest)
           const nextSelected =
             state.selectedTaskId === taskId ? sorted[0]?.task_id : state.selectedTaskId
           return {
             tasksById: rest,
+            payloadById: restPayload,
             activeTaskIds: state.activeTaskIds.filter((id) => id !== taskId),
             selectedTaskId: nextSelected,
           }
@@ -182,9 +222,11 @@ export const useBacktestTaskStore = create<BacktestTaskStoreState>()(
             ([, task]) => task.status === 'pending' || task.status === 'running' || task.status === 'paused',
           )
           const tasksById = Object.fromEntries(keptEntries)
+          const payloadById = pickPayloadByTask(state.payloadById, tasksById)
           const sorted = sortTasksByUpdatedAtDesc(tasksById)
           return {
             tasksById,
+            payloadById,
             activeTaskIds: sorted.map((task) => task.task_id),
             selectedTaskId: sorted[0]?.task_id,
           }
@@ -202,6 +244,7 @@ export const useBacktestTaskStore = create<BacktestTaskStoreState>()(
         }
         return {
           tasksById,
+          payloadById: state.payloadById,
           activeTaskIds: state.activeTaskIds,
           selectedTaskId: state.selectedTaskId,
         }

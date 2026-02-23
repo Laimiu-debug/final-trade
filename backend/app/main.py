@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from fastapi import FastAPI, Path, Query, Request
+from fastapi import FastAPI, File, Path, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -19,6 +19,12 @@ from .models import (
     BacktestPlateauTaskStatusResponse,
     BacktestTaskStartResponse,
     BacktestTaskStatusResponse,
+    BacktestReportBuildRequest,
+    BacktestReportBuildResponse,
+    BacktestReportDeleteResponse,
+    BacktestReportDetail,
+    BacktestReportImportResponse,
+    BacktestReportListResponse,
     BoardFilter,
     Market,
     AnnotationUpdateResponse,
@@ -323,6 +329,75 @@ def post_backtest_task_cancel(task_id: str = Path(min_length=8, max_length=64)) 
         return error_response(status_code, exc.code, str(exc))
     except ValueError as exc:
         return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.post("/api/backtest/reports/build", response_model=BacktestReportBuildResponse)
+def post_backtest_report_build(payload: BacktestReportBuildRequest) -> BacktestReportBuildResponse | JSONResponse:
+    try:
+        return store.build_backtest_report_package(payload)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_REPORT_INVALID", str(exc))
+
+
+@app.post("/api/backtest/reports/import", response_model=BacktestReportImportResponse)
+async def post_backtest_report_import(file: UploadFile = File(...)) -> BacktestReportImportResponse | JSONResponse:
+    try:
+        package_bytes = await file.read()
+    except Exception as exc:
+        return error_response(400, "BACKTEST_REPORT_IMPORT_FAILED", f"读取导入文件失败: {exc}")
+    if len(package_bytes) <= 0:
+        return error_response(400, "BACKTEST_REPORT_INVALID", "导入文件为空。")
+    try:
+        return store.import_backtest_report_package(
+            package_bytes,
+            source_file_name=file.filename,
+        )
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_REPORT_IMPORT_FAILED", str(exc))
+
+
+@app.get("/api/backtest/reports", response_model=BacktestReportListResponse)
+def get_backtest_reports() -> BacktestReportListResponse | JSONResponse:
+    try:
+        return store.list_backtest_reports()
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_REPORT_INVALID", str(exc))
+
+
+@app.get("/api/backtest/reports/{report_id}", response_model=BacktestReportDetail)
+def get_backtest_report(
+    report_id: str = Path(min_length=4, max_length=96, pattern=r"^[A-Za-z0-9._-]+$"),
+) -> BacktestReportDetail | JSONResponse:
+    try:
+        detail = store.get_backtest_report(report_id)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_REPORT_INVALID", str(exc))
+    if detail is None:
+        return error_response(404, "BACKTEST_REPORT_NOT_FOUND", "回测报告不存在")
+    return detail
+
+
+@app.delete("/api/backtest/reports/{report_id}", response_model=BacktestReportDeleteResponse)
+def delete_backtest_report(
+    report_id: str = Path(min_length=4, max_length=96, pattern=r"^[A-Za-z0-9._-]+$"),
+) -> BacktestReportDeleteResponse | JSONResponse:
+    try:
+        deleted = store.delete_backtest_report(report_id)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_REPORT_DELETE_FAILED", str(exc))
+    if not deleted:
+        return error_response(404, "BACKTEST_REPORT_NOT_FOUND", "回测报告不存在")
+    return BacktestReportDeleteResponse(deleted=True, report_id=report_id)
 
 
 @app.post("/api/sim/orders", response_model=CreateOrderResponse)

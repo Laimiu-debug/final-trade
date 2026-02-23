@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import base64
 import os
 import sys
 import tempfile
@@ -174,6 +175,11 @@ def test_backtest_run_trend_pool_smoke() -> None:
     assert isinstance(body["notes"], list)
     assert isinstance(body["trades"], list)
     assert isinstance(body["equity_curve"], list)
+    assert isinstance(body.get("risk_metrics"), dict)
+    assert isinstance(body.get("stability_diagnostics"), dict)
+    assert isinstance(body.get("regime_breakdown"), list)
+    assert isinstance(body.get("monte_carlo"), dict)
+    assert "walk_forward" in body
 
 
 def test_backtest_plateau_endpoint_handles_truncation_and_failures(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -182,9 +188,10 @@ def test_backtest_plateau_endpoint_handles_truncation_and_failures(monkeypatch: 
         if float(payload.min_score) >= 58.0:
             raise ValueError("mock failure for plateau")
         total_return = float(payload.min_score) / 100.0
+        win_rate = 0.3 if int(payload.window_days) <= 40 else 0.62
         return BacktestResponse(
             stats=ReviewStats(
-                win_rate=0.55,
+                win_rate=win_rate,
                 total_return=total_return,
                 max_drawdown=-0.12,
                 avg_pnl_ratio=0.03,
@@ -245,8 +252,11 @@ def test_backtest_plateau_endpoint_handles_truncation_and_failures(monkeypatch: 
     assert body["evaluated_combinations"] == 3
     assert len(body["points"]) == 3
     assert body["best_point"] is not None
+    assert body["best_point"]["params"]["window_days"] == 60
+    assert len(body["correlations"]) == 8
     assert any("参数组合总数" in note for note in body["notes"])
     assert any("参数评估失败" in note for note in body["notes"])
+    assert any("低胜率惩罚" in note for note in body["notes"])
     assert sum(1 for point in body["points"] if point.get("error")) >= 1
 
 
@@ -334,9 +344,13 @@ def test_backtest_plateau_endpoint_lhs_sampling_is_repeatable(monkeypatch: pytes
     assert body1["total_combinations"] == 12
     assert body1["evaluated_combinations"] == 12
     assert len(body1["points"]) == 12
+    assert len(body1["correlations"]) == 8
+    assert any(row["parameter"] == "min_score" for row in body1["correlations"])
     assert body1["points"] == body2["points"]
+    assert body1["correlations"] == body2["correlations"]
     assert any("参数采样模式: lhs" in note for note in body1["notes"])
     assert any("LHS 随机种子: 20260221" in note for note in body1["notes"])
+    assert any("低胜率惩罚" in note for note in body1["notes"])
 
 
 def test_backtest_plateau_task_supports_pause_resume_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1393,3 +1407,134 @@ def test_backtest_result_cache_reuses_persisted_result(
     assert call_counter["matrix"] == 1
     assert any("回测结果缓存命中" in note for note in second.notes)
 
+
+
+def _build_backtest_report_build_payload(report_id: str) -> dict[str, object]:
+    return {
+        "report_id": report_id,
+        "app_name": "Final Trade",
+        "app_version": "test",
+        "run_request": {
+            "mode": "full_market",
+            "trend_step": "auto",
+            "pool_roll_mode": "daily",
+            "date_from": "2025-01-02",
+            "date_to": "2025-01-31",
+            "window_days": 60,
+            "min_score": 55,
+            "require_sequence": False,
+            "min_event_count": 1,
+            "entry_events": ["Spring", "SOS", "JOC", "LPS"],
+            "exit_events": ["UTAD", "SOW", "LPSY"],
+            "initial_capital": 1000000,
+            "position_pct": 0.2,
+            "max_positions": 5,
+            "stop_loss": 0.05,
+            "take_profit": 0.15,
+            "max_hold_days": 60,
+            "fee_bps": 8,
+            "prioritize_signals": True,
+            "priority_mode": "balanced",
+            "priority_topk_per_day": 0,
+            "enforce_t1": True,
+            "max_symbols": 120,
+        },
+        "run_result": {
+            "stats": {
+                "win_rate": 0.5,
+                "total_return": 0.08,
+                "max_drawdown": 0.05,
+                "avg_pnl_ratio": 0.02,
+                "trade_count": 2,
+                "win_count": 1,
+                "loss_count": 1,
+                "profit_factor": 1.4,
+            },
+            "trades": [
+                {
+                    "symbol": "sz300750",
+                    "name": "宁德时代",
+                    "signal_date": "2025-01-03",
+                    "entry_date": "2025-01-06",
+                    "exit_date": "2025-01-10",
+                    "entry_signal": "SOS",
+                    "entry_phase": "吸筹D",
+                    "entry_quality_score": 78.0,
+                    "exit_reason": "event_exit:SOW",
+                    "quantity": 100,
+                    "entry_price": 150.0,
+                    "exit_price": 158.0,
+                    "holding_days": 4,
+                    "pnl_amount": 780.0,
+                    "pnl_ratio": 0.052,
+                }
+            ],
+            "equity_curve": [
+                {"date": "2025-01-02", "equity": 1000000, "realized_pnl": 0},
+                {"date": "2025-01-10", "equity": 1000780, "realized_pnl": 780},
+            ],
+            "drawdown_curve": [
+                {"date": "2025-01-02", "drawdown": 0},
+                {"date": "2025-01-10", "drawdown": -0.01},
+            ],
+            "monthly_returns": [
+                {"month": "2025-01", "return_ratio": 0.00078, "pnl_amount": 780, "trade_count": 1}
+            ],
+            "range": {"date_from": "2025-01-02", "date_to": "2025-01-31", "date_axis": "sell"},
+            "notes": ["mock note"],
+            "candidate_count": 6,
+            "skipped_count": 2,
+            "fill_rate": 0.333333,
+            "max_concurrent_positions": 2,
+        },
+        "report_html": "<html><body>mock report</body></html>",
+        "report_xlsx_base64": base64.b64encode(b"mock-xlsx-bytes").decode("ascii"),
+    }
+
+
+def test_backtest_report_build_import_and_manage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TDX_TREND_BACKTEST_REPORT_STORE_DIR", str(tmp_path / "backtest-reports"))
+
+    report_id = "bt_report_test_001"
+    build_resp = client.post("/api/backtest/reports/build", json=_build_backtest_report_build_payload(report_id))
+    assert build_resp.status_code == 200
+    build_body = build_resp.json()
+    assert build_body["report_id"] == report_id
+    assert build_body["manifest"]["schema_version"] == "ftbt-1.0"
+    assert any(item["path"] == "report.xlsx" for item in build_body["manifest"]["files"])
+
+    package_bytes = base64.b64decode(build_body["file_base64"])
+    import_resp = client.post(
+        "/api/backtest/reports/import",
+        files={"file": (f"{report_id}.ftbt", package_bytes, "application/octet-stream")},
+    )
+    assert import_resp.status_code == 200
+    import_body = import_resp.json()
+    assert import_body["summary"]["report_id"] == report_id
+
+    list_resp = client.get("/api/backtest/reports")
+    assert list_resp.status_code == 200
+    list_body = list_resp.json()
+    assert any(item["report_id"] == report_id for item in list_body["items"])
+
+    detail_resp = client.get(f"/api/backtest/reports/{report_id}")
+    assert detail_resp.status_code == 200
+    detail_body = detail_resp.json()
+    assert detail_body["run_request"]["mode"] == "full_market"
+    assert detail_body["run_result"]["stats"]["trade_count"] == 2
+
+    import_resp2 = client.post(
+        "/api/backtest/reports/import",
+        files={"file": (f"{report_id}.ftbt", package_bytes, "application/octet-stream")},
+    )
+    assert import_resp2.status_code == 200
+    import_body2 = import_resp2.json()
+    assert import_body2["summary"]["first_imported_at"] == import_body["summary"]["first_imported_at"]
+
+    delete_resp = client.delete(f"/api/backtest/reports/{report_id}")
+    assert delete_resp.status_code == 200
+    assert delete_resp.json()["deleted"] is True
+
+    missing_resp = client.get(f"/api/backtest/reports/{report_id}")
+    assert missing_resp.status_code == 404
+    assert missing_resp.json()["code"] == "BACKTEST_REPORT_NOT_FOUND"

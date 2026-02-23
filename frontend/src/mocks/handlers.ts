@@ -48,6 +48,8 @@ import {
 import type {
   AIProviderTestRequest,
   AppConfig,
+  BacktestReportDetail,
+  BacktestReportSummary,
   BacktestPlateauRunRequest,
   BacktestRunRequest,
   BacktestResponse,
@@ -69,7 +71,13 @@ type MockBacktestTask = {
   result: BacktestResponse
 }
 
+type MockBacktestReport = {
+  summary: BacktestReportSummary
+  detail: BacktestReportDetail
+}
+
 const mockBacktestTaskStore = new Map<string, MockBacktestTask>()
+const mockBacktestReportStore = new Map<string, MockBacktestReport>()
 
 export const handlers = [
   http.post('/api/screener/run', async ({ request }) => {
@@ -267,6 +275,166 @@ export const handlers = [
       result: task.result,
       error: null,
     })
+  }),
+
+  http.post('/api/backtest/reports/build', async ({ request }) => {
+    await delay(80)
+    const payload = (await request.json()) as {
+      report_id?: string
+      app_name?: string
+      app_version?: string
+    }
+    const reportId = String(payload.report_id || `bt_mock_report_${Date.now()}`)
+    const createdAt = new Date().toISOString()
+    return HttpResponse.json({
+      report_id: reportId,
+      file_name: `${reportId}.ftbt`,
+      file_base64: 'bW9jay1mdGJ0',
+      manifest: {
+        schema_version: 'ftbt-1.0',
+        package_type: 'backtest_report',
+        created_at: createdAt,
+        report_id: reportId,
+        app: {
+          name: String(payload.app_name || 'Final Trade'),
+          version: String(payload.app_version || 'mock'),
+        },
+        files: [],
+      },
+    })
+  }),
+
+  http.post('/api/backtest/reports/import', async ({ request }) => {
+    await delay(100)
+    const formData = await request.formData()
+    const file = formData.get('file') as File | null
+    const nowText = new Date().toISOString()
+    const fileName = file?.name || 'mock-import.ftbt'
+    const reportId = String(fileName).replace(/\.ftbt$/i, '') || `bt_mock_import_${Date.now()}`
+    const summary: BacktestReportSummary = {
+      report_id: reportId,
+      created_at: nowText,
+      first_imported_at: nowText,
+      last_imported_at: nowText,
+      source_file_name: fileName,
+      package_size_bytes: Number(file?.size || 0),
+      trade_count: 0,
+      total_return: 0,
+      max_drawdown: 0,
+      win_rate: 0,
+      date_from: '2025-01-01',
+      date_to: '2025-01-31',
+      has_plateau_result: false,
+    }
+    const detail: BacktestReportDetail = {
+      summary,
+      manifest: {
+        schema_version: 'ftbt-1.0',
+        package_type: 'backtest_report',
+        created_at: nowText,
+        report_id: reportId,
+        app: {
+          name: 'Final Trade',
+          version: 'mock',
+        },
+        files: [],
+      },
+      run_request: {
+        mode: 'full_market',
+        trend_step: 'auto',
+        pool_roll_mode: 'daily',
+        date_from: '2025-01-01',
+        date_to: '2025-01-31',
+        window_days: 60,
+        min_score: 55,
+        require_sequence: false,
+        min_event_count: 1,
+        entry_events: ['Spring', 'SOS'],
+        exit_events: ['SOW', 'UTAD'],
+        initial_capital: 1_000_000,
+        position_pct: 0.2,
+        max_positions: 5,
+        stop_loss: 0.05,
+        take_profit: 0.15,
+        max_hold_days: 60,
+        fee_bps: 8,
+        prioritize_signals: true,
+        priority_mode: 'balanced',
+        priority_topk_per_day: 0,
+        enforce_t1: true,
+        max_symbols: 120,
+      },
+      run_result: runBacktestStore({
+        mode: 'full_market',
+        trend_step: 'auto',
+        date_from: '2025-01-01',
+        date_to: '2025-01-31',
+        window_days: 60,
+        min_score: 55,
+        require_sequence: false,
+        min_event_count: 1,
+        entry_events: ['Spring', 'SOS'],
+        exit_events: ['SOW', 'UTAD'],
+        initial_capital: 1_000_000,
+        position_pct: 0.2,
+        max_positions: 5,
+        stop_loss: 0.05,
+        take_profit: 0.15,
+        max_hold_days: 60,
+        fee_bps: 8,
+        prioritize_signals: true,
+        priority_mode: 'balanced',
+        priority_topk_per_day: 0,
+        enforce_t1: true,
+        max_symbols: 120,
+        pool_roll_mode: 'daily',
+      }),
+      plateau_result: null,
+    }
+    mockBacktestReportStore.set(reportId, { summary, detail })
+    return HttpResponse.json({ summary })
+  }),
+
+  http.get('/api/backtest/reports', async () => {
+    await delay(50)
+    return HttpResponse.json({
+      items: Array.from(mockBacktestReportStore.values()).map((item) => item.summary),
+    })
+  }),
+
+  http.get('/api/backtest/reports/:reportId', async ({ params }) => {
+    await delay(60)
+    const reportId = String(params.reportId || '')
+    const report = mockBacktestReportStore.get(reportId)
+    if (!report) {
+      return HttpResponse.json(
+        {
+          code: 'BACKTEST_REPORT_NOT_FOUND',
+          message: '回测报告不存在',
+          trace_id: `${Date.now()}`,
+        },
+        { status: 404 },
+      )
+    }
+    return HttpResponse.json(report.detail)
+  }),
+
+  http.delete('/api/backtest/reports/:reportId', async ({ params }) => {
+    await delay(60)
+    const reportId = String(params.reportId || '')
+    const exists = mockBacktestReportStore.has(reportId)
+    if (!exists) {
+      return HttpResponse.json(
+        {
+          code: 'BACKTEST_REPORT_NOT_FOUND',
+          message: '回测报告不存在',
+          trace_id: `${Date.now()}`,
+        },
+        { status: 404 },
+      )
+    }
+    mockBacktestReportStore.delete(reportId)
+    return HttpResponse.json({ deleted: true, report_id: reportId })
   }),
 
   http.post('/api/sim/orders', async ({ request }) => {

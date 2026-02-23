@@ -381,6 +381,7 @@ class BacktestRunRequest(BaseModel):
     enforce_t1: bool = True
     max_symbols: int = Field(default=120, ge=20, le=2000)
     pool_roll_mode: BacktestPoolRollMode = "daily"
+    enable_advanced_analysis: bool = True
 
 
 class BacktestTrade(BaseModel):
@@ -401,6 +402,72 @@ class BacktestTrade(BaseModel):
     pnl_ratio: float
 
 
+class BacktestRiskMetrics(BaseModel):
+    sharpe: float = 0.0
+    sortino: float = 0.0
+    calmar: float = 0.0
+    expectancy: float = 0.0
+    avg_win_pnl_ratio: float = 0.0
+    avg_loss_pnl_ratio: float = 0.0
+    max_consecutive_losses: int = 0
+    recovery_days: int = 0
+
+
+class BacktestStabilityDiagnostics(BaseModel):
+    stability_score: float = 0.0
+    min_trade_count_threshold: int = 20
+    trade_count_penalty: float = 0.0
+    neighborhood_consistency: float = 0.0
+    return_variance_penalty: float = 0.0
+    monthly_return_std: float = 0.0
+    notes: list[str] = Field(default_factory=list)
+
+
+class BacktestRegimeBucket(BaseModel):
+    regime: Literal["bull", "range", "bear"]
+    label: str
+    trade_count: int = 0
+    win_rate: float = 0.0
+    total_return: float = 0.0
+    avg_pnl_ratio: float = 0.0
+    max_drawdown: float = 0.0
+
+
+class BacktestMonteCarloSummary(BaseModel):
+    simulations: int = 0
+    seed: int = 0
+    total_return_p5: float = 0.0
+    total_return_p50: float = 0.0
+    total_return_p95: float = 0.0
+    max_drawdown_p5: float = 0.0
+    max_drawdown_p50: float = 0.0
+    max_drawdown_p95: float = 0.0
+    ruin_probability: float = 0.0
+
+
+class BacktestWalkForwardFold(BaseModel):
+    fold_index: int
+    train_date_from: str
+    train_date_to: str
+    test_date_from: str
+    test_date_to: str
+    selected_params: "BacktestPlateauParams"
+    train_score: float = 0.0
+    test_score: float = 0.0
+    train_stats: ReviewStats
+    test_stats: ReviewStats
+
+
+class BacktestWalkForwardReport(BaseModel):
+    fold_count: int = 0
+    candidate_count: int = 0
+    oos_pass_rate: float = 0.0
+    avg_test_return: float = 0.0
+    avg_test_win_rate: float = 0.0
+    folds: list[BacktestWalkForwardFold] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class BacktestResponse(BaseModel):
     stats: ReviewStats
     trades: list[BacktestTrade]
@@ -416,6 +483,11 @@ class BacktestResponse(BaseModel):
     skipped_count: int = 0
     fill_rate: float = 0.0
     max_concurrent_positions: int = 0
+    risk_metrics: BacktestRiskMetrics | None = None
+    stability_diagnostics: BacktestStabilityDiagnostics | None = None
+    regime_breakdown: list[BacktestRegimeBucket] = Field(default_factory=list)
+    monte_carlo: BacktestMonteCarloSummary | None = None
+    walk_forward: BacktestWalkForwardReport | None = None
 
 
 class BacktestTaskStartResponse(BaseModel):
@@ -489,12 +561,21 @@ class BacktestPlateauPoint(BaseModel):
     error: str | None = None
 
 
+class BacktestPlateauCorrelationRow(BaseModel):
+    parameter: str
+    parameter_label: str
+    score_corr: float = 0.0
+    total_return_corr: float = 0.0
+    win_rate_corr: float = 0.0
+
+
 class BacktestPlateauResponse(BaseModel):
     base_payload: BacktestRunRequest
     total_combinations: int
     evaluated_combinations: int
     points: list[BacktestPlateauPoint] = Field(default_factory=list)
     best_point: BacktestPlateauPoint | None = None
+    correlations: list[BacktestPlateauCorrelationRow] = Field(default_factory=list)
     generated_at: str
     notes: list[str] = Field(default_factory=list)
 
@@ -516,6 +597,81 @@ class BacktestPlateauTaskStatusResponse(BaseModel):
     result: BacktestPlateauResponse | None = None
     error: str | None = None
     error_code: str | None = None
+
+
+class BacktestReportManifestFile(BaseModel):
+    path: str
+    sha256: str
+    bytes: int = Field(ge=0)
+
+
+class BacktestReportManifestApp(BaseModel):
+    name: str
+    version: str
+
+
+class BacktestReportManifest(BaseModel):
+    schema_version: Literal["ftbt-1.0"] = "ftbt-1.0"
+    package_type: Literal["backtest_report"] = "backtest_report"
+    created_at: str
+    report_id: str
+    app: BacktestReportManifestApp
+    files: list[BacktestReportManifestFile] = Field(default_factory=list)
+
+
+class BacktestReportBuildRequest(BaseModel):
+    run_request: BacktestRunRequest
+    run_result: BacktestResponse
+    report_html: str = Field(min_length=1)
+    report_xlsx_base64: str = Field(min_length=1)
+    plateau_result: BacktestPlateauResponse | None = None
+    report_id: str | None = None
+    app_name: str = "Final Trade"
+    app_version: str = "unknown"
+
+
+class BacktestReportBuildResponse(BaseModel):
+    report_id: str
+    file_name: str
+    file_base64: str
+    manifest: BacktestReportManifest
+
+
+class BacktestReportSummary(BaseModel):
+    report_id: str
+    created_at: str
+    first_imported_at: str
+    last_imported_at: str
+    source_file_name: str
+    package_size_bytes: int = Field(ge=0)
+    trade_count: int = 0
+    total_return: float = 0.0
+    max_drawdown: float = 0.0
+    win_rate: float = 0.0
+    date_from: str
+    date_to: str
+    has_plateau_result: bool = False
+
+
+class BacktestReportListResponse(BaseModel):
+    items: list[BacktestReportSummary] = Field(default_factory=list)
+
+
+class BacktestReportDetail(BaseModel):
+    summary: BacktestReportSummary
+    manifest: BacktestReportManifest
+    run_request: BacktestRunRequest
+    run_result: BacktestResponse
+    plateau_result: BacktestPlateauResponse | None = None
+
+
+class BacktestReportImportResponse(BaseModel):
+    summary: BacktestReportSummary
+
+
+class BacktestReportDeleteResponse(BaseModel):
+    deleted: bool
+    report_id: str
 
 
 class ReviewTag(BaseModel):
@@ -834,3 +990,6 @@ class AIProviderTestResponse(BaseModel):
     latency_ms: int
     message: str
     error_code: str | None = None
+
+
+BacktestWalkForwardFold.model_rebuild()

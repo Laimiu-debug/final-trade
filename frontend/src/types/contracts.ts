@@ -383,6 +383,7 @@ export interface BacktestRunRequest {
   priority_topk_per_day: number
   enforce_t1: boolean
   max_symbols: number
+  enable_advanced_analysis?: boolean
 }
 
 export interface BacktestTrade {
@@ -418,6 +419,77 @@ export interface BacktestResponse {
   skipped_count: number
   fill_rate: number
   max_concurrent_positions: number
+  risk_metrics?: BacktestRiskMetrics | null
+  stability_diagnostics?: BacktestStabilityDiagnostics | null
+  regime_breakdown?: BacktestRegimeBucket[]
+  monte_carlo?: BacktestMonteCarloSummary | null
+  walk_forward?: BacktestWalkForwardReport | null
+}
+
+export interface BacktestRiskMetrics {
+  sharpe: number
+  sortino: number
+  calmar: number
+  expectancy: number
+  avg_win_pnl_ratio: number
+  avg_loss_pnl_ratio: number
+  max_consecutive_losses: number
+  recovery_days: number
+}
+
+export interface BacktestStabilityDiagnostics {
+  stability_score: number
+  min_trade_count_threshold: number
+  trade_count_penalty: number
+  neighborhood_consistency: number
+  return_variance_penalty: number
+  monthly_return_std: number
+  notes: string[]
+}
+
+export interface BacktestRegimeBucket {
+  regime: 'bull' | 'range' | 'bear'
+  label: string
+  trade_count: number
+  win_rate: number
+  total_return: number
+  avg_pnl_ratio: number
+  max_drawdown: number
+}
+
+export interface BacktestMonteCarloSummary {
+  simulations: number
+  seed: number
+  total_return_p5: number
+  total_return_p50: number
+  total_return_p95: number
+  max_drawdown_p5: number
+  max_drawdown_p50: number
+  max_drawdown_p95: number
+  ruin_probability: number
+}
+
+export interface BacktestWalkForwardFold {
+  fold_index: number
+  train_date_from: string
+  train_date_to: string
+  test_date_from: string
+  test_date_to: string
+  selected_params: BacktestPlateauParams
+  train_score: number
+  test_score: number
+  train_stats: ReviewStats
+  test_stats: ReviewStats
+}
+
+export interface BacktestWalkForwardReport {
+  fold_count: number
+  candidate_count: number
+  oos_pass_rate: number
+  avg_test_return: number
+  avg_test_win_rate: number
+  folds: BacktestWalkForwardFold[]
+  notes: string[]
 }
 
 export interface BacktestTaskStartResponse {
@@ -491,12 +563,21 @@ export interface BacktestPlateauPoint {
   error?: string | null
 }
 
+export interface BacktestPlateauCorrelationRow {
+  parameter: string
+  parameter_label: string
+  score_corr: number
+  total_return_corr: number
+  win_rate_corr: number
+}
+
 export interface BacktestPlateauResponse {
   base_payload: BacktestRunRequest
   total_combinations: number
   evaluated_combinations: number
   points: BacktestPlateauPoint[]
   best_point?: BacktestPlateauPoint | null
+  correlations?: BacktestPlateauCorrelationRow[]
   generated_at: string
   notes: string[]
 }
@@ -518,6 +599,81 @@ export interface BacktestPlateauTaskStatusResponse {
   result?: BacktestPlateauResponse | null
   error?: string | null
   error_code?: string | null
+}
+
+export interface BacktestReportManifestFile {
+  path: string
+  sha256: string
+  bytes: number
+}
+
+export interface BacktestReportManifestApp {
+  name: string
+  version: string
+}
+
+export interface BacktestReportManifest {
+  schema_version: 'ftbt-1.0'
+  package_type: 'backtest_report'
+  created_at: string
+  report_id: string
+  app: BacktestReportManifestApp
+  files: BacktestReportManifestFile[]
+}
+
+export interface BacktestReportBuildRequest {
+  run_request: BacktestRunRequest
+  run_result: BacktestResponse
+  report_html: string
+  report_xlsx_base64: string
+  plateau_result?: BacktestPlateauResponse | null
+  report_id?: string
+  app_name?: string
+  app_version?: string
+}
+
+export interface BacktestReportBuildResponse {
+  report_id: string
+  file_name: string
+  file_base64: string
+  manifest: BacktestReportManifest
+}
+
+export interface BacktestReportSummary {
+  report_id: string
+  created_at: string
+  first_imported_at: string
+  last_imported_at: string
+  source_file_name: string
+  package_size_bytes: number
+  trade_count: number
+  total_return: number
+  max_drawdown: number
+  win_rate: number
+  date_from: string
+  date_to: string
+  has_plateau_result: boolean
+}
+
+export interface BacktestReportListResponse {
+  items: BacktestReportSummary[]
+}
+
+export interface BacktestReportDetail {
+  summary: BacktestReportSummary
+  manifest: BacktestReportManifest
+  run_request: BacktestRunRequest
+  run_result: BacktestResponse
+  plateau_result?: BacktestPlateauResponse | null
+}
+
+export interface BacktestReportImportResponse {
+  summary: BacktestReportSummary
+}
+
+export interface BacktestReportDeleteResponse {
+  deleted: boolean
+  report_id: string
 }
 
 export type ReviewTagType = 'emotion' | 'reason'

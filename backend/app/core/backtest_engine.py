@@ -142,6 +142,14 @@ class BacktestEngine:
         return event_count
 
     @staticmethod
+    def _build_matrix_exit_signal_label(payload: BacktestRunRequest) -> str:
+        configured = [str(item).strip() for item in payload.exit_events if str(item).strip()]
+        for item in ("UTAD", "SOW", "LPSY"):
+            if item in configured:
+                return item
+        return configured[0] if configured else "SELL"
+
+    @staticmethod
     def _structure_score(structure_hhh: str) -> int:
         parts = [part.strip() for part in str(structure_hhh).split("|")]
         return sum(1 for part in parts if part and part != "-")
@@ -268,7 +276,7 @@ class BacktestEngine:
             if take_price is not None and high_price >= take_price:
                 return bar_index, float(take_price), "take_profit"
             if bool(sell_col[bar_index]):
-                return bar_index, float(close_price), "event_exit:MATRIX_SELL"
+                return bar_index, float(close_price), f"event_exit:{BacktestEngine._build_matrix_exit_signal_label(payload)}"
             if (bar_index - entry_index + 1) >= payload.max_hold_days:
                 return bar_index, float(close_price), "time_exit"
 
@@ -390,11 +398,11 @@ class BacktestEngine:
                 exit_index, exit_price, exit_reason = exit_resolved
                 entry_tags: list[str] = []
                 if bool(matrix_signals.s5[signal_index, col]):
-                    entry_tags.append("M5")
+                    entry_tags.append("SOS")
                 if bool(matrix_signals.s6[signal_index, col]):
-                    entry_tags.append("M6")
+                    entry_tags.append("LPS")
                 if not entry_tags:
-                    entry_tags.append("MATRIX")
+                    entry_tags.append(payload.entry_events[0] if payload.entry_events else "ENTRY")
                 entry_phase = "吸筹D" if bool(matrix_signals.s7[signal_index, col]) else "阶段未明"
                 entry_quality_score = float(score_col[signal_index]) if math.isfinite(float(score_col[signal_index])) else 0.0
 
@@ -670,11 +678,11 @@ class BacktestEngine:
 
                 entry_tags: list[str] = []
                 if bool(matrix_signals.s5[signal_index, col]):
-                    entry_tags.append("M5")
+                    entry_tags.append("SOS")
                 if bool(matrix_signals.s6[signal_index, col]):
-                    entry_tags.append("M6")
+                    entry_tags.append("LPS")
                 if not entry_tags:
-                    entry_tags.append("MATRIX")
+                    entry_tags.append(payload.entry_events[0] if payload.entry_events else "ENTRY")
                 entry_phase = "吸筹D" if bool(matrix_signals.s7[signal_index, col]) else "阶段未明"
                 raw_quality = float(score_col[signal_index]) if math.isfinite(float(score_col[signal_index])) else 0.0
                 entry_quality_score = max(0.0, min(100.0, raw_quality))
