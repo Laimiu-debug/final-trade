@@ -30,9 +30,26 @@ class SignalAnalyzer:
         return sum(values) / len(values)
 
     @staticmethod
+    def safe_std(values: list[float] | list[int]) -> float:
+        """Calculate standard deviation, handling empty lists."""
+        if not values:
+            return 0.0
+        mean = SignalAnalyzer.safe_mean(values)
+        variance = SignalAnalyzer.safe_mean([(float(value) - mean) ** 2 for value in values])
+        return variance ** 0.5
+
+    @staticmethod
     def clamp_score(value: float, lower: float = 0.0, upper: float = 100.0) -> float:
         """Clamp a value to a specified range."""
         return max(lower, min(upper, value))
+
+    @staticmethod
+    def _event_grade_from_score(score: float) -> str:
+        if score >= 75.0:
+            return "A"
+        if score >= 60.0:
+            return "B"
+        return "C"
 
     @staticmethod
     def phase_hint(phase: str) -> str:
@@ -151,9 +168,27 @@ class SignalAnalyzer:
         # Determine phase
         phase = cls._determine_phase(events, risk_events, ret20, ma20, row)
 
+        # Trend health diagnostics (M2)
+        health_metrics = cls._calculate_health_metrics(
+            closes=closes,
+            highs=highs,
+            lows=lows,
+            ma20=ma20,
+            row=row,
+        )
+
         # Calculate scores
         scores = cls._calculate_scores(
-            phase, events, risk_events, structure_hhh, row, ret20, ret10
+            phase=phase,
+            events=events,
+            risk_events=risk_events,
+            structure_hhh=structure_hhh,
+            row=row,
+            ret20=ret20,
+            ret10=ret10,
+            tr_pos=tr_pos,
+            sequence_ok=sequence_ok,
+            health_metrics=health_metrics,
         )
 
         # Determine primary signal
@@ -193,6 +228,16 @@ class SignalAnalyzer:
             "structure_score": 0.0,
             "trend_score": 0.0,
             "volatility_score": 0.0,
+            "health_score": 0.0,
+            "slope_stability": 0.0,
+            "pullback_quality": 0.0,
+            "event_score": 0.0,
+            "event_grade": "C",
+            "event_background_score": 0.0,
+            "event_position_score": 0.0,
+            "event_vol_price_score": 0.0,
+            "event_confirmation_score": 0.0,
+            "event_grade_map": {},
             "entry_quality_score": 0.0,
             "trigger_date": fallback_date,
         }
@@ -615,8 +660,53 @@ class SignalAnalyzer:
         return "\u9636\u6bb5\u672a\u660e"
 
     @classmethod
+    def _calculate_health_metrics(
+        cls,
+        *,
+        closes: list[float],
+        highs: list[float],
+        lows: list[float],
+        ma20: float,
+        row: ScreenerResult,
+    ) -> dict[str, float]:
+        daily_returns: list[float] = []
+        for idx in range(1, len(closes)):
+            prev = max(float(closes[idx - 1]), 0.01)
+            daily_returns.append((float(closes[idx]) - float(closes[idx - 1])) / prev)
+        slope_std = cls.safe_std(daily_returns[-20:])
+        slope_stability = cls.clamp_score(100.0 - slope_std * 900.0)
+
+        range_ratios: list[float] = []
+        for idx in range(len(closes)):
+            close_px = max(float(closes[idx]), 0.01)
+            range_ratios.append(max(0.0, float(highs[idx]) - float(lows[idx])) / close_px)
+        range_mean = cls.safe_mean(range_ratios[-20:])
+        volatility_stability = cls.clamp_score(100.0 - range_mean * 700.0)
+
+        retrace_center = abs(float(row.retrace20) - 0.12)
+        retrace_component = cls.clamp_score(100.0 - retrace_center / 0.12 * 100.0)
+        ma_hold_bonus = 10.0 if closes[-1] >= ma20 * 0.99 else -10.0
+        rebound_bonus = 0.0
+        if len(closes) >= 6 and closes[-1] >= closes[-6]:
+            rebound_bonus = 8.0
+        pullback_quality = cls.clamp_score(25.0 + retrace_component * 0.75 + ma_hold_bonus + rebound_bonus)
+
+        health_score = cls.clamp_score(
+            slope_stability * 0.40
+            + volatility_stability * 0.35
+            + pullback_quality * 0.25
+        )
+        return {
+            "slope_stability": round(slope_stability, 2),
+            "volatility_stability": round(volatility_stability, 2),
+            "pullback_quality": round(pullback_quality, 2),
+            "health_score": round(health_score, 2),
+        }
+
+    @classmethod
     def _calculate_scores(
         cls,
+        *,
         phase: str,
         events: list[str],
         risk_events: list[str],
@@ -624,6 +714,9 @@ class SignalAnalyzer:
         row: ScreenerResult,
         ret20: float,
         ret10: float,
+        tr_pos: float,
+        sequence_ok: bool,
+        health_metrics: dict[str, float] | None = None,
     ) -> dict:
         """Calculate various analysis scores."""
         # Phase score
@@ -655,6 +748,59 @@ class SignalAnalyzer:
             event_strength_score += risk_event_penalty.get(event, 0)
         event_strength_score = cls.clamp_score(event_strength_score)
 
+        phase_background_bonus = {
+            "\u5438\u7b79A": 6.0,
+            "\u5438\u7b79B": 10.0,
+            "\u5438\u7b79C": 14.0,
+            "\u5438\u7b79D": 18.0,
+            "\u5438\u7b79E": 20.0,
+            "\u6d3e\u53d1A": -10.0,
+            "\u6d3e\u53d1B": -14.0,
+            "\u6d3e\u53d1C": -18.0,
+            "\u6d3e\u53d1D": -22.0,
+            "\u6d3e\u53d1E": -24.0,
+        }
+        background_score = cls.clamp_score(
+            45.0
+            + phase_background_bonus.get(phase, 0.0)
+            + float(row.ret40) * 90.0
+            - max(0.0, float(row.retrace20) - 0.15) * 180.0
+            - len(risk_events) * 6.0
+        )
+        position_score = cls.clamp_score(100.0 - abs(float(tr_pos) - 0.65) * 120.0)
+        vol_price_score = cls.clamp_score(event_strength_score)
+        confirm_bonus = 0.0
+        if {"SOS", "JOC", "LPS"} & set(events):
+            confirm_bonus += 18.0
+        elif events:
+            confirm_bonus += 8.0
+        confirmation_score = cls.clamp_score(
+            35.0
+            + (25.0 if sequence_ok else -10.0)
+            + confirm_bonus
+            - len(risk_events) * 5.0
+        )
+        event_score = cls.clamp_score(
+            background_score * 0.30
+            + position_score * 0.25
+            + vol_price_score * 0.25
+            + confirmation_score * 0.20
+            - len(risk_events) * 2.5
+        )
+        event_grade = cls._event_grade_from_score(event_score)
+
+        event_grade_map: dict[str, str] = {}
+        event_set = [str(item).strip() for item in [*events, *risk_events] if str(item).strip()]
+        for event_name in event_set:
+            event_level_score = float(event_score)
+            if event_name in {"SOS", "JOC", "LPS", "Spring", "TSO"}:
+                event_level_score += 6.0
+            if event_name in {"PS", "SC", "AR", "ST"}:
+                event_level_score -= 4.0
+            if event_name in set(risk_events):
+                event_level_score -= 12.0
+            event_grade_map[event_name] = cls._event_grade_from_score(cls.clamp_score(event_level_score))
+
         # Structure score
         hh, hl, hc = [part != "-" for part in structure_hhh.split("|")]
         structure_score = cls.clamp_score(35 + (22 if hh else 0) + (22 if hl else 0) + (21 if hc else 0))
@@ -665,14 +811,23 @@ class SignalAnalyzer:
         # Volatility score
         volatility_score = cls.clamp_score(100 - row.amplitude20 * 620)
 
+        normalized_health = health_metrics or {}
+        health_score = cls.clamp_score(float(normalized_health.get("health_score", 0.0) or 0.0))
+        slope_stability = cls.clamp_score(float(normalized_health.get("slope_stability", 0.0) or 0.0))
+        volatility_stability = cls.clamp_score(
+            float(normalized_health.get("volatility_stability", 0.0) or 0.0)
+        )
+        pullback_quality = cls.clamp_score(float(normalized_health.get("pullback_quality", 0.0) or 0.0))
+
         # Entry quality score (weighted composite)
         risk_penalty = len(risk_events) * 4.5
         entry_quality_score = cls.clamp_score(
-            phase_score * 0.34
-            + event_strength_score * 0.24
-            + structure_score * 0.20
-            + trend_score * 0.14
-            + volatility_score * 0.08
+            phase_score * 0.30
+            + event_strength_score * 0.21
+            + structure_score * 0.17
+            + trend_score * 0.12
+            + volatility_score * 0.10
+            + health_score * 0.10
             - risk_penalty
         )
 
@@ -682,6 +837,17 @@ class SignalAnalyzer:
             "structure_score": round(structure_score, 2),
             "trend_score": round(trend_score, 2),
             "volatility_score": round(volatility_score, 2),
+            "health_score": round(health_score, 2),
+            "slope_stability": round(slope_stability, 2),
+            "volatility_stability": round(volatility_stability, 2),
+            "pullback_quality": round(pullback_quality, 2),
+            "event_score": round(event_score, 2),
+            "event_grade": event_grade,
+            "event_background_score": round(background_score, 2),
+            "event_position_score": round(position_score, 2),
+            "event_vol_price_score": round(vol_price_score, 2),
+            "event_confirmation_score": round(confirmation_score, 2),
+            "event_grade_map": event_grade_map,
             "entry_quality_score": round(entry_quality_score, 2),
         }
 

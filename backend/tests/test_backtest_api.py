@@ -24,7 +24,16 @@ os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_READ_ONLY", "0")
 
 from app.main import app
 import app.store as store_module
-from app.models import BacktestResponse, BacktestRunRequest, ReviewRange, ReviewStats, ScreenerParams, ScreenerResult
+from app.models import (
+    BacktestResponse,
+    BacktestRiskMetrics,
+    BacktestRunRequest,
+    BacktestTrade,
+    ReviewRange,
+    ReviewStats,
+    ScreenerParams,
+    ScreenerResult,
+)
 from app.store import BacktestValidationError, store
 
 client = TestClient(app)
@@ -181,6 +190,114 @@ def test_backtest_run_trend_pool_smoke() -> None:
     assert isinstance(body.get("regime_breakdown"), list)
     assert isinstance(body.get("monte_carlo"), dict)
     assert "walk_forward" in body
+
+
+def test_backtest_experiment_ab_endpoint_reports_baseline_and_deltas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats_by_delay = {
+        1: (0.08, 0.45, -0.14, 3, 1, 3),
+        2: (0.13, 0.58, -0.09, 2, 0, 3),
+        3: (0.07, 0.42, -0.16, 4, 1, 2),
+    }
+
+    def _fake_run_backtest(payload: BacktestRunRequest) -> BacktestResponse:
+        total_return, win_rate, max_drawdown, max_losses, utad_count, trade_count = stats_by_delay[
+            int(payload.entry_delay_days)
+        ]
+        trades: list[BacktestTrade] = []
+        for idx in range(trade_count):
+            is_utad = idx < int(utad_count)
+            entry_signal = "SOS" if idx % 2 == 0 else "JOC"
+            trades.append(
+                BacktestTrade(
+                    symbol=f"sz30075{idx}",
+                    name=f"mock-{idx}",
+                    signal_date=payload.date_from,
+                    entry_date=payload.date_from,
+                    exit_date=payload.date_to,
+                    entry_signal=entry_signal,
+                    entry_phase="吸筹D",
+                    exit_reason=("UTAD" if is_utad else "TAKE_PROFIT"),
+                    quantity=100,
+                    entry_price=100.0,
+                    exit_price=(98.0 if is_utad else 103.0),
+                    holding_days=3,
+                    pnl_amount=(-200.0 if is_utad else 300.0),
+                    pnl_ratio=(-0.02 if is_utad else 0.03),
+                )
+            )
+
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=win_rate,
+                total_return=total_return,
+                max_drawdown=max_drawdown,
+                avg_pnl_ratio=0.02,
+                trade_count=trade_count,
+                win_count=max(0, trade_count - int(utad_count)),
+                loss_count=int(utad_count),
+                profit_factor=1.3,
+            ),
+            trades=trades,
+            range=ReviewRange(
+                date_from=payload.date_from,
+                date_to=payload.date_to,
+                date_axis="sell",
+            ),
+            notes=[],
+            candidate_count=20,
+            skipped_count=4,
+            fill_rate=0.8,
+            max_concurrent_positions=3,
+            risk_metrics=BacktestRiskMetrics(max_consecutive_losses=max_losses),
+        )
+
+    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
+
+    payload = {
+        "base_payload": {
+            "mode": "full_market",
+            "pool_roll_mode": "daily",
+            "date_from": "2025-01-02",
+            "date_to": "2025-01-31",
+            "entry_delay_days": 1,
+        },
+        "auto_generate_default_matrix": False,
+        "max_variants": 8,
+        "variants": [
+            {"label": "delay_2", "entry_delay_days": 2},
+            {"label": "delay_3", "entry_delay_days": 3},
+        ],
+    }
+    resp = client.post("/api/backtest/experiments/ab", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["baseline_variant_id"] == "v01"
+    assert body["best_variant_id"] == "v02"
+    assert isinstance(body["notes"], list)
+
+    variants_by_label = {str(item["label"]): item for item in body["variants"]}
+    assert {"baseline", "delay_2", "delay_3"} <= set(variants_by_label)
+    assert variants_by_label["baseline"]["run_request"]["entry_delay_days"] == 1
+    assert variants_by_label["delay_2"]["status"] == "succeeded"
+    assert variants_by_label["delay_2"]["trade_count"] == 3
+    assert variants_by_label["delay_2"]["utad_exit_ratio"] == 0.0
+    assert variants_by_label["delay_3"]["trade_count"] == 2
+    assert variants_by_label["delay_3"]["utad_exit_ratio"] == 0.5
+    breakdown_delay2 = {row["signal"]: row for row in variants_by_label["delay_2"]["signal_breakdown"]}
+    assert {"SOS", "JOC"} <= set(breakdown_delay2)
+    assert breakdown_delay2["SOS"]["trade_count"] == 2
+    assert breakdown_delay2["JOC"]["trade_count"] == 1
+    assert breakdown_delay2["SOS"]["utad_exit_ratio"] == 0.0
+
+    comparisons_by_label = {str(item["label"]): item for item in body["comparisons"]}
+    assert set(comparisons_by_label) == {"delay_2", "delay_3"}
+    assert comparisons_by_label["delay_2"]["total_return_delta"] == pytest.approx(0.05, abs=1e-6)
+    assert comparisons_by_label["delay_2"]["win_rate_delta"] == pytest.approx(0.13, abs=1e-6)
+    assert comparisons_by_label["delay_2"]["max_drawdown_delta"] == pytest.approx(0.05, abs=1e-6)
+    assert comparisons_by_label["delay_2"]["utad_exit_ratio_delta"] == pytest.approx(-0.333333, abs=1e-6)
+    assert comparisons_by_label["delay_2"]["max_consecutive_losses_delta"] == -1
 
 
 def test_backtest_plateau_endpoint_handles_truncation_and_failures(monkeypatch: pytest.MonkeyPatch) -> None:

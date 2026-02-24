@@ -14,8 +14,10 @@ import {
   InputNumber,
   Radio,
   Row,
+  Select,
   Space,
   Statistic,
+  Switch,
   Table,
   Tag,
   Typography,
@@ -25,11 +27,32 @@ import type { ColumnsType } from 'antd/es/table'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import wyckoffCycleDiagram from '@/assets/wyckoff-cycle.svg'
 import { ApiError } from '@/shared/api/client'
-import { getLatestScreenerRun, getScreenerRun, getSignals } from '@/shared/api/endpoints'
+import { getLatestScreenerRun, getScreenerRun, getSignals, getStrategies } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
+import {
+  buildStrategyParamsPayload,
+  deleteSharedStrategyPreset,
+  getSharedLastStrategyId,
+  getSharedStrategyParams,
+  listSharedStrategyPresets,
+  normalizeStrategyParams,
+  parseStrategyParamSchema,
+  resolveDefaultStrategyId,
+  saveSharedStrategyPreset,
+  setSharedStrategyParams,
+} from '@/shared/utils/strategyParams'
+import type { StrategyParamPreset, StrategyParamSpec } from '@/shared/utils/strategyParams'
 import { upsertPendingBuyDraft } from '@/shared/utils/simPendingOrders'
 import { useUIStore } from '@/state/uiStore'
-import type { BoardFilter, Market, SignalResult, SignalScanMode, SignalType, TrendPoolStep } from '@/types/contracts'
+import type {
+  BoardFilter,
+  Market,
+  SignalResult,
+  SignalScanMode,
+  SignalType,
+  StrategyId,
+  TrendPoolStep,
+} from '@/types/contracts'
 
 type StatusFilter = 'active' | 'expiring' | 'expired' | 'all'
 
@@ -40,6 +63,7 @@ interface SignalTableRow extends SignalResult {
   event_count: number
   quality_score: number
   sequence_ok: boolean
+  signal_age_days: number
   days_to_expire: number
   is_today_trigger: boolean
 }
@@ -310,6 +334,10 @@ function normalizeSignalRow(item: SignalResult, todayStart: dayjs.Dayjs): Signal
       ? item.entry_quality_score
       : Math.min(99, item.priority * 25 + eventCount * 6)
   const sequenceOk = item.wy_sequence_ok ?? false
+  const signalAgeDays =
+    typeof item.signal_age_days === 'number'
+      ? Math.max(0, Math.round(item.signal_age_days))
+      : Math.max(0, todayStart.diff(safeTrigger, 'day'))
   const daysToExpire = safeExpire.diff(todayStart, 'day')
   const isTodayTrigger = safeTrigger.isSame(todayStart, 'day')
 
@@ -321,6 +349,7 @@ function normalizeSignalRow(item: SignalResult, todayStart: dayjs.Dayjs): Signal
     event_count: eventCount,
     quality_score: qualityScore,
     sequence_ok: sequenceOk,
+    signal_age_days: signalAgeDays,
     days_to_expire: daysToExpire,
     is_today_trigger: isTodayTrigger,
   }
@@ -381,8 +410,32 @@ export function SignalsPage() {
   const initialMinEventCount = Number.isFinite(parsedInitialMinEventCount)
     ? Math.max(1, Math.min(12, Math.round(parsedInitialMinEventCount)))
     : 1
+  const parsedInitialSignalAgeMin = Number(
+    searchParams.get('signal_age_min') ?? 0,
+  )
+  const initialSignalAgeMin = Number.isFinite(parsedInitialSignalAgeMin)
+    ? Math.max(0, Math.min(240, Math.round(parsedInitialSignalAgeMin)))
+    : 0
+  const initialSignalAgeMaxRaw = searchParams.get('signal_age_max') ?? ''
+  const parsedInitialSignalAgeMax = Number(initialSignalAgeMaxRaw)
+  const initialSignalAgeMax = Number.isFinite(parsedInitialSignalAgeMax)
+    ? Math.max(initialSignalAgeMin, Math.min(240, Math.round(parsedInitialSignalAgeMax)))
+    : null
   const initialRequireSequence =
     (searchParams.get('require_sequence') ?? searchParams.get('signal_require_sequence')) === 'true'
+  const strategyIdFromQuery = (searchParams.get('strategy_id') ?? '').trim()
+  const initialStrategyId: StrategyId = strategyIdFromQuery
+    ? (strategyIdFromQuery === 'wyckoff_trend_v2' ? 'wyckoff_trend_v2' : 'wyckoff_trend_v1')
+    : getSharedLastStrategyId('wyckoff_trend_v1')
+  const initialStrategyParams = (() => {
+    const raw = (searchParams.get('strategy_params') ?? '').trim()
+    if (!raw) return getSharedStrategyParams(initialStrategyId)
+    try {
+      return normalizeStrategyParams(JSON.parse(raw) as unknown)
+    } catch {
+      return getSharedStrategyParams(initialStrategyId)
+    }
+  })()
 
   const [mode, setMode] = useState<SignalScanMode>(initialMode)
   const [trendStep, setTrendStep] = useState<TrendPoolStep>(initialTrendStep)
@@ -393,7 +446,14 @@ export function SignalsPage() {
   const [windowDays, setWindowDays] = useState(initialWindowDays)
   const [minScore, setMinScore] = useState(initialMinScore)
   const [minEventCount, setMinEventCount] = useState(initialMinEventCount)
+  const [signalAgeMin, setSignalAgeMin] = useState(initialSignalAgeMin)
+  const [signalAgeMax, setSignalAgeMax] = useState<number | null>(initialSignalAgeMax)
   const [requireSequence, setRequireSequence] = useState(initialRequireSequence)
+  const [strategyId, setStrategyId] = useState<StrategyId>(initialStrategyId)
+  const [strategyParams, setStrategyParams] = useState<Record<string, unknown>>(initialStrategyParams)
+  const [strategyPresetName, setStrategyPresetName] = useState('')
+  const [strategyPresetId, setStrategyPresetId] = useState<string | null>(null)
+  const [strategyPresetRefreshTick, setStrategyPresetRefreshTick] = useState(0)
   const [keyword, setKeyword] = useState('')
   const [signalFilter, setSignalFilter] = useState<'all' | SignalType>('all')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('active')
@@ -407,6 +467,81 @@ export function SignalsPage() {
   const refreshTrackerRef = useRef(0)
   const missingRunHandledRef = useRef('')
   const searchParamsSnapshot = searchParams.toString()
+  const strategyCatalogQuery = useQuery({
+    queryKey: ['strategy-catalog'],
+    queryFn: getStrategies,
+    staleTime: 5 * 60_000,
+  })
+  const strategyItems = strategyCatalogQuery.data?.items ?? []
+  const selectedStrategy = useMemo(
+    () => strategyItems.find((item) => item.strategy_id === strategyId) ?? null,
+    [strategyId, strategyItems],
+  )
+  const strategyParamsSchema = useMemo(
+    () => parseStrategyParamSchema(selectedStrategy?.strategy_params_schema ?? {}),
+    [selectedStrategy?.strategy_params_schema],
+  )
+  const strategyParamsDefaults = useMemo(
+    () => normalizeStrategyParams(selectedStrategy?.strategy_params_defaults),
+    [selectedStrategy?.strategy_params_defaults],
+  )
+  const strategyParamsPayload = useMemo(
+    () => buildStrategyParamsPayload({
+      schema: strategyParamsSchema,
+      params: strategyParams,
+      defaults: strategyParamsDefaults,
+      includeDefaults: true,
+    }),
+    [strategyParams, strategyParamsDefaults, strategyParamsSchema],
+  )
+  const strategyParamEntries = useMemo<StrategyParamSpec[]>(
+    () => Object.values(strategyParamsSchema),
+    [strategyParamsSchema],
+  )
+
+  useEffect(() => {
+    if (strategyItems.length <= 0) return
+    const allIds = new Set(strategyItems.map((item) => item.strategy_id))
+    if (allIds.has(strategyId)) return
+    setStrategyId(resolveDefaultStrategyId(strategyItems, 'wyckoff_trend_v1'))
+  }, [strategyId, strategyItems])
+
+  useEffect(() => {
+    if (!selectedStrategy) return
+    setStrategyParams((previous) => {
+      const normalizedPrevious = normalizeStrategyParams(previous)
+      const merged = {
+        ...strategyParamsDefaults,
+        ...normalizedPrevious,
+      }
+      const next = buildStrategyParamsPayload({
+        schema: strategyParamsSchema,
+        params: merged,
+        defaults: strategyParamsDefaults,
+        includeDefaults: true,
+      })
+      return JSON.stringify(next) === JSON.stringify(normalizedPrevious) ? previous : next
+    })
+  }, [selectedStrategy?.strategy_id, strategyParamsDefaults, strategyParamsSchema])
+
+  useEffect(() => {
+    setSharedStrategyParams(strategyId, strategyParamsPayload)
+  }, [strategyId, strategyParamsPayload])
+
+  const strategyPresets = useMemo<StrategyParamPreset[]>(
+    () => listSharedStrategyPresets(strategyId),
+    [strategyId, strategyPresetRefreshTick],
+  )
+  const selectedStrategyPreset = useMemo(
+    () => strategyPresets.find((item) => item.id === strategyPresetId) ?? null,
+    [strategyPresetId, strategyPresets],
+  )
+
+  useEffect(() => {
+    if (!strategyPresetId) return
+    if (strategyPresets.some((item) => item.id === strategyPresetId)) return
+    setStrategyPresetId(null)
+  }, [strategyPresetId, strategyPresets])
 
   useEffect(() => {
     try {
@@ -489,6 +624,12 @@ export function SignalsPage() {
     } else {
       next.delete('trend_step')
     }
+    next.set('strategy_id', strategyId)
+    if (Object.keys(strategyParamsPayload).length > 0) {
+      next.set('strategy_params', JSON.stringify(strategyParamsPayload))
+    } else {
+      next.delete('strategy_params')
+    }
     next.delete('market_filters')
     if (mode === 'full_market' && marketFilters.length > 0) {
       marketFilters.forEach((item) => next.append('market_filters', item))
@@ -502,6 +643,12 @@ export function SignalsPage() {
     next.set('window_days', String(windowDays))
     next.set('min_score', String(minScore))
     next.set('min_event_count', String(minEventCount))
+    next.set('signal_age_min', String(signalAgeMin))
+    if (signalAgeMax !== null) {
+      next.set('signal_age_max', String(Math.max(signalAgeMin, signalAgeMax)))
+    } else {
+      next.delete('signal_age_max')
+    }
     next.set('require_sequence', String(requireSequence))
 
     const normalizedAsOfDate = asOfDate.trim()
@@ -518,16 +665,66 @@ export function SignalsPage() {
     asOfDate,
     minEventCount,
     minScore,
+    signalAgeMax,
+    signalAgeMin,
     mode,
     marketFilters,
     boardFilters,
     runId,
     trendStep,
     requireSequence,
+    strategyId,
+    strategyParamsPayload,
     searchParamsSnapshot,
     setSearchParams,
     windowDays,
   ])
+
+  function updateStrategyParam(key: string, value: unknown) {
+    const normalizedKey = String(key || '').trim()
+    if (!normalizedKey) return
+    setStrategyParams((previous) => {
+      const next = { ...normalizeStrategyParams(previous) }
+      if (value === null || value === undefined || value === '') {
+        delete next[normalizedKey]
+      } else {
+        next[normalizedKey] = value
+      }
+      return next
+    })
+  }
+
+  function handleSaveStrategyPreset() {
+    const preset = saveSharedStrategyPreset({
+      strategyId,
+      name: strategyPresetName || `${strategyId}-${dayjs().format('MMDD-HHmm')}`,
+      params: strategyParamsPayload,
+    })
+    setStrategyPresetId(preset.id)
+    setStrategyPresetName(preset.name)
+    setStrategyPresetRefreshTick((value) => value + 1)
+    message.success(`已保存策略预设：${preset.name}`)
+  }
+
+  function handleApplyStrategyPreset() {
+    if (!selectedStrategyPreset) {
+      message.info('请先选择策略预设。')
+      return
+    }
+    setStrategyParams(normalizeStrategyParams(selectedStrategyPreset.strategy_params))
+    message.success(`已应用策略预设：${selectedStrategyPreset.name}`)
+  }
+
+  function handleDeleteStrategyPreset() {
+    if (!selectedStrategyPreset) {
+      message.info('请先选择策略预设。')
+      return
+    }
+    deleteSharedStrategyPreset(strategyId, selectedStrategyPreset.id)
+    setStrategyPresetId(null)
+    setStrategyPresetRefreshTick((value) => value + 1)
+    message.success(`已删除策略预设：${selectedStrategyPreset.name}`)
+  }
 
   const runDetailQuery = useQuery({
     queryKey: ['screener-run', runId],
@@ -582,12 +779,16 @@ export function SignalsPage() {
       mode,
       runId,
       trendStep,
+      strategyId,
+      JSON.stringify(strategyParamsPayload),
       marketFilters.join(','),
       boardFilters.join(','),
       asOfDate,
       windowDays,
       minScore,
       minEventCount,
+      signalAgeMin,
+      signalAgeMax ?? -1,
       requireSequence,
       refreshCounter,
     ],
@@ -602,6 +803,8 @@ export function SignalsPage() {
         mode,
         run_id: mode === 'trend_pool' ? runId : undefined,
         trend_step: mode === 'trend_pool' ? trendStep : undefined,
+        strategy_id: strategyId,
+        strategy_params: strategyParamsPayload,
         market_filters: mode === 'full_market' && marketFilters.length > 0 ? marketFilters : undefined,
         board_filters: boardFilters.length > 0 ? boardFilters : undefined,
         as_of_date: normalizedAsOfDate || undefined,
@@ -610,6 +813,8 @@ export function SignalsPage() {
         min_score: minScore,
         require_sequence: requireSequence,
         min_event_count: minEventCount,
+        signal_age_min: signalAgeMin,
+        signal_age_max: signalAgeMax ?? undefined,
       })
     },
     staleTime: 30_000,
@@ -808,6 +1013,13 @@ export function SignalsPage() {
         render: (_, row) => row.event_count,
       },
       {
+        title: '信号年龄',
+        key: 'signal_age_days',
+        width: 96,
+        sorter: (a, b) => a.signal_age_days - b.signal_age_days,
+        render: (_, row) => `${row.signal_age_days}天`,
+      },
+      {
         title: '序列完整',
         key: 'sequence_ok',
         width: 96,
@@ -847,11 +1059,19 @@ export function SignalsPage() {
                 const params = new URLSearchParams({
                   signal_mode: mode,
                   signal_trend_step: trendStep,
+                  signal_strategy_id: strategyId,
                   signal_window_days: String(windowDays),
                   signal_min_score: String(minScore),
                   signal_min_event_count: String(minEventCount),
+                  signal_age_min: String(signalAgeMin),
                   signal_require_sequence: String(requireSequence),
                 })
+                if (Object.keys(strategyParamsPayload).length > 0) {
+                  params.set('signal_strategy_params', JSON.stringify(strategyParamsPayload))
+                }
+                if (signalAgeMax !== null) {
+                  params.set('signal_age_max', String(Math.max(signalAgeMin, signalAgeMax)))
+                }
                 const signalAsOfDate = (signalQuery.data?.as_of_date ?? asOfDate).trim()
                 if (signalAsOfDate) {
                   params.set('signal_as_of_date', signalAsOfDate)
@@ -916,6 +1136,8 @@ export function SignalsPage() {
       eventFilters,
       minEventCount,
       minScore,
+      signalAgeMax,
+      signalAgeMin,
       mode,
       marketFilters,
       navigate,
@@ -1237,6 +1459,144 @@ export function SignalsPage() {
             </Col>
           </Row>
 
+          <Row gutter={[12, 12]}>
+            <Col xs={24} md={12} lg={8}>
+              <Typography.Text type="secondary">策略</Typography.Text>
+              <Select
+                loading={strategyCatalogQuery.isLoading}
+                value={strategyId}
+                onChange={(value) => {
+                  setStrategyId(String(value) as StrategyId)
+                  setStrategyParams({})
+                }}
+                options={(strategyItems.length > 0
+                  ? strategyItems
+                  : [{ strategy_id: 'wyckoff_trend_v1', name: 'Wyckoff Trend V1', version: '1.0.0', enabled: true }])
+                  .map((item) => ({
+                    value: item.strategy_id,
+                    label: `${item.name} (${item.version})${item.enabled === false ? ' - disabled' : ''}`,
+                    disabled: item.enabled === false,
+                  }))}
+              />
+            </Col>
+            <Col xs={24} md={12} lg={16}>
+              <Alert
+                type="info"
+                showIcon
+                message={selectedStrategy ? `策略：${selectedStrategy.name}` : '策略信息'}
+                description={
+                  selectedStrategy
+                    ? `id=${selectedStrategy.strategy_id}, version=${selectedStrategy.version}`
+                    : '未加载到策略目录，先按默认策略继续。'
+                }
+              />
+            </Col>
+          </Row>
+
+          {strategyParamEntries.length > 0 ? (
+            <Row gutter={[12, 12]}>
+              {strategyParamEntries.map((spec) => {
+                const value = strategyParamsPayload[spec.key]
+                if (spec.type === 'boolean') {
+                  return (
+                    <Col xs={24} md={12} lg={6} key={spec.key}>
+                      <Typography.Text type="secondary">{spec.title}</Typography.Text>
+                      <div style={{ marginTop: 8 }}>
+                        <Switch checked={Boolean(value)} onChange={(checked) => updateStrategyParam(spec.key, checked)} />
+                      </div>
+                    </Col>
+                  )
+                }
+                if (spec.type === 'enum') {
+                  return (
+                    <Col xs={24} md={12} lg={6} key={spec.key}>
+                      <Typography.Text type="secondary">{spec.title}</Typography.Text>
+                      <Select
+                        value={typeof value === 'string' ? value : undefined}
+                        options={spec.options.map((item) => ({ value: item, label: item }))}
+                        onChange={(next) => updateStrategyParam(spec.key, String(next))}
+                        allowClear
+                      />
+                    </Col>
+                  )
+                }
+                return (
+                  <Col xs={24} md={12} lg={6} key={spec.key}>
+                    <Typography.Text type="secondary">{spec.title}</Typography.Text>
+                    <InputNumber
+                      value={typeof value === 'number' ? value : undefined}
+                      min={typeof spec.minimum === 'number' ? spec.minimum : undefined}
+                      max={typeof spec.maximum === 'number' ? spec.maximum : undefined}
+                      step={spec.type === 'integer' ? 1 : 0.1}
+                      style={{ width: '100%' }}
+                      onChange={(next) => {
+                        if (next === null || next === undefined || Number.isNaN(Number(next))) {
+                          updateStrategyParam(spec.key, undefined)
+                          return
+                        }
+                        updateStrategyParam(spec.key, Number(next))
+                      }}
+                    />
+                  </Col>
+                )
+              })}
+            </Row>
+          ) : null}
+
+          <Row gutter={[12, 12]}>
+            <Col xs={24} md={8}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <Typography.Text type="secondary">策略预设</Typography.Text>
+                <Select
+                  value={strategyPresetId ?? undefined}
+                  placeholder="选择预设"
+                  options={strategyPresets.map((item, index) => ({
+                    value: item.id,
+                    label: `预设#${index + 1} | ${item.name}`,
+                  }))}
+                  onChange={(value) => {
+                    const nextId = String(value || '').trim()
+                    if (!nextId) {
+                      setStrategyPresetId(null)
+                      return
+                    }
+                    setStrategyPresetId(nextId)
+                    const matched = strategyPresets.find((item) => item.id === nextId)
+                    if (matched) {
+                      setStrategyPresetName(matched.name)
+                    }
+                  }}
+                  allowClear
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={8}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <Typography.Text type="secondary">预设名称</Typography.Text>
+                <Input
+                  value={strategyPresetName}
+                  onChange={(event) => setStrategyPresetName(event.target.value)}
+                  placeholder="输入预设名后保存"
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={8}>
+              <Space style={{ marginTop: 22 }} wrap>
+                <Button size="small" onClick={handleSaveStrategyPreset}>保存预设</Button>
+                <Button size="small" onClick={handleApplyStrategyPreset}>应用预设</Button>
+                <Button size="small" danger onClick={handleDeleteStrategyPreset}>删除预设</Button>
+              </Space>
+            </Col>
+          </Row>
+          {selectedStrategyPreset ? (
+            <Alert
+              type="info"
+              showIcon
+              message={`当前预设：${selectedStrategyPreset.name}`}
+              description={`保存时间：${selectedStrategyPreset.saved_at}`}
+            />
+          ) : null}
+
           {mode === 'trend_pool' ? (
             <Row gutter={[12, 12]}>
               <Col xs={24} lg={12}>
@@ -1333,6 +1693,40 @@ export function SignalsPage() {
                     setAsOfDateTouched(true)
                   }
                   setAsOfDate((prev) => (prev === nextDate ? prev : nextDate))
+                }}
+              />
+            </Col>
+            <Col xs={24} md={12} lg={4}>
+              <Typography.Text type="secondary">信号年龄最小(天)</Typography.Text>
+              <InputNumber
+                min={0}
+                max={240}
+                value={signalAgeMin}
+                style={{ width: '100%' }}
+                onChange={(value) => {
+                  const nextMin = Number.isFinite(Number(value)) ? Math.max(0, Math.min(240, Math.round(Number(value)))) : 0
+                  setSignalAgeMin(nextMin)
+                  if (signalAgeMax !== null && signalAgeMax < nextMin) {
+                    setSignalAgeMax(nextMin)
+                  }
+                }}
+              />
+            </Col>
+            <Col xs={24} md={12} lg={4}>
+              <Typography.Text type="secondary">信号年龄最大(天)</Typography.Text>
+              <InputNumber
+                min={signalAgeMin}
+                max={240}
+                value={signalAgeMax ?? undefined}
+                placeholder="留空=不限"
+                style={{ width: '100%' }}
+                onChange={(value) => {
+                  if (value === null || value === undefined || String(value).trim() === '') {
+                    setSignalAgeMax(null)
+                    return
+                  }
+                  const nextMax = Math.max(signalAgeMin, Math.min(240, Math.round(Number(value))))
+                  setSignalAgeMax(nextMax)
                 }}
               />
             </Col>

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 import time
@@ -40,18 +40,26 @@ ENTRY_EVENT_WEIGHTS: dict[str, float] = {
 }
 
 PHASE_PRIORITY_SCORE: dict[str, float] = {
-    "吸筹A": 1.1,
-    "吸筹B": 1.4,
-    "吸筹C": 2.2,
-    "吸筹D": 2.0,
-    "吸筹E": 0.2,
-    "阶段未明": 0.0,
-    "派发A": -0.8,
-    "派发B": -1.2,
-    "派发C": -2.0,
-    "派发D": -2.2,
-    "派发E": -2.5,
+    "鍚哥A": 1.1,
+    "鍚哥B": 1.4,
+    "鍚哥C": 2.2,
+    "鍚哥D": 2.0,
+    "鍚哥E": 0.2,
+    "闃舵鏈槑": 0.0,
+    "娲惧彂A": -0.8,
+    "娲惧彂B": -1.2,
+    "娲惧彂C": -2.0,
+    "娲惧彂D": -2.2,
+    "娲惧彂E": -2.5,
 }
+
+
+DELAY_INVALIDATION_RISK_EVENTS: tuple[str, ...] = ("UTAD", "SOW", "LPSY")
+DELAY_SKIP_REASON_NO_ENTRY_DAY = "delay_no_entry_day"
+DELAY_SKIP_REASON_RISK_EVENT = "delay_invalidated_by_risk_event"
+DELAY_SKIP_REASON_SELL_SIGNAL = "delay_invalidated_by_sell_signal"
+EVENT_GRADE_RANK: dict[str, int] = {"C": 1, "B": 2, "A": 3}
+MATRIX_SEMANTIC_ALIGNED = "aligned_wyckoff_v2"
 
 
 @dataclass
@@ -68,6 +76,10 @@ class CandidateTrade:
     entry_structure_score: int
     entry_trend_score: float
     entry_volatility_score: float
+    health_score: float
+    event_score: float
+    event_grade: str
+    final_rank_score: float
     entry_price: float
     exit_price: float
     holding_days: int
@@ -89,6 +101,10 @@ class MatrixEntryIntent:
     entry_structure_score: int
     entry_trend_score: float
     entry_volatility_score: float
+    health_score: float
+    event_score: float
+    event_grade: str
+    final_rank_score: float
     entry_price: float
 
 
@@ -150,6 +166,166 @@ class BacktestEngine:
         return configured[0] if configured else "SELL"
 
     @staticmethod
+    def _build_delay_skip_counter() -> dict[str, int]:
+        return {
+            DELAY_SKIP_REASON_NO_ENTRY_DAY: 0,
+            DELAY_SKIP_REASON_RISK_EVENT: 0,
+            DELAY_SKIP_REASON_SELL_SIGNAL: 0,
+        }
+
+    @staticmethod
+    def _resolve_entry_index(signal_index: int, payload: BacktestRunRequest) -> int:
+        return int(signal_index) + max(1, int(payload.entry_delay_days))
+
+    @staticmethod
+    def _normalize_event_grade(raw: Any) -> str:
+        text = str(raw or "C").strip().upper()
+        return text if text in EVENT_GRADE_RANK else "C"
+
+    @staticmethod
+    def _event_grade_meets_threshold(*, grade: str, minimum: str) -> bool:
+        return EVENT_GRADE_RANK.get(BacktestEngine._normalize_event_grade(grade), 1) >= EVENT_GRADE_RANK.get(
+            BacktestEngine._normalize_event_grade(minimum),
+            1,
+        )
+
+    @staticmethod
+    def _resolve_rank_weights(payload: BacktestRunRequest) -> tuple[float, float]:
+        w_health = max(0.0, float(payload.rank_weight_health))
+        w_event = max(0.0, float(payload.rank_weight_event))
+        total = w_health + w_event
+        if total <= 0:
+            return 0.45, 0.55
+        return w_health / total, w_event / total
+
+    @staticmethod
+    def _compute_final_rank_score(
+        *,
+        payload: BacktestRunRequest,
+        health_score: float,
+        event_score: float,
+    ) -> float:
+        w_health, w_event = BacktestEngine._resolve_rank_weights(payload)
+        score = float(health_score) * w_health + float(event_score) * w_event
+        return max(0.0, min(100.0, score))
+
+    @staticmethod
+    def _passes_semantic_score_gates(
+        *,
+        payload: BacktestRunRequest,
+        health_score: float,
+        event_score: float,
+        event_grade: str,
+    ) -> bool:
+        if float(health_score) < float(payload.health_score_min):
+            return False
+        if float(event_score) < float(payload.event_score_min):
+            return False
+        if not BacktestEngine._event_grade_meets_threshold(
+            grade=event_grade,
+            minimum=payload.event_grade_min,
+        ):
+            return False
+        return True
+
+    def _build_matrix_semantic_meta(
+        self,
+        *,
+        symbol: str,
+        signal_date: str,
+        payload: BacktestRunRequest,
+    ) -> dict[str, Any] | None:
+        row = self._build_row(symbol, signal_date)
+        if row is None:
+            return None
+        snapshot = self._calc_snapshot(row, payload.window_days, signal_date)
+        event_dates = self._normalize_event_dates(snapshot.get("event_dates"))
+        day_entry_events = [
+            event_name
+            for event_name in payload.entry_events
+            if event_dates.get(event_name) == signal_date
+        ]
+        if not day_entry_events:
+            return None
+        event_count = self._normalize_event_count(snapshot)
+        sequence_ok = bool(snapshot.get("sequence_ok"))
+        entry_quality_score = float(snapshot.get("entry_quality_score", 0.0) or 0.0)
+        if event_count < payload.min_event_count:
+            return None
+        if payload.require_sequence and not sequence_ok:
+            return None
+        if entry_quality_score < payload.min_score:
+            return None
+
+        entry_phase = str(snapshot.get("phase", "闂冭埖顔岄張顏呮"))
+        structure_hhh = str(snapshot.get("structure_hhh", "-"))
+        health_score = float(snapshot.get("health_score", entry_quality_score) or entry_quality_score)
+        event_score = float(
+            snapshot.get(
+                "event_score",
+                snapshot.get("event_strength_score", entry_quality_score),
+            )
+            or 0.0
+        )
+        event_grade = self._normalize_event_grade(snapshot.get("event_grade", "C"))
+        if not self._passes_semantic_score_gates(
+            payload=payload,
+            health_score=health_score,
+            event_score=event_score,
+            event_grade=event_grade,
+        ):
+            return None
+        return {
+            "entry_signal": " / ".join(day_entry_events),
+            "entry_phase": entry_phase,
+            "entry_quality_score": float(entry_quality_score),
+            "entry_phase_score": float(PHASE_PRIORITY_SCORE.get(entry_phase, 0.0)),
+            "entry_events_weight": float(sum(ENTRY_EVENT_WEIGHTS.get(evt, 1.0) for evt in day_entry_events)),
+            "entry_structure_score": self._structure_score(structure_hhh),
+            "entry_trend_score": float(snapshot.get("trend_score", 50.0) or 50.0),
+            "entry_volatility_score": float(snapshot.get("volatility_score", 50.0) or 50.0),
+            "health_score": max(0.0, min(100.0, health_score)),
+            "event_score": max(0.0, min(100.0, event_score)),
+            "event_grade": event_grade,
+        }
+
+    @staticmethod
+    def _resolve_delay_invalidation_reason_legacy(
+        *,
+        signal_index: int,
+        entry_index: int,
+        risk_events_by_index: dict[int, list[str]],
+        exit_signal_events_by_index: dict[int, list[str]],
+    ) -> str | None:
+        if entry_index - signal_index <= 1:
+            return None
+        for probe_index in range(signal_index + 1, entry_index):
+            if risk_events_by_index.get(probe_index):
+                return DELAY_SKIP_REASON_RISK_EVENT
+            if exit_signal_events_by_index.get(probe_index):
+                return DELAY_SKIP_REASON_SELL_SIGNAL
+        return None
+
+    @staticmethod
+    def _resolve_delay_invalidation_reason_matrix(
+        *,
+        signal_index: int,
+        entry_index: int,
+        valid_col: np.ndarray,
+        sell_col: np.ndarray,
+    ) -> str | None:
+        if entry_index - signal_index <= 1:
+            return None
+        for probe_index in range(signal_index + 1, entry_index):
+            if probe_index >= int(valid_col.shape[0]):
+                break
+            if not bool(valid_col[probe_index]):
+                continue
+            if bool(sell_col[probe_index]):
+                return DELAY_SKIP_REASON_SELL_SIGNAL
+        return None
+
+    @staticmethod
     def _structure_score(structure_hhh: str) -> int:
         parts = [part.strip() for part in str(structure_hhh).split("|")]
         return sum(1 for part in parts if part and part != "-")
@@ -164,6 +340,7 @@ class BacktestEngine:
             return (
                 row.entry_date,
                 -row.entry_phase_score,
+                -row.final_rank_score,
                 -row.entry_quality_score,
                 -row.entry_events_weight,
                 -row.entry_structure_score,
@@ -174,6 +351,7 @@ class BacktestEngine:
             return (
                 row.entry_date,
                 -row.entry_trend_score,
+                -row.final_rank_score,
                 -row.entry_quality_score,
                 -row.entry_events_weight,
                 -row.entry_structure_score,
@@ -182,6 +360,7 @@ class BacktestEngine:
             )
         return (
             row.entry_date,
+            -row.final_rank_score,
             -row.entry_quality_score,
             -row.entry_phase_score,
             -row.entry_events_weight,
@@ -300,10 +479,10 @@ class BacktestEngine:
         allowed_symbols_by_date: dict[str, set[str]] | None = None,
         allow_reentry_after_skipped: bool = False,
         control_callback: Callable[[], None] | None = None,
-    ) -> tuple[list[CandidateTrade], int]:
+    ) -> tuple[list[CandidateTrade], int, dict[str, int]]:
         dates = list(matrix_bundle.dates)
         if not dates:
-            return [], 0
+            return [], 0, self._build_delay_skip_counter()
 
         total_shape = (len(dates), len(matrix_bundle.symbols))
         if (
@@ -324,11 +503,12 @@ class BacktestEngine:
             count=len(dates),
         )
         if int(np.count_nonzero(in_range_mask)) < 2:
-            return [], 0
+            return [], 0, self._build_delay_skip_counter()
 
         symbol_to_col = matrix_bundle.symbol_to_index()
         out: list[CandidateTrade] = []
         t1_no_sellable_skips = 0
+        delay_skip_reasons = self._build_delay_skip_counter()
         in_range_valid_buy = matrix_signals.buy_signal & matrix_bundle.valid_mask & in_range_mask[:, np.newaxis]
         buy_any_by_col = np.any(in_range_valid_buy, axis=0)
 
@@ -371,11 +551,22 @@ class BacktestEngine:
                 if (not allow_reentry_after_skipped) and signal_index <= blocked_until:
                     continue
 
-                entry_index = signal_index + 1
+                entry_index = self._resolve_entry_index(signal_index, payload)
                 if entry_index >= len(dates):
+                    delay_skip_reasons[DELAY_SKIP_REASON_NO_ENTRY_DAY] += 1
                     continue
                 if not bool(valid_col[entry_index]):
                     continue
+                if payload.delay_invalidation_enabled:
+                    delay_reason = self._resolve_delay_invalidation_reason_matrix(
+                        signal_index=int(signal_index),
+                        entry_index=int(entry_index),
+                        valid_col=valid_col,
+                        sell_col=sell_col,
+                    )
+                    if delay_reason:
+                        delay_skip_reasons[delay_reason] = delay_skip_reasons.get(delay_reason, 0) + 1
+                        continue
 
                 entry_price = float(open_col[entry_index])
                 if (not math.isfinite(entry_price)) or entry_price <= 0:
@@ -403,8 +594,50 @@ class BacktestEngine:
                     entry_tags.append("LPS")
                 if not entry_tags:
                     entry_tags.append(payload.entry_events[0] if payload.entry_events else "ENTRY")
-                entry_phase = "吸筹D" if bool(matrix_signals.s7[signal_index, col]) else "阶段未明"
+                entry_phase = "鍚哥D" if bool(matrix_signals.s7[signal_index, col]) else "闃舵鏈槑"
                 entry_quality_score = float(score_col[signal_index]) if math.isfinite(float(score_col[signal_index])) else 0.0
+                entry_signal_text = " / ".join(entry_tags)
+                entry_phase_score = float(PHASE_PRIORITY_SCORE.get(entry_phase, 0.0))
+                entry_events_weight = float(len(entry_tags))
+                entry_structure_score = int(bool(matrix_signals.in_pool[signal_index, col]))
+                entry_trend_score = max(0.0, min(100.0, entry_quality_score))
+                entry_volatility_score = max(0.0, min(100.0, entry_quality_score))
+                health_score = max(0.0, min(100.0, entry_quality_score))
+                event_score = max(0.0, min(100.0, entry_quality_score))
+                event_grade = "C"
+
+                if payload.matrix_event_semantic_version == MATRIX_SEMANTIC_ALIGNED:
+                    semantic_meta = self._build_matrix_semantic_meta(
+                        symbol=symbol,
+                        signal_date=dates[signal_index],
+                        payload=payload,
+                    )
+                    if semantic_meta is None:
+                        continue
+                    entry_signal_text = str(semantic_meta["entry_signal"])
+                    entry_phase = str(semantic_meta["entry_phase"])
+                    entry_quality_score = float(semantic_meta["entry_quality_score"])
+                    entry_phase_score = float(semantic_meta["entry_phase_score"])
+                    entry_events_weight = float(semantic_meta["entry_events_weight"])
+                    entry_structure_score = int(semantic_meta["entry_structure_score"])
+                    entry_trend_score = float(semantic_meta["entry_trend_score"])
+                    entry_volatility_score = float(semantic_meta["entry_volatility_score"])
+                    health_score = float(semantic_meta["health_score"])
+                    event_score = float(semantic_meta["event_score"])
+                    event_grade = self._normalize_event_grade(semantic_meta["event_grade"])
+                elif not self._passes_semantic_score_gates(
+                    payload=payload,
+                    health_score=health_score,
+                    event_score=event_score,
+                    event_grade=event_grade,
+                ):
+                    continue
+
+                final_rank_score = self._compute_final_rank_score(
+                    payload=payload,
+                    health_score=health_score,
+                    event_score=event_score,
+                )
 
                 out.append(
                     CandidateTrade(
@@ -412,14 +645,18 @@ class BacktestEngine:
                         signal_date=dates[signal_index],
                         entry_date=dates[entry_index],
                         exit_date=dates[exit_index],
-                        entry_signal=" / ".join(entry_tags),
+                        entry_signal=entry_signal_text,
                         entry_phase=entry_phase,
                         entry_quality_score=max(0.0, min(100.0, entry_quality_score)),
-                        entry_phase_score=float(PHASE_PRIORITY_SCORE.get(entry_phase, 0.0)),
-                        entry_events_weight=float(len(entry_tags)),
-                        entry_structure_score=int(bool(matrix_signals.in_pool[signal_index, col])),
-                        entry_trend_score=max(0.0, min(100.0, entry_quality_score)),
-                        entry_volatility_score=max(0.0, min(100.0, entry_quality_score)),
+                        entry_phase_score=float(entry_phase_score),
+                        entry_events_weight=float(entry_events_weight),
+                        entry_structure_score=int(entry_structure_score),
+                        entry_trend_score=float(entry_trend_score),
+                        entry_volatility_score=float(entry_volatility_score),
+                        health_score=max(0.0, min(100.0, health_score)),
+                        event_score=max(0.0, min(100.0, event_score)),
+                        event_grade=event_grade,
+                        final_rank_score=float(final_rank_score),
                         entry_price=entry_price,
                         exit_price=float(exit_price),
                         holding_days=max(0, exit_index - entry_index + 1),
@@ -429,7 +666,7 @@ class BacktestEngine:
                 if not allow_reentry_after_skipped:
                     blocked_until = max(blocked_until, int(exit_index))
 
-        return out, t1_no_sellable_skips
+        return out, t1_no_sellable_skips, delay_skip_reasons
 
     def _build_candidates_for_symbol(
         self,
@@ -440,10 +677,10 @@ class BacktestEngine:
         allowed_symbols_by_date: dict[str, set[str]] | None = None,
         allow_reentry_after_skipped: bool = False,
         control_callback: Callable[[], None] | None = None,
-    ) -> tuple[list[CandidateTrade], int]:
+    ) -> tuple[list[CandidateTrade], int, dict[str, int]]:
         candles = self._get_candles(symbol)
         if len(candles) < 30:
-            return [], 0
+            return [], 0, self._build_delay_skip_counter()
 
         in_range_indexes = [
             idx
@@ -451,11 +688,13 @@ class BacktestEngine:
             if start_date <= candle.time <= end_date
         ]
         if len(in_range_indexes) < 2:
-            return [], 0
+            return [], 0, self._build_delay_skip_counter()
 
         entry_meta_by_index: dict[int, dict[str, Any]] = {}
         exit_signal_events_by_index: dict[int, list[str]] = {}
+        risk_events_by_index: dict[int, list[str]] = {}
         t1_no_sellable_skips = 0
+        delay_skip_reasons = self._build_delay_skip_counter()
 
         for idx in in_range_indexes:
             if control_callback is not None:
@@ -481,23 +720,57 @@ class BacktestEngine:
                 for event_name in payload.exit_events
                 if event_dates.get(event_name) == as_of_date
             ]
+            raw_risk_events = snapshot.get("risk_events")
+            day_risk_events: list[str] = []
+            if isinstance(raw_risk_events, list):
+                for raw_event in raw_risk_events:
+                    event_text = str(raw_event).strip()
+                    if not event_text:
+                        continue
+                    if event_text not in DELAY_INVALIDATION_RISK_EVENTS:
+                        continue
+                    if event_dates.get(event_text) == as_of_date:
+                        day_risk_events.append(event_text)
             if day_exit_events:
                 exit_signal_events_by_index[idx] = day_exit_events
+            if day_risk_events:
+                risk_events_by_index[idx] = day_risk_events
             if not day_entry_events:
                 continue
 
             event_count = self._normalize_event_count(snapshot)
             sequence_ok = bool(snapshot.get("sequence_ok"))
             entry_quality_score = float(snapshot.get("entry_quality_score", 0.0) or 0.0)
+            health_score = float(snapshot.get("health_score", entry_quality_score) or entry_quality_score)
+            event_score = float(
+                snapshot.get(
+                    "event_score",
+                    snapshot.get("event_strength_score", entry_quality_score),
+                )
+                or 0.0
+            )
+            event_grade = self._normalize_event_grade(snapshot.get("event_grade", "C"))
             if event_count < payload.min_event_count:
                 continue
             if payload.require_sequence and not sequence_ok:
                 continue
             if entry_quality_score < payload.min_score:
                 continue
+            if not self._passes_semantic_score_gates(
+                payload=payload,
+                health_score=health_score,
+                event_score=event_score,
+                event_grade=event_grade,
+            ):
+                continue
 
-            entry_phase = str(snapshot.get("phase", "阶段未明"))
+            entry_phase = str(snapshot.get("phase", "闃舵鏈槑"))
             structure_hhh = str(snapshot.get("structure_hhh", "-"))
+            final_rank_score = self._compute_final_rank_score(
+                payload=payload,
+                health_score=health_score,
+                event_score=event_score,
+            )
             entry_meta_by_index[idx] = {
                 "entry_signal": " / ".join(day_entry_events),
                 "entry_phase": entry_phase,
@@ -507,6 +780,10 @@ class BacktestEngine:
                 "entry_structure_score": self._structure_score(structure_hhh),
                 "entry_trend_score": float(snapshot.get("trend_score", 50.0) or 50.0),
                 "entry_volatility_score": float(snapshot.get("volatility_score", 50.0) or 50.0),
+                "health_score": max(0.0, min(100.0, health_score)),
+                "event_score": max(0.0, min(100.0, event_score)),
+                "event_grade": event_grade,
+                "final_rank_score": final_rank_score,
             }
 
         out: list[CandidateTrade] = []
@@ -518,9 +795,21 @@ class BacktestEngine:
                 cursor += 1
                 continue
 
-            entry_index = signal_index + 1
+            entry_index = self._resolve_entry_index(signal_index, payload)
             if entry_index >= len(candles):
+                delay_skip_reasons[DELAY_SKIP_REASON_NO_ENTRY_DAY] += 1
                 break
+            if payload.delay_invalidation_enabled:
+                delay_reason = self._resolve_delay_invalidation_reason_legacy(
+                    signal_index=int(signal_index),
+                    entry_index=int(entry_index),
+                    risk_events_by_index=risk_events_by_index,
+                    exit_signal_events_by_index=exit_signal_events_by_index,
+                )
+                if delay_reason:
+                    delay_skip_reasons[delay_reason] = delay_skip_reasons.get(delay_reason, 0) + 1
+                    cursor += 1
+                    continue
             entry_bar = candles[entry_index]
             entry_price = float(entry_bar.open)
             if not math.isfinite(entry_price) or entry_price <= 0:
@@ -548,6 +837,10 @@ class BacktestEngine:
                     entry_structure_score=int(meta["entry_structure_score"]),
                     entry_trend_score=float(meta["entry_trend_score"]),
                     entry_volatility_score=float(meta["entry_volatility_score"]),
+                    health_score=float(meta["health_score"]),
+                    event_score=float(meta["event_score"]),
+                    event_grade=str(meta["event_grade"]),
+                    final_rank_score=float(meta["final_rank_score"]),
                     entry_price=entry_price,
                     exit_price=float(exit_price),
                     holding_days=max(0, exit_index - entry_index + 1),
@@ -561,7 +854,7 @@ class BacktestEngine:
                 while cursor < len(in_range_indexes) and in_range_indexes[cursor] <= exit_index:
                     cursor += 1
 
-        return out, t1_no_sellable_skips
+        return out, t1_no_sellable_skips, delay_skip_reasons
 
     @staticmethod
     def _matrix_intent_sort_key(
@@ -573,6 +866,7 @@ class BacktestEngine:
             return (
                 row.entry_date,
                 -row.entry_phase_score,
+                -row.final_rank_score,
                 -row.entry_quality_score,
                 -row.entry_events_weight,
                 -row.entry_structure_score,
@@ -583,6 +877,7 @@ class BacktestEngine:
             return (
                 row.entry_date,
                 -row.entry_trend_score,
+                -row.final_rank_score,
                 -row.entry_quality_score,
                 -row.entry_events_weight,
                 -row.entry_structure_score,
@@ -591,6 +886,7 @@ class BacktestEngine:
             )
         return (
             row.entry_date,
+            -row.final_rank_score,
             -row.entry_quality_score,
             -row.entry_phase_score,
             -row.entry_events_weight,
@@ -610,10 +906,10 @@ class BacktestEngine:
         matrix_signals: BacktestSignalMatrix,
         allowed_symbols_by_date: dict[str, set[str]] | None = None,
         control_callback: Callable[[], None] | None = None,
-    ) -> list[MatrixEntryIntent]:
+    ) -> tuple[list[MatrixEntryIntent], dict[str, int]]:
         dates = list(matrix_bundle.dates)
         if not dates:
-            return []
+            return [], self._build_delay_skip_counter()
 
         total_shape = (len(dates), len(matrix_bundle.symbols))
         if (
@@ -630,12 +926,13 @@ class BacktestEngine:
             count=len(dates),
         )
         if int(np.count_nonzero(in_range_mask)) < 2:
-            return []
+            return [], self._build_delay_skip_counter()
 
         symbol_to_col = matrix_bundle.symbol_to_index()
         in_range_valid_buy = matrix_signals.buy_signal & matrix_bundle.valid_mask & in_range_mask[:, np.newaxis]
         buy_any_by_col = np.any(in_range_valid_buy, axis=0)
         out: list[MatrixEntryIntent] = []
+        delay_skip_reasons = self._build_delay_skip_counter()
 
         for raw_symbol in symbols:
             if control_callback is not None:
@@ -650,6 +947,7 @@ class BacktestEngine:
             open_col = matrix_bundle.open[:, col]
             valid_col = matrix_bundle.valid_mask[:, col]
             score_col = matrix_signals.score[:, col]
+            sell_col = matrix_signals.sell_signal[:, col]
             buy_indexes = np.flatnonzero(in_range_valid_buy[:, col])
             if buy_indexes.size <= 0:
                 continue
@@ -666,11 +964,22 @@ class BacktestEngine:
             for signal_index in buy_indexes.tolist():
                 if control_callback is not None:
                     control_callback()
-                entry_index = int(signal_index) + 1
+                entry_index = self._resolve_entry_index(signal_index, payload)
                 if entry_index >= len(dates):
+                    delay_skip_reasons[DELAY_SKIP_REASON_NO_ENTRY_DAY] += 1
                     continue
                 if not bool(valid_col[entry_index]):
                     continue
+                if payload.delay_invalidation_enabled:
+                    delay_reason = self._resolve_delay_invalidation_reason_matrix(
+                        signal_index=int(signal_index),
+                        entry_index=int(entry_index),
+                        valid_col=valid_col,
+                        sell_col=sell_col,
+                    )
+                    if delay_reason:
+                        delay_skip_reasons[delay_reason] = delay_skip_reasons.get(delay_reason, 0) + 1
+                        continue
 
                 entry_price = float(open_col[entry_index])
                 if (not math.isfinite(entry_price)) or entry_price <= 0:
@@ -683,9 +992,51 @@ class BacktestEngine:
                     entry_tags.append("LPS")
                 if not entry_tags:
                     entry_tags.append(payload.entry_events[0] if payload.entry_events else "ENTRY")
-                entry_phase = "吸筹D" if bool(matrix_signals.s7[signal_index, col]) else "阶段未明"
+                entry_phase = "鍚哥D" if bool(matrix_signals.s7[signal_index, col]) else "闃舵鏈槑"
                 raw_quality = float(score_col[signal_index]) if math.isfinite(float(score_col[signal_index])) else 0.0
                 entry_quality_score = max(0.0, min(100.0, raw_quality))
+                entry_signal_text = " / ".join(entry_tags)
+                entry_phase_score = float(PHASE_PRIORITY_SCORE.get(entry_phase, 0.0))
+                entry_events_weight = float(len(entry_tags))
+                entry_structure_score = int(bool(matrix_signals.in_pool[signal_index, col]))
+                entry_trend_score = entry_quality_score
+                entry_volatility_score = entry_quality_score
+                health_score = entry_quality_score
+                event_score = entry_quality_score
+                event_grade = "C"
+
+                if payload.matrix_event_semantic_version == MATRIX_SEMANTIC_ALIGNED:
+                    semantic_meta = self._build_matrix_semantic_meta(
+                        symbol=symbol,
+                        signal_date=dates[signal_index],
+                        payload=payload,
+                    )
+                    if semantic_meta is None:
+                        continue
+                    entry_signal_text = str(semantic_meta["entry_signal"])
+                    entry_phase = str(semantic_meta["entry_phase"])
+                    entry_quality_score = float(semantic_meta["entry_quality_score"])
+                    entry_phase_score = float(semantic_meta["entry_phase_score"])
+                    entry_events_weight = float(semantic_meta["entry_events_weight"])
+                    entry_structure_score = int(semantic_meta["entry_structure_score"])
+                    entry_trend_score = float(semantic_meta["entry_trend_score"])
+                    entry_volatility_score = float(semantic_meta["entry_volatility_score"])
+                    health_score = float(semantic_meta["health_score"])
+                    event_score = float(semantic_meta["event_score"])
+                    event_grade = self._normalize_event_grade(semantic_meta["event_grade"])
+                elif not self._passes_semantic_score_gates(
+                    payload=payload,
+                    health_score=health_score,
+                    event_score=event_score,
+                    event_grade=event_grade,
+                ):
+                    continue
+
+                final_rank_score = self._compute_final_rank_score(
+                    payload=payload,
+                    health_score=health_score,
+                    event_score=event_score,
+                )
 
                 out.append(
                     MatrixEntryIntent(
@@ -694,18 +1045,22 @@ class BacktestEngine:
                         entry_index=entry_index,
                         signal_date=dates[signal_index],
                         entry_date=dates[entry_index],
-                        entry_signal=" / ".join(entry_tags),
+                        entry_signal=entry_signal_text,
                         entry_phase=entry_phase,
                         entry_quality_score=entry_quality_score,
-                        entry_phase_score=float(PHASE_PRIORITY_SCORE.get(entry_phase, 0.0)),
-                        entry_events_weight=float(len(entry_tags)),
-                        entry_structure_score=int(bool(matrix_signals.in_pool[signal_index, col])),
-                        entry_trend_score=entry_quality_score,
-                        entry_volatility_score=entry_quality_score,
+                        entry_phase_score=entry_phase_score,
+                        entry_events_weight=entry_events_weight,
+                        entry_structure_score=entry_structure_score,
+                        entry_trend_score=entry_trend_score,
+                        entry_volatility_score=entry_volatility_score,
+                        health_score=health_score,
+                        event_score=event_score,
+                        event_grade=event_grade,
+                        final_rank_score=final_rank_score,
                         entry_price=entry_price,
                     )
                 )
-        return out
+        return out, delay_skip_reasons
 
     def _execute_matrix_position_intents(
         self,
@@ -835,6 +1190,9 @@ class BacktestEngine:
                     entry_signal=row.entry_signal,
                     entry_phase=row.entry_phase,
                     entry_quality_score=round(row.entry_quality_score, 2),
+                    health_score=round(row.health_score, 2),
+                    event_score=round(row.event_score, 2),
+                    event_grade=self._normalize_event_grade(row.event_grade),  # type: ignore[arg-type]
                     exit_reason=exit_reason,
                     quantity=shares,
                     entry_price=round(row.entry_price, 4),
@@ -868,7 +1226,7 @@ class BacktestEngine:
         start_dt = self._parse_date(payload.date_from)
         end_dt = self._parse_date(payload.date_to)
         if start_dt is None or end_dt is None:
-            raise ValueError("date_from/date_to 必须是 YYYY-MM-DD")
+            raise ValueError("date_from/date_to 蹇呴』鏄?YYYY-MM-DD")
         if start_dt > end_dt:
             start_dt, end_dt = end_dt, start_dt
         start_date = start_dt.strftime("%Y-%m-%d")
@@ -882,12 +1240,13 @@ class BacktestEngine:
 
         notes: list[str] = []
         intents: list[MatrixEntryIntent] = []
+        delay_skip_reasons = self._build_delay_skip_counter()
         candidate_stage_start = time.perf_counter()
         if matrix_bundle is not None and matrix_signals is not None:
             if use_matrix_position_intents:
                 candidates = []
                 total_t1_skips = 0
-                intents = self._build_matrix_entry_intents(
+                intents, delay_skips_intents = self._build_matrix_entry_intents(
                     payload=payload,
                     symbols=symbols,
                     start_date=start_date,
@@ -897,8 +1256,11 @@ class BacktestEngine:
                     allowed_symbols_by_date=allowed_symbols_by_date,
                     control_callback=control_callback,
                 )
+                for key, value in delay_skips_intents.items():
+                    if value > 0:
+                        delay_skip_reasons[key] = delay_skip_reasons.get(key, 0) + int(value)
             else:
-                candidates, total_t1_skips = self._build_candidates_from_matrix(
+                candidates, total_t1_skips, delay_skips_matrix = self._build_candidates_from_matrix(
                     payload=payload,
                     symbols=symbols,
                     start_date=start_date,
@@ -909,14 +1271,17 @@ class BacktestEngine:
                     allow_reentry_after_skipped=allow_reentry_after_skipped,
                     control_callback=control_callback,
                 )
-            notes.append("矩阵信号引擎: 使用 (T,N) 信号切片路径，跳过逐股逐日 snapshot 重算。")
+                for key, value in delay_skips_matrix.items():
+                    if value > 0:
+                        delay_skip_reasons[key] = delay_skip_reasons.get(key, 0) + int(value)
+            notes.append("矩阵信号引擎：使用 (T,N) 信号切片路径，跳过逐股逐日 snapshot 重算。")
         else:
             candidates = []
             total_t1_skips = 0
             for symbol in symbols:
                 if control_callback is not None:
                     control_callback()
-                rows, t1_skips = self._build_candidates_for_symbol(
+                rows, t1_skips, delay_skips_legacy = self._build_candidates_for_symbol(
                     symbol,
                     payload,
                     start_date,
@@ -927,26 +1292,54 @@ class BacktestEngine:
                 )
                 candidates.extend(rows)
                 total_t1_skips += t1_skips
+                for key, value in delay_skips_legacy.items():
+                    if value > 0:
+                        delay_skip_reasons[key] = delay_skip_reasons.get(key, 0) + int(value)
+        if matrix_bundle is not None and matrix_signals is not None:
+            notes.append(f"执行路径: matrix (semantic={payload.matrix_event_semantic_version})")
+        else:
+            notes.append("执行路径: legacy")
+        if payload.entry_delay_days != 1:
+            notes.append(f"延迟入场已启用：entry_delay_days={payload.entry_delay_days}（交易日）")
+        if payload.delay_invalidation_enabled:
+            notes.append("延迟窗口失效保护已启用。")
+        delay_skipped_total = int(sum(delay_skip_reasons.values()))
+        if delay_skipped_total > 0:
+            detail = ", ".join(f"{key}:{value}" for key, value in delay_skip_reasons.items() if value > 0)
+            notes.append(f"延迟窗口共跳过 {delay_skipped_total} 笔信号（{detail}）。")
         if total_t1_skips > 0:
-            notes.append(f"T+1 约束下有 {total_t1_skips} 笔信号因样本内无可卖出日被跳过。")
+            notes.append(f"T+1 约束导致 {total_t1_skips} 笔信号因样本内无可卖出日被跳过。")
         if allow_reentry_after_skipped:
-            notes.append("持仓触发滚动：未成交信号不会阻断同一标的后续信号。")
+            notes.append("持仓触发滚动：未成交信号不会阻断同标的后续信号。")
+        if payload.health_score_min > 0 or payload.event_score_min > 0 or payload.event_grade_min != "C":
+            notes.append(
+                f"语义门控已启用：health_score_min={payload.health_score_min}, "
+                f"event_score_min={payload.event_score_min}, event_grade_min={payload.event_grade_min}。"
+            )
 
         if use_matrix_position_intents:
             if payload.prioritize_signals:
                 intents.sort(key=lambda row: self._matrix_intent_sort_key(row, priority_mode=payload.priority_mode))
-                notes.append(f"同日信号按优先级执行（模式: {payload.priority_mode}）。")
+                w_health, w_event = self._resolve_rank_weights(payload)
+                notes.append(
+                    f"同日信号按优先级执行（mode={payload.priority_mode}, "
+                    f"health={w_health:.2f}, event={w_event:.2f}）。"
+                )
             else:
                 intents.sort(key=lambda row: (row.entry_date, row.symbol, row.signal_date))
                 if payload.priority_topk_per_day > 0:
-                    notes.append("未启用优先级排序，priority_topk_per_day 配置未生效。")
+                    notes.append("未启用优先级排序，priority_topk_per_day 不生效。")
         elif payload.prioritize_signals:
             candidates.sort(key=lambda row: self._candidate_sort_key(row, priority_mode=payload.priority_mode))
-            notes.append(f"同日信号按优先级执行（模式: {payload.priority_mode}）。")
+            w_health, w_event = self._resolve_rank_weights(payload)
+            notes.append(
+                f"同日信号按优先级执行（mode={payload.priority_mode}, "
+                f"health={w_health:.2f}, event={w_event:.2f}）。"
+            )
         else:
             candidates.sort(key=lambda row: (row.entry_date, row.symbol, row.exit_date))
             if payload.priority_topk_per_day > 0:
-                notes.append("未启用优先级排序，priority_topk_per_day 配置未生效。")
+                notes.append("未启用优先级排序，priority_topk_per_day 不生效。")
 
         if use_matrix_position_intents and payload.prioritize_signals and payload.priority_topk_per_day > 0:
             before_count = len(intents)
@@ -961,7 +1354,7 @@ class BacktestEngine:
             dropped = before_count - len(intents)
             if dropped > 0:
                 notes.append(
-                    f"同日 TopK 限流已生效：每日保留前 {payload.priority_topk_per_day} 笔候选，共过滤 {dropped} 笔。"
+                    f"同日 TopK 限流生效：每日保留前 {payload.priority_topk_per_day} 笔候选，过滤 {dropped} 笔。"
                 )
 
         if (not use_matrix_position_intents) and payload.prioritize_signals and payload.priority_topk_per_day > 0:
@@ -977,7 +1370,7 @@ class BacktestEngine:
             dropped = before_count - len(candidates)
             if dropped > 0:
                 notes.append(
-                    f"同日 TopK 限流已生效：每日保留前 {payload.priority_topk_per_day} 笔候选，共过滤 {dropped} 笔。"
+                    f"同日 TopK 限流生效：每日保留前 {payload.priority_topk_per_day} 笔候选，过滤 {dropped} 笔。"
                 )
 
         candidate_count = len(intents) if use_matrix_position_intents else len(candidates)
@@ -998,7 +1391,7 @@ class BacktestEngine:
             )
             total_t1_skips += t1_skips_exec
             if t1_skips_exec > 0:
-                notes.append(f"T+1 约束下有 {t1_skips_exec} 笔持仓候选因无可卖出日被跳过。")
+                notes.append(f"T+1 约束导致 {t1_skips_exec} 笔持仓候选因无可卖出日被跳过。")
         else:
             cash = float(payload.initial_capital)
             equity = float(payload.initial_capital)
@@ -1086,6 +1479,9 @@ class BacktestEngine:
                         entry_signal=row.entry_signal,
                         entry_phase=row.entry_phase,
                         entry_quality_score=round(row.entry_quality_score, 2),
+                        health_score=round(row.health_score, 2),
+                        event_score=round(row.event_score, 2),
+                        event_grade=self._normalize_event_grade(row.event_grade),  # type: ignore[arg-type]
                         exit_reason=row.exit_reason,
                         quantity=shares,
                         entry_price=round(row.entry_price, 4),
@@ -1100,6 +1496,10 @@ class BacktestEngine:
                 for item in sorted(active_positions, key=lambda row: str(row.get("exit_date", ""))):
                     cash += float(item.get("exit_amount", 0.0))
                     equity += float(item.get("pnl_amount", 0.0))
+
+        for key, value in delay_skip_reasons.items():
+            if value > 0:
+                skip_reasons[key] = skip_reasons.get(key, 0) + int(value)
 
         execution_match_elapsed = time.perf_counter() - match_stage_start
         skipped_count = int(sum(skip_reasons.values()))
@@ -1394,3 +1794,6 @@ class BacktestEngine:
             fill_rate=round(fill_rate, 6),
             max_concurrent_positions=max_concurrent_positions,
         )
+
+
+

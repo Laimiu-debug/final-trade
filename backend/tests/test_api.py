@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+import json
+
 import os
 import sqlite3
 import sys
@@ -553,6 +555,10 @@ def test_signals_endpoint_full_market_fields() -> None:
         assert "wyckoff_phase" in first
         assert "wy_events" in first
         assert "entry_quality_score" in first
+        assert "health_score" in first
+        assert "volatility_stability" in first
+        assert "event_score" in first
+        assert first.get("event_grade") in {"A", "B", "C"}
         assert "scan_mode" in first
 
 
@@ -589,6 +595,157 @@ def test_signals_endpoint_trend_pool_mode() -> None:
     assert body["source_count"] >= 0
     assert isinstance(body["items"], list)
     assert all(item["trigger_date"] <= as_of_date for item in body["items"])
+
+
+def test_strategy_catalog_endpoint() -> None:
+    resp = client.get("/api/strategies")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body.get("items"), list)
+    ids = {str(item.get("strategy_id")) for item in body["items"]}
+    assert "wyckoff_trend_v1" in ids
+    assert "wyckoff_trend_v2" in ids
+
+
+def test_signals_endpoint_rejects_unknown_strategy() -> None:
+    resp = client.get("/api/signals", params={"strategy_id": "unknown_strategy"})
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["code"] == "STRATEGY_NOT_FOUND"
+
+
+def test_signals_endpoint_accepts_strategy_params_json() -> None:
+    dates = _load_symbol_dates("sz300750")
+    as_of_date = dates[-8]
+    resp = client.get(
+        "/api/signals",
+        params={
+            "mode": "full_market",
+            "as_of_date": as_of_date,
+            "min_score": 40,
+            "min_event_count": 0,
+            "strategy_id": "wyckoff_trend_v2",
+            "strategy_params": json.dumps(
+                {
+                    "matrix_event_semantic_version": "aligned_wyckoff_v2",
+                    "health_score_min": 0.0,
+                    "event_score_min": 0.0,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["strategy_id"] == "wyckoff_trend_v2"
+    assert isinstance(body.get("strategy_params_hash"), str)
+    assert len(body["strategy_params_hash"]) == 12
+
+
+def test_signals_endpoint_applies_strategy_default_params() -> None:
+    dates = _load_symbol_dates("sz300750")
+    as_of_date = dates[-8]
+    resp = client.get(
+        "/api/signals",
+        params={
+            "mode": "full_market",
+            "as_of_date": as_of_date,
+            "min_score": 0,
+            "min_event_count": 0,
+            "strategy_id": "wyckoff_trend_v2",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["strategy_id"] == "wyckoff_trend_v2"
+    strategy_params = body.get("strategy_params") or {}
+    assert strategy_params.get("matrix_event_semantic_version") == "aligned_wyckoff_v2"
+    assert strategy_params.get("event_grade_min") == "B"
+    assert strategy_params.get("health_score_min") == 55.0
+    assert strategy_params.get("event_score_min") == 55.0
+
+
+def test_signals_endpoint_supports_signal_age_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    dates = _load_symbol_dates("sz300750")
+    as_of_trade_date = dates[-1]
+    trigger_date = dates[-3]
+    expected_age_days = 2
+    row = store._build_row_from_candles("sz300750", as_of_date=as_of_trade_date)
+    assert row is not None
+
+    def fake_resolve_signal_candidates(
+        *,
+        mode: str,
+        run_id: str | None,
+        trend_step: str = "auto",
+        as_of_date: str | None = None,
+    ):
+        _ = (mode, trend_step)
+        return [row], None, run_id or "mock-run", as_of_date or as_of_trade_date
+
+    def fake_calc_wyckoff_snapshot(
+        candidate_row,
+        window_days: int,
+        *,
+        as_of_date: str | None = None,
+    ) -> dict[str, object]:
+        _ = (candidate_row, window_days, as_of_date)
+        return {
+            "events": ["SC", "AR", "ST", "SOS"],
+            "risk_events": [],
+            "event_dates": {"SC": trigger_date, "AR": trigger_date, "ST": trigger_date, "SOS": trigger_date},
+            "event_chain": [{"event": "SOS", "date": trigger_date, "category": "accumulation"}],
+            "sequence_ok": True,
+            "entry_quality_score": 82.0,
+            "phase": "吸筹D",
+            "signal": "SOS",
+            "trigger_date": trigger_date,
+            "phase_hint": "测试信号",
+            "structure_hhh": "HH|HL|HC",
+            "event_strength_score": 70.0,
+            "phase_score": 72.0,
+            "structure_score": 68.0,
+            "trend_score": 66.0,
+            "volatility_score": 64.0,
+        }
+
+    monkeypatch.setattr(store, "_resolve_signal_candidates", fake_resolve_signal_candidates)
+    monkeypatch.setattr(store, "_calc_wyckoff_snapshot", fake_calc_wyckoff_snapshot)
+    store._signals_cache.clear()
+
+    base_params = {
+        "mode": "trend_pool",
+        "run_id": "mock-run",
+        "as_of_date": as_of_trade_date,
+        "refresh": "true",
+        "window_days": "60",
+        "min_score": "0",
+        "require_sequence": "false",
+        "min_event_count": "0",
+    }
+    resp_kept = client.get(
+        "/api/signals",
+        params={
+            **base_params,
+            "signal_age_min": str(expected_age_days),
+            "signal_age_max": str(expected_age_days),
+        },
+    )
+    assert resp_kept.status_code == 200
+    body_kept = resp_kept.json()
+    assert len(body_kept["items"]) == 1
+    assert int(body_kept["items"][0]["signal_age_days"]) == expected_age_days
+
+    resp_filtered = client.get(
+        "/api/signals",
+        params={
+            **base_params,
+            "signal_age_min": str(expected_age_days + 1),
+        },
+    )
+    assert resp_filtered.status_code == 200
+    body_filtered = resp_filtered.json()
+    assert body_filtered["items"] == []
 
 
 def test_signals_disk_cache_reuses_persisted_payload(
@@ -677,6 +834,9 @@ def test_wyckoff_event_store_lazy_fill_and_reuse(monkeypatch: pytest.MonkeyPatch
         with sqlite3.connect(str(db_path)) as conn:
             conn.execute("DELETE FROM wyckoff_daily_events")
             conn.commit()
+    runtime_cache = getattr(store._wyckoff_event_store, "_runtime_cache", None)
+    if isinstance(runtime_cache, dict):
+        runtime_cache.clear()
 
     dates = _load_symbol_dates("sz300750")
     as_of_date = dates[-8]
@@ -1278,3 +1438,4 @@ def test_market_news_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     assert body["fallback_used"] is False
     assert body["degraded"] is False
     assert len(body["items"]) == 1
+

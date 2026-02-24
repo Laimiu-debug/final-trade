@@ -1,0 +1,260 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class StrategyCapabilities:
+    supports_matrix: bool
+    supports_signal_age_filter: bool
+    supports_entry_delay: bool
+
+
+@dataclass(frozen=True)
+class StrategyDescriptor:
+    strategy_id: str
+    name: str
+    version: str
+    enabled: bool
+    is_default: bool
+    capabilities: StrategyCapabilities
+    params_schema: dict[str, dict[str, Any]]
+    default_params: dict[str, Any]
+
+
+class StrategyRegistry:
+    _DEFAULT_STRATEGY_ID = "wyckoff_trend_v1"
+
+    def __init__(self) -> None:
+        self._strategies: dict[str, StrategyDescriptor] = {}
+        self._register_builtin()
+
+    def _register_builtin(self) -> None:
+        v1 = StrategyDescriptor(
+            strategy_id="wyckoff_trend_v1",
+            name="Wyckoff Trend V1",
+            version="1.0.0",
+            enabled=True,
+            is_default=True,
+            capabilities=StrategyCapabilities(
+                supports_matrix=True,
+                supports_signal_age_filter=True,
+                supports_entry_delay=True,
+            ),
+            params_schema={},
+            default_params={},
+        )
+        v2_schema: dict[str, dict[str, Any]] = {
+            "matrix_event_semantic_version": {
+                "type": "enum",
+                "title": "矩阵事件语义",
+                "options": ["matrix_v1", "aligned_wyckoff_v2"],
+                "default": "aligned_wyckoff_v2",
+            },
+            "rank_weight_health": {
+                "type": "number",
+                "title": "健康分权重",
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "default": 0.5,
+            },
+            "rank_weight_event": {
+                "type": "number",
+                "title": "事件分权重",
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "default": 0.5,
+            },
+            "health_score_min": {
+                "type": "number",
+                "title": "健康分门槛",
+                "minimum": 0.0,
+                "maximum": 100.0,
+                "default": 55.0,
+            },
+            "event_score_min": {
+                "type": "number",
+                "title": "事件分门槛",
+                "minimum": 0.0,
+                "maximum": 100.0,
+                "default": 55.0,
+            },
+            "event_grade_min": {
+                "type": "enum",
+                "title": "事件评级门槛",
+                "options": ["A", "B", "C"],
+                "default": "B",
+            },
+            "min_score": {
+                "type": "number",
+                "title": "入场质量最低分",
+                "minimum": 0.0,
+                "maximum": 100.0,
+                "default": 60.0,
+            },
+            "min_event_count": {
+                "type": "integer",
+                "title": "最少事件数",
+                "minimum": 0,
+                "maximum": 12,
+                "default": 1,
+            },
+            "require_sequence": {
+                "type": "boolean",
+                "title": "要求事件序列",
+                "default": False,
+            },
+        }
+        v2 = StrategyDescriptor(
+            strategy_id="wyckoff_trend_v2",
+            name="Wyckoff Trend V2",
+            version="2.0.0-alpha",
+            enabled=True,
+            is_default=False,
+            capabilities=StrategyCapabilities(
+                supports_matrix=True,
+                supports_signal_age_filter=True,
+                supports_entry_delay=True,
+            ),
+            params_schema=v2_schema,
+            default_params={
+                "matrix_event_semantic_version": "aligned_wyckoff_v2",
+                "rank_weight_health": 0.5,
+                "rank_weight_event": 0.5,
+                "health_score_min": 55.0,
+                "event_score_min": 55.0,
+                "event_grade_min": "B",
+            },
+        )
+        self._strategies[v1.strategy_id] = v1
+        self._strategies[v2.strategy_id] = v2
+
+    @property
+    def default_strategy_id(self) -> str:
+        return self._DEFAULT_STRATEGY_ID
+
+    def normalize_strategy_id(self, raw_strategy_id: str | None) -> str:
+        text = str(raw_strategy_id or "").strip()
+        if not text:
+            return self._DEFAULT_STRATEGY_ID
+        return text
+
+    def get(self, strategy_id: str) -> StrategyDescriptor | None:
+        return self._strategies.get(str(strategy_id).strip())
+
+    def list(self) -> list[StrategyDescriptor]:
+        return list(self._strategies.values())
+
+    @staticmethod
+    def _clamp_number(value: Any, *, minimum: float | None, maximum: float | None) -> float | None:
+        try:
+            parsed = float(value)
+        except Exception:
+            return None
+        if minimum is not None and parsed < float(minimum):
+            parsed = float(minimum)
+        if maximum is not None and parsed > float(maximum):
+            parsed = float(maximum)
+        return parsed
+
+    @staticmethod
+    def _clamp_integer(value: Any, *, minimum: int | None, maximum: int | None) -> int | None:
+        try:
+            parsed = int(value)
+        except Exception:
+            return None
+        if minimum is not None and parsed < int(minimum):
+            parsed = int(minimum)
+        if maximum is not None and parsed > int(maximum):
+            parsed = int(maximum)
+        return parsed
+
+    def normalize_params(self, strategy_id: str, raw_params: dict[str, Any] | None) -> dict[str, Any]:
+        descriptor = self.get(strategy_id)
+        if descriptor is None:
+            return {}
+        params = raw_params if isinstance(raw_params, dict) else {}
+        normalized: dict[str, Any] = {}
+        for key, spec in descriptor.params_schema.items():
+            if key not in params:
+                continue
+            value = params.get(key)
+            type_name = str(spec.get("type") or "").strip().lower()
+            if type_name == "number":
+                parsed = self._clamp_number(
+                    value,
+                    minimum=float(spec["minimum"]) if "minimum" in spec else None,
+                    maximum=float(spec["maximum"]) if "maximum" in spec else None,
+                )
+                if parsed is not None:
+                    normalized[key] = float(parsed)
+                continue
+            if type_name == "integer":
+                parsed = self._clamp_integer(
+                    value,
+                    minimum=int(spec["minimum"]) if "minimum" in spec else None,
+                    maximum=int(spec["maximum"]) if "maximum" in spec else None,
+                )
+                if parsed is not None:
+                    normalized[key] = int(parsed)
+                continue
+            if type_name == "boolean":
+                if isinstance(value, bool):
+                    normalized[key] = value
+                    continue
+                value_text = str(value).strip().lower()
+                if value_text in {"1", "true", "yes", "y", "on"}:
+                    normalized[key] = True
+                elif value_text in {"0", "false", "no", "n", "off"}:
+                    normalized[key] = False
+                continue
+            if type_name == "enum":
+                options = [str(item) for item in spec.get("options", [])]
+                value_text = str(value).strip()
+                if value_text in options:
+                    normalized[key] = value_text
+                continue
+        return normalized
+
+    def resolve_backtest_overrides(self, strategy_id: str, normalized_params: dict[str, Any]) -> dict[str, Any]:
+        _ = strategy_id
+        allowed = {
+            "matrix_event_semantic_version",
+            "rank_weight_health",
+            "rank_weight_event",
+            "health_score_min",
+            "event_score_min",
+            "event_grade_min",
+            "min_score",
+            "min_event_count",
+            "require_sequence",
+        }
+        return {
+            key: value
+            for key, value in normalized_params.items()
+            if key in allowed
+        }
+
+    def resolve_signal_overrides(self, strategy_id: str, normalized_params: dict[str, Any]) -> dict[str, Any]:
+        _ = strategy_id
+        allowed = {
+            "min_score",
+            "min_event_count",
+            "require_sequence",
+            "health_score_min",
+            "event_score_min",
+            "event_grade_min",
+        }
+        return {
+            key: value
+            for key, value in normalized_params.items()
+            if key in allowed
+        }
+
+    @staticmethod
+    def params_hash(normalized_params: dict[str, Any]) -> str:
+        raw = json.dumps(normalized_params, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]

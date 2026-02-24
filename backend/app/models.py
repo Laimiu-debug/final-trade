@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -20,6 +20,7 @@ ReviewTagType = Literal["emotion", "reason"]
 BacktestPriorityMode = Literal["phase_first", "balanced", "momentum"]
 BacktestPoolRollMode = Literal["daily", "weekly", "position"]
 BoardFilter = Literal["main", "gem", "star", "beijing", "st"]
+StrategyId = Literal["wyckoff_trend_v1", "wyckoff_trend_v2"]
 
 
 class ApiErrorPayload(BaseModel):
@@ -178,6 +179,7 @@ class SignalResult(BaseModel):
     secondary_signals: list[SignalType]
     trigger_date: str
     expire_date: str
+    signal_age_days: int = 0
     trigger_reason: str
     priority: int
     wyckoff_phase: str = "阶段未明"
@@ -197,6 +199,17 @@ class SignalResult(BaseModel):
     structure_score: float = 0.0
     trend_score: float = 0.0
     volatility_score: float = 0.0
+    health_score: float = 0.0
+    slope_stability: float = 0.0
+    volatility_stability: float = 0.0
+    pullback_quality: float = 0.0
+    event_score: float = 0.0
+    event_grade: Literal["A", "B", "C"] = "C"
+    event_background_score: float = 0.0
+    event_position_score: float = 0.0
+    event_vol_price_score: float = 0.0
+    event_confirmation_score: float = 0.0
+    event_grade_map: dict[str, str] = Field(default_factory=dict)
 
 
 class SignalsResponse(BaseModel):
@@ -208,6 +221,31 @@ class SignalsResponse(BaseModel):
     degraded: bool = False
     degraded_reason: str | None = None
     source_count: int = 0
+    strategy_id: StrategyId = "wyckoff_trend_v1"
+    strategy_version: str = "1.0.0"
+    strategy_params: dict[str, Any] = Field(default_factory=dict)
+    strategy_params_hash: str = ""
+
+
+class StrategyCapabilities(BaseModel):
+    supports_matrix: bool = False
+    supports_signal_age_filter: bool = True
+    supports_entry_delay: bool = True
+
+
+class StrategyDescriptor(BaseModel):
+    strategy_id: StrategyId
+    name: str
+    version: str
+    enabled: bool = True
+    is_default: bool = False
+    capabilities: StrategyCapabilities
+    strategy_params_schema: dict[str, Any] = Field(default_factory=dict)
+    strategy_params_defaults: dict[str, Any] = Field(default_factory=dict)
+
+
+class StrategyCatalogResponse(BaseModel):
+    items: list[StrategyDescriptor] = Field(default_factory=list)
 
 
 class SimTradingConfig(BaseModel):
@@ -352,6 +390,8 @@ class BacktestRunRequest(BaseModel):
     run_id: str | None = None
     trend_step: TrendPoolStep = "auto"
     board_filters: list[BoardFilter] = Field(default_factory=list, max_length=5)
+    strategy_id: StrategyId = "wyckoff_trend_v1"
+    strategy_params: dict[str, Any] = Field(default_factory=dict)
     date_from: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     date_to: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     window_days: int = Field(default=60, ge=20, le=240)
@@ -378,7 +418,15 @@ class BacktestRunRequest(BaseModel):
     prioritize_signals: bool = True
     priority_mode: BacktestPriorityMode = "balanced"
     priority_topk_per_day: int = Field(default=0, ge=0, le=500)
+    rank_weight_health: float = Field(default=0.45, ge=0.0, le=1.0)
+    rank_weight_event: float = Field(default=0.55, ge=0.0, le=1.0)
+    health_score_min: float = Field(default=0.0, ge=0.0, le=100.0)
+    event_score_min: float = Field(default=0.0, ge=0.0, le=100.0)
+    event_grade_min: Literal["A", "B", "C"] = "C"
+    matrix_event_semantic_version: Literal["matrix_v1", "aligned_wyckoff_v2"] = "matrix_v1"
     enforce_t1: bool = True
+    entry_delay_days: int = Field(default=1, ge=1, le=5)
+    delay_invalidation_enabled: bool = True
     max_symbols: int = Field(default=120, ge=20, le=2000)
     pool_roll_mode: BacktestPoolRollMode = "daily"
     enable_advanced_analysis: bool = True
@@ -393,6 +441,9 @@ class BacktestTrade(BaseModel):
     entry_signal: str
     entry_phase: str = "阶段未明"
     entry_quality_score: float = 0.0
+    health_score: float = 0.0
+    event_score: float = 0.0
+    event_grade: Literal["A", "B", "C"] = "C"
     exit_reason: str
     quantity: int
     entry_price: float
@@ -488,6 +539,74 @@ class BacktestResponse(BaseModel):
     regime_breakdown: list[BacktestRegimeBucket] = Field(default_factory=list)
     monte_carlo: BacktestMonteCarloSummary | None = None
     walk_forward: BacktestWalkForwardReport | None = None
+    strategy_id: StrategyId = "wyckoff_trend_v1"
+    strategy_version: str = "1.0.0"
+    strategy_params: dict[str, Any] = Field(default_factory=dict)
+    strategy_params_hash: str = ""
+
+
+class BacktestABVariantConfig(BaseModel):
+    label: str | None = None
+    entry_delay_days: int | None = Field(default=None, ge=1, le=5)
+    health_score_min: float | None = Field(default=None, ge=0.0, le=100.0)
+    event_score_min: float | None = Field(default=None, ge=0.0, le=100.0)
+    event_grade_min: Literal["A", "B", "C"] | None = None
+    matrix_event_semantic_version: Literal["matrix_v1", "aligned_wyckoff_v2"] | None = None
+    rank_weight_health: float | None = Field(default=None, ge=0.0, le=1.0)
+    rank_weight_event: float | None = Field(default=None, ge=0.0, le=1.0)
+    strategy_id: StrategyId | None = None
+    strategy_params: dict[str, Any] | None = None
+    enable_advanced_analysis: bool | None = None
+
+
+class BacktestABExperimentRequest(BaseModel):
+    base_payload: BacktestRunRequest
+    variants: list[BacktestABVariantConfig] = Field(default_factory=list, max_length=64)
+    auto_generate_default_matrix: bool = True
+    max_variants: int = Field(default=16, ge=1, le=64)
+
+
+class BacktestABSignalBucket(BaseModel):
+    signal: str
+    trade_count: int = 0
+    win_rate: float = 0.0
+    avg_pnl_ratio: float = 0.0
+    total_pnl_ratio: float = 0.0
+    utad_exit_ratio: float = 0.0
+
+
+class BacktestABVariantResult(BaseModel):
+    variant_id: str
+    label: str
+    run_request: BacktestRunRequest
+    status: Literal["succeeded", "failed"] = "succeeded"
+    error: str | None = None
+    stats: ReviewStats | None = None
+    risk_metrics: BacktestRiskMetrics | None = None
+    candidate_count: int = 0
+    trade_count: int = 0
+    utad_exit_ratio: float = 0.0
+    max_consecutive_losses: int = 0
+    signal_breakdown: list[BacktestABSignalBucket] = Field(default_factory=list)
+
+
+class BacktestABComparisonRow(BaseModel):
+    baseline_variant_id: str
+    variant_id: str
+    label: str
+    total_return_delta: float = 0.0
+    win_rate_delta: float = 0.0
+    max_drawdown_delta: float = 0.0
+    utad_exit_ratio_delta: float = 0.0
+    max_consecutive_losses_delta: int = 0
+
+
+class BacktestABExperimentResponse(BaseModel):
+    baseline_variant_id: str | None = None
+    best_variant_id: str | None = None
+    variants: list[BacktestABVariantResult] = Field(default_factory=list)
+    comparisons: list[BacktestABComparisonRow] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 class BacktestTaskStartResponse(BaseModel):

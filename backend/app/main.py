@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+import json
+
 from typing import Literal
 
 from fastapi import FastAPI, File, Path, Query, Request, UploadFile
@@ -12,6 +14,8 @@ from .models import (
     AIProviderTestRequest,
     AIProviderTestResponse,
     AIRecordsResponse,
+    BacktestABExperimentRequest,
+    BacktestABExperimentResponse,
     BacktestResponse,
     BacktestRunRequest,
     BacktestPlateauRunRequest,
@@ -54,6 +58,7 @@ from .models import (
     SimTradingConfig,
     SystemStorageStatus,
     SignalScanMode,
+    StrategyCatalogResponse,
     TrendPoolStep,
     ScreenerParams,
     ScreenerRunDetail,
@@ -175,6 +180,8 @@ def get_signals(
     mode: SignalScanMode = Query(default="trend_pool"),
     run_id: str = Query(default="", min_length=0, max_length=64),
     trend_step: TrendPoolStep = Query(default="auto"),
+    strategy_id: str = Query(default="wyckoff_trend_v1", min_length=1, max_length=64),
+    strategy_params_json: str = Query(default="", alias="strategy_params"),
     market_filters: list[Market] | None = Query(default=None),
     board_filters: list[BoardFilter] | None = Query(default=None),
     as_of_date: str | None = Query(default=None, min_length=10, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
@@ -183,26 +190,61 @@ def get_signals(
     min_score: float = Query(default=60, ge=0, le=100),
     require_sequence: bool = Query(default=False),
     min_event_count: int = Query(default=1, ge=0, le=12),
-) -> SignalsResponse:
-    return store.get_signals(
-        mode=mode,
-        run_id=run_id.strip() or None,
-        trend_step=trend_step,
-        market_filters=list(dict.fromkeys(market_filters or [])),
-        board_filters=list(dict.fromkeys(board_filters or [])),
-        as_of_date=as_of_date,
-        refresh=refresh,
-        window_days=window_days,
-        min_score=min_score,
-        require_sequence=require_sequence,
-        min_event_count=min_event_count,
-    )
+    signal_age_min: int = Query(default=0, ge=0, le=240),
+    signal_age_max: int | None = Query(default=None, ge=0, le=240),
+) -> SignalsResponse | JSONResponse:
+    strategy_params: dict[str, object] | None = None
+    if strategy_params_json.strip():
+        try:
+            parsed = json.loads(strategy_params_json)
+        except Exception:
+            return error_response(400, "STRATEGY_PARAMS_INVALID", "strategy_params 必须为 JSON 对象字符串。")
+        if not isinstance(parsed, dict):
+            return error_response(400, "STRATEGY_PARAMS_INVALID", "strategy_params 必须为 JSON 对象字符串。")
+        strategy_params = parsed
+    try:
+        return store.get_signals(
+            mode=mode,
+            run_id=run_id.strip() or None,
+            trend_step=trend_step,
+            strategy_id=strategy_id.strip(),
+            strategy_params=strategy_params,
+            market_filters=list(dict.fromkeys(market_filters or [])),
+            board_filters=list(dict.fromkeys(board_filters or [])),
+            as_of_date=as_of_date,
+            refresh=refresh,
+            window_days=window_days,
+            min_score=min_score,
+            require_sequence=require_sequence,
+            min_event_count=min_event_count,
+            signal_age_min=signal_age_min,
+            signal_age_max=signal_age_max,
+        )
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "SIGNALS_INVALID", str(exc))
+
+
+@app.get("/api/strategies", response_model=StrategyCatalogResponse)
+def get_strategies() -> StrategyCatalogResponse:
+    return store.list_strategies()
 
 
 @app.post("/api/backtest/run", response_model=BacktestResponse)
 def post_backtest_run(payload: BacktestRunRequest) -> BacktestResponse | JSONResponse:
     try:
         return store.run_backtest(payload)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.post("/api/backtest/experiments/ab", response_model=BacktestABExperimentResponse)
+def post_backtest_experiment_ab(payload: BacktestABExperimentRequest) -> BacktestABExperimentResponse | JSONResponse:
+    try:
+        return store.run_backtest_ab_experiment(payload)
     except BacktestValidationError as exc:
         return error_response(400, exc.code, str(exc))
     except ValueError as exc:
@@ -686,3 +728,4 @@ def post_wyckoff_event_store_backfill(
 @app.post("/api/system/sync-market-data", response_model=MarketDataSyncResponse)
 def post_sync_market_data(payload: MarketDataSyncRequest) -> MarketDataSyncResponse:
     return store.sync_market_data(payload)
+

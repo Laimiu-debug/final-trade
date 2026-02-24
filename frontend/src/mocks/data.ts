@@ -45,6 +45,7 @@ import type {
   SignalsResponse,
   StockAnalysis,
   StockAnnotation,
+  StrategyCatalogResponse,
   SystemStorageStatus,
   TradeFillTagAssignment,
   TradeFillTagUpdateRequest,
@@ -91,6 +92,56 @@ let reviewTagsStore: ReviewTagsPayload = {
 
 const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 'st']
 const ALLOWED_MARKET_FILTERS: Market[] = ['sh', 'sz', 'bj']
+const strategyCatalogStore: StrategyCatalogResponse = {
+  items: [
+    {
+      strategy_id: 'wyckoff_trend_v1',
+      name: 'Wyckoff Trend V1',
+      version: '1.0.0',
+      enabled: true,
+      is_default: true,
+      capabilities: {
+        supports_matrix: true,
+        supports_signal_age_filter: true,
+        supports_entry_delay: true,
+      },
+      strategy_params_schema: {
+        health_score_min: { type: 'number', title: '健康分下限', minimum: 0, maximum: 100, default: 55 },
+        event_score_min: { type: 'number', title: '事件分下限', minimum: 0, maximum: 100, default: 55 },
+        event_grade_min: { type: 'enum', title: '事件等级下限', options: ['A', 'B', 'C'], default: 'B' },
+      },
+      strategy_params_defaults: {
+        health_score_min: 55,
+        event_score_min: 55,
+        event_grade_min: 'B',
+      },
+    },
+    {
+      strategy_id: 'wyckoff_trend_v2',
+      name: 'Wyckoff Trend V2',
+      version: '0.2.0',
+      enabled: true,
+      is_default: false,
+      capabilities: {
+        supports_matrix: true,
+        supports_signal_age_filter: true,
+        supports_entry_delay: true,
+      },
+      strategy_params_schema: {
+        health_score_min: { type: 'number', title: '健康分下限', minimum: 0, maximum: 100, default: 60 },
+        event_score_min: { type: 'number', title: '事件分下限', minimum: 0, maximum: 100, default: 60 },
+        rank_weight_health: { type: 'number', title: '健康分权重', minimum: 0, maximum: 1, default: 0.45 },
+        rank_weight_event: { type: 'number', title: '事件分权重', minimum: 0, maximum: 1, default: 0.55 },
+      },
+      strategy_params_defaults: {
+        health_score_min: 60,
+        event_score_min: 60,
+        rank_weight_health: 0.45,
+        rank_weight_event: 0.55,
+      },
+    },
+  ],
+}
 
 const marketNewsSeed: MarketNewsResponse['items'] = [
   {
@@ -481,6 +532,17 @@ export function getLatestScreenerRunStore() {
   return seeded
 }
 
+export function getStrategiesStore(): StrategyCatalogResponse {
+  return {
+    items: strategyCatalogStore.items.map((item) => ({
+      ...item,
+      capabilities: { ...item.capabilities },
+      strategy_params_schema: { ...item.strategy_params_schema },
+      strategy_params_defaults: { ...item.strategy_params_defaults },
+    })),
+  }
+}
+
 export function getCandlePayload(symbol: string) {
   const candles = ensureCandles(symbol)
   const degraded = candles.some((point) => point.price_source === 'approx')
@@ -573,10 +635,13 @@ export function getSignals(params?: {
   mode?: SignalScanMode
   market_filters?: Market[]
   board_filters?: BoardFilter[]
+  as_of_date?: string
   window_days?: number
   min_score?: number
   require_sequence?: boolean
   min_event_count?: number
+  signal_age_min?: number
+  signal_age_max?: number
 }): SignalsResponse {
   const raw: Array<{ symbol: string; name: string; trigger_reason: string; signals: Array<'A' | 'B' | 'C'> }> = [
     { symbol: 'sz300750', name: '宁德时代', trigger_reason: '突破前高后缩量回踩确认', signals: ['A', 'B'] },
@@ -592,20 +657,28 @@ export function getSignals(params?: {
   )
   const minScore = params?.min_score ?? 60
   const minEventCount = params?.min_event_count ?? 1
+  const signalAgeMin = Math.max(0, Math.round(params?.signal_age_min ?? 0))
+  const signalAgeMax = typeof params?.signal_age_max === 'number'
+    ? Math.max(signalAgeMin, Math.round(params.signal_age_max))
+    : null
   const requireSequence = params?.require_sequence ?? false
+  const asOfDate = dayjs(params?.as_of_date || dayjs().format('YYYY-MM-DD'))
 
   const items: SignalResult[] = raw.map((item, index) => {
     const resolved = resolveSignalPriority(item.signals)
     const wyEvents = ['SC', 'AR', 'ST', 'SOS', 'LPS'].slice(0, 3 + (index % 3))
     const wyRisk = index === 1 ? ['UTAD'] : []
     const score = 70 + (2 - index) * 8 - wyRisk.length * 6
+    const triggerDate = dayjs().subtract(index, 'day').format('YYYY-MM-DD')
+    const signalAgeDays = Math.max(0, asOfDate.diff(dayjs(triggerDate), 'day'))
     return {
       symbol: item.symbol,
       name: item.name,
       primary_signal: resolved.primary ?? 'C',
       secondary_signals: resolved.secondary,
-      trigger_date: dayjs().subtract(index, 'day').format('YYYY-MM-DD'),
+      trigger_date: triggerDate,
       expire_date: dayjs().add(2 - index, 'day').format('YYYY-MM-DD'),
+      signal_age_days: signalAgeDays,
       trigger_reason: item.trigger_reason,
       priority: resolved.primary === 'B' ? 3 : resolved.primary === 'A' ? 2 : 1,
       wyckoff_phase: index === 0 ? '吸筹D' : index === 1 ? '派发A' : '吸筹B',
@@ -631,6 +704,8 @@ export function getSignals(params?: {
   const filtered = boardMatched.filter((row) => {
     if ((row.entry_quality_score ?? 0) < minScore) return false
     if ((row.wy_event_count ?? 0) < minEventCount) return false
+    if ((row.signal_age_days ?? 0) < signalAgeMin) return false
+    if (signalAgeMax !== null && (row.signal_age_days ?? 0) > signalAgeMax) return false
     if (requireSequence && !row.wy_sequence_ok) return false
     return true
   })
@@ -972,11 +1047,21 @@ export function runBacktestStore(payload: BacktestRunRequest): BacktestResponse 
   const rangeTo = dateTo.format('YYYY-MM-DD')
 
   const notes: string[] = []
+  const entryDelayDays = Math.max(1, Math.min(5, Math.round(payload.entry_delay_days ?? 1)))
+  const delayInvalidationEnabled = payload.delay_invalidation_enabled !== false
+  let delayInvalidationSkips = 0
+  let delayNoEntryDaySkips = 0
   if (payload.mode === 'trend_pool' && !payload.run_id?.trim()) {
     notes.push('Mock 模式未传 run_id，已按当前信号池模拟趋势池回测。')
   }
   if (payload.priority_topk_per_day > 0 && !payload.prioritize_signals) {
     notes.push('未启用优先排序，priority_topk_per_day 配置未生效。')
+  }
+  if (entryDelayDays !== 1) {
+    notes.push(`延迟入场已启用：entry_delay_days=${entryDelayDays}（交易日）`)
+  }
+  if (delayInvalidationEnabled) {
+    notes.push('延迟窗口失效保护已启用。')
   }
 
   const signalRows = getSignals({
@@ -1021,9 +1106,21 @@ export function runBacktestStore(payload: BacktestRunRequest): BacktestResponse 
       if (signalDay.isBefore(dateFrom)) signalDay = dateFrom
       if (signalDay.isAfter(dateTo)) signalDay = dateTo
 
-      let entryDay = signalDay.add(1, 'day')
+      if (
+        delayInvalidationEnabled
+        && entryDelayDays > 1
+        && (row.wy_risk_events ?? []).some((event) => ['UTAD', 'SOW', 'LPSY'].includes(String(event)))
+      ) {
+        delayInvalidationSkips += 1
+        return null
+      }
+
+      let entryDay = signalDay.add(entryDelayDays, 'day')
       if (entryDay.isBefore(dateFrom)) entryDay = dateFrom
-      if (entryDay.isAfter(dateTo)) return null
+      if (entryDay.isAfter(dateTo)) {
+        delayNoEntryDaySkips += 1
+        return null
+      }
 
       const proposedHoldDays = Math.max(2, Math.min(payload.max_hold_days, 3 + (index % 18)))
       let exitDay = entryDay.add(proposedHoldDays, 'day')
@@ -1094,6 +1191,16 @@ export function runBacktestStore(payload: BacktestRunRequest): BacktestResponse 
       } satisfies Candidate
     })
     .filter((row): row is Candidate => Boolean(row))
+
+  if (delayInvalidationSkips > 0 || delayNoEntryDaySkips > 0) {
+    const detail = [
+      delayInvalidationSkips > 0 ? `delay_invalidated_by_risk_event:${delayInvalidationSkips}` : '',
+      delayNoEntryDaySkips > 0 ? `delay_no_entry_day:${delayNoEntryDaySkips}` : '',
+    ]
+      .filter(Boolean)
+      .join(', ')
+    notes.push(`延迟窗口跳过 ${delayInvalidationSkips + delayNoEntryDaySkips} 笔信号（${detail}）。`)
+  }
 
   if (payload.prioritize_signals) {
     candidateRows.sort((a, b) => {

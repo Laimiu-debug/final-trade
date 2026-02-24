@@ -16,6 +16,8 @@ import type {
   BacktestPlateauResponse,
   BacktestPlateauTaskStatusResponse,
   BacktestPlateauRunRequest,
+  BacktestABExperimentRequest,
+  BacktestABExperimentResponse,
   BacktestRunRequest,
   BoardFilter,
   CandlePoint,
@@ -50,6 +52,8 @@ import type {
   SimTradingConfig,
   StockAnalysis,
   StockAnnotation,
+  StrategyCatalogResponse,
+  StrategyId,
   SystemStorageStatus,
   TradeFillTagAssignment,
   TradeFillTagUpdateRequest,
@@ -111,6 +115,8 @@ export function getSignals(params?: {
   mode?: SignalScanMode
   run_id?: string
   trend_step?: TrendPoolStep
+  strategy_id?: StrategyId
+  strategy_params?: Record<string, unknown>
   market_filters?: Market[]
   board_filters?: BoardFilter[]
   as_of_date?: string
@@ -119,11 +125,17 @@ export function getSignals(params?: {
   min_score?: number
   require_sequence?: boolean
   min_event_count?: number
+  signal_age_min?: number
+  signal_age_max?: number
 }) {
   const query = new URLSearchParams()
   if (params?.mode) query.set('mode', params.mode)
   if (params?.run_id) query.set('run_id', params.run_id)
   if (params?.trend_step) query.set('trend_step', params.trend_step)
+  if (params?.strategy_id) query.set('strategy_id', params.strategy_id)
+  if (params?.strategy_params && Object.keys(params.strategy_params).length > 0) {
+    query.set('strategy_params', JSON.stringify(params.strategy_params))
+  }
   if (params?.market_filters?.length) {
     params.market_filters.forEach((item) => query.append('market_filters', item))
   }
@@ -139,6 +151,12 @@ export function getSignals(params?: {
   }
   if (typeof params?.min_event_count === 'number') {
     query.set('min_event_count', String(params.min_event_count))
+  }
+  if (typeof params?.signal_age_min === 'number') {
+    query.set('signal_age_min', String(params.signal_age_min))
+  }
+  if (typeof params?.signal_age_max === 'number') {
+    query.set('signal_age_max', String(params.signal_age_max))
   }
   const suffix = query.toString()
   const timeoutMs = params?.mode === 'full_market' ? 240_000 : 45_000
@@ -267,6 +285,21 @@ export function runBacktest(payload: BacktestRunRequest) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     timeoutMs,
+  })
+}
+
+export function runBacktestABExperiment(payload: BacktestABExperimentRequest) {
+  return apiRequest<BacktestABExperimentResponse>('/api/backtest/experiments/ab', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 300_000,
+  })
+}
+
+export function getStrategies() {
+  return apiRequest<StrategyCatalogResponse>('/api/strategies', {
+    timeoutMs: 45_000,
   })
 }
 

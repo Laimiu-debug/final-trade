@@ -29,6 +29,7 @@ import {
   getLatestScreenerRunStore,
   getScreenerRun,
   getSignals,
+  getStrategiesStore,
   getSystemStorageStore,
   getWeeklyReviewStore,
   getWeeklyReviewsStore,
@@ -175,19 +176,26 @@ export const handlers = [
       ),
     )
     const refresh = url.searchParams.get('refresh') === 'true'
+    const asOfDateRaw = (url.searchParams.get('as_of_date') ?? '').trim()
+    const asOfDate = /^\d{4}-\d{2}-\d{2}$/.test(asOfDateRaw) ? asOfDateRaw : undefined
     const windowDays = Number(url.searchParams.get('window_days') ?? 60)
     const minScore = Number(url.searchParams.get('min_score') ?? 60)
     const requireSequence = url.searchParams.get('require_sequence') === 'true'
     const minEventCount = Number(url.searchParams.get('min_event_count') ?? 1)
+    const signalAgeMin = Number(url.searchParams.get('signal_age_min') ?? 0)
+    const signalAgeMax = Number(url.searchParams.get('signal_age_max') ?? '')
     return HttpResponse.json(
       getSignals({
         mode,
         market_filters: marketFilters,
         board_filters: boardFilters,
+        as_of_date: asOfDate,
         window_days: Number.isFinite(windowDays) ? windowDays : 60,
         min_score: Number.isFinite(minScore) ? minScore : 60,
         require_sequence: requireSequence,
         min_event_count: Number.isFinite(minEventCount) ? minEventCount : 1,
+        signal_age_min: Number.isFinite(signalAgeMin) ? signalAgeMin : 0,
+        signal_age_max: Number.isFinite(signalAgeMax) ? signalAgeMax : undefined,
       }),
       {
         headers: {
@@ -195,6 +203,11 @@ export const handlers = [
         },
       },
     )
+  }),
+
+  http.get('/api/strategies', async () => {
+    await delay(80)
+    return HttpResponse.json(getStrategiesStore())
   }),
 
   http.post('/api/backtest/run', async ({ request }) => {

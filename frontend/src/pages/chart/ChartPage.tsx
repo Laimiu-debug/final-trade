@@ -134,6 +134,12 @@ export function ChartPage() {
   const signalMinScore = Number.isFinite(parsedMinScore) ? Math.max(0, Math.min(100, parsedMinScore)) : 60
   const parsedMinEventCount = Number(searchParams.get('signal_min_event_count') ?? 1)
   const signalMinEventCount = Number.isFinite(parsedMinEventCount) ? Math.max(1, Math.round(parsedMinEventCount)) : 1
+  const parsedSignalAgeMin = Number(searchParams.get('signal_age_min') ?? 0)
+  const signalAgeMin = Number.isFinite(parsedSignalAgeMin) ? Math.max(0, Math.min(240, Math.round(parsedSignalAgeMin))) : 0
+  const parsedSignalAgeMax = Number(searchParams.get('signal_age_max') ?? '')
+  const signalAgeMax = Number.isFinite(parsedSignalAgeMax)
+    ? Math.max(signalAgeMin, Math.min(240, Math.round(parsedSignalAgeMax)))
+    : undefined
   const signalRequireSequence = searchParams.get('signal_require_sequence') === 'true'
   const signalMarketFilters = parseSignalMarketFilters(searchParams)
   const signalBoardFilters = parseSignalBoardFilters(searchParams)
@@ -160,6 +166,8 @@ export function ChartPage() {
       signalWindowDays,
       signalMinScore,
       signalMinEventCount,
+      signalAgeMin,
+      signalAgeMax ?? -1,
       signalRequireSequence,
       signalMarketFilters.join(','),
       signalBoardFilters.join(','),
@@ -175,6 +183,8 @@ export function ChartPage() {
         window_days: signalWindowDays,
         min_score: signalMinScore,
         min_event_count: signalMinEventCount,
+        signal_age_min: signalAgeMin,
+        signal_age_max: signalAgeMax,
         require_sequence: signalRequireSequence,
       }),
   })

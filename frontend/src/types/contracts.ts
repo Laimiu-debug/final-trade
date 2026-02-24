@@ -8,6 +8,7 @@ export type TrendPoolStep = 'auto' | 'step1' | 'step2' | 'step3' | 'step4'
 export type BacktestPriorityMode = 'phase_first' | 'balanced' | 'momentum'
 export type BacktestPoolRollMode = 'daily' | 'weekly' | 'position'
 export type BoardFilter = 'main' | 'gem' | 'star' | 'beijing' | 'st'
+export type StrategyId = 'wyckoff_trend_v1' | 'wyckoff_trend_v2'
 export type MarketDataSource = 'tdx_only' | 'tdx_then_akshare' | 'akshare_only'
 export type MarketSyncProvider = 'baostock'
 export type MarketSyncMode = 'incremental' | 'full'
@@ -169,6 +170,7 @@ export interface SignalResult {
   secondary_signals: SignalType[]
   trigger_date: string
   expire_date: string
+  signal_age_days?: number
   trigger_reason: string
   priority: number
   wyckoff_phase?: string
@@ -192,6 +194,17 @@ export interface SignalResult {
   structure_score?: number
   trend_score?: number
   volatility_score?: number
+  health_score?: number
+  slope_stability?: number
+  volatility_stability?: number
+  pullback_quality?: number
+  event_score?: number
+  event_grade?: 'A' | 'B' | 'C'
+  event_background_score?: number
+  event_position_score?: number
+  event_vol_price_score?: number
+  event_confirmation_score?: number
+  event_grade_map?: Record<string, 'A' | 'B' | 'C'>
 }
 
 export interface SignalsResponse {
@@ -203,6 +216,10 @@ export interface SignalsResponse {
   degraded: boolean
   degraded_reason?: string
   source_count: number
+  strategy_id?: StrategyId
+  strategy_version?: string
+  strategy_params?: Record<string, unknown>
+  strategy_params_hash?: string
 }
 
 export interface SimTradeOrder {
@@ -363,6 +380,8 @@ export interface BacktestRunRequest {
   trend_step: TrendPoolStep
   pool_roll_mode: BacktestPoolRollMode
   board_filters?: BoardFilter[]
+  strategy_id?: StrategyId
+  strategy_params?: Record<string, unknown>
   date_from: string
   date_to: string
   window_days: number
@@ -381,7 +400,15 @@ export interface BacktestRunRequest {
   prioritize_signals: boolean
   priority_mode: BacktestPriorityMode
   priority_topk_per_day: number
+  rank_weight_health?: number
+  rank_weight_event?: number
+  health_score_min?: number
+  event_score_min?: number
+  event_grade_min?: 'A' | 'B' | 'C'
+  matrix_event_semantic_version?: 'matrix_v1' | 'aligned_wyckoff_v2'
   enforce_t1: boolean
+  entry_delay_days?: number
+  delay_invalidation_enabled?: boolean
   max_symbols: number
   enable_advanced_analysis?: boolean
 }
@@ -395,6 +422,9 @@ export interface BacktestTrade {
   entry_signal: string
   entry_phase: string
   entry_quality_score: number
+  health_score?: number
+  event_score?: number
+  event_grade?: 'A' | 'B' | 'C'
   exit_reason: string
   quantity: number
   entry_price: number
@@ -424,6 +454,10 @@ export interface BacktestResponse {
   regime_breakdown?: BacktestRegimeBucket[]
   monte_carlo?: BacktestMonteCarloSummary | null
   walk_forward?: BacktestWalkForwardReport | null
+  strategy_id?: StrategyId
+  strategy_version?: string
+  strategy_params?: Record<string, unknown>
+  strategy_params_hash?: string
 }
 
 export interface BacktestRiskMetrics {
@@ -599,6 +633,91 @@ export interface BacktestPlateauTaskStatusResponse {
   result?: BacktestPlateauResponse | null
   error?: string | null
   error_code?: string | null
+}
+
+export interface StrategyCapabilities {
+  supports_matrix: boolean
+  supports_signal_age_filter: boolean
+  supports_entry_delay: boolean
+}
+
+export interface StrategyDescriptor {
+  strategy_id: StrategyId
+  name: string
+  version: string
+  enabled: boolean
+  is_default: boolean
+  capabilities: StrategyCapabilities
+  strategy_params_schema: Record<string, unknown>
+  strategy_params_defaults: Record<string, unknown>
+}
+
+export interface StrategyCatalogResponse {
+  items: StrategyDescriptor[]
+}
+
+export interface BacktestABVariantConfig {
+  label?: string
+  entry_delay_days?: number
+  health_score_min?: number
+  event_score_min?: number
+  event_grade_min?: 'A' | 'B' | 'C'
+  matrix_event_semantic_version?: 'matrix_v1' | 'aligned_wyckoff_v2'
+  rank_weight_health?: number
+  rank_weight_event?: number
+  strategy_id?: StrategyId
+  strategy_params?: Record<string, unknown>
+  enable_advanced_analysis?: boolean
+}
+
+export interface BacktestABExperimentRequest {
+  base_payload: BacktestRunRequest
+  variants?: BacktestABVariantConfig[]
+  auto_generate_default_matrix?: boolean
+  max_variants?: number
+}
+
+export interface BacktestABSignalBucket {
+  signal: string
+  trade_count: number
+  win_rate: number
+  avg_pnl_ratio: number
+  total_pnl_ratio: number
+  utad_exit_ratio: number
+}
+
+export interface BacktestABVariantResult {
+  variant_id: string
+  label: string
+  run_request: BacktestRunRequest
+  status: 'succeeded' | 'failed'
+  error?: string | null
+  stats?: ReviewStats | null
+  risk_metrics?: BacktestRiskMetrics | null
+  candidate_count: number
+  trade_count: number
+  utad_exit_ratio: number
+  max_consecutive_losses: number
+  signal_breakdown?: BacktestABSignalBucket[]
+}
+
+export interface BacktestABComparisonRow {
+  baseline_variant_id: string
+  variant_id: string
+  label: string
+  total_return_delta: number
+  win_rate_delta: number
+  max_drawdown_delta: number
+  utad_exit_ratio_delta: number
+  max_consecutive_losses_delta: number
+}
+
+export interface BacktestABExperimentResponse {
+  baseline_variant_id?: string | null
+  best_variant_id?: string | null
+  variants: BacktestABVariantResult[]
+  comparisons: BacktestABComparisonRow[]
+  notes: string[]
 }
 
 export interface BacktestReportManifestFile {

@@ -1,6 +1,6 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react'
 import dayjs, { Dayjs } from 'dayjs'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Alert,
   App as AntdApp,
@@ -31,19 +31,38 @@ import {
   cancelBacktestTask,
   deleteBacktestReport,
   getBacktestReport,
+  getStrategies,
   importBacktestReportPackage,
   listBacktestReports,
   pauseBacktestPlateauTask,
   pauseBacktestTask,
   resumeBacktestPlateauTask,
   resumeBacktestTask,
+  runBacktestABExperiment,
   startBacktestPlateauTask,
   startBacktestTask,
 } from '@/shared/api/endpoints'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { useBacktestPlateauTaskStore } from '@/state/backtestPlateauTaskStore'
 import { useBacktestTaskStore } from '@/state/backtestTaskStore'
+import {
+  buildStrategyParamsPayload,
+  deleteSharedStrategyPreset,
+  getSharedLastStrategyId,
+  getSharedStrategyParams,
+  listSharedStrategyPresets,
+  normalizeStrategyParams,
+  parseStrategyParamSchema,
+  resolveDefaultStrategyId,
+  saveSharedStrategyPreset,
+  setSharedStrategyParams,
+} from '@/shared/utils/strategyParams'
+import type { StrategyParamPreset, StrategyParamSpec } from '@/shared/utils/strategyParams'
 import type {
+  BacktestABComparisonRow,
+  BacktestABExperimentResponse,
+  BacktestABVariantConfig,
+  BacktestABVariantResult,
   BacktestPlateauCorrelationRow,
   BacktestPlateauPoint,
   BacktestPlateauResponse,
@@ -61,6 +80,7 @@ import type {
   BacktestWalkForwardReport,
   BoardFilter,
   SignalScanMode,
+  StrategyId,
   TrendPoolStep,
 } from '@/types/contracts'
 import { formatMoney, formatPct } from '@/shared/utils/format'
@@ -86,6 +106,8 @@ const TRADE_BACKTEST_DEFAULTS = {
   priorityMode: 'balanced' as BacktestPriorityMode,
   priorityTopK: 0,
   enforceT1: true,
+  entryDelayDays: 1,
+  delayInvalidationEnabled: true,
   maxSymbols: 120,
   enableAdvancedAnalysis: true,
   defaultLookbackDays: 180,
@@ -141,6 +163,8 @@ type BacktestFormDraft = {
   pool_roll_mode: BacktestPoolRollMode
   run_id: string
   board_filters: BoardFilter[]
+  strategy_id: StrategyId
+  strategy_params: Record<string, unknown>
   date_from: string
   date_to: string
   window_days: number
@@ -160,6 +184,8 @@ type BacktestFormDraft = {
   priority_mode: BacktestPriorityMode
   priority_topk_per_day: number
   enforce_t1: boolean
+  entry_delay_days: number
+  delay_invalidation_enabled: boolean
   max_symbols: number
   enable_advanced_analysis: boolean
   trades_page_size: number
@@ -867,6 +893,8 @@ function buildDefaultDraft(): BacktestFormDraft {
     pool_roll_mode: TRADE_BACKTEST_DEFAULTS.poolRollMode,
     run_id: '',
     board_filters: BACKTEST_DEFAULT_BOARD_FILTERS,
+    strategy_id: 'wyckoff_trend_v1',
+    strategy_params: {},
     date_from: dateFrom,
     date_to: dateTo,
     window_days: TRADE_BACKTEST_DEFAULTS.windowDays,
@@ -886,6 +914,8 @@ function buildDefaultDraft(): BacktestFormDraft {
     priority_mode: TRADE_BACKTEST_DEFAULTS.priorityMode,
     priority_topk_per_day: TRADE_BACKTEST_DEFAULTS.priorityTopK,
     enforce_t1: TRADE_BACKTEST_DEFAULTS.enforceT1,
+    entry_delay_days: TRADE_BACKTEST_DEFAULTS.entryDelayDays,
+    delay_invalidation_enabled: TRADE_BACKTEST_DEFAULTS.delayInvalidationEnabled,
     max_symbols: TRADE_BACKTEST_DEFAULTS.maxSymbols,
     enable_advanced_analysis: TRADE_BACKTEST_DEFAULTS.enableAdvancedAnalysis,
     trades_page_size: 25,
@@ -910,9 +940,17 @@ function loadBacktestDraft(): BacktestFormDraft {
     }
     const boardFilters = sanitizeBoardFilters(merged.board_filters)
     merged.board_filters = boardFilters.length > 0 ? boardFilters : defaults.board_filters
+    merged.strategy_id = merged.strategy_id === 'wyckoff_trend_v2' ? 'wyckoff_trend_v2' : 'wyckoff_trend_v1'
+    merged.strategy_params = normalizeStrategyParams(merged.strategy_params)
     if (!['daily', 'weekly', 'position'].includes(String(merged.pool_roll_mode))) {
       merged.pool_roll_mode = defaults.pool_roll_mode
     }
+    if (!Number.isFinite(merged.entry_delay_days)) {
+      merged.entry_delay_days = defaults.entry_delay_days
+    } else {
+      merged.entry_delay_days = Math.max(1, Math.min(5, Math.round(Number(merged.entry_delay_days))))
+    }
+    merged.delay_invalidation_enabled = merged.delay_invalidation_enabled !== false
     merged.enable_advanced_analysis = merged.enable_advanced_analysis !== false
     if (!Number.isFinite(merged.trades_page_size) || (merged.trades_page_size ?? 0) <= 0) {
       merged.trades_page_size = defaults.trades_page_size
@@ -1439,6 +1477,16 @@ export function BacktestPage() {
   const [poolRollMode, setPoolRollMode] = useState<BacktestPoolRollMode>(initialDraft.pool_roll_mode)
   const [runId, setRunId] = useState(initialDraft.run_id)
   const [boardFilters, setBoardFilters] = useState<BoardFilter[]>(initialDraft.board_filters)
+  const [strategyId, setStrategyId] = useState<StrategyId>(() => getSharedLastStrategyId(initialDraft.strategy_id))
+  const [strategyParams, setStrategyParams] = useState<Record<string, unknown>>(() => {
+    const seedStrategyId = getSharedLastStrategyId(initialDraft.strategy_id)
+    const draftParams = normalizeStrategyParams(initialDraft.strategy_params)
+    if (Object.keys(draftParams).length > 0) return draftParams
+    return getSharedStrategyParams(seedStrategyId)
+  })
+  const [strategyPresetName, setStrategyPresetName] = useState('')
+  const [strategyPresetId, setStrategyPresetId] = useState<string | null>(null)
+  const [strategyPresetRefreshTick, setStrategyPresetRefreshTick] = useState(0)
   const [range, setRange] = useState<[Dayjs, Dayjs]>([
     dayjs(initialDraft.date_from),
     dayjs(initialDraft.date_to),
@@ -1460,6 +1508,8 @@ export function BacktestPage() {
   const [priorityMode, setPriorityMode] = useState<BacktestPriorityMode>(initialDraft.priority_mode)
   const [priorityTopK, setPriorityTopK] = useState(initialDraft.priority_topk_per_day)
   const [enforceT1, setEnforceT1] = useState(initialDraft.enforce_t1)
+  const [entryDelayDays, setEntryDelayDays] = useState(initialDraft.entry_delay_days)
+  const [delayInvalidationEnabled, setDelayInvalidationEnabled] = useState(initialDraft.delay_invalidation_enabled)
   const [maxSymbols, setMaxSymbols] = useState(initialDraft.max_symbols)
   const [enableAdvancedAnalysis, setEnableAdvancedAnalysis] = useState(initialDraft.enable_advanced_analysis)
   const [plateauSamplingMode, setPlateauSamplingMode] = useState<'grid' | 'lhs'>(initialPlateauDraft.sampling_mode)
@@ -1492,6 +1542,11 @@ export function BacktestPage() {
   const [reportLibrary, setReportLibrary] = useState<BacktestReportSummary[]>([])
   const [reportLibraryLoading, setReportLibraryLoading] = useState(false)
   const [selectedReportId, setSelectedReportId] = useState<string | null>(null)
+  const [abAutoGenerateDefaults, setAbAutoGenerateDefaults] = useState(true)
+  const [abMaxVariants, setAbMaxVariants] = useState(16)
+  const [abCustomVariantsText, setAbCustomVariantsText] = useState('')
+  const [abResult, setAbResult] = useState<BacktestABExperimentResponse | null>(null)
+  const [abError, setAbError] = useState<string | null>(null)
   const importReportFileRef = useRef<HTMLInputElement | null>(null)
   const tasksById = useBacktestTaskStore((state) => state.tasksById)
   const payloadById = useBacktestTaskStore((state) => state.payloadById)
@@ -1554,6 +1609,76 @@ export function BacktestPage() {
   const plateauTaskProgress = plateauTaskStatus?.progress
   const plateauResult = plateauTaskStatus?.result ?? null
   const plateauTaskRunningCount = plateauActiveTaskIds.length
+  const strategyCatalogQuery = useQuery({
+    queryKey: ['strategy-catalog'],
+    queryFn: getStrategies,
+    staleTime: 5 * 60_000,
+  })
+  const strategyItems = strategyCatalogQuery.data?.items ?? []
+  const selectedStrategy = useMemo(
+    () => strategyItems.find((item) => item.strategy_id === strategyId) ?? null,
+    [strategyId, strategyItems],
+  )
+  const strategyParamsSchema = useMemo(
+    () => parseStrategyParamSchema(selectedStrategy?.strategy_params_schema ?? {}),
+    [selectedStrategy?.strategy_params_schema],
+  )
+  const strategyParamsDefaults = useMemo(
+    () => normalizeStrategyParams(selectedStrategy?.strategy_params_defaults),
+    [selectedStrategy?.strategy_params_defaults],
+  )
+  const strategyParamsPayload = useMemo(
+    () => buildStrategyParamsPayload({
+      schema: strategyParamsSchema,
+      params: strategyParams,
+      defaults: strategyParamsDefaults,
+      includeDefaults: true,
+    }),
+    [strategyParams, strategyParamsDefaults, strategyParamsSchema],
+  )
+
+  useEffect(() => {
+    if (strategyItems.length <= 0) return
+    const allIds = new Set(strategyItems.map((item) => item.strategy_id))
+    if (allIds.has(strategyId)) return
+    const defaultId = resolveDefaultStrategyId(strategyItems, 'wyckoff_trend_v1')
+    setStrategyId(defaultId)
+  }, [strategyId, strategyItems])
+
+  useEffect(() => {
+    if (!selectedStrategy) return
+    setStrategyParams((previous) => {
+      const normalizedPrevious = normalizeStrategyParams(previous)
+      const merged = {
+        ...strategyParamsDefaults,
+        ...normalizedPrevious,
+      }
+      const next = buildStrategyParamsPayload({
+        schema: strategyParamsSchema,
+        params: merged,
+        defaults: strategyParamsDefaults,
+        includeDefaults: true,
+      })
+      return JSON.stringify(next) === JSON.stringify(normalizedPrevious) ? previous : next
+    })
+  }, [selectedStrategy?.strategy_id, strategyParamsDefaults, strategyParamsSchema])
+
+  useEffect(() => {
+    setSharedStrategyParams(strategyId, strategyParamsPayload)
+  }, [strategyId, strategyParamsPayload])
+
+  const strategyParamEntries = useMemo<StrategyParamSpec[]>(
+    () => Object.values(strategyParamsSchema),
+    [strategyParamsSchema],
+  )
+  const strategyPresets = useMemo<StrategyParamPreset[]>(
+    () => listSharedStrategyPresets(strategyId),
+    [strategyId, strategyPresetRefreshTick],
+  )
+  const selectedStrategyPreset = useMemo(
+    () => strategyPresets.find((item) => item.id === strategyPresetId) ?? null,
+    [strategyPresetId, strategyPresets],
+  )
 
   function applyRunMeta(nextRunId: string, asOfDate?: string) {
     setMode('trend_pool')
@@ -1598,6 +1723,8 @@ export function BacktestPage() {
       pool_roll_mode: poolRollMode,
       run_id: runId,
       board_filters: boardFilters,
+      strategy_id: strategyId,
+      strategy_params: strategyParamsPayload,
       date_from: range[0].format('YYYY-MM-DD'),
       date_to: range[1].format('YYYY-MM-DD'),
       window_days: windowDays,
@@ -1617,6 +1744,8 @@ export function BacktestPage() {
       priority_mode: priorityMode,
       priority_topk_per_day: priorityTopK,
       enforce_t1: enforceT1,
+      entry_delay_days: entryDelayDays,
+      delay_invalidation_enabled: delayInvalidationEnabled,
       max_symbols: maxSymbols,
       enable_advanced_analysis: enableAdvancedAnalysis,
       trades_page_size: tradePageSize,
@@ -1628,6 +1757,8 @@ export function BacktestPage() {
     poolRollMode,
     runId,
     boardFilters,
+    strategyId,
+    strategyParamsPayload,
     range,
     windowDays,
     minScore,
@@ -1646,6 +1777,8 @@ export function BacktestPage() {
     priorityMode,
     priorityTopK,
     enforceT1,
+    entryDelayDays,
+    delayInvalidationEnabled,
     maxSymbols,
     enableAdvancedAnalysis,
     tradePageSize,
@@ -1677,6 +1810,20 @@ export function BacktestPage() {
     onError: (error) => {
       const text = formatApiError(error)
       setPlateauError(text)
+      message.error(text)
+    },
+  })
+
+  const runABExperimentMutation = useMutation({
+    mutationFn: runBacktestABExperiment,
+    onSuccess: (payload) => {
+      setAbResult(payload)
+      setAbError(null)
+      message.success(`A/B 实验完成：共 ${payload.variants.length} 个变体。`)
+    },
+    onError: (error) => {
+      const text = formatApiError(error)
+      setAbError(text)
       message.error(text)
     },
   })
@@ -2083,6 +2230,8 @@ export function BacktestPage() {
       trend_step: trendStep,
       pool_roll_mode: poolRollMode,
       board_filters: mode === 'trend_pool' ? effectiveBoardFilters : undefined,
+      strategy_id: strategyId,
+      strategy_params: strategyParamsPayload,
       date_from: range[0].format('YYYY-MM-DD'),
       date_to: range[1].format('YYYY-MM-DD'),
       window_days: windowDays,
@@ -2102,9 +2251,58 @@ export function BacktestPage() {
       priority_mode: priorityMode,
       priority_topk_per_day: priorityTopK,
       enforce_t1: enforceT1,
+      entry_delay_days: entryDelayDays,
+      delay_invalidation_enabled: delayInvalidationEnabled,
       max_symbols: maxSymbols,
       enable_advanced_analysis: enableAdvancedAnalysis,
     }
+  }
+
+  function updateStrategyParam(key: string, value: unknown) {
+    const normalizedKey = String(key || '').trim()
+    if (!normalizedKey) return
+    setStrategyParams((previous) => {
+      const next = { ...normalizeStrategyParams(previous) }
+      if (value === null || value === undefined || value === '') {
+        delete next[normalizedKey]
+      } else {
+        next[normalizedKey] = value
+      }
+      return next
+    })
+  }
+
+  function handleSaveStrategyPreset() {
+    const preset = saveSharedStrategyPreset({
+      strategyId,
+      name: strategyPresetName || `${strategyId}-${dayjs().format('MMDD-HHmm')}`,
+      params: strategyParamsPayload,
+    })
+    setStrategyPresetId(preset.id)
+    setStrategyPresetName(preset.name)
+    setStrategyPresetRefreshTick((value) => value + 1)
+    message.success(`已保存策略预设：${preset.name}`)
+  }
+
+  function handleApplyStrategyPreset() {
+    if (!selectedStrategyPreset) {
+      message.info('请先选择策略预设。')
+      return
+    }
+    setStrategyParams(normalizeStrategyParams(selectedStrategyPreset.strategy_params))
+    setRunError(null)
+    message.success(`已应用策略预设：${selectedStrategyPreset.name}`)
+  }
+
+  function handleDeleteStrategyPreset() {
+    if (!selectedStrategyPreset) {
+      message.info('请先选择策略预设。')
+      return
+    }
+    deleteSharedStrategyPreset(strategyId, selectedStrategyPreset.id)
+    setStrategyPresetId(null)
+    setStrategyPresetRefreshTick((value) => value + 1)
+    message.success(`已删除策略预设：${selectedStrategyPreset.name}`)
   }
 
   function handleRun() {
@@ -2126,6 +2324,51 @@ export function BacktestPage() {
     const payload = buildBacktestPayload(shouldApplyBoardFilters ? effectiveBoardFilters : undefined)
     setRunError(null)
     startTaskMutation.mutate(payload)
+  }
+
+  function parseABCustomVariants(text: string): BacktestABVariantConfig[] | null {
+    const raw = String(text || '').trim()
+    if (!raw) return []
+    try {
+      const parsed = JSON.parse(raw) as unknown
+      if (!Array.isArray(parsed)) {
+        message.warning('自定义 A/B 变体格式错误：请提供 JSON 数组。')
+        return null
+      }
+      return parsed as BacktestABVariantConfig[]
+    } catch {
+      message.warning('自定义 A/B 变体 JSON 解析失败，请检查格式。')
+      return null
+    }
+  }
+
+  function handleRunABExperiment() {
+    if (runABExperimentMutation.isPending) return
+    if (entryEvents.length === 0 || exitEvents.length === 0) {
+      message.warning('请至少选择一个入场事件和离场事件')
+      return
+    }
+    const cached = readScreenerRunMetaFromStorage()
+    const effectiveBoardFilters = cached?.boardFilters?.length ? cached.boardFilters : boardFilters
+    const shouldApplyBoardFilters = mode === 'trend_pool'
+    if (shouldApplyBoardFilters && effectiveBoardFilters.length === 0) {
+      message.warning('请至少选择一个板块后再运行 A/B')
+      return
+    }
+    if (cached?.boardFilters?.length) {
+      setBoardFilters(cached.boardFilters)
+    }
+
+    const customVariants = parseABCustomVariants(abCustomVariantsText)
+    if (customVariants === null) return
+    const payload = {
+      base_payload: buildBacktestPayload(shouldApplyBoardFilters ? effectiveBoardFilters : undefined),
+      variants: customVariants,
+      auto_generate_default_matrix: abAutoGenerateDefaults,
+      max_variants: Math.max(1, Math.min(64, Math.round(Number(abMaxVariants) || 16))),
+    }
+    setAbError(null)
+    runABExperimentMutation.mutate(payload)
   }
 
   function handleBindLatestRunId() {
@@ -3057,6 +3300,93 @@ export function BacktestPage() {
       })),
     }
   }, [taskProgress?.stage_timings])
+  const abVariantRows = abResult?.variants ?? []
+  const abComparisonRows = abResult?.comparisons ?? []
+  const abVariantColumns = useMemo<ColumnsType<BacktestABVariantResult>>(
+    () => [
+      { title: '变体ID', dataIndex: 'variant_id', width: 92 },
+      { title: '标签', dataIndex: 'label', width: 220 },
+      {
+        title: '状态',
+        dataIndex: 'status',
+        width: 96,
+        render: (value: BacktestABVariantResult['status']) =>
+          value === 'succeeded' ? <Tag color="success">成功</Tag> : <Tag color="error">失败</Tag>,
+      },
+      {
+        title: '总收益',
+        width: 110,
+        render: (_value, row) => (row.stats ? formatPct(row.stats.total_return) : '--'),
+      },
+      {
+        title: '胜率',
+        width: 100,
+        render: (_value, row) => (row.stats ? formatPct(row.stats.win_rate) : '--'),
+      },
+      {
+        title: '最大回撤',
+        width: 110,
+        render: (_value, row) => (row.stats ? formatPct(row.stats.max_drawdown) : '--'),
+      },
+      { title: '交易数', dataIndex: 'trade_count', width: 90 },
+      {
+        title: 'UTAD占比',
+        width: 108,
+        render: (_value, row) => formatPct(row.utad_exit_ratio),
+      },
+      { title: '最大连亏', dataIndex: 'max_consecutive_losses', width: 100 },
+      {
+        title: '按入场信号分组',
+        width: 260,
+        render: (_value, row) => {
+          const buckets = Array.isArray(row.signal_breakdown) ? row.signal_breakdown : []
+          if (buckets.length <= 0) return '--'
+          return buckets
+            .map((item) => `${item.signal}:${item.trade_count}笔/${formatPct(item.win_rate)}`)
+            .join(' | ')
+        },
+      },
+      {
+        title: '错误',
+        dataIndex: 'error',
+        width: 260,
+        ellipsis: true,
+      },
+    ],
+    [],
+  )
+  const abComparisonColumns = useMemo<ColumnsType<BacktestABComparisonRow>>(
+    () => [
+      { title: '变体ID', dataIndex: 'variant_id', width: 92 },
+      { title: '标签', dataIndex: 'label', width: 220 },
+      {
+        title: '收益Δ',
+        width: 100,
+        render: (_value, row) => formatPct(row.total_return_delta),
+      },
+      {
+        title: '胜率Δ',
+        width: 100,
+        render: (_value, row) => formatPct(row.win_rate_delta),
+      },
+      {
+        title: '回撤Δ',
+        width: 100,
+        render: (_value, row) => formatPct(row.max_drawdown_delta),
+      },
+      {
+        title: 'UTAD占比Δ',
+        width: 120,
+        render: (_value, row) => formatPct(row.utad_exit_ratio_delta),
+      },
+      {
+        title: '最大连亏Δ',
+        dataIndex: 'max_consecutive_losses_delta',
+        width: 110,
+      },
+    ],
+    [],
+  )
 
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
@@ -3124,6 +3454,145 @@ export function BacktestPage() {
               </div>
             </Space>
           </Col>
+          <Col xs={24} md={6}>
+            <Space orientation="vertical" style={{ width: '100%' }}>
+              <span>策略</span>
+              <Select
+                loading={strategyCatalogQuery.isLoading}
+                value={strategyId}
+                onChange={(value) => {
+                  const next = String(value) as StrategyId
+                  setStrategyId(next)
+                  setStrategyParams(getSharedStrategyParams(next))
+                  setStrategyPresetId(null)
+                }}
+                options={(strategyItems.length > 0
+                  ? strategyItems
+                  : [{ strategy_id: 'wyckoff_trend_v1', name: 'Wyckoff Trend V1', version: '1.0.0', enabled: true }])
+                  .map((item) => ({
+                    value: item.strategy_id,
+                    label: `${item.name} (${item.version})${item.enabled === false ? ' - disabled' : ''}`,
+                    disabled: item.enabled === false,
+                  }))}
+              />
+            </Space>
+          </Col>
+          <Col xs={24} md={18}>
+            <Alert
+              type="info"
+              showIcon
+              title={selectedStrategy ? `策略：${selectedStrategy.name}` : '策略信息'}
+              description={
+                selectedStrategy
+                  ? `id=${selectedStrategy.strategy_id}, version=${selectedStrategy.version}`
+                  : '未加载到策略目录，先按默认策略继续。'
+              }
+            />
+          </Col>
+
+          {strategyParamEntries.length > 0 ? (
+            <Col xs={24}>
+              <Card size="small" title="策略参数（Schema驱动）">
+                <Row gutter={[12, 12]}>
+                  {strategyParamEntries.map((spec) => {
+                    const value = strategyParamsPayload[spec.key]
+                    if (spec.type === 'boolean') {
+                      return (
+                        <Col xs={24} md={8} key={spec.key}>
+                          <Space orientation="vertical">
+                            <span>{spec.title}</span>
+                            <Switch
+                              checked={Boolean(value)}
+                              onChange={(checked) => updateStrategyParam(spec.key, checked)}
+                            />
+                          </Space>
+                        </Col>
+                      )
+                    }
+                    if (spec.type === 'enum') {
+                      return (
+                        <Col xs={24} md={8} key={spec.key}>
+                          <Space orientation="vertical" style={{ width: '100%' }}>
+                            <span>{spec.title}</span>
+                            <Select
+                              value={typeof value === 'string' ? value : undefined}
+                              options={spec.options.map((item) => ({ value: item, label: item }))}
+                              onChange={(next) => updateStrategyParam(spec.key, String(next))}
+                              allowClear
+                            />
+                          </Space>
+                        </Col>
+                      )
+                    }
+                    return (
+                      <Col xs={24} md={8} key={spec.key}>
+                        <Space orientation="vertical" style={{ width: '100%' }}>
+                          <span>{spec.title}</span>
+                          <InputNumber
+                            value={typeof value === 'number' ? value : undefined}
+                            min={typeof spec.minimum === 'number' ? spec.minimum : undefined}
+                            max={typeof spec.maximum === 'number' ? spec.maximum : undefined}
+                            step={spec.type === 'integer' ? 1 : 0.1}
+                            style={{ width: '100%' }}
+                            onChange={(next) => {
+                              if (next === null || next === undefined || Number.isNaN(Number(next))) {
+                                updateStrategyParam(spec.key, undefined)
+                                return
+                              }
+                              updateStrategyParam(spec.key, Number(next))
+                            }}
+                          />
+                        </Space>
+                      </Col>
+                    )
+                  })}
+                </Row>
+                <Row gutter={[12, 12]} style={{ marginTop: 8 }}>
+                  <Col xs={24} md={8}>
+                    <Space orientation="vertical" style={{ width: '100%' }}>
+                      <span>策略预设</span>
+                      <Select
+                        value={strategyPresetId ?? undefined}
+                        placeholder="选择预设"
+                        options={strategyPresets.map((item, index) => ({
+                          value: item.id,
+                          label: `预设#${index + 1} | ${item.name}`,
+                        }))}
+                        onChange={(value) => setStrategyPresetId(String(value))}
+                        allowClear
+                      />
+                    </Space>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Space orientation="vertical" style={{ width: '100%' }}>
+                      <span>预设名称</span>
+                      <Input
+                        value={strategyPresetName}
+                        onChange={(event) => setStrategyPresetName(event.target.value)}
+                        placeholder="输入预设名后保存"
+                      />
+                    </Space>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Space style={{ marginTop: 22 }} wrap>
+                      <Button size="small" onClick={handleSaveStrategyPreset}>保存预设</Button>
+                      <Button size="small" onClick={handleApplyStrategyPreset}>应用预设</Button>
+                      <Button size="small" danger onClick={handleDeleteStrategyPreset}>删除预设</Button>
+                    </Space>
+                  </Col>
+                </Row>
+                {selectedStrategyPreset ? (
+                  <Alert
+                    style={{ marginTop: 10 }}
+                    type="info"
+                    showIcon
+                    message={`当前预设：${selectedStrategyPreset.name}`}
+                    description={`保存时间：${selectedStrategyPreset.saved_at}`}
+                  />
+                ) : null}
+              </Card>
+            </Col>
+          ) : null}
 
           {mode === 'full_market' ? (
             <Col xs={24}>
@@ -3365,6 +3834,24 @@ export function BacktestPage() {
             </Space>
           </Col>
           <Col xs={24} md={6}>
+            <Space orientation="vertical" style={{ width: '100%' }}>
+              <span>延迟入场天数(交易日)</span>
+              <InputNumber
+                min={1}
+                max={5}
+                value={entryDelayDays}
+                onChange={(value) => setEntryDelayDays(Number(value || TRADE_BACKTEST_DEFAULTS.entryDelayDays))}
+                style={{ width: '100%' }}
+              />
+            </Space>
+          </Col>
+          <Col xs={24} md={6}>
+            <Space orientation="vertical">
+              <span>延迟窗口失效保护</span>
+              <Switch checked={delayInvalidationEnabled} onChange={setDelayInvalidationEnabled} />
+            </Space>
+          </Col>
+          <Col xs={24} md={6}>
             <Space orientation="vertical">
               <span>高级分析</span>
               <Switch checked={enableAdvancedAnalysis} onChange={setEnableAdvancedAnalysis} />
@@ -3471,6 +3958,87 @@ export function BacktestPage() {
             <Tag color={taskStatusColor(taskStatus.status)}>{taskStatusLabel(taskStatus.status)}</Tag>
           ) : null}
           {result ? <Tag color="green">{`${result.range.date_from} ~ ${result.range.date_to}`}</Tag> : null}
+        </Space>
+      </Card>
+
+      <Card title="A/B 实验（延迟/门控/语义）">
+        <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+          <Row gutter={[12, 12]}>
+            <Col xs={24} md={8}>
+              <Space orientation="vertical">
+                <span>自动生成默认变体</span>
+                <Switch checked={abAutoGenerateDefaults} onChange={setAbAutoGenerateDefaults} />
+              </Space>
+            </Col>
+            <Col xs={24} md={8}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>最大变体数</span>
+                <InputNumber
+                  min={1}
+                  max={64}
+                  value={abMaxVariants}
+                  style={{ width: '100%' }}
+                  onChange={(value) => setAbMaxVariants(Math.max(1, Math.min(64, Math.round(Number(value) || 16))))}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={8}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>动作</span>
+                <Button type="primary" ghost loading={runABExperimentMutation.isPending} onClick={handleRunABExperiment}>
+                  运行 A/B 实验
+                </Button>
+              </Space>
+            </Col>
+            <Col xs={24}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>自定义变体（可选 JSON 数组）</span>
+                <Input.TextArea
+                  rows={3}
+                  value={abCustomVariantsText}
+                  onChange={(event) => setAbCustomVariantsText(event.target.value)}
+                  placeholder='例如：[{"label":"delay_2","entry_delay_days":2},{"label":"v2_gate","strategy_id":"wyckoff_trend_v2"}]'
+                />
+              </Space>
+            </Col>
+          </Row>
+
+          {abError ? <Alert type="error" showIcon message={abError} /> : null}
+          {abResult ? (
+            <Space wrap>
+              <Tag color="geekblue">{`baseline=${abResult.baseline_variant_id || '-'}`}</Tag>
+              <Tag color="success">{`best=${abResult.best_variant_id || '-'}`}</Tag>
+              <Tag>{`variants=${abVariantRows.length}`}</Tag>
+            </Space>
+          ) : null}
+          {abResult?.notes?.length ? (
+            <Alert
+              type="info"
+              showIcon
+              message="实验说明"
+              description={abResult.notes.join(' ')}
+            />
+          ) : null}
+          {abVariantRows.length > 0 ? (
+            <Table
+              size="small"
+              rowKey={(row) => row.variant_id}
+              columns={abVariantColumns}
+              dataSource={abVariantRows}
+              pagination={{ pageSize: 8, showSizeChanger: false }}
+              scroll={{ x: 1200 }}
+            />
+          ) : null}
+          {abComparisonRows.length > 0 ? (
+            <Table
+              size="small"
+              rowKey={(row) => `${row.baseline_variant_id}-${row.variant_id}`}
+              columns={abComparisonColumns}
+              dataSource={abComparisonRows}
+              pagination={{ pageSize: 8, showSizeChanger: false }}
+              scroll={{ x: 920 }}
+            />
+          ) : null}
         </Space>
       </Card>
 
