@@ -96,7 +96,7 @@ const strategyCatalogStore: StrategyCatalogResponse = {
   items: [
     {
       strategy_id: 'wyckoff_trend_v1',
-      name: 'Wyckoff Trend V1',
+      name: '维科夫趋势V1',
       version: '1.0.0',
       enabled: true,
       is_default: true,
@@ -118,7 +118,7 @@ const strategyCatalogStore: StrategyCatalogResponse = {
     },
     {
       strategy_id: 'wyckoff_trend_v2',
-      name: 'Wyckoff Trend V2',
+      name: '维科夫趋势V2',
       version: '0.2.0',
       enabled: true,
       is_default: false,
@@ -144,7 +144,7 @@ const strategyCatalogStore: StrategyCatalogResponse = {
     },
     {
       strategy_id: 'relative_strength_breakout_v1',
-      name: 'Relative Strength Breakout V1',
+      name: '相对强弱突破V1',
       version: '1.0.0-alpha',
       enabled: true,
       is_default: false,

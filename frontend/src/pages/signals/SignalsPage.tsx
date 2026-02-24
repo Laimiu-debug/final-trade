@@ -17,7 +17,6 @@ import {
   Select,
   Space,
   Statistic,
-  Switch,
   Table,
   Tag,
   Typography,
@@ -28,20 +27,17 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import wyckoffCycleDiagram from '@/assets/wyckoff-cycle.svg'
 import { ApiError } from '@/shared/api/client'
 import { getLatestScreenerRun, getScreenerRun, getSignals, getStrategies } from '@/shared/api/endpoints'
+import { DismissibleAlert } from '@/shared/components/DismissibleAlert'
 import { PageHeader } from '@/shared/components/PageHeader'
 import {
   buildStrategyParamsPayload,
-  deleteSharedStrategyPreset,
   getSharedLastStrategyId,
   getSharedStrategyParams,
-  listSharedStrategyPresets,
   normalizeStrategyParams,
   parseStrategyParamSchema,
   resolveDefaultStrategyId,
-  saveSharedStrategyPreset,
   setSharedStrategyParams,
 } from '@/shared/utils/strategyParams'
-import type { StrategyParamPreset, StrategyParamSpec } from '@/shared/utils/strategyParams'
 import { upsertPendingBuyDraft } from '@/shared/utils/simPendingOrders'
 import { useUIStore } from '@/state/uiStore'
 import type {
@@ -463,9 +459,6 @@ export function SignalsPage() {
   const [requireSequence, setRequireSequence] = useState(initialRequireSequence)
   const [strategyId, setStrategyId] = useState<StrategyId>(initialStrategyId)
   const [strategyParams, setStrategyParams] = useState<Record<string, unknown>>(initialStrategyParams)
-  const [strategyPresetName, setStrategyPresetName] = useState('')
-  const [strategyPresetId, setStrategyPresetId] = useState<string | null>(null)
-  const [strategyPresetRefreshTick, setStrategyPresetRefreshTick] = useState(0)
   const [keyword, setKeyword] = useState('')
   const [signalFilter, setSignalFilter] = useState<'all' | SignalType>('all')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('active')
@@ -509,16 +502,14 @@ export function SignalsPage() {
     }),
     [strategyParams, strategyParamsDefaults, strategyParamsSchema],
   )
-  const strategyParamEntries = useMemo<StrategyParamSpec[]>(
-    () => Object.values(strategyParamsSchema),
-    [strategyParamsSchema],
-  )
 
   useEffect(() => {
     if (strategyItems.length <= 0) return
     const allIds = new Set(strategyItems.map((item) => item.strategy_id))
     if (allIds.has(strategyId)) return
-    setStrategyId(resolveDefaultStrategyId(strategyItems, 'wyckoff_trend_v1'))
+    const fallback = resolveDefaultStrategyId(strategyItems, 'wyckoff_trend_v1')
+    setStrategyId(fallback)
+    setStrategyParams(getSharedStrategyParams(fallback))
   }, [strategyId, strategyItems])
 
   useEffect(() => {
@@ -548,21 +539,6 @@ export function SignalsPage() {
   useEffect(() => {
     setSharedStrategyParams(strategyId, strategyParamsPayload)
   }, [strategyId, strategyParamsPayload])
-
-  const strategyPresets = useMemo<StrategyParamPreset[]>(
-    () => listSharedStrategyPresets(strategyId),
-    [strategyId, strategyPresetRefreshTick],
-  )
-  const selectedStrategyPreset = useMemo(
-    () => strategyPresets.find((item) => item.id === strategyPresetId) ?? null,
-    [strategyPresetId, strategyPresets],
-  )
-
-  useEffect(() => {
-    if (!strategyPresetId) return
-    if (strategyPresets.some((item) => item.id === strategyPresetId)) return
-    setStrategyPresetId(null)
-  }, [strategyPresetId, strategyPresets])
 
   useEffect(() => {
     try {
@@ -712,52 +688,6 @@ export function SignalsPage() {
     setSearchParams,
     windowDays,
   ])
-
-  function updateStrategyParam(key: string, value: unknown) {
-    const normalizedKey = String(key || '').trim()
-    if (!normalizedKey) return
-    setStrategyParams((previous) => {
-      const next = { ...normalizeStrategyParams(previous) }
-      if (value === null || value === undefined || value === '') {
-        delete next[normalizedKey]
-      } else {
-        next[normalizedKey] = value
-      }
-      return next
-    })
-  }
-
-  function handleSaveStrategyPreset() {
-    const preset = saveSharedStrategyPreset({
-      strategyId,
-      name: strategyPresetName || `${strategyId}-${dayjs().format('MMDD-HHmm')}`,
-      params: strategyParamsPayload,
-    })
-    setStrategyPresetId(preset.id)
-    setStrategyPresetName(preset.name)
-    setStrategyPresetRefreshTick((value) => value + 1)
-    message.success(`已保存策略预设：${preset.name}`)
-  }
-
-  function handleApplyStrategyPreset() {
-    if (!selectedStrategyPreset) {
-      message.info('请先选择策略预设。')
-      return
-    }
-    setStrategyParams(normalizeStrategyParams(selectedStrategyPreset.strategy_params))
-    message.success(`已应用策略预设：${selectedStrategyPreset.name}`)
-  }
-
-  function handleDeleteStrategyPreset() {
-    if (!selectedStrategyPreset) {
-      message.info('请先选择策略预设。')
-      return
-    }
-    deleteSharedStrategyPreset(strategyId, selectedStrategyPreset.id)
-    setStrategyPresetId(null)
-    setStrategyPresetRefreshTick((value) => value + 1)
-    message.success(`已删除策略预设：${selectedStrategyPreset.name}`)
-  }
 
   const runDetailQuery = useQuery({
     queryKey: ['screener-run', runId],
@@ -1556,24 +1486,26 @@ export function SignalsPage() {
                 loading={strategyCatalogQuery.isLoading}
                 value={strategyId}
                 onChange={(value) => {
-                  setStrategyId(String(value) as StrategyId)
-                  setStrategyParams({})
+                  const next = String(value) as StrategyId
+                  setStrategyId(next)
+                  setStrategyParams(getSharedStrategyParams(next))
                 }}
                 options={(strategyItems.length > 0
                   ? strategyItems
-                  : [{ strategy_id: 'wyckoff_trend_v1', name: 'Wyckoff Trend V1', version: '1.0.0', enabled: true }])
+                  : [{ strategy_id: 'wyckoff_trend_v1', name: '维科夫趋势V1', version: '1.0.0', enabled: true }])
                   .map((item) => ({
                     value: item.strategy_id,
-                    label: `${item.name} (${item.version})${item.enabled === false ? ' - disabled' : ''}`,
+                    label: `${item.name} (${item.version})${item.enabled === false ? ' - 已禁用' : ''}`,
                     disabled: item.enabled === false,
                   }))}
               />
             </Col>
             <Col xs={24} md={12} lg={16}>
-              <Alert
+              <DismissibleAlert
+                dismissKey="signals.strategy-info"
                 type="info"
                 showIcon
-                message={selectedStrategy ? `策略：${selectedStrategy.name}` : '策略信息'}
+                title={selectedStrategy ? `策略：${selectedStrategy.name}` : '策略信息'}
                 description={
                   selectedStrategy
                     ? `id=${selectedStrategy.strategy_id}, version=${selectedStrategy.version}, cap=matrix:${strategySupportsMatrix ? 1 : 0}|age:${strategySupportsSignalAgeFilter ? 1 : 0}|delay:${strategySupportsEntryDelay ? 1 : 0}`
@@ -1587,114 +1519,24 @@ export function SignalsPage() {
             <Alert
               type="warning"
               showIcon
-              message="当前策略不支持信号年龄过滤"
+              title="当前策略不支持信号年龄过滤"
               description="已自动忽略 signal_age_min / signal_age_max，并固定为默认值。"
             />
           ) : null}
-
-          {strategyParamEntries.length > 0 ? (
-            <Row gutter={[12, 12]}>
-              {strategyParamEntries.map((spec) => {
-                const value = strategyParamsPayload[spec.key]
-                if (spec.type === 'boolean') {
-                  return (
-                    <Col xs={24} md={12} lg={6} key={spec.key}>
-                      <Typography.Text type="secondary">{spec.title}</Typography.Text>
-                      <div style={{ marginTop: 8 }}>
-                        <Switch checked={Boolean(value)} onChange={(checked) => updateStrategyParam(spec.key, checked)} />
-                      </div>
-                    </Col>
-                  )
-                }
-                if (spec.type === 'enum') {
-                  return (
-                    <Col xs={24} md={12} lg={6} key={spec.key}>
-                      <Typography.Text type="secondary">{spec.title}</Typography.Text>
-                      <Select
-                        value={typeof value === 'string' ? value : undefined}
-                        options={spec.options.map((item) => ({ value: item, label: item }))}
-                        onChange={(next) => updateStrategyParam(spec.key, String(next))}
-                        allowClear
-                      />
-                    </Col>
-                  )
-                }
-                return (
-                  <Col xs={24} md={12} lg={6} key={spec.key}>
-                    <Typography.Text type="secondary">{spec.title}</Typography.Text>
-                    <InputNumber
-                      value={typeof value === 'number' ? value : undefined}
-                      min={typeof spec.minimum === 'number' ? spec.minimum : undefined}
-                      max={typeof spec.maximum === 'number' ? spec.maximum : undefined}
-                      step={spec.type === 'integer' ? 1 : 0.1}
-                      style={{ width: '100%' }}
-                      onChange={(next) => {
-                        if (next === null || next === undefined || Number.isNaN(Number(next))) {
-                          updateStrategyParam(spec.key, undefined)
-                          return
-                        }
-                        updateStrategyParam(spec.key, Number(next))
-                      }}
-                    />
-                  </Col>
-                )
-              })}
-            </Row>
-          ) : null}
-
-          <Row gutter={[12, 12]}>
-            <Col xs={24} md={8}>
-              <Space orientation="vertical" style={{ width: '100%' }}>
-                <Typography.Text type="secondary">策略预设</Typography.Text>
-                <Select
-                  value={strategyPresetId ?? undefined}
-                  placeholder="选择预设"
-                  options={strategyPresets.map((item, index) => ({
-                    value: item.id,
-                    label: `预设#${index + 1} | ${item.name}`,
-                  }))}
-                  onChange={(value) => {
-                    const nextId = String(value || '').trim()
-                    if (!nextId) {
-                      setStrategyPresetId(null)
-                      return
-                    }
-                    setStrategyPresetId(nextId)
-                    const matched = strategyPresets.find((item) => item.id === nextId)
-                    if (matched) {
-                      setStrategyPresetName(matched.name)
-                    }
-                  }}
-                  allowClear
-                />
+          <DismissibleAlert
+            dismissKey="signals.strategy-center-tip"
+            type="info"
+            showIcon
+            title="策略参数与预设已迁移到策略中心"
+            description={
+              <Space wrap size={8}>
+                <Typography.Text type="secondary">当前页面仅保留策略选择，参数统一在策略中心维护。</Typography.Text>
+                <Button type="link" size="small" onClick={() => navigate('/strategy')}>
+                  前往策略中心
+                </Button>
               </Space>
-            </Col>
-            <Col xs={24} md={8}>
-              <Space orientation="vertical" style={{ width: '100%' }}>
-                <Typography.Text type="secondary">预设名称</Typography.Text>
-                <Input
-                  value={strategyPresetName}
-                  onChange={(event) => setStrategyPresetName(event.target.value)}
-                  placeholder="输入预设名后保存"
-                />
-              </Space>
-            </Col>
-            <Col xs={24} md={8}>
-              <Space style={{ marginTop: 22 }} wrap>
-                <Button size="small" onClick={handleSaveStrategyPreset}>保存预设</Button>
-                <Button size="small" onClick={handleApplyStrategyPreset}>应用预设</Button>
-                <Button size="small" danger onClick={handleDeleteStrategyPreset}>删除预设</Button>
-              </Space>
-            </Col>
-          </Row>
-          {selectedStrategyPreset ? (
-            <Alert
-              type="info"
-              showIcon
-              message={`当前预设：${selectedStrategyPreset.name}`}
-              description={`保存时间：${selectedStrategyPreset.saved_at}`}
-            />
-          ) : null}
+            }
+          />
 
           {mode === 'trend_pool' ? (
             <Row gutter={[12, 12]}>

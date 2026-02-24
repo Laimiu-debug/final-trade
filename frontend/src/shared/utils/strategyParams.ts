@@ -12,6 +12,18 @@ export type StrategyParamSpec = {
   defaultValue?: unknown
 }
 
+const STRATEGY_ENUM_OPTION_LABELS: Record<string, Record<string, string>> = {
+  matrix_event_semantic_version: {
+    matrix_v1: '矩阵基础语义（matrix_v1）',
+    aligned_wyckoff_v2: '对齐威科夫V2语义（aligned_wyckoff_v2）',
+  },
+  event_grade_min: {
+    A: 'A级',
+    B: 'B级',
+    C: 'C级',
+  },
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -91,6 +103,17 @@ export function coerceStrategyParamValue(spec: StrategyParamSpec, raw: unknown):
   if (!value) return undefined
   if (spec.options.length <= 0) return value
   return spec.options.includes(value) ? value : undefined
+}
+
+export function resolveStrategyEnumOptionLabel(specKey: string, rawValue: unknown): string {
+  const key = String(specKey || '').trim()
+  const value = String(rawValue || '').trim()
+  if (!value) return ''
+  const mapByKey = STRATEGY_ENUM_OPTION_LABELS[key]
+  if (mapByKey && mapByKey[value]) {
+    return mapByKey[value]
+  }
+  return value
 }
 
 export function buildStrategyParamsPayload(options: {
@@ -247,6 +270,14 @@ export function setSharedStrategyParams(strategyId: StrategyId, params: Record<s
 export function getSharedLastStrategyId(fallback: StrategyId = 'wyckoff_trend_v1'): StrategyId {
   const state = loadStrategySharedState()
   return normalizeStrategyId(state.last_strategy_id, fallback)
+}
+
+export function setSharedLastStrategyId(strategyId: StrategyId): void {
+  const state = loadStrategySharedState()
+  saveStrategySharedState({
+    ...state,
+    last_strategy_id: normalizeStrategyId(strategyId),
+  })
 }
 
 export function listSharedStrategyPresets(strategyId: StrategyId): StrategyParamPreset[] {

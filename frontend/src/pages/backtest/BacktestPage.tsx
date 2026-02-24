@@ -42,22 +42,19 @@ import {
   startBacktestPlateauTask,
   startBacktestTask,
 } from '@/shared/api/endpoints'
+import { DismissibleAlert } from '@/shared/components/DismissibleAlert'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { useBacktestPlateauTaskStore } from '@/state/backtestPlateauTaskStore'
 import { useBacktestTaskStore } from '@/state/backtestTaskStore'
 import {
   buildStrategyParamsPayload,
-  deleteSharedStrategyPreset,
   getSharedLastStrategyId,
   getSharedStrategyParams,
-  listSharedStrategyPresets,
   normalizeStrategyParams,
   parseStrategyParamSchema,
   resolveDefaultStrategyId,
-  saveSharedStrategyPreset,
   setSharedStrategyParams,
 } from '@/shared/utils/strategyParams'
-import type { StrategyParamPreset, StrategyParamSpec } from '@/shared/utils/strategyParams'
 import type {
   BacktestABComparisonRow,
   BacktestABExperimentResponse,
@@ -1535,9 +1532,6 @@ export function BacktestPage() {
     if (Object.keys(draftParams).length > 0) return draftParams
     return getSharedStrategyParams(seedStrategyId)
   })
-  const [strategyPresetName, setStrategyPresetName] = useState('')
-  const [strategyPresetId, setStrategyPresetId] = useState<string | null>(null)
-  const [strategyPresetRefreshTick, setStrategyPresetRefreshTick] = useState(0)
   const [range, setRange] = useState<[Dayjs, Dayjs]>([
     dayjs(initialDraft.date_from),
     dayjs(initialDraft.date_to),
@@ -1697,6 +1691,7 @@ export function BacktestPage() {
     if (allIds.has(strategyId)) return
     const defaultId = resolveDefaultStrategyId(strategyItems, 'wyckoff_trend_v1')
     setStrategyId(defaultId)
+    setStrategyParams(getSharedStrategyParams(defaultId))
   }, [strategyId, strategyItems])
 
   useEffect(() => {
@@ -1726,19 +1721,6 @@ export function BacktestPage() {
   useEffect(() => {
     setSharedStrategyParams(strategyId, strategyParamsPayload)
   }, [strategyId, strategyParamsPayload])
-
-  const strategyParamEntries = useMemo<StrategyParamSpec[]>(
-    () => Object.values(strategyParamsSchema),
-    [strategyParamsSchema],
-  )
-  const strategyPresets = useMemo<StrategyParamPreset[]>(
-    () => listSharedStrategyPresets(strategyId),
-    [strategyId, strategyPresetRefreshTick],
-  )
-  const selectedStrategyPreset = useMemo(
-    () => strategyPresets.find((item) => item.id === strategyPresetId) ?? null,
-    [strategyPresetId, strategyPresets],
-  )
 
   function applyRunMeta(nextRunId: string, asOfDate?: string) {
     setMode('trend_pool')
@@ -2316,53 +2298,6 @@ export function BacktestPage() {
       max_symbols: maxSymbols,
       enable_advanced_analysis: enableAdvancedAnalysis,
     }
-  }
-
-  function updateStrategyParam(key: string, value: unknown) {
-    const normalizedKey = String(key || '').trim()
-    if (!normalizedKey) return
-    setStrategyParams((previous) => {
-      const next = { ...normalizeStrategyParams(previous) }
-      if (value === null || value === undefined || value === '') {
-        delete next[normalizedKey]
-      } else {
-        next[normalizedKey] = value
-      }
-      return next
-    })
-  }
-
-  function handleSaveStrategyPreset() {
-    const preset = saveSharedStrategyPreset({
-      strategyId,
-      name: strategyPresetName || `${strategyId}-${dayjs().format('MMDD-HHmm')}`,
-      params: strategyParamsPayload,
-    })
-    setStrategyPresetId(preset.id)
-    setStrategyPresetName(preset.name)
-    setStrategyPresetRefreshTick((value) => value + 1)
-    message.success(`已保存策略预设：${preset.name}`)
-  }
-
-  function handleApplyStrategyPreset() {
-    if (!selectedStrategyPreset) {
-      message.info('请先选择策略预设。')
-      return
-    }
-    setStrategyParams(normalizeStrategyParams(selectedStrategyPreset.strategy_params))
-    setRunError(null)
-    message.success(`已应用策略预设：${selectedStrategyPreset.name}`)
-  }
-
-  function handleDeleteStrategyPreset() {
-    if (!selectedStrategyPreset) {
-      message.info('请先选择策略预设。')
-      return
-    }
-    deleteSharedStrategyPreset(strategyId, selectedStrategyPreset.id)
-    setStrategyPresetId(null)
-    setStrategyPresetRefreshTick((value) => value + 1)
-    message.success(`已删除策略预设：${selectedStrategyPreset.name}`)
   }
 
   function handleRun() {
@@ -3544,21 +3479,21 @@ export function BacktestPage() {
                   const next = String(value) as StrategyId
                   setStrategyId(next)
                   setStrategyParams(getSharedStrategyParams(next))
-                  setStrategyPresetId(null)
                 }}
                 options={(strategyItems.length > 0
                   ? strategyItems
-                  : [{ strategy_id: 'wyckoff_trend_v1', name: 'Wyckoff Trend V1', version: '1.0.0', enabled: true }])
+                  : [{ strategy_id: 'wyckoff_trend_v1', name: '维科夫趋势V1', version: '1.0.0', enabled: true }])
                   .map((item) => ({
                     value: item.strategy_id,
-                    label: `${item.name} (${item.version})${item.enabled === false ? ' - disabled' : ''}`,
+                    label: `${item.name} (${item.version})${item.enabled === false ? ' - 已禁用' : ''}`,
                     disabled: item.enabled === false,
                   }))}
               />
             </Space>
           </Col>
           <Col xs={24} md={18}>
-            <Alert
+            <DismissibleAlert
+              dismissKey="backtest.strategy-info"
               type="info"
               showIcon
               title={selectedStrategy ? `策略：${selectedStrategy.name}` : '策略信息'}
@@ -3572,7 +3507,8 @@ export function BacktestPage() {
 
           {!strategySupportsEntryDelay ? (
             <Col xs={24}>
-              <Alert
+              <DismissibleAlert
+                dismissKey="backtest.unsupported-entry-delay-tip"
                 type="warning"
                 showIcon
                 title="当前策略不支持延迟入场"
@@ -3581,113 +3517,25 @@ export function BacktestPage() {
             </Col>
           ) : null}
 
-          {strategyParamEntries.length > 0 ? (
-            <Col xs={24}>
-              <Card size="small" title="策略参数（Schema驱动）">
-                <Row gutter={[12, 12]}>
-                  {strategyParamEntries.map((spec) => {
-                    const value = strategyParamsPayload[spec.key]
-                    if (spec.type === 'boolean') {
-                      return (
-                        <Col xs={24} md={8} key={spec.key}>
-                          <Space orientation="vertical">
-                            <span>{spec.title}</span>
-                            <Switch
-                              checked={Boolean(value)}
-                              onChange={(checked) => updateStrategyParam(spec.key, checked)}
-                            />
-                          </Space>
-                        </Col>
-                      )
-                    }
-                    if (spec.type === 'enum') {
-                      return (
-                        <Col xs={24} md={8} key={spec.key}>
-                          <Space orientation="vertical" style={{ width: '100%' }}>
-                            <span>{spec.title}</span>
-                            <Select
-                              value={typeof value === 'string' ? value : undefined}
-                              options={spec.options.map((item) => ({ value: item, label: item }))}
-                              onChange={(next) => updateStrategyParam(spec.key, String(next))}
-                              allowClear
-                            />
-                          </Space>
-                        </Col>
-                      )
-                    }
-                    return (
-                      <Col xs={24} md={8} key={spec.key}>
-                        <Space orientation="vertical" style={{ width: '100%' }}>
-                          <span>{spec.title}</span>
-                          <InputNumber
-                            value={typeof value === 'number' ? value : undefined}
-                            min={typeof spec.minimum === 'number' ? spec.minimum : undefined}
-                            max={typeof spec.maximum === 'number' ? spec.maximum : undefined}
-                            step={spec.type === 'integer' ? 1 : 0.1}
-                            style={{ width: '100%' }}
-                            onChange={(next) => {
-                              if (next === null || next === undefined || Number.isNaN(Number(next))) {
-                                updateStrategyParam(spec.key, undefined)
-                                return
-                              }
-                              updateStrategyParam(spec.key, Number(next))
-                            }}
-                          />
-                        </Space>
-                      </Col>
-                    )
-                  })}
-                </Row>
-                <Row gutter={[12, 12]} style={{ marginTop: 8 }}>
-                  <Col xs={24} md={8}>
-                    <Space orientation="vertical" style={{ width: '100%' }}>
-                      <span>策略预设</span>
-                      <Select
-                        value={strategyPresetId ?? undefined}
-                        placeholder="选择预设"
-                        options={strategyPresets.map((item, index) => ({
-                          value: item.id,
-                          label: `预设#${index + 1} | ${item.name}`,
-                        }))}
-                        onChange={(value) => setStrategyPresetId(String(value))}
-                        allowClear
-                      />
-                    </Space>
-                  </Col>
-                  <Col xs={24} md={8}>
-                    <Space orientation="vertical" style={{ width: '100%' }}>
-                      <span>预设名称</span>
-                      <Input
-                        value={strategyPresetName}
-                        onChange={(event) => setStrategyPresetName(event.target.value)}
-                        placeholder="输入预设名后保存"
-                      />
-                    </Space>
-                  </Col>
-                  <Col xs={24} md={8}>
-                    <Space style={{ marginTop: 22 }} wrap>
-                      <Button size="small" onClick={handleSaveStrategyPreset}>保存预设</Button>
-                      <Button size="small" onClick={handleApplyStrategyPreset}>应用预设</Button>
-                      <Button size="small" danger onClick={handleDeleteStrategyPreset}>删除预设</Button>
-                    </Space>
-                  </Col>
-                </Row>
-                {selectedStrategyPreset ? (
-                  <Alert
-                    style={{ marginTop: 10 }}
-                    type="info"
-                    showIcon
-                    message={`当前预设：${selectedStrategyPreset.name}`}
-                    description={`保存时间：${selectedStrategyPreset.saved_at}`}
-                  />
-                ) : null}
-              </Card>
-            </Col>
-          ) : null}
+          <Col xs={24}>
+            <DismissibleAlert
+              dismissKey="backtest.strategy-center-tip"
+              type="info"
+              showIcon
+              title="策略参数与预设已迁移到策略中心"
+              description={
+                <Space wrap size={8}>
+                  <span>当前页面仅保留策略选择，参数统一在策略中心维护。</span>
+                  <Link to="/strategy">前往策略中心</Link>
+                </Space>
+              }
+            />
+          </Col>
 
           {mode === 'full_market' ? (
             <Col xs={24}>
-              <Alert
+              <DismissibleAlert
+                dismissKey={`backtest.full-market-roll-mode.${poolRollMode}`}
                 type="warning"
                 showIcon
                 title={
@@ -3708,7 +3556,8 @@ export function BacktestPage() {
 
           {mode === 'trend_pool' ? (
             <Col xs={24}>
-              <Alert
+              <DismissibleAlert
+                dismissKey={`backtest.trend-pool-roll-mode.${poolRollMode}`}
                 type={poolRollMode === 'position' ? 'info' : 'warning'}
                 showIcon
                 title={
@@ -4099,7 +3948,7 @@ export function BacktestPage() {
             </Col>
           </Row>
 
-          {abError ? <Alert type="error" showIcon message={abError} /> : null}
+          {abError ? <Alert type="error" showIcon title={abError} /> : null}
           {abResult ? (
             <Space wrap>
               <Tag color="geekblue">{`baseline=${abResult.baseline_variant_id || '-'}`}</Tag>
@@ -4111,7 +3960,7 @@ export function BacktestPage() {
             <Alert
               type="info"
               showIcon
-              message="实验说明"
+              title="实验说明"
               description={abResult.notes.join(' ')}
             />
           ) : null}

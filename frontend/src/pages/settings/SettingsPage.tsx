@@ -30,6 +30,7 @@ import {
   testAIProvider,
   updateConfig,
 } from '@/shared/api/endpoints'
+import { resetAllDismissedAlerts } from '@/shared/components/DismissibleAlert'
 import { PageHeader } from '@/shared/components/PageHeader'
 import type { AppConfig, Market } from '@/types/contracts'
 
@@ -414,6 +415,15 @@ export function SettingsPage() {
     })
   }
 
+  function handleResetDismissedAlerts() {
+    const removedCount = resetAllDismissedAlerts()
+    if (removedCount > 0) {
+      message.success(`已恢复 ${removedCount} 条提示`)
+      return
+    }
+    message.info('当前没有已关闭的提示条')
+  }
+
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
       <PageHeader title="系统设置" subtitle="支持自定义 AI Provider 与信息源，满足多来源接入。" />
@@ -731,9 +741,15 @@ export function SettingsPage() {
                   style={{ marginTop: 8 }}
                   type="warning"
                   showIcon
-                  message={wyckoffBackfillMutation.data?.warnings.join('；')}
+                  title={wyckoffBackfillMutation.data?.warnings.join('；')}
                 />
               ) : null}
+              <Space wrap style={{ marginTop: 8 }}>
+                <Button onClick={handleResetDismissedAlerts}>恢复已关闭提示条</Button>
+                <Typography.Text type="secondary">
+                  用于恢复选股漏斗、待买信号、回测、策略中心顶部信息提示。
+                </Typography.Text>
+              </Space>
             </Col>
           </Row>
 

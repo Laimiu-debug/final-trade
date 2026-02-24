@@ -1,5 +1,5 @@
 ﻿import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import dayjs from 'dayjs'
 import {
   App as AntdApp,
@@ -15,6 +15,7 @@ import {
   Popover,
   Radio,
   Row,
+  Select,
   Space,
   Statistic,
   Table,
@@ -32,8 +33,14 @@ import { jsPDF } from 'jspdf'
 import autoTable from 'jspdf-autotable'
 import * as XLSX from 'xlsx'
 import { PageHeader } from '@/shared/components/PageHeader'
+import { DismissibleAlert } from '@/shared/components/DismissibleAlert'
 import { ApiError } from '@/shared/api/client'
-import { getScreenerRun, runScreener, syncMarketData } from '@/shared/api/endpoints'
+import { getScreenerRun, getStrategies, runScreener, syncMarketData } from '@/shared/api/endpoints'
+import {
+  getSharedLastStrategyId,
+  resolveDefaultStrategyId,
+  setSharedLastStrategyId,
+} from '@/shared/utils/strategyParams'
 import { useUIStore } from '@/state/uiStore'
 import { upsertPendingBuyDraft } from '@/shared/utils/simPendingOrders'
 import type {
@@ -41,6 +48,7 @@ import type {
   ScreenerPoolKey,
   ScreenerResult,
   ScreenerStepPools,
+  StrategyId,
   ThemeStage,
   TrendClass,
 } from '@/types/contracts'
@@ -897,6 +905,18 @@ export function ScreenerPage() {
   const [inputPoolKey, setInputPoolKey] = useState(initialCache.input_pool_key ?? '')
   const [rawInputPool, setRawInputPool] = useState<ScreenerResult[]>(initialCache.raw_input_pool ?? [])
   const [quickSearchKeyword, setQuickSearchKeyword] = useState('')
+  const [strategyId, setStrategyId] = useState<StrategyId>(() => getSharedLastStrategyId('wyckoff_trend_v1'))
+
+  const strategyCatalogQuery = useQuery({
+    queryKey: ['strategy-catalog'],
+    queryFn: getStrategies,
+    staleTime: 5 * 60_000,
+  })
+  const strategyItems = strategyCatalogQuery.data?.items ?? []
+  const selectedStrategy = useMemo(
+    () => strategyItems.find((item) => item.strategy_id === strategyId) ?? null,
+    [strategyId, strategyItems],
+  )
 
   const { control, handleSubmit, getValues, setValue, trigger } = useForm<FormValues>({
     resolver: zodResolver(formSchema),
@@ -961,6 +981,17 @@ export function ScreenerPage() {
   )
   const latestCacheSnapshotRef = useRef<ScreenerCachePayload>(cacheSnapshot)
   const recoveredFromRunRef = useRef(false)
+
+  useEffect(() => {
+    if (strategyItems.length <= 0) return
+    const allIds = new Set(strategyItems.map((item) => item.strategy_id))
+    if (allIds.has(strategyId)) return
+    setStrategyId(resolveDefaultStrategyId(strategyItems, 'wyckoff_trend_v1'))
+  }, [strategyId, strategyItems])
+
+  useEffect(() => {
+    setSharedLastStrategyId(strategyId)
+  }, [strategyId])
 
   useEffect(() => {
     latestCacheSnapshotRef.current = cacheSnapshot
@@ -2327,6 +2358,45 @@ export function ScreenerPage() {
                     </Space>
                   )
                 }}
+              />
+            </Col>
+          </Row>
+
+          <Row gutter={[12, 12]}>
+            <Col xs={24} md={8}>
+              <Space orientation="vertical" size={4} style={{ width: '100%' }}>
+                <Typography.Text type="secondary">策略</Typography.Text>
+                <Select
+                  loading={strategyCatalogQuery.isLoading}
+                  value={strategyId}
+                  onChange={(value) => setStrategyId(String(value) as StrategyId)}
+                  options={(strategyItems.length > 0
+                    ? strategyItems
+                    : [{ strategy_id: 'wyckoff_trend_v1', name: '维科夫趋势V1', version: '1.0.0', enabled: true }])
+                    .map((item) => ({
+                      value: item.strategy_id,
+                      label: `${item.name} (${item.version})${item.enabled === false ? ' - 已禁用' : ''}`,
+                      disabled: item.enabled === false,
+                    }))}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={16}>
+              <DismissibleAlert
+                dismissKey="screener.strategy-info"
+                type="info"
+                showIcon
+                title={selectedStrategy ? `当前策略：${selectedStrategy.name}` : '策略信息'}
+                description={
+                  <Space wrap size={8}>
+                    <Typography.Text type="secondary">
+                      选股漏斗页仅选择策略，策略参数请在策略中心统一维护。
+                    </Typography.Text>
+                    <Button type="link" size="small" onClick={() => navigate('/strategy')}>
+                      前往策略中心
+                    </Button>
+                  </Space>
+                }
               />
             </Col>
           </Row>
