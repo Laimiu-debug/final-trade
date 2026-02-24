@@ -421,11 +421,21 @@ export function SignalsPage() {
   const initialSignalAgeMax = Number.isFinite(parsedInitialSignalAgeMax)
     ? Math.max(initialSignalAgeMin, Math.min(240, Math.round(parsedInitialSignalAgeMax)))
     : null
+  const initialCostCenterMinRaw = (searchParams.get('cost_center_min') ?? '').trim()
+  const parsedInitialCostCenterMin = Number(initialCostCenterMinRaw)
+  const initialCostCenterMin = initialCostCenterMinRaw && Number.isFinite(parsedInitialCostCenterMin)
+    ? Math.max(0, Math.min(100, parsedInitialCostCenterMin))
+    : null
+  const initialWeeklyContextMinRaw = (searchParams.get('weekly_context_min') ?? '').trim()
+  const parsedInitialWeeklyContextMin = Number(initialWeeklyContextMinRaw)
+  const initialWeeklyContextMin = initialWeeklyContextMinRaw && Number.isFinite(parsedInitialWeeklyContextMin)
+    ? Math.max(0, Math.min(100, parsedInitialWeeklyContextMin))
+    : null
   const initialRequireSequence =
     (searchParams.get('require_sequence') ?? searchParams.get('signal_require_sequence')) === 'true'
   const strategyIdFromQuery = (searchParams.get('strategy_id') ?? '').trim()
   const initialStrategyId: StrategyId = strategyIdFromQuery
-    ? (strategyIdFromQuery === 'wyckoff_trend_v2' ? 'wyckoff_trend_v2' : 'wyckoff_trend_v1')
+    ? strategyIdFromQuery
     : getSharedLastStrategyId('wyckoff_trend_v1')
   const initialStrategyParams = (() => {
     const raw = (searchParams.get('strategy_params') ?? '').trim()
@@ -448,6 +458,8 @@ export function SignalsPage() {
   const [minEventCount, setMinEventCount] = useState(initialMinEventCount)
   const [signalAgeMin, setSignalAgeMin] = useState(initialSignalAgeMin)
   const [signalAgeMax, setSignalAgeMax] = useState<number | null>(initialSignalAgeMax)
+  const [costCenterMin, setCostCenterMin] = useState<number | null>(initialCostCenterMin)
+  const [weeklyContextMin, setWeeklyContextMin] = useState<number | null>(initialWeeklyContextMin)
   const [requireSequence, setRequireSequence] = useState(initialRequireSequence)
   const [strategyId, setStrategyId] = useState<StrategyId>(initialStrategyId)
   const [strategyParams, setStrategyParams] = useState<Record<string, unknown>>(initialStrategyParams)
@@ -477,6 +489,9 @@ export function SignalsPage() {
     () => strategyItems.find((item) => item.strategy_id === strategyId) ?? null,
     [strategyId, strategyItems],
   )
+  const strategySupportsMatrix = selectedStrategy?.capabilities?.supports_matrix !== false
+  const strategySupportsSignalAgeFilter = selectedStrategy?.capabilities?.supports_signal_age_filter !== false
+  const strategySupportsEntryDelay = selectedStrategy?.capabilities?.supports_entry_delay !== false
   const strategyParamsSchema = useMemo(
     () => parseStrategyParamSchema(selectedStrategy?.strategy_params_schema ?? {}),
     [selectedStrategy?.strategy_params_schema],
@@ -523,6 +538,12 @@ export function SignalsPage() {
       return JSON.stringify(next) === JSON.stringify(normalizedPrevious) ? previous : next
     })
   }, [selectedStrategy?.strategy_id, strategyParamsDefaults, strategyParamsSchema])
+
+  useEffect(() => {
+    if (strategySupportsSignalAgeFilter) return
+    setSignalAgeMin((previous) => (previous === 0 ? previous : 0))
+    setSignalAgeMax((previous) => (previous === null ? previous : null))
+  }, [strategySupportsSignalAgeFilter])
 
   useEffect(() => {
     setSharedStrategyParams(strategyId, strategyParamsPayload)
@@ -649,6 +670,16 @@ export function SignalsPage() {
     } else {
       next.delete('signal_age_max')
     }
+    if (costCenterMin !== null) {
+      next.set('cost_center_min', String(Math.max(0, Math.min(100, costCenterMin))))
+    } else {
+      next.delete('cost_center_min')
+    }
+    if (weeklyContextMin !== null) {
+      next.set('weekly_context_min', String(Math.max(0, Math.min(100, weeklyContextMin))))
+    } else {
+      next.delete('weekly_context_min')
+    }
     next.set('require_sequence', String(requireSequence))
 
     const normalizedAsOfDate = asOfDate.trim()
@@ -667,6 +698,8 @@ export function SignalsPage() {
     minScore,
     signalAgeMax,
     signalAgeMin,
+    costCenterMin,
+    weeklyContextMin,
     mode,
     marketFilters,
     boardFilters,
@@ -921,6 +954,12 @@ export function SignalsPage() {
       if (statusFilter === 'expired' && row.days_to_expire >= 0) {
         return false
       }
+      if (costCenterMin !== null && Number(row.cost_center_shift_score ?? 0) < costCenterMin) {
+        return false
+      }
+      if (weeklyContextMin !== null && Number(row.weekly_context_score ?? 0) < weeklyContextMin) {
+        return false
+      }
       if (!normalizedKeyword) {
         return true
       }
@@ -935,7 +974,7 @@ export function SignalsPage() {
         .toLowerCase()
       return haystack.includes(normalizedKeyword)
     })
-  }, [allRows, keyword, signalFilter, statusFilter])
+  }, [allRows, keyword, signalFilter, statusFilter, costCenterMin, weeklyContextMin])
 
   useEffect(() => {
     const maxPage = Math.max(1, Math.ceil(filteredRows.length / tablePageSize))
@@ -1006,6 +1045,30 @@ export function SignalsPage() {
         render: (_, row) => row.quality_score.toFixed(1),
       },
       {
+        title: '筹码分',
+        key: 'cost_center_shift_score',
+        width: 94,
+        sorter: (a, b) =>
+          Number(a.cost_center_shift_score ?? 0) - Number(b.cost_center_shift_score ?? 0),
+        render: (_, row) => Number(row.cost_center_shift_score ?? 0).toFixed(1),
+      },
+      {
+        title: '周线分',
+        key: 'weekly_context_score',
+        width: 94,
+        sorter: (a, b) =>
+          Number(a.weekly_context_score ?? 0) - Number(b.weekly_context_score ?? 0),
+        render: (_, row) => Number(row.weekly_context_score ?? 0).toFixed(1),
+      },
+      {
+        title: '周乘数',
+        key: 'weekly_context_multiplier',
+        width: 90,
+        sorter: (a, b) =>
+          Number(a.weekly_context_multiplier ?? 1) - Number(b.weekly_context_multiplier ?? 1),
+        render: (_, row) => Number(row.weekly_context_multiplier ?? 1).toFixed(3),
+      },
+      {
         title: '事件数',
         key: 'event_count',
         width: 88,
@@ -1071,6 +1134,12 @@ export function SignalsPage() {
                 }
                 if (signalAgeMax !== null) {
                   params.set('signal_age_max', String(Math.max(signalAgeMin, signalAgeMax)))
+                }
+                if (costCenterMin !== null) {
+                  params.set('signal_cost_center_min', String(Math.max(0, Math.min(100, costCenterMin))))
+                }
+                if (weeklyContextMin !== null) {
+                  params.set('signal_weekly_context_min', String(Math.max(0, Math.min(100, weeklyContextMin))))
                 }
                 const signalAsOfDate = (signalQuery.data?.as_of_date ?? asOfDate).trim()
                 if (signalAsOfDate) {
@@ -1138,6 +1207,8 @@ export function SignalsPage() {
       minScore,
       signalAgeMax,
       signalAgeMin,
+      costCenterMin,
+      weeklyContextMin,
       mode,
       marketFilters,
       navigate,
@@ -1185,6 +1256,9 @@ export function SignalsPage() {
         <Tag>结构评分 {Number(row.structure_score ?? 0).toFixed(1)}</Tag>
         <Tag>趋势评分 {Number(row.trend_score ?? 0).toFixed(1)}</Tag>
         <Tag>波动评分 {Number(row.volatility_score ?? 0).toFixed(1)}</Tag>
+        <Tag>筹码分 {Number(row.cost_center_shift_score ?? 0).toFixed(1)}</Tag>
+        <Tag>周线分 {Number(row.weekly_context_score ?? 0).toFixed(1)}</Tag>
+        <Tag>周乘数 {Number(row.weekly_context_multiplier ?? 1).toFixed(3)}</Tag>
       </Space>
     </Space>
   )
@@ -1195,6 +1269,7 @@ export function SignalsPage() {
   }
 
   const errorMessage = trendPoolReady && signalQuery.error ? formatSignalError(signalQuery.error) : ''
+  const signalNotes = Array.isArray(signalQuery.data?.notes) ? signalQuery.data.notes : []
 
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
@@ -1219,6 +1294,21 @@ export function SignalsPage() {
           showIcon
           title="当前结果处于降级模式"
           description={signalQuery.data.degraded_reason ?? '数据源部分不可用，已使用降级结果。'}
+        />
+      ) : null}
+
+      {signalNotes.length > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          title="策略能力提示"
+          description={(
+            <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+              {signalNotes.map((note, idx) => (
+                <li key={`${idx}-${note}`}>{note}</li>
+              ))}
+            </ul>
+          )}
         />
       ) : null}
 
@@ -1486,12 +1576,21 @@ export function SignalsPage() {
                 message={selectedStrategy ? `策略：${selectedStrategy.name}` : '策略信息'}
                 description={
                   selectedStrategy
-                    ? `id=${selectedStrategy.strategy_id}, version=${selectedStrategy.version}`
+                    ? `id=${selectedStrategy.strategy_id}, version=${selectedStrategy.version}, cap=matrix:${strategySupportsMatrix ? 1 : 0}|age:${strategySupportsSignalAgeFilter ? 1 : 0}|delay:${strategySupportsEntryDelay ? 1 : 0}`
                     : '未加载到策略目录，先按默认策略继续。'
                 }
               />
             </Col>
           </Row>
+
+          {!strategySupportsSignalAgeFilter ? (
+            <Alert
+              type="warning"
+              showIcon
+              message="当前策略不支持信号年龄过滤"
+              description="已自动忽略 signal_age_min / signal_age_max，并固定为默认值。"
+            />
+          ) : null}
 
           {strategyParamEntries.length > 0 ? (
             <Row gutter={[12, 12]}>
@@ -1702,8 +1801,10 @@ export function SignalsPage() {
                 min={0}
                 max={240}
                 value={signalAgeMin}
+                disabled={!strategySupportsSignalAgeFilter}
                 style={{ width: '100%' }}
                 onChange={(value) => {
+                  if (!strategySupportsSignalAgeFilter) return
                   const nextMin = Number.isFinite(Number(value)) ? Math.max(0, Math.min(240, Math.round(Number(value)))) : 0
                   setSignalAgeMin(nextMin)
                   if (signalAgeMax !== null && signalAgeMax < nextMin) {
@@ -1718,15 +1819,53 @@ export function SignalsPage() {
                 min={signalAgeMin}
                 max={240}
                 value={signalAgeMax ?? undefined}
+                disabled={!strategySupportsSignalAgeFilter}
                 placeholder="留空=不限"
                 style={{ width: '100%' }}
                 onChange={(value) => {
+                  if (!strategySupportsSignalAgeFilter) return
                   if (value === null || value === undefined || String(value).trim() === '') {
                     setSignalAgeMax(null)
                     return
                   }
                   const nextMax = Math.max(signalAgeMin, Math.min(240, Math.round(Number(value))))
                   setSignalAgeMax(nextMax)
+                }}
+              />
+            </Col>
+            <Col xs={24} md={12} lg={5}>
+              <Typography.Text type="secondary">筹码分下限</Typography.Text>
+              <InputNumber
+                min={0}
+                max={100}
+                value={costCenterMin ?? undefined}
+                placeholder="留空=不限"
+                style={{ width: '100%' }}
+                onChange={(value) => {
+                  if (value === null || value === undefined || String(value).trim() === '') {
+                    setCostCenterMin(null)
+                    return
+                  }
+                  const next = Math.max(0, Math.min(100, Number(value)))
+                  setCostCenterMin(next)
+                }}
+              />
+            </Col>
+            <Col xs={24} md={12} lg={5}>
+              <Typography.Text type="secondary">周线分下限</Typography.Text>
+              <InputNumber
+                min={0}
+                max={100}
+                value={weeklyContextMin ?? undefined}
+                placeholder="留空=不限"
+                style={{ width: '100%' }}
+                onChange={(value) => {
+                  if (value === null || value === undefined || String(value).trim() === '') {
+                    setWeeklyContextMin(null)
+                    return
+                  }
+                  const next = Math.max(0, Math.min(100, Number(value)))
+                  setWeeklyContextMin(next)
                 }}
               />
             </Col>

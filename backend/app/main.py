@@ -59,6 +59,8 @@ from .models import (
     SystemStorageStatus,
     SignalScanMode,
     StrategyCatalogResponse,
+    StrategyDescriptor,
+    StrategyUpdateRequest,
     TrendPoolStep,
     ScreenerParams,
     ScreenerRunDetail,
@@ -229,6 +231,21 @@ def get_signals(
 @app.get("/api/strategies", response_model=StrategyCatalogResponse)
 def get_strategies() -> StrategyCatalogResponse:
     return store.list_strategies()
+
+
+@app.patch("/api/strategies/{strategy_id}", response_model=StrategyDescriptor)
+def patch_strategy(strategy_id: str, payload: StrategyUpdateRequest) -> StrategyDescriptor | JSONResponse:
+    if payload.enabled is None and payload.is_default is None and payload.version is None:
+        return error_response(400, "STRATEGY_UPDATE_EMPTY", "至少需要提供一个可更新字段：enabled/is_default/version。")
+    try:
+        return store.update_strategy(
+            strategy_id=strategy_id.strip(),
+            enabled=payload.enabled,
+            is_default=payload.is_default,
+            version=payload.version,
+        )
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
 
 
 @app.post("/api/backtest/run", response_model=BacktestResponse)

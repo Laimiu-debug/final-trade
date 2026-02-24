@@ -5,6 +5,8 @@ This module implements the Wyckoff methodology for detecting accumulation
 and distribution patterns in stock price movements.
 """
 
+import math
+from datetime import datetime
 from typing import Callable, Optional
 
 from ..models import CandlePoint, ScreenerResult, Stage, ThemeStage
@@ -15,6 +17,40 @@ WYCKOFF_ACC_EVENTS = ("PS", "SC", "AR", "ST", "TSO", "Spring", "SOS", "JOC", "LP
 WYCKOFF_DIST_EVENTS = ("PSY", "BC", "AR(d)", "ST(d)")
 WYCKOFF_RISK_EVENTS = (*WYCKOFF_DIST_EVENTS, "UTAD", "SOW", "LPSY")
 WYCKOFF_EVENT_ORDER = (*WYCKOFF_ACC_EVENTS, *WYCKOFF_RISK_EVENTS)
+WYCKOFF_KEY_CONFIRM_EVENTS = ("SOS", "LPS", "Spring", "JOC")
+WYCKOFF_PREREQUISITE_MAP: dict[str, tuple[str, ...]] = {
+    "TSO": ("SC", "ST"),
+    "Spring": ("SC", "ST", "AR"),
+    "SOS": ("SC", "AR", "ST", "Spring", "TSO"),
+    "JOC": ("SOS", "Spring", "ST", "TSO"),
+    "LPS": ("SOS", "JOC"),
+    "UTAD": ("BC", "AR(d)", "ST(d)", "PSY"),
+    "SOW": ("UTAD", "AR(d)", "ST(d)"),
+    "LPSY": ("SOW", "UTAD", "ST(d)"),
+}
+EVENT_DECAY_LAMBDA_DEFAULT = 0.075
+EVENT_DECAY_MAX_AGE_DAYS = 45
+VOLUME_CALENDAR_BASE_LOOKBACK = 20
+VOLUME_CALENDAR_EXT_LOOKBACK = 60
+COST_CENTER_EMA_WINDOW = 20
+EVENT_DECAY_LAMBDA_MAP: dict[str, float] = {
+    "PS": 0.08,
+    "SC": 0.08,
+    "AR": 0.075,
+    "ST": 0.075,
+    "TSO": 0.07,
+    "Spring": 0.07,
+    "SOS": 0.065,
+    "JOC": 0.065,
+    "LPS": 0.06,
+    "PSY": 0.09,
+    "BC": 0.09,
+    "AR(d)": 0.085,
+    "ST(d)": 0.085,
+    "UTAD": 0.08,
+    "SOW": 0.08,
+    "LPSY": 0.08,
+}
 
 
 class SignalAnalyzer:
@@ -83,6 +119,433 @@ class SignalAnalyzer:
         it = iter(target)
         return all(event in it for event in sequence)
 
+    @staticmethod
+    def _event_decay_weight(event_name: str, age_days: int) -> float:
+        age = max(0, int(age_days))
+        if age >= EVENT_DECAY_MAX_AGE_DAYS:
+            return 0.0
+        decay_lambda = float(EVENT_DECAY_LAMBDA_MAP.get(event_name, EVENT_DECAY_LAMBDA_DEFAULT))
+        return max(0.0, min(1.0, math.exp(-decay_lambda * float(age))))
+
+    @classmethod
+    def _build_event_age_days(
+        cls,
+        *,
+        dates: list[str],
+        event_chain: list[dict[str, str]],
+    ) -> dict[str, int]:
+        if not dates or not event_chain:
+            return {}
+        index_by_date = {str(day): idx for idx, day in enumerate(dates)}
+        last_idx = len(dates) - 1
+        out: dict[str, int] = {}
+        for item in event_chain:
+            event_name = str(item.get("event", "")).strip()
+            event_date = str(item.get("date", "")).strip()
+            if not event_name or event_date not in index_by_date:
+                continue
+            age_days = max(0, last_idx - int(index_by_date[event_date]))
+            previous = out.get(event_name)
+            if previous is None or age_days < previous:
+                out[event_name] = age_days
+        return out
+
+    @classmethod
+    def _calculate_phase_context_score(
+        cls,
+        *,
+        events: list[str],
+        risk_events: list[str],
+        event_age_days: dict[str, int] | None = None,
+    ) -> float:
+        normalized_age = event_age_days or {}
+        event_set = {str(item).strip() for item in [*events, *risk_events] if str(item).strip()}
+        if not event_set:
+            return 45.0
+
+        score = 68.0
+        for event_name in sorted(event_set):
+            prerequisites = WYCKOFF_PREREQUISITE_MAP.get(event_name)
+            if not prerequisites:
+                continue
+            matched = [
+                ref
+                for ref in prerequisites
+                if ref in event_set and int(normalized_age.get(ref, EVENT_DECAY_MAX_AGE_DAYS)) <= 35
+            ]
+            if not matched:
+                score -= 14.0
+            elif len(matched) == 1:
+                score += 3.0
+            else:
+                score += 6.0
+
+        if {"SOS", "JOC", "LPS"} & event_set and not ({"SC", "AR", "ST", "Spring", "TSO"} & event_set):
+            score -= 18.0
+        if {"UTAD", "SOW", "LPSY"} & event_set and not ({"PSY", "BC", "AR(d)", "ST(d)"} & event_set):
+            score -= 10.0
+
+        stale_penalty = 0.0
+        for event_name in event_set:
+            age_days = int(normalized_age.get(event_name, EVENT_DECAY_MAX_AGE_DAYS))
+            if age_days > 30:
+                stale_penalty += min(10.0, float(age_days - 30) * 0.5)
+        score -= stale_penalty
+        return cls.clamp_score(score)
+
+    @classmethod
+    def _calculate_event_recency_score(
+        cls,
+        *,
+        events: list[str],
+        risk_events: list[str],
+        event_age_days: dict[str, int] | None = None,
+    ) -> float:
+        names = [str(item).strip() for item in [*events, *risk_events] if str(item).strip()]
+        if not names:
+            return 40.0
+        normalized_age = event_age_days or {}
+        weights = [
+            cls._event_decay_weight(name, int(normalized_age.get(name, EVENT_DECAY_MAX_AGE_DAYS)))
+            for name in names
+        ]
+        return cls.clamp_score(cls.safe_mean(weights) * 100.0)
+
+    @staticmethod
+    def _parse_trading_date(text: str) -> datetime | None:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.strptime(raw, "%Y-%m-%d")
+        except Exception:
+            return None
+
+    @classmethod
+    def _weekday_adjusted_volume_baseline(
+        cls,
+        *,
+        volumes: list[int],
+        dates: list[str],
+        idx: int,
+        window: int = VOLUME_CALENDAR_BASE_LOOKBACK,
+    ) -> float:
+        if idx < 0 or idx >= len(volumes):
+            return 1.0
+        recent_left = max(0, int(idx) - max(5, int(window)))
+        recent_samples = [float(volumes[pos]) for pos in range(recent_left, idx)]
+        if not recent_samples:
+            return max(1.0, float(volumes[idx]))
+        ma_base = max(1.0, cls.safe_mean(recent_samples))
+
+        weekday_base = 0.0
+        target_dt = cls._parse_trading_date(dates[idx] if idx < len(dates) else "")
+        if target_dt is not None:
+            target_weekday = target_dt.weekday()
+            ext_left = max(0, idx - max(window * 3, VOLUME_CALENDAR_EXT_LOOKBACK))
+            weekday_samples: list[float] = []
+            for pos in range(ext_left, idx):
+                probe_dt = cls._parse_trading_date(dates[pos] if pos < len(dates) else "")
+                if probe_dt is None or probe_dt.weekday() != target_weekday:
+                    continue
+                weekday_samples.append(float(volumes[pos]))
+            if weekday_samples:
+                weekday_base = cls.safe_mean(weekday_samples[-8:])
+
+        baseline = ma_base if weekday_base <= 0 else ma_base * 0.55 + weekday_base * 0.45
+
+        # Long holiday windows tend to produce artificial volume spikes.
+        if idx > 0 and idx < len(dates):
+            current_dt = cls._parse_trading_date(dates[idx])
+            previous_dt = cls._parse_trading_date(dates[idx - 1])
+            if current_dt is not None and previous_dt is not None:
+                gap_days = (current_dt - previous_dt).days
+                if gap_days > 4:
+                    baseline *= min(1.35, 1.0 + float(gap_days - 4) * 0.045)
+
+        return max(1.0, float(baseline))
+
+    @classmethod
+    def _volume_ratio_with_calendar_adjustment(
+        cls,
+        *,
+        volumes: list[int],
+        dates: list[str],
+        idx: int,
+        window: int = VOLUME_CALENDAR_BASE_LOOKBACK,
+    ) -> float:
+        if idx < 0 or idx >= len(volumes):
+            return 0.0
+        baseline = cls._weekday_adjusted_volume_baseline(
+            volumes=volumes,
+            dates=dates,
+            idx=idx,
+            window=window,
+        )
+        ratio = float(volumes[idx]) / max(1.0, baseline)
+
+        short_left = max(0, idx - max(8, window))
+        short_samples = [float(volumes[pos]) for pos in range(short_left, idx)]
+        if len(short_samples) >= 8:
+            z_mean = cls.safe_mean(short_samples)
+            z_std = max(1.0, cls.safe_std(short_samples))
+            zscore = (float(volumes[idx]) - z_mean) / z_std
+            if zscore >= 2.5:
+                ratio *= 0.92
+            elif zscore <= -2.0:
+                ratio *= 1.05
+        return max(0.0, float(ratio))
+
+    @staticmethod
+    def _candle_shape_metrics(
+        *,
+        idx: int,
+        opens: list[float],
+        highs: list[float],
+        lows: list[float],
+        closes: list[float],
+    ) -> tuple[float, float, float, float]:
+        if idx < 0 or idx >= len(opens):
+            return 0.0, 0.0, 0.0, 0.0
+        open_px = float(opens[idx])
+        high_px = float(highs[idx])
+        low_px = float(lows[idx])
+        close_px = float(closes[idx])
+        candle_range = max(high_px - low_px, 0.01)
+        body_ratio = abs(close_px - open_px) / candle_range
+        upper_shadow_ratio = max(0.0, high_px - max(open_px, close_px)) / candle_range
+        lower_shadow_ratio = max(0.0, min(open_px, close_px) - low_px) / candle_range
+        close_location = (close_px - low_px) / candle_range
+        return body_ratio, upper_shadow_ratio, lower_shadow_ratio, close_location
+
+    @classmethod
+    def _event_candle_quality_score(
+        cls,
+        *,
+        event_name: str,
+        idx: int,
+        opens: list[float],
+        highs: list[float],
+        lows: list[float],
+        closes: list[float],
+    ) -> float:
+        body_ratio, upper_shadow_ratio, lower_shadow_ratio, close_location = cls._candle_shape_metrics(
+            idx=idx,
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+        )
+        open_px = float(opens[idx]) if 0 <= idx < len(opens) else 0.0
+        close_px = float(closes[idx]) if 0 <= idx < len(closes) else 0.0
+        is_bull = close_px >= open_px
+
+        event_text = str(event_name).strip()
+        if event_text in set(WYCKOFF_RISK_EVENTS):
+            score = (
+                40.0
+                + body_ratio * 12.0
+                + upper_shadow_ratio * 34.0
+                + (1.0 - close_location) * 28.0
+                + lower_shadow_ratio * 8.0
+            )
+            score += 6.0 if not is_bull else -4.0
+            return cls.clamp_score(score)
+
+        score = (
+            36.0
+            + body_ratio * 24.0
+            + close_location * 30.0
+            + (1.0 - upper_shadow_ratio) * 16.0
+        )
+        score += 6.0 if is_bull else -4.0
+        if event_text in {"Spring", "SC", "ST", "TSO"}:
+            score += lower_shadow_ratio * 10.0
+        if event_text in {"SOS", "JOC", "LPS"}:
+            score += body_ratio * 10.0
+            score -= lower_shadow_ratio * 4.0
+        return cls.clamp_score(score)
+
+    @classmethod
+    def _calculate_candle_quality_score(
+        cls,
+        *,
+        events: list[str],
+        risk_events: list[str],
+        event_dates: dict[str, str],
+        dates: list[str],
+        opens: list[float],
+        highs: list[float],
+        lows: list[float],
+        closes: list[float],
+    ) -> float:
+        if not dates:
+            return 45.0
+        index_by_date = {str(day): idx for idx, day in enumerate(dates)}
+        last_idx = len(dates) - 1
+        weighted_scores: list[float] = []
+        weights: list[float] = []
+        for event_name in [*events, *risk_events]:
+            event_text = str(event_name).strip()
+            if not event_text:
+                continue
+            event_date = str(event_dates.get(event_text, "")).strip()
+            idx = index_by_date.get(event_date)
+            if idx is None:
+                continue
+            age_days = max(0, last_idx - int(idx))
+            decay_weight = max(0.1, cls._event_decay_weight(event_text, age_days))
+            if event_text in set(WYCKOFF_RISK_EVENTS):
+                decay_weight *= 1.1
+            score = cls._event_candle_quality_score(
+                event_name=event_text,
+                idx=int(idx),
+                opens=opens,
+                highs=highs,
+                lows=lows,
+                closes=closes,
+            )
+            weighted_scores.append(score * decay_weight)
+            weights.append(decay_weight)
+        if not weights:
+            return 45.0
+        return cls.clamp_score(sum(weighted_scores) / max(sum(weights), 0.01))
+
+    @staticmethod
+    def _ema(values: list[float], window: int) -> list[float]:
+        if not values:
+            return []
+        span = max(1, int(window))
+        alpha = 2.0 / (float(span) + 1.0)
+        out: list[float] = []
+        prev = float(values[0])
+        out.append(prev)
+        for value in values[1:]:
+            prev = alpha * float(value) + (1.0 - alpha) * prev
+            out.append(prev)
+        return out
+
+    @classmethod
+    def _calculate_cost_center_shift_score(
+        cls,
+        *,
+        closes: list[float],
+        volumes: list[int],
+        row: ScreenerResult,
+    ) -> float:
+        if len(closes) < 10 or len(closes) != len(volumes):
+            return 45.0
+
+        weighted_price = [float(close_px) * max(0.0, float(vol)) for close_px, vol in zip(closes, volumes)]
+        ema_weighted = cls._ema(weighted_price, COST_CENTER_EMA_WINDOW)
+        ema_volume = cls._ema([max(0.0, float(vol)) for vol in volumes], COST_CENTER_EMA_WINDOW)
+        cost_center_series: list[float] = []
+        for idx in range(len(closes)):
+            denom = max(ema_volume[idx], 1.0)
+            cost_center_series.append(float(ema_weighted[idx]) / denom)
+
+        lookback = min(10, len(cost_center_series) - 1)
+        base_idx = len(cost_center_series) - 1 - lookback
+        latest_idx = len(cost_center_series) - 1
+        base_cost = max(abs(float(cost_center_series[base_idx])), 0.01)
+        base_price = max(abs(float(closes[base_idx])), 0.01)
+
+        cost_shift = (float(cost_center_series[latest_idx]) - float(cost_center_series[base_idx])) / base_cost
+        price_shift = (float(closes[latest_idx]) - float(closes[base_idx])) / base_price
+        divergence = float(price_shift - cost_shift)
+
+        spread_series: list[float] = []
+        for idx in range(base_idx, latest_idx + 1):
+            close_px = max(float(closes[idx]), 0.01)
+            spread_series.append((float(closes[idx]) - float(cost_center_series[idx])) / close_px)
+        spread_std = cls.safe_std(spread_series)
+
+        score = (
+            56.0
+            + cost_shift * 210.0
+            - max(0.0, divergence) * 175.0
+            - max(0.0, float(row.retrace20) - 0.15) * 80.0
+            - spread_std * 180.0
+        )
+        return cls.clamp_score(score)
+
+    @classmethod
+    def _calculate_weekly_context_metrics(
+        cls,
+        *,
+        dates: list[str],
+        opens: list[float],
+        highs: list[float],
+        lows: list[float],
+        closes: list[float],
+        volumes: list[int],
+    ) -> tuple[float, float]:
+        if not dates or len(dates) < 15:
+            return 50.0, 1.0
+
+        weekly_rows: list[dict[str, float | int | str]] = []
+        current_week_key = ""
+        current: dict[str, float | int | str] | None = None
+
+        for idx, day_text in enumerate(dates):
+            dt = cls._parse_trading_date(day_text)
+            if dt is None:
+                continue
+            week_info = dt.isocalendar()
+            week_key = f"{week_info.year:04d}-{int(week_info.week):02d}"
+            if week_key != current_week_key:
+                if current is not None:
+                    weekly_rows.append(current)
+                current_week_key = week_key
+                current = {
+                    "week": week_key,
+                    "open": float(opens[idx]),
+                    "high": float(highs[idx]),
+                    "low": float(lows[idx]),
+                    "close": float(closes[idx]),
+                    "volume": max(0.0, float(volumes[idx])),
+                }
+            else:
+                if current is None:
+                    continue
+                current["high"] = max(float(current["high"]), float(highs[idx]))
+                current["low"] = min(float(current["low"]), float(lows[idx]))
+                current["close"] = float(closes[idx])
+                current["volume"] = float(current["volume"]) + max(0.0, float(volumes[idx]))
+        if current is not None:
+            weekly_rows.append(current)
+
+        if len(weekly_rows) < 4:
+            return 50.0, 1.0
+
+        weekly_closes = [float(item["close"]) for item in weekly_rows]
+        weekly_highs = [float(item["high"]) for item in weekly_rows]
+        weekly_lows = [float(item["low"]) for item in weekly_rows]
+
+        fast_window = min(5, len(weekly_closes))
+        slow_window = min(10, len(weekly_closes))
+        weekly_ma_fast = cls.safe_mean(weekly_closes[-fast_window:])
+        weekly_ma_slow = cls.safe_mean(weekly_closes[-slow_window:])
+        latest_close = float(weekly_closes[-1])
+        base_idx = max(0, len(weekly_closes) - 5)
+        base_close = max(float(weekly_closes[base_idx]), 0.01)
+        weekly_ret = (latest_close - float(weekly_closes[base_idx])) / base_close
+
+        range_window = min(20, len(weekly_highs))
+        recent_high = max(weekly_highs[-range_window:])
+        recent_low = min(weekly_lows[-range_window:])
+        weekly_pos = (latest_close - recent_low) / max(recent_high - recent_low, 0.01)
+
+        score = 50.0
+        score += 10.0 if latest_close > weekly_ma_fast else -8.0
+        score += 12.0 if weekly_ma_fast > weekly_ma_slow else -10.0
+        score += weekly_ret * 120.0
+        score += (weekly_pos - 0.5) * 30.0
+        score -= max(0.0, 0.35 - weekly_pos) * 40.0
+        weekly_context_score = cls.clamp_score(score)
+        weekly_multiplier = max(0.85, min(1.15, 0.88 + weekly_context_score / 100.0 * 0.24))
+        return weekly_context_score, weekly_multiplier
+
     @classmethod
     def calculate_wyckoff_snapshot(
         cls,
@@ -144,6 +607,15 @@ class SignalAnalyzer:
         event_dates, event_chain = cls._detect_wyckoff_events(
             highs, lows, closes, volumes, dates, ma20, avg_v5, avg_v20, row, tr_pos, ret10, opens_list
         )
+        event_confirmation_map = cls._evaluate_event_confirmation_map(
+            event_dates=event_dates,
+            dates=dates,
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            volumes=volumes,
+        )
 
         # Categorize events
         events = [event for event in WYCKOFF_ACC_EVENTS if event in event_dates]
@@ -161,6 +633,12 @@ class SignalAnalyzer:
         )
         sequence = [str(item["event"]) for item in ordered_events if str(item.get("event", "")) in WYCKOFF_ACC_EVENTS]
         sequence_ok = cls.is_subsequence(sequence, WYCKOFF_ACC_EVENTS)
+        event_age_days = cls._build_event_age_days(dates=dates, event_chain=ordered_events)
+        phase_context_score = cls._calculate_phase_context_score(
+            events=events,
+            risk_events=risk_events,
+            event_age_days=event_age_days,
+        )
 
         # Analyze structure (HH/HL/HC)
         structure_hhh = cls._analyze_structure(highs, lows, closes)
@@ -176,6 +654,29 @@ class SignalAnalyzer:
             ma20=ma20,
             row=row,
         )
+        candle_quality_score = cls._calculate_candle_quality_score(
+            events=events,
+            risk_events=risk_events,
+            event_dates=event_dates,
+            dates=dates,
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+        )
+        cost_center_shift_score = cls._calculate_cost_center_shift_score(
+            closes=closes,
+            volumes=volumes,
+            row=row,
+        )
+        weekly_context_score, weekly_context_multiplier = cls._calculate_weekly_context_metrics(
+            dates=dates,
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            volumes=volumes,
+        )
 
         # Calculate scores
         scores = cls._calculate_scores(
@@ -189,6 +690,13 @@ class SignalAnalyzer:
             tr_pos=tr_pos,
             sequence_ok=sequence_ok,
             health_metrics=health_metrics,
+            event_age_days=event_age_days,
+            phase_context_score=phase_context_score,
+            candle_quality_score=candle_quality_score,
+            cost_center_shift_score=cost_center_shift_score,
+            weekly_context_score=weekly_context_score,
+            weekly_context_multiplier=weekly_context_multiplier,
+            event_confirmation_map=event_confirmation_map,
         )
 
         # Determine primary signal
@@ -205,9 +713,102 @@ class SignalAnalyzer:
             "signal": wyckoff_signal,
             "structure_hhh": structure_hhh,
             "sequence_ok": sequence_ok,
+            "event_confirmation_map": event_confirmation_map,
+            "phase_context_score": round(float(phase_context_score), 2),
             "trigger_date": trigger_date,
             **scores,
         }
+
+    @classmethod
+    def _evaluate_event_confirmation_map(
+        cls,
+        *,
+        event_dates: dict[str, str],
+        dates: list[str],
+        opens: list[float],
+        highs: list[float],
+        lows: list[float],
+        closes: list[float],
+        volumes: list[int],
+    ) -> dict[str, str]:
+        index_by_date = {str(day): idx for idx, day in enumerate(dates)}
+        last_idx = len(dates) - 1
+        if last_idx < 0:
+            return {}
+
+        def ma_at(idx: int, window: int = 20) -> float:
+            if idx < 0:
+                return 0.0
+            start = max(0, idx - window + 1)
+            return cls.safe_mean(closes[start:idx + 1])
+
+        def prior_high_at(idx: int, lookback: int = 20) -> float:
+            start = max(0, idx - lookback)
+            if start >= idx:
+                return highs[idx]
+            return max(highs[start:idx])
+
+        def vol_avg_at(idx: int, window: int = 5) -> float:
+            if idx <= 0:
+                return float(volumes[idx]) if 0 <= idx < len(volumes) else 0.0
+            start = max(0, idx - window)
+            return cls.safe_mean(volumes[start:idx])
+
+        out: dict[str, str] = {}
+        for event_name in WYCKOFF_KEY_CONFIRM_EVENTS:
+            event_day = str(event_dates.get(event_name, "")).strip()
+            idx = index_by_date.get(event_day)
+            if idx is None:
+                continue
+            if idx >= last_idx:
+                out[event_name] = "pending"
+                continue
+
+            if event_name == "SOS":
+                breakout_level = max(prior_high_at(idx, 20), ma_at(idx, 20))
+                end = min(last_idx, idx + 3)
+                future_closes = closes[idx + 1 : end + 1]
+                if not future_closes:
+                    out[event_name] = "pending"
+                    continue
+                holds = min(future_closes) >= breakout_level * 0.995
+                out[event_name] = "confirmed" if holds else "failed"
+                continue
+
+            if event_name == "Spring":
+                next_idx = idx + 1
+                if next_idx > last_idx:
+                    out[event_name] = "pending"
+                    continue
+                not_break_low = lows[next_idx] >= lows[idx] * 0.997
+                bullish_confirm = closes[next_idx] >= max(opens[next_idx], closes[idx] * 0.998)
+                out[event_name] = "confirmed" if (not_break_low and bullish_confirm) else "failed"
+                continue
+
+            if event_name == "JOC":
+                breakout_level = prior_high_at(idx, 20)
+                end = min(last_idx, idx + 2)
+                future_closes = closes[idx + 1 : end + 1]
+                if not future_closes:
+                    out[event_name] = "pending"
+                    continue
+                no_fast_fail = min(future_closes) >= breakout_level * 0.99
+                out[event_name] = "confirmed" if no_fast_fail else "failed"
+                continue
+
+            if event_name == "LPS":
+                end = min(last_idx, idx + 2)
+                prev_vol = max(1.0, float(vol_avg_at(idx, 5)))
+                vol_shrink = float(volumes[idx]) <= prev_vol * 0.95
+                bullish_reversal = False
+                for probe in range(idx, end + 1):
+                    if closes[probe] >= opens[probe] * 1.002 and closes[probe] >= ma_at(probe, 20) * 0.995:
+                        bullish_reversal = True
+                        break
+                out[event_name] = "confirmed" if (vol_shrink and bullish_reversal) else "failed"
+                continue
+
+        return out
 
     @classmethod
     def _insufficient_data_snapshot(cls, candles: list[CandlePoint]) -> dict:
@@ -223,6 +824,7 @@ class SignalAnalyzer:
             "signal": "",
             "structure_hhh": "-",
             "sequence_ok": False,
+            "event_confirmation_map": {},
             "event_strength_score": 0.0,
             "phase_score": 45.0,
             "structure_score": 0.0,
@@ -230,6 +832,7 @@ class SignalAnalyzer:
             "volatility_score": 0.0,
             "health_score": 0.0,
             "slope_stability": 0.0,
+            "volatility_stability": 0.0,
             "pullback_quality": 0.0,
             "event_score": 0.0,
             "event_grade": "C",
@@ -237,6 +840,14 @@ class SignalAnalyzer:
             "event_position_score": 0.0,
             "event_vol_price_score": 0.0,
             "event_confirmation_score": 0.0,
+            "event_recency_score": 0.0,
+            "phase_context_score": 0.0,
+            "candle_quality_score": 0.0,
+            "cost_center_shift_score": 0.0,
+            "weekly_context_score": 0.0,
+            "weekly_context_multiplier": 1.0,
+            "risk_score": 0.0,
+            "confirmation_status": "unconfirmed",
             "event_grade_map": {},
             "entry_quality_score": 0.0,
             "trigger_date": fallback_date,
@@ -275,8 +886,12 @@ class SignalAnalyzer:
             return cls.safe_mean(volumes[start:idx + 1])
 
         def vol_ratio_at(idx: int, window: int = 20) -> float:
-            base = vol_avg_at(idx, window)
-            return volumes[idx] / max(base, 1.0)
+            return cls._volume_ratio_with_calendar_adjustment(
+                volumes=volumes,
+                dates=dates,
+                idx=idx,
+                window=window,
+            )
 
         def ret_at(idx: int, lookback: int = 10) -> float:
             start = max(0, idx - lookback)
@@ -717,6 +1332,13 @@ class SignalAnalyzer:
         tr_pos: float,
         sequence_ok: bool,
         health_metrics: dict[str, float] | None = None,
+        event_age_days: dict[str, int] | None = None,
+        phase_context_score: float | None = None,
+        candle_quality_score: float | None = None,
+        cost_center_shift_score: float | None = None,
+        weekly_context_score: float | None = None,
+        weekly_context_multiplier: float | None = None,
+        event_confirmation_map: dict[str, str] | None = None,
     ) -> dict:
         """Calculate various analysis scores."""
         # Phase score
@@ -742,11 +1364,47 @@ class SignalAnalyzer:
         }
         risk_event_penalty = {"PSY": -4, "BC": -6, "AR(d)": -6, "ST(d)": -6, "UTAD": -10, "SOW": -9, "LPSY": -8}
         event_strength_score = 48.0
+        normalized_event_age = event_age_days or {}
         for event in events:
-            event_strength_score += positive_event_weights.get(event, 0)
+            event_strength_score += (
+                positive_event_weights.get(event, 0)
+                * cls._event_decay_weight(event, int(normalized_event_age.get(event, EVENT_DECAY_MAX_AGE_DAYS)))
+            )
         for event in risk_events:
-            event_strength_score += risk_event_penalty.get(event, 0)
+            event_strength_score += (
+                risk_event_penalty.get(event, 0)
+                * cls._event_decay_weight(event, int(normalized_event_age.get(event, EVENT_DECAY_MAX_AGE_DAYS)))
+            )
         event_strength_score = cls.clamp_score(event_strength_score)
+        computed_phase_context_score = cls.clamp_score(
+            float(
+                phase_context_score
+                if phase_context_score is not None
+                else cls._calculate_phase_context_score(
+                    events=events,
+                    risk_events=risk_events,
+                    event_age_days=normalized_event_age,
+                )
+            )
+        )
+        event_recency_score = cls._calculate_event_recency_score(
+            events=events,
+            risk_events=risk_events,
+            event_age_days=normalized_event_age,
+        )
+        normalized_candle_quality = cls.clamp_score(float(candle_quality_score if candle_quality_score is not None else 45.0))
+        normalized_cost_center_shift = cls.clamp_score(
+            float(cost_center_shift_score if cost_center_shift_score is not None else 45.0)
+        )
+        normalized_weekly_context = cls.clamp_score(
+            float(weekly_context_score if weekly_context_score is not None else 50.0)
+        )
+        resolved_weekly_multiplier = float(
+            weekly_context_multiplier
+            if weekly_context_multiplier is not None
+            else max(0.85, min(1.15, 0.88 + normalized_weekly_context / 100.0 * 0.24))
+        )
+        resolved_weekly_multiplier = max(0.85, min(1.15, resolved_weekly_multiplier))
 
         phase_background_bonus = {
             "\u5438\u7b79A": 6.0,
@@ -766,39 +1424,93 @@ class SignalAnalyzer:
             + float(row.ret40) * 90.0
             - max(0.0, float(row.retrace20) - 0.15) * 180.0
             - len(risk_events) * 6.0
+            + (normalized_weekly_context - 50.0) * 0.28
         )
         position_score = cls.clamp_score(100.0 - abs(float(tr_pos) - 0.65) * 120.0)
-        vol_price_score = cls.clamp_score(event_strength_score)
+        vol_price_score = cls.clamp_score(event_strength_score * 0.75 + normalized_cost_center_shift * 0.25)
+        risk_score_raw = 0.0
+        for event in risk_events:
+            risk_weight = abs(float(risk_event_penalty.get(event, -6)))
+            risk_score_raw += risk_weight * cls._event_decay_weight(
+                event,
+                int(normalized_event_age.get(event, EVENT_DECAY_MAX_AGE_DAYS)),
+            )
+        risk_score_raw += max(0.0, 52.0 - normalized_cost_center_shift) * 0.22
+        risk_score = cls.clamp_score(risk_score_raw * 3.0)
+        key_confirm_map = event_confirmation_map or {}
+        key_confirmed = sum(
+            1
+            for event_name in events
+            if event_name in set(WYCKOFF_KEY_CONFIRM_EVENTS) and str(key_confirm_map.get(event_name, "")) == "confirmed"
+        )
+        key_pending = sum(
+            1
+            for event_name in events
+            if event_name in set(WYCKOFF_KEY_CONFIRM_EVENTS) and str(key_confirm_map.get(event_name, "")) == "pending"
+        )
+        key_failed = sum(
+            1
+            for event_name in events
+            if event_name in set(WYCKOFF_KEY_CONFIRM_EVENTS) and str(key_confirm_map.get(event_name, "")) == "failed"
+        )
         confirm_bonus = 0.0
         if {"SOS", "JOC", "LPS"} & set(events):
             confirm_bonus += 18.0
         elif events:
             confirm_bonus += 8.0
+        confirm_bonus += float(key_confirmed) * 5.0
+        confirm_bonus -= float(key_pending) * 4.0
+        confirm_bonus -= float(key_failed) * 10.0
         confirmation_score = cls.clamp_score(
-            35.0
-            + (25.0 if sequence_ok else -10.0)
+            28.0
+            + (24.0 if sequence_ok else -12.0)
             + confirm_bonus
-            - len(risk_events) * 5.0
+            + computed_phase_context_score * 0.20
+            + event_recency_score * 0.12
+            + normalized_candle_quality * 0.10
+            + normalized_weekly_context * 0.08
+            + normalized_cost_center_shift * 0.10
+            - risk_score * 0.28
         )
-        event_score = cls.clamp_score(
-            background_score * 0.30
-            + position_score * 0.25
-            + vol_price_score * 0.25
-            + confirmation_score * 0.20
-            - len(risk_events) * 2.5
+        event_score_raw = cls.clamp_score(
+            background_score * 0.22
+            + position_score * 0.16
+            + vol_price_score * 0.18
+            + confirmation_score * 0.18
+            + computed_phase_context_score * 0.12
+            + event_recency_score * 0.08
+            + normalized_candle_quality * 0.06
+            + normalized_cost_center_shift * 0.04
+            + normalized_weekly_context * 0.04
+            - risk_score * 0.20
         )
+        if key_failed > 0:
+            event_score_raw -= min(18.0, float(key_failed) * 8.0)
+        if key_pending > 0:
+            event_score_raw -= min(10.0, float(key_pending) * 3.5)
+        event_score = cls.clamp_score(event_score_raw * resolved_weekly_multiplier)
         event_grade = cls._event_grade_from_score(event_score)
 
         event_grade_map: dict[str, str] = {}
         event_set = [str(item).strip() for item in [*events, *risk_events] if str(item).strip()]
         for event_name in event_set:
-            event_level_score = float(event_score)
+            event_decay = cls._event_decay_weight(
+                event_name,
+                int(normalized_event_age.get(event_name, EVENT_DECAY_MAX_AGE_DAYS)),
+            )
+            event_level_score = float(event_score) * (0.6 + event_decay * 0.4)
             if event_name in {"SOS", "JOC", "LPS", "Spring", "TSO"}:
                 event_level_score += 6.0
             if event_name in {"PS", "SC", "AR", "ST"}:
                 event_level_score -= 4.0
             if event_name in set(risk_events):
                 event_level_score -= 12.0
+            if event_name in set(WYCKOFF_KEY_CONFIRM_EVENTS):
+                status = str(key_confirm_map.get(event_name, "")).strip().lower()
+                if status == "failed":
+                    event_level_score -= 14.0
+                elif status == "pending":
+                    event_level_score -= 7.0
             event_grade_map[event_name] = cls._event_grade_from_score(cls.clamp_score(event_level_score))
 
         # Structure score
@@ -820,16 +1532,35 @@ class SignalAnalyzer:
         pullback_quality = cls.clamp_score(float(normalized_health.get("pullback_quality", 0.0) or 0.0))
 
         # Entry quality score (weighted composite)
-        risk_penalty = len(risk_events) * 4.5
+        risk_penalty = len(risk_events) * 3.5 + risk_score * 0.18
         entry_quality_score = cls.clamp_score(
-            phase_score * 0.30
-            + event_strength_score * 0.21
-            + structure_score * 0.17
-            + trend_score * 0.12
-            + volatility_score * 0.10
+            phase_score * 0.22
+            + event_strength_score * 0.14
+            + structure_score * 0.12
+            + trend_score * 0.09
+            + volatility_score * 0.07
             + health_score * 0.10
+            + event_score * 0.08
+            + computed_phase_context_score * 0.06
+            + event_recency_score * 0.04
+            + normalized_candle_quality * 0.06
+            + normalized_cost_center_shift * 0.06
+            + normalized_weekly_context * 0.04
             - risk_penalty
         )
+        has_strong_confirmation = bool({"SOS", "JOC", "LPS"} & set(events))
+        if risk_score >= 60.0:
+            confirmation_status = "risk_blocked"
+        elif key_failed > 0:
+            confirmation_status = "unconfirmed"
+        elif key_pending > 0 and has_strong_confirmation:
+            confirmation_status = "partial"
+        elif sequence_ok and computed_phase_context_score >= 70.0 and has_strong_confirmation:
+            confirmation_status = "confirmed"
+        elif sequence_ok and computed_phase_context_score >= 55.0 and bool(events):
+            confirmation_status = "partial"
+        else:
+            confirmation_status = "unconfirmed"
 
         return {
             "event_strength_score": round(event_strength_score, 2),
@@ -847,6 +1578,15 @@ class SignalAnalyzer:
             "event_position_score": round(position_score, 2),
             "event_vol_price_score": round(vol_price_score, 2),
             "event_confirmation_score": round(confirmation_score, 2),
+            "event_recency_score": round(event_recency_score, 2),
+            "phase_context_score": round(computed_phase_context_score, 2),
+            "candle_quality_score": round(normalized_candle_quality, 2),
+            "cost_center_shift_score": round(normalized_cost_center_shift, 2),
+            "weekly_context_score": round(normalized_weekly_context, 2),
+            "weekly_context_multiplier": round(resolved_weekly_multiplier, 4),
+            "risk_score": round(risk_score, 2),
+            "confirmation_status": confirmation_status,
+            "event_confirmation_map": key_confirm_map,
             "event_grade_map": event_grade_map,
             "entry_quality_score": round(entry_quality_score, 2),
         }

@@ -20,7 +20,7 @@ ReviewTagType = Literal["emotion", "reason"]
 BacktestPriorityMode = Literal["phase_first", "balanced", "momentum"]
 BacktestPoolRollMode = Literal["daily", "weekly", "position"]
 BoardFilter = Literal["main", "gem", "star", "beijing", "st"]
-StrategyId = Literal["wyckoff_trend_v1", "wyckoff_trend_v2"]
+StrategyId = str
 
 
 class ApiErrorPayload(BaseModel):
@@ -209,6 +209,15 @@ class SignalResult(BaseModel):
     event_position_score: float = 0.0
     event_vol_price_score: float = 0.0
     event_confirmation_score: float = 0.0
+    candle_quality_score: float = 0.0
+    cost_center_shift_score: float = 0.0
+    weekly_context_score: float = 0.0
+    weekly_context_multiplier: float = 1.0
+    event_recency_score: float = 0.0
+    phase_context_score: float = 0.0
+    risk_score: float = 0.0
+    confirmation_status: Literal["confirmed", "partial", "unconfirmed", "risk_blocked"] = "unconfirmed"
+    event_confirmation_map: dict[str, str] = Field(default_factory=dict)
     event_grade_map: dict[str, str] = Field(default_factory=dict)
 
 
@@ -225,6 +234,7 @@ class SignalsResponse(BaseModel):
     strategy_version: str = "1.0.0"
     strategy_params: dict[str, Any] = Field(default_factory=dict)
     strategy_params_hash: str = ""
+    notes: list[str] = Field(default_factory=list)
 
 
 class StrategyCapabilities(BaseModel):
@@ -246,6 +256,12 @@ class StrategyDescriptor(BaseModel):
 
 class StrategyCatalogResponse(BaseModel):
     items: list[StrategyDescriptor] = Field(default_factory=list)
+
+
+class StrategyUpdateRequest(BaseModel):
+    enabled: bool | None = None
+    is_default: bool | None = None
+    version: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class SimTradingConfig(BaseModel):
@@ -423,6 +439,8 @@ class BacktestRunRequest(BaseModel):
     health_score_min: float = Field(default=0.0, ge=0.0, le=100.0)
     event_score_min: float = Field(default=0.0, ge=0.0, le=100.0)
     event_grade_min: Literal["A", "B", "C"] = "C"
+    require_key_event_confirmation: bool = False
+    execution_path_preference: Literal["auto", "matrix", "legacy"] = "auto"
     matrix_event_semantic_version: Literal["matrix_v1", "aligned_wyckoff_v2"] = "matrix_v1"
     enforce_t1: bool = True
     entry_delay_days: int = Field(default=1, ge=1, le=5)
@@ -441,10 +459,20 @@ class BacktestTrade(BaseModel):
     entry_signal: str
     entry_phase: str = "阶段未明"
     entry_quality_score: float = 0.0
+    candle_quality_score: float = 0.0
+    cost_center_shift_score: float = 0.0
+    weekly_context_score: float = 0.0
+    weekly_context_multiplier: float = 1.0
     health_score: float = 0.0
     event_score: float = 0.0
+    risk_score: float = 0.0
+    confirmation_status: Literal["confirmed", "partial", "unconfirmed", "risk_blocked"] = "unconfirmed"
     event_grade: Literal["A", "B", "C"] = "C"
+    phase_context_score: float = 0.0
+    event_recency_score: float = 0.0
     exit_reason: str
+    delay_entry_days: int = 1
+    delay_window_days: int = 0
     quantity: int
     entry_price: float
     exit_price: float
@@ -539,6 +567,7 @@ class BacktestResponse(BaseModel):
     regime_breakdown: list[BacktestRegimeBucket] = Field(default_factory=list)
     monte_carlo: BacktestMonteCarloSummary | None = None
     walk_forward: BacktestWalkForwardReport | None = None
+    execution_path: Literal["matrix", "legacy"] | None = None
     strategy_id: StrategyId = "wyckoff_trend_v1"
     strategy_version: str = "1.0.0"
     strategy_params: dict[str, Any] = Field(default_factory=dict)
@@ -551,6 +580,8 @@ class BacktestABVariantConfig(BaseModel):
     health_score_min: float | None = Field(default=None, ge=0.0, le=100.0)
     event_score_min: float | None = Field(default=None, ge=0.0, le=100.0)
     event_grade_min: Literal["A", "B", "C"] | None = None
+    require_key_event_confirmation: bool | None = None
+    execution_path_preference: Literal["auto", "matrix", "legacy"] | None = None
     matrix_event_semantic_version: Literal["matrix_v1", "aligned_wyckoff_v2"] | None = None
     rank_weight_health: float | None = Field(default=None, ge=0.0, le=1.0)
     rank_weight_event: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -583,6 +614,7 @@ class BacktestABVariantResult(BaseModel):
     error: str | None = None
     stats: ReviewStats | None = None
     risk_metrics: BacktestRiskMetrics | None = None
+    execution_path: Literal["matrix", "legacy"] | None = None
     candidate_count: int = 0
     trade_count: int = 0
     utad_exit_ratio: float = 0.0
@@ -597,7 +629,9 @@ class BacktestABComparisonRow(BaseModel):
     total_return_delta: float = 0.0
     win_rate_delta: float = 0.0
     max_drawdown_delta: float = 0.0
+    trade_count_delta: int = 0
     utad_exit_ratio_delta: float = 0.0
+    expectancy_delta: float = 0.0
     max_consecutive_losses_delta: int = 0
 
 

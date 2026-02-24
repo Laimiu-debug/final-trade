@@ -559,6 +559,14 @@ def test_signals_endpoint_full_market_fields() -> None:
         assert "volatility_stability" in first
         assert "event_score" in first
         assert first.get("event_grade") in {"A", "B", "C"}
+        assert "candle_quality_score" in first
+        assert "cost_center_shift_score" in first
+        assert "weekly_context_score" in first
+        assert "weekly_context_multiplier" in first
+        assert "phase_context_score" in first
+        assert "event_recency_score" in first
+        assert "risk_score" in first
+        assert first.get("confirmation_status") in {"confirmed", "partial", "unconfirmed", "risk_blocked"}
         assert "scan_mode" in first
 
 
@@ -605,6 +613,44 @@ def test_strategy_catalog_endpoint() -> None:
     ids = {str(item.get("strategy_id")) for item in body["items"]}
     assert "wyckoff_trend_v1" in ids
     assert "wyckoff_trend_v2" in ids
+    assert "relative_strength_breakout_v1" in ids
+
+
+def test_strategy_update_endpoint_supports_default_and_version_switch() -> None:
+    registry = store._strategy_registry
+    before_registry = dict(registry._strategies)
+    before_resp = client.get("/api/strategies")
+    assert before_resp.status_code == 200
+    before_items = before_resp.json().get("items") or []
+    before_map = {str(item.get("strategy_id")): item for item in before_items}
+    assert "wyckoff_trend_v1" in before_map and "wyckoff_trend_v2" in before_map
+
+    try:
+        update_resp = client.patch(
+            "/api/strategies/wyckoff_trend_v2",
+            json={"is_default": True, "version": "2.0.0-test"},
+        )
+        assert update_resp.status_code == 200
+        updated = update_resp.json()
+        assert updated["strategy_id"] == "wyckoff_trend_v2"
+        assert updated["is_default"] is True
+        assert updated["version"] == "2.0.0-test"
+
+        after_resp = client.get("/api/strategies")
+        assert after_resp.status_code == 200
+        after_items = after_resp.json().get("items") or []
+        after_map = {str(item.get("strategy_id")): item for item in after_items}
+        assert after_map["wyckoff_trend_v2"]["is_default"] is True
+        assert after_map["wyckoff_trend_v1"]["is_default"] is False
+    finally:
+        registry._strategies = dict(before_registry)
+
+
+def test_strategy_update_endpoint_rejects_empty_payload() -> None:
+    resp = client.patch("/api/strategies/wyckoff_trend_v1", json={})
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["code"] == "STRATEGY_UPDATE_EMPTY"
 
 
 def test_signals_endpoint_rejects_unknown_strategy() -> None:
@@ -663,6 +709,31 @@ def test_signals_endpoint_applies_strategy_default_params() -> None:
     assert strategy_params.get("event_grade_min") == "B"
     assert strategy_params.get("health_score_min") == 55.0
     assert strategy_params.get("event_score_min") == 55.0
+    assert strategy_params.get("require_key_event_confirmation") is True
+
+
+def test_signals_endpoint_supports_relative_strength_strategy_defaults() -> None:
+    dates = _load_symbol_dates("sz300750")
+    as_of_date = dates[-8]
+    resp = client.get(
+        "/api/signals",
+        params={
+            "mode": "full_market",
+            "as_of_date": as_of_date,
+            "min_score": 0,
+            "min_event_count": 0,
+            "strategy_id": "relative_strength_breakout_v1",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["strategy_id"] == "relative_strength_breakout_v1"
+    strategy_params = body.get("strategy_params") or {}
+    assert strategy_params.get("min_ret40") == 0.12
+    assert strategy_params.get("max_retrace20") == 0.22
+    assert strategy_params.get("min_up_down_volume_ratio") == 1.15
+    assert strategy_params.get("rank_weight_strength") == 0.3
+    assert strategy_params.get("require_key_event_confirmation") is False
 
 
 def test_signals_endpoint_supports_signal_age_filter(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -748,6 +819,55 @@ def test_signals_endpoint_supports_signal_age_filter(monkeypatch: pytest.MonkeyP
     assert body_filtered["items"] == []
 
 
+def test_signals_endpoint_ignores_signal_age_filter_when_capability_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    registry = store._strategy_registry
+    original = registry._strategies["wyckoff_trend_v1"]
+    downgraded = replace(
+        original,
+        capabilities=replace(
+            original.capabilities,
+            supports_signal_age_filter=False,
+        ),
+    )
+    monkeypatch.setitem(registry._strategies, "wyckoff_trend_v1", downgraded)
+    store._signals_cache.clear()
+
+    dates = _load_symbol_dates("sz300750")
+    as_of_date = dates[-8]
+    base_params = {
+        "mode": "full_market",
+        "as_of_date": as_of_date,
+        "refresh": "true",
+        "window_days": "60",
+        "min_score": "0",
+        "min_event_count": "0",
+        "strategy_id": "wyckoff_trend_v1",
+    }
+    resp_base = client.get("/api/signals", params=base_params)
+    assert resp_base.status_code == 200
+    body_base = resp_base.json()
+    base_count = len(body_base["items"])
+    assert base_count > 0
+
+    resp_filtered = client.get(
+        "/api/signals",
+        params={
+            **base_params,
+            "signal_age_min": "240",
+            "signal_age_max": "240",
+        },
+    )
+    assert resp_filtered.status_code == 200
+    body_filtered = resp_filtered.json()
+    assert len(body_filtered["items"]) == base_count
+    notes = body_filtered.get("notes") or []
+    assert any("不支持 signal_age 过滤" in str(note) for note in notes)
+
+
 def test_signals_disk_cache_reuses_persisted_payload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -829,6 +949,11 @@ def test_signals_disk_cache_reuses_persisted_payload(
 
 
 def test_wyckoff_event_store_lazy_fill_and_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_calc = store.__class__._calc_wyckoff_snapshot.__get__(store, store.__class__)
+    monkeypatch.setattr(store, "_calc_wyckoff_snapshot", original_calc)
+    monkeypatch.setattr(store._wyckoff_event_store, "_enabled", True)
+    monkeypatch.setattr(store._wyckoff_event_store, "_read_only", False)
+    store._wyckoff_event_store._init_db()
     db_path = Path(os.environ["TDX_TREND_WYCKOFF_STORE_PATH"])
     if db_path.exists():
         with sqlite3.connect(str(db_path)) as conn:
@@ -869,15 +994,20 @@ def test_wyckoff_event_store_lazy_fill_and_reuse(monkeypatch: pytest.MonkeyPatch
     assert first_resp.status_code == 200
     assert db_path.exists()
 
-    with sqlite3.connect(str(db_path)) as conn:
-        first_row = conn.execute(
-            """
-            SELECT symbol, trade_date, window_days, created_at, updated_at
-            FROM wyckoff_daily_events
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """
-        ).fetchone()
+    first_row = None
+    deadline = time.time() + 3.0
+    while first_row is None and time.time() < deadline:
+        with sqlite3.connect(str(db_path)) as conn:
+            first_row = conn.execute(
+                """
+                SELECT symbol, trade_date, window_days, created_at, updated_at
+                FROM wyckoff_daily_events
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if first_row is None:
+            time.sleep(0.1)
     assert first_row is not None
     symbol, trade_date, window_days, created_at, updated_at = first_row
     assert symbol

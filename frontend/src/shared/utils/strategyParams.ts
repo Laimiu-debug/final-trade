@@ -16,6 +16,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+function normalizeStrategyId(raw: unknown, fallback: StrategyId = 'wyckoff_trend_v1'): StrategyId {
+  const text = String(raw || '').trim()
+  return text || fallback
+}
+
 export function normalizeStrategyParams(raw: unknown): Record<string, unknown> {
   if (!isRecord(raw)) return {}
   const out: Record<string, unknown> = {}
@@ -123,7 +128,7 @@ export function resolveDefaultStrategyId(
   if (defaultItem) return defaultItem.strategy_id
   if (enabled.length > 0) return enabled[0].strategy_id
   const fallbackExists = normalized.some((item) => item.strategy_id === fallback)
-  return fallbackExists ? fallback : 'wyckoff_trend_v1'
+  return fallbackExists ? fallback : (normalized[0]?.strategy_id || fallback || 'wyckoff_trend_v1')
 }
 
 export type StrategyParamPreset = {
@@ -155,8 +160,7 @@ function normalizePreset(raw: unknown): StrategyParamPreset | null {
   const id = String(raw.id || '').trim()
   const name = String(raw.name || '').trim()
   const savedAt = String(raw.saved_at || '').trim()
-  const strategyIdRaw = String(raw.strategy_id || '').trim()
-  const strategyId: StrategyId = strategyIdRaw === 'wyckoff_trend_v2' ? 'wyckoff_trend_v2' : 'wyckoff_trend_v1'
+  const strategyId = normalizeStrategyId(raw.strategy_id)
   if (!id || !name || !savedAt) return null
   return {
     id,
@@ -171,8 +175,7 @@ function normalizeSharedState(raw: unknown): StrategySharedState {
   const defaults = buildDefaultSharedState()
   if (!isRecord(raw)) return defaults
 
-  const lastStrategyRaw = String(raw.last_strategy_id || '').trim()
-  const lastStrategyId: StrategyId = lastStrategyRaw === 'wyckoff_trend_v2' ? 'wyckoff_trend_v2' : 'wyckoff_trend_v1'
+  const lastStrategyId = normalizeStrategyId(raw.last_strategy_id, defaults.last_strategy_id || 'wyckoff_trend_v1')
 
   const paramsByStrategy: Record<string, Record<string, unknown>> = {}
   if (isRecord(raw.params_by_strategy)) {
@@ -243,9 +246,7 @@ export function setSharedStrategyParams(strategyId: StrategyId, params: Record<s
 
 export function getSharedLastStrategyId(fallback: StrategyId = 'wyckoff_trend_v1'): StrategyId {
   const state = loadStrategySharedState()
-  const text = String(state.last_strategy_id || '').trim()
-  if (text === 'wyckoff_trend_v2') return 'wyckoff_trend_v2'
-  return fallback === 'wyckoff_trend_v2' ? 'wyckoff_trend_v2' : 'wyckoff_trend_v1'
+  return normalizeStrategyId(state.last_strategy_id, fallback)
 }
 
 export function listSharedStrategyPresets(strategyId: StrategyId): StrategyParamPreset[] {

@@ -8,7 +8,7 @@ export type TrendPoolStep = 'auto' | 'step1' | 'step2' | 'step3' | 'step4'
 export type BacktestPriorityMode = 'phase_first' | 'balanced' | 'momentum'
 export type BacktestPoolRollMode = 'daily' | 'weekly' | 'position'
 export type BoardFilter = 'main' | 'gem' | 'star' | 'beijing' | 'st'
-export type StrategyId = 'wyckoff_trend_v1' | 'wyckoff_trend_v2'
+export type StrategyId = string
 export type MarketDataSource = 'tdx_only' | 'tdx_then_akshare' | 'akshare_only'
 export type MarketSyncProvider = 'baostock'
 export type MarketSyncMode = 'incremental' | 'full'
@@ -204,6 +204,15 @@ export interface SignalResult {
   event_position_score?: number
   event_vol_price_score?: number
   event_confirmation_score?: number
+  candle_quality_score?: number
+  cost_center_shift_score?: number
+  weekly_context_score?: number
+  weekly_context_multiplier?: number
+  event_recency_score?: number
+  phase_context_score?: number
+  risk_score?: number
+  confirmation_status?: 'confirmed' | 'partial' | 'unconfirmed' | 'risk_blocked'
+  event_confirmation_map?: Record<string, string>
   event_grade_map?: Record<string, 'A' | 'B' | 'C'>
 }
 
@@ -220,6 +229,7 @@ export interface SignalsResponse {
   strategy_version?: string
   strategy_params?: Record<string, unknown>
   strategy_params_hash?: string
+  notes?: string[]
 }
 
 export interface SimTradeOrder {
@@ -405,6 +415,8 @@ export interface BacktestRunRequest {
   health_score_min?: number
   event_score_min?: number
   event_grade_min?: 'A' | 'B' | 'C'
+  require_key_event_confirmation?: boolean
+  execution_path_preference?: 'auto' | 'matrix' | 'legacy'
   matrix_event_semantic_version?: 'matrix_v1' | 'aligned_wyckoff_v2'
   enforce_t1: boolean
   entry_delay_days?: number
@@ -422,10 +434,20 @@ export interface BacktestTrade {
   entry_signal: string
   entry_phase: string
   entry_quality_score: number
+  candle_quality_score?: number
+  cost_center_shift_score?: number
+  weekly_context_score?: number
+  weekly_context_multiplier?: number
   health_score?: number
   event_score?: number
+  risk_score?: number
+  confirmation_status?: 'confirmed' | 'partial' | 'unconfirmed' | 'risk_blocked'
   event_grade?: 'A' | 'B' | 'C'
+  phase_context_score?: number
+  event_recency_score?: number
   exit_reason: string
+  delay_entry_days?: number
+  delay_window_days?: number
   quantity: number
   entry_price: number
   exit_price: number
@@ -454,6 +476,7 @@ export interface BacktestResponse {
   regime_breakdown?: BacktestRegimeBucket[]
   monte_carlo?: BacktestMonteCarloSummary | null
   walk_forward?: BacktestWalkForwardReport | null
+  execution_path?: 'matrix' | 'legacy' | null
   strategy_id?: StrategyId
   strategy_version?: string
   strategy_params?: Record<string, unknown>
@@ -662,6 +685,8 @@ export interface BacktestABVariantConfig {
   health_score_min?: number
   event_score_min?: number
   event_grade_min?: 'A' | 'B' | 'C'
+  require_key_event_confirmation?: boolean
+  execution_path_preference?: 'auto' | 'matrix' | 'legacy'
   matrix_event_semantic_version?: 'matrix_v1' | 'aligned_wyckoff_v2'
   rank_weight_health?: number
   rank_weight_event?: number
@@ -694,6 +719,7 @@ export interface BacktestABVariantResult {
   error?: string | null
   stats?: ReviewStats | null
   risk_metrics?: BacktestRiskMetrics | null
+  execution_path?: 'matrix' | 'legacy' | null
   candidate_count: number
   trade_count: number
   utad_exit_ratio: number
@@ -708,7 +734,9 @@ export interface BacktestABComparisonRow {
   total_return_delta: number
   win_rate_delta: number
   max_drawdown_delta: number
+  trade_count_delta: number
   utad_exit_ratio_delta: number
+  expectancy_delta: number
   max_consecutive_losses_delta: number
 }
 

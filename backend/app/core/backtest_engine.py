@@ -71,6 +71,10 @@ class CandidateTrade:
     entry_signal: str
     entry_phase: str
     entry_quality_score: float
+    candle_quality_score: float
+    cost_center_shift_score: float
+    weekly_context_score: float
+    weekly_context_multiplier: float
     entry_phase_score: float
     entry_events_weight: float
     entry_structure_score: int
@@ -78,7 +82,13 @@ class CandidateTrade:
     entry_volatility_score: float
     health_score: float
     event_score: float
+    risk_score: float
+    confirmation_status: str
     event_grade: str
+    phase_context_score: float
+    event_recency_score: float
+    delay_entry_days: int
+    delay_window_days: int
     final_rank_score: float
     entry_price: float
     exit_price: float
@@ -96,6 +106,10 @@ class MatrixEntryIntent:
     entry_signal: str
     entry_phase: str
     entry_quality_score: float
+    candle_quality_score: float
+    cost_center_shift_score: float
+    weekly_context_score: float
+    weekly_context_multiplier: float
     entry_phase_score: float
     entry_events_weight: float
     entry_structure_score: int
@@ -103,7 +117,13 @@ class MatrixEntryIntent:
     entry_volatility_score: float
     health_score: float
     event_score: float
+    risk_score: float
+    confirmation_status: str
     event_grade: str
+    phase_context_score: float
+    event_recency_score: float
+    delay_entry_days: int
+    delay_window_days: int
     final_rank_score: float
     entry_price: float
 
@@ -183,6 +203,13 @@ class BacktestEngine:
         return text if text in EVENT_GRADE_RANK else "C"
 
     @staticmethod
+    def _normalize_confirmation_status(raw: Any) -> str:
+        text = str(raw or "").strip().lower()
+        if text in {"confirmed", "partial", "unconfirmed", "risk_blocked"}:
+            return text
+        return "unconfirmed"
+
+    @staticmethod
     def _event_grade_meets_threshold(*, grade: str, minimum: str) -> bool:
         return EVENT_GRADE_RANK.get(BacktestEngine._normalize_event_grade(grade), 1) >= EVENT_GRADE_RANK.get(
             BacktestEngine._normalize_event_grade(minimum),
@@ -216,6 +243,7 @@ class BacktestEngine:
         health_score: float,
         event_score: float,
         event_grade: str,
+        confirmation_status: str = "unconfirmed",
     ) -> bool:
         if float(health_score) < float(payload.health_score_min):
             return False
@@ -226,6 +254,10 @@ class BacktestEngine:
             minimum=payload.event_grade_min,
         ):
             return False
+        if bool(payload.require_key_event_confirmation):
+            normalized_status = BacktestEngine._normalize_confirmation_status(confirmation_status)
+            if normalized_status != "confirmed":
+                return False
         return True
 
     def _build_matrix_semantic_meta(
@@ -250,6 +282,10 @@ class BacktestEngine:
         event_count = self._normalize_event_count(snapshot)
         sequence_ok = bool(snapshot.get("sequence_ok"))
         entry_quality_score = float(snapshot.get("entry_quality_score", 0.0) or 0.0)
+        candle_quality_score = float(snapshot.get("candle_quality_score", 0.0) or 0.0)
+        cost_center_shift_score = float(snapshot.get("cost_center_shift_score", 0.0) or 0.0)
+        weekly_context_score = float(snapshot.get("weekly_context_score", 50.0) or 50.0)
+        weekly_context_multiplier = float(snapshot.get("weekly_context_multiplier", 1.0) or 1.0)
         if event_count < payload.min_event_count:
             return None
         if payload.require_sequence and not sequence_ok:
@@ -267,18 +303,27 @@ class BacktestEngine:
             )
             or 0.0
         )
+        risk_score = float(snapshot.get("risk_score", 0.0) or 0.0)
+        confirmation_status = self._normalize_confirmation_status(snapshot.get("confirmation_status", "unconfirmed"))
+        phase_context_score = float(snapshot.get("phase_context_score", 0.0) or 0.0)
+        event_recency_score = float(snapshot.get("event_recency_score", 0.0) or 0.0)
         event_grade = self._normalize_event_grade(snapshot.get("event_grade", "C"))
         if not self._passes_semantic_score_gates(
             payload=payload,
             health_score=health_score,
             event_score=event_score,
             event_grade=event_grade,
+            confirmation_status=confirmation_status,
         ):
             return None
         return {
             "entry_signal": " / ".join(day_entry_events),
             "entry_phase": entry_phase,
             "entry_quality_score": float(entry_quality_score),
+            "candle_quality_score": max(0.0, min(100.0, candle_quality_score)),
+            "cost_center_shift_score": max(0.0, min(100.0, cost_center_shift_score)),
+            "weekly_context_score": max(0.0, min(100.0, weekly_context_score)),
+            "weekly_context_multiplier": max(0.85, min(1.15, weekly_context_multiplier)),
             "entry_phase_score": float(PHASE_PRIORITY_SCORE.get(entry_phase, 0.0)),
             "entry_events_weight": float(sum(ENTRY_EVENT_WEIGHTS.get(evt, 1.0) for evt in day_entry_events)),
             "entry_structure_score": self._structure_score(structure_hhh),
@@ -286,7 +331,11 @@ class BacktestEngine:
             "entry_volatility_score": float(snapshot.get("volatility_score", 50.0) or 50.0),
             "health_score": max(0.0, min(100.0, health_score)),
             "event_score": max(0.0, min(100.0, event_score)),
+            "risk_score": max(0.0, min(100.0, risk_score)),
+            "confirmation_status": confirmation_status,
             "event_grade": event_grade,
+            "phase_context_score": max(0.0, min(100.0, phase_context_score)),
+            "event_recency_score": max(0.0, min(100.0, event_recency_score)),
         }
 
     @staticmethod
@@ -323,6 +372,51 @@ class BacktestEngine:
                 continue
             if bool(sell_col[probe_index]):
                 return DELAY_SKIP_REASON_SELL_SIGNAL
+        return None
+
+    def _resolve_delay_invalidation_reason_matrix_aligned(
+        self,
+        *,
+        symbol: str,
+        signal_index: int,
+        entry_index: int,
+        dates: list[str],
+        payload: BacktestRunRequest,
+    ) -> str | None:
+        if entry_index - signal_index <= 1:
+            return None
+        for probe_index in range(signal_index + 1, entry_index):
+            if probe_index >= len(dates):
+                break
+            probe_date = str(dates[probe_index]).strip()
+            if not probe_date:
+                continue
+            row = self._build_row(symbol, probe_date)
+            if row is None:
+                continue
+            snapshot = self._calc_snapshot(row, payload.window_days, probe_date)
+            event_dates = self._normalize_event_dates(snapshot.get("event_dates"))
+
+            raw_risk_events = snapshot.get("risk_events")
+            if isinstance(raw_risk_events, list):
+                for raw_event in raw_risk_events:
+                    event_text = str(raw_event).strip()
+                    if not event_text or event_text not in DELAY_INVALIDATION_RISK_EVENTS:
+                        continue
+                    event_day = str(event_dates.get(event_text, "")).strip()
+                    if event_day == probe_date or (not event_day and event_text in event_dates):
+                        return DELAY_SKIP_REASON_RISK_EVENT
+
+            for risk_event in DELAY_INVALIDATION_RISK_EVENTS:
+                if str(event_dates.get(risk_event, "")).strip() == probe_date:
+                    return DELAY_SKIP_REASON_RISK_EVENT
+
+            for exit_event in payload.exit_events:
+                exit_name = str(exit_event).strip()
+                if not exit_name:
+                    continue
+                if str(event_dates.get(exit_name, "")).strip() == probe_date:
+                    return DELAY_SKIP_REASON_SELL_SIGNAL
         return None
 
     @staticmethod
@@ -558,12 +652,21 @@ class BacktestEngine:
                 if not bool(valid_col[entry_index]):
                     continue
                 if payload.delay_invalidation_enabled:
-                    delay_reason = self._resolve_delay_invalidation_reason_matrix(
-                        signal_index=int(signal_index),
-                        entry_index=int(entry_index),
-                        valid_col=valid_col,
-                        sell_col=sell_col,
-                    )
+                    if payload.matrix_event_semantic_version == MATRIX_SEMANTIC_ALIGNED:
+                        delay_reason = self._resolve_delay_invalidation_reason_matrix_aligned(
+                            symbol=symbol,
+                            signal_index=int(signal_index),
+                            entry_index=int(entry_index),
+                            dates=dates,
+                            payload=payload,
+                        )
+                    else:
+                        delay_reason = self._resolve_delay_invalidation_reason_matrix(
+                            signal_index=int(signal_index),
+                            entry_index=int(entry_index),
+                            valid_col=valid_col,
+                            sell_col=sell_col,
+                        )
                     if delay_reason:
                         delay_skip_reasons[delay_reason] = delay_skip_reasons.get(delay_reason, 0) + 1
                         continue
@@ -596,6 +699,10 @@ class BacktestEngine:
                     entry_tags.append(payload.entry_events[0] if payload.entry_events else "ENTRY")
                 entry_phase = "鍚哥D" if bool(matrix_signals.s7[signal_index, col]) else "闃舵鏈槑"
                 entry_quality_score = float(score_col[signal_index]) if math.isfinite(float(score_col[signal_index])) else 0.0
+                candle_quality_score = max(0.0, min(100.0, entry_quality_score))
+                cost_center_shift_score = max(0.0, min(100.0, entry_quality_score))
+                weekly_context_score = max(0.0, min(100.0, entry_quality_score))
+                weekly_context_multiplier = 1.0
                 entry_signal_text = " / ".join(entry_tags)
                 entry_phase_score = float(PHASE_PRIORITY_SCORE.get(entry_phase, 0.0))
                 entry_events_weight = float(len(entry_tags))
@@ -604,7 +711,11 @@ class BacktestEngine:
                 entry_volatility_score = max(0.0, min(100.0, entry_quality_score))
                 health_score = max(0.0, min(100.0, entry_quality_score))
                 event_score = max(0.0, min(100.0, entry_quality_score))
+                risk_score = 0.0
+                confirmation_status = "unconfirmed"
                 event_grade = "C"
+                phase_context_score = 0.0
+                event_recency_score = 0.0
 
                 if payload.matrix_event_semantic_version == MATRIX_SEMANTIC_ALIGNED:
                     semantic_meta = self._build_matrix_semantic_meta(
@@ -617,6 +728,10 @@ class BacktestEngine:
                     entry_signal_text = str(semantic_meta["entry_signal"])
                     entry_phase = str(semantic_meta["entry_phase"])
                     entry_quality_score = float(semantic_meta["entry_quality_score"])
+                    candle_quality_score = float(semantic_meta.get("candle_quality_score", 0.0) or 0.0)
+                    cost_center_shift_score = float(semantic_meta.get("cost_center_shift_score", 0.0) or 0.0)
+                    weekly_context_score = float(semantic_meta.get("weekly_context_score", 50.0) or 50.0)
+                    weekly_context_multiplier = float(semantic_meta.get("weekly_context_multiplier", 1.0) or 1.0)
                     entry_phase_score = float(semantic_meta["entry_phase_score"])
                     entry_events_weight = float(semantic_meta["entry_events_weight"])
                     entry_structure_score = int(semantic_meta["entry_structure_score"])
@@ -624,12 +739,19 @@ class BacktestEngine:
                     entry_volatility_score = float(semantic_meta["entry_volatility_score"])
                     health_score = float(semantic_meta["health_score"])
                     event_score = float(semantic_meta["event_score"])
+                    risk_score = float(semantic_meta.get("risk_score", 0.0) or 0.0)
+                    confirmation_status = self._normalize_confirmation_status(
+                        semantic_meta.get("confirmation_status", "unconfirmed")
+                    )
                     event_grade = self._normalize_event_grade(semantic_meta["event_grade"])
+                    phase_context_score = float(semantic_meta.get("phase_context_score", 0.0) or 0.0)
+                    event_recency_score = float(semantic_meta.get("event_recency_score", 0.0) or 0.0)
                 elif not self._passes_semantic_score_gates(
                     payload=payload,
                     health_score=health_score,
                     event_score=event_score,
                     event_grade=event_grade,
+                    confirmation_status=confirmation_status,
                 ):
                     continue
 
@@ -648,6 +770,10 @@ class BacktestEngine:
                         entry_signal=entry_signal_text,
                         entry_phase=entry_phase,
                         entry_quality_score=max(0.0, min(100.0, entry_quality_score)),
+                        candle_quality_score=max(0.0, min(100.0, candle_quality_score)),
+                        cost_center_shift_score=max(0.0, min(100.0, cost_center_shift_score)),
+                        weekly_context_score=max(0.0, min(100.0, weekly_context_score)),
+                        weekly_context_multiplier=max(0.85, min(1.15, weekly_context_multiplier)),
                         entry_phase_score=float(entry_phase_score),
                         entry_events_weight=float(entry_events_weight),
                         entry_structure_score=int(entry_structure_score),
@@ -655,7 +781,13 @@ class BacktestEngine:
                         entry_volatility_score=float(entry_volatility_score),
                         health_score=max(0.0, min(100.0, health_score)),
                         event_score=max(0.0, min(100.0, event_score)),
+                        risk_score=max(0.0, min(100.0, risk_score)),
+                        confirmation_status=confirmation_status,
                         event_grade=event_grade,
+                        phase_context_score=max(0.0, min(100.0, phase_context_score)),
+                        event_recency_score=max(0.0, min(100.0, event_recency_score)),
+                        delay_entry_days=max(1, int(payload.entry_delay_days)),
+                        delay_window_days=max(0, int(entry_index) - int(signal_index) - 1),
                         final_rank_score=float(final_rank_score),
                         entry_price=entry_price,
                         exit_price=float(exit_price),
@@ -741,6 +873,12 @@ class BacktestEngine:
             event_count = self._normalize_event_count(snapshot)
             sequence_ok = bool(snapshot.get("sequence_ok"))
             entry_quality_score = float(snapshot.get("entry_quality_score", 0.0) or 0.0)
+            candle_quality_score = float(snapshot.get("candle_quality_score", 0.0) or 0.0)
+            cost_center_shift_score = float(
+                snapshot.get("cost_center_shift_score", entry_quality_score) or entry_quality_score
+            )
+            weekly_context_score = float(snapshot.get("weekly_context_score", 50.0) or 50.0)
+            weekly_context_multiplier = float(snapshot.get("weekly_context_multiplier", 1.0) or 1.0)
             health_score = float(snapshot.get("health_score", entry_quality_score) or entry_quality_score)
             event_score = float(
                 snapshot.get(
@@ -749,6 +887,8 @@ class BacktestEngine:
                 )
                 or 0.0
             )
+            risk_score = float(snapshot.get("risk_score", 0.0) or 0.0)
+            confirmation_status = self._normalize_confirmation_status(snapshot.get("confirmation_status", "unconfirmed"))
             event_grade = self._normalize_event_grade(snapshot.get("event_grade", "C"))
             if event_count < payload.min_event_count:
                 continue
@@ -761,6 +901,7 @@ class BacktestEngine:
                 health_score=health_score,
                 event_score=event_score,
                 event_grade=event_grade,
+                confirmation_status=confirmation_status,
             ):
                 continue
 
@@ -775,6 +916,10 @@ class BacktestEngine:
                 "entry_signal": " / ".join(day_entry_events),
                 "entry_phase": entry_phase,
                 "entry_quality_score": entry_quality_score,
+                "candle_quality_score": max(0.0, min(100.0, candle_quality_score)),
+                "cost_center_shift_score": max(0.0, min(100.0, cost_center_shift_score)),
+                "weekly_context_score": max(0.0, min(100.0, weekly_context_score)),
+                "weekly_context_multiplier": max(0.85, min(1.15, weekly_context_multiplier)),
                 "entry_phase_score": PHASE_PRIORITY_SCORE.get(entry_phase, 0.0),
                 "entry_events_weight": float(sum(ENTRY_EVENT_WEIGHTS.get(evt, 1.0) for evt in day_entry_events)),
                 "entry_structure_score": self._structure_score(structure_hhh),
@@ -782,7 +927,11 @@ class BacktestEngine:
                 "entry_volatility_score": float(snapshot.get("volatility_score", 50.0) or 50.0),
                 "health_score": max(0.0, min(100.0, health_score)),
                 "event_score": max(0.0, min(100.0, event_score)),
+                "risk_score": max(0.0, min(100.0, risk_score)),
+                "confirmation_status": confirmation_status,
                 "event_grade": event_grade,
+                "phase_context_score": max(0.0, min(100.0, float(snapshot.get("phase_context_score", 0.0) or 0.0))),
+                "event_recency_score": max(0.0, min(100.0, float(snapshot.get("event_recency_score", 0.0) or 0.0))),
                 "final_rank_score": final_rank_score,
             }
 
@@ -832,6 +981,10 @@ class BacktestEngine:
                     entry_signal=str(meta["entry_signal"]),
                     entry_phase=str(meta["entry_phase"]),
                     entry_quality_score=float(meta["entry_quality_score"]),
+                    candle_quality_score=float(meta["candle_quality_score"]),
+                    cost_center_shift_score=float(meta["cost_center_shift_score"]),
+                    weekly_context_score=float(meta["weekly_context_score"]),
+                    weekly_context_multiplier=float(meta["weekly_context_multiplier"]),
                     entry_phase_score=float(meta["entry_phase_score"]),
                     entry_events_weight=float(meta["entry_events_weight"]),
                     entry_structure_score=int(meta["entry_structure_score"]),
@@ -839,7 +992,13 @@ class BacktestEngine:
                     entry_volatility_score=float(meta["entry_volatility_score"]),
                     health_score=float(meta["health_score"]),
                     event_score=float(meta["event_score"]),
+                    risk_score=float(meta["risk_score"]),
+                    confirmation_status=self._normalize_confirmation_status(meta["confirmation_status"]),
                     event_grade=str(meta["event_grade"]),
+                    phase_context_score=float(meta["phase_context_score"]),
+                    event_recency_score=float(meta["event_recency_score"]),
+                    delay_entry_days=max(1, int(payload.entry_delay_days)),
+                    delay_window_days=max(0, int(entry_index) - int(signal_index) - 1),
                     final_rank_score=float(meta["final_rank_score"]),
                     entry_price=entry_price,
                     exit_price=float(exit_price),
@@ -971,12 +1130,21 @@ class BacktestEngine:
                 if not bool(valid_col[entry_index]):
                     continue
                 if payload.delay_invalidation_enabled:
-                    delay_reason = self._resolve_delay_invalidation_reason_matrix(
-                        signal_index=int(signal_index),
-                        entry_index=int(entry_index),
-                        valid_col=valid_col,
-                        sell_col=sell_col,
-                    )
+                    if payload.matrix_event_semantic_version == MATRIX_SEMANTIC_ALIGNED:
+                        delay_reason = self._resolve_delay_invalidation_reason_matrix_aligned(
+                            symbol=symbol,
+                            signal_index=int(signal_index),
+                            entry_index=int(entry_index),
+                            dates=dates,
+                            payload=payload,
+                        )
+                    else:
+                        delay_reason = self._resolve_delay_invalidation_reason_matrix(
+                            signal_index=int(signal_index),
+                            entry_index=int(entry_index),
+                            valid_col=valid_col,
+                            sell_col=sell_col,
+                        )
                     if delay_reason:
                         delay_skip_reasons[delay_reason] = delay_skip_reasons.get(delay_reason, 0) + 1
                         continue
@@ -995,6 +1163,10 @@ class BacktestEngine:
                 entry_phase = "鍚哥D" if bool(matrix_signals.s7[signal_index, col]) else "闃舵鏈槑"
                 raw_quality = float(score_col[signal_index]) if math.isfinite(float(score_col[signal_index])) else 0.0
                 entry_quality_score = max(0.0, min(100.0, raw_quality))
+                candle_quality_score = entry_quality_score
+                cost_center_shift_score = entry_quality_score
+                weekly_context_score = entry_quality_score
+                weekly_context_multiplier = 1.0
                 entry_signal_text = " / ".join(entry_tags)
                 entry_phase_score = float(PHASE_PRIORITY_SCORE.get(entry_phase, 0.0))
                 entry_events_weight = float(len(entry_tags))
@@ -1003,7 +1175,11 @@ class BacktestEngine:
                 entry_volatility_score = entry_quality_score
                 health_score = entry_quality_score
                 event_score = entry_quality_score
+                risk_score = 0.0
+                confirmation_status = "unconfirmed"
                 event_grade = "C"
+                phase_context_score = 0.0
+                event_recency_score = 0.0
 
                 if payload.matrix_event_semantic_version == MATRIX_SEMANTIC_ALIGNED:
                     semantic_meta = self._build_matrix_semantic_meta(
@@ -1016,6 +1192,10 @@ class BacktestEngine:
                     entry_signal_text = str(semantic_meta["entry_signal"])
                     entry_phase = str(semantic_meta["entry_phase"])
                     entry_quality_score = float(semantic_meta["entry_quality_score"])
+                    candle_quality_score = float(semantic_meta.get("candle_quality_score", 0.0) or 0.0)
+                    cost_center_shift_score = float(semantic_meta.get("cost_center_shift_score", 0.0) or 0.0)
+                    weekly_context_score = float(semantic_meta.get("weekly_context_score", 50.0) or 50.0)
+                    weekly_context_multiplier = float(semantic_meta.get("weekly_context_multiplier", 1.0) or 1.0)
                     entry_phase_score = float(semantic_meta["entry_phase_score"])
                     entry_events_weight = float(semantic_meta["entry_events_weight"])
                     entry_structure_score = int(semantic_meta["entry_structure_score"])
@@ -1023,12 +1203,19 @@ class BacktestEngine:
                     entry_volatility_score = float(semantic_meta["entry_volatility_score"])
                     health_score = float(semantic_meta["health_score"])
                     event_score = float(semantic_meta["event_score"])
+                    risk_score = float(semantic_meta.get("risk_score", 0.0) or 0.0)
+                    confirmation_status = self._normalize_confirmation_status(
+                        semantic_meta.get("confirmation_status", "unconfirmed")
+                    )
                     event_grade = self._normalize_event_grade(semantic_meta["event_grade"])
+                    phase_context_score = float(semantic_meta.get("phase_context_score", 0.0) or 0.0)
+                    event_recency_score = float(semantic_meta.get("event_recency_score", 0.0) or 0.0)
                 elif not self._passes_semantic_score_gates(
                     payload=payload,
                     health_score=health_score,
                     event_score=event_score,
                     event_grade=event_grade,
+                    confirmation_status=confirmation_status,
                 ):
                     continue
 
@@ -1048,6 +1235,10 @@ class BacktestEngine:
                         entry_signal=entry_signal_text,
                         entry_phase=entry_phase,
                         entry_quality_score=entry_quality_score,
+                        candle_quality_score=max(0.0, min(100.0, candle_quality_score)),
+                        cost_center_shift_score=max(0.0, min(100.0, cost_center_shift_score)),
+                        weekly_context_score=max(0.0, min(100.0, weekly_context_score)),
+                        weekly_context_multiplier=max(0.85, min(1.15, weekly_context_multiplier)),
                         entry_phase_score=entry_phase_score,
                         entry_events_weight=entry_events_weight,
                         entry_structure_score=entry_structure_score,
@@ -1055,7 +1246,13 @@ class BacktestEngine:
                         entry_volatility_score=entry_volatility_score,
                         health_score=health_score,
                         event_score=event_score,
+                        risk_score=risk_score,
+                        confirmation_status=confirmation_status,
                         event_grade=event_grade,
+                        phase_context_score=phase_context_score,
+                        event_recency_score=event_recency_score,
+                        delay_entry_days=max(1, int(payload.entry_delay_days)),
+                        delay_window_days=max(0, int(entry_index) - int(signal_index) - 1),
                         final_rank_score=final_rank_score,
                         entry_price=entry_price,
                     )
@@ -1190,10 +1387,20 @@ class BacktestEngine:
                     entry_signal=row.entry_signal,
                     entry_phase=row.entry_phase,
                     entry_quality_score=round(row.entry_quality_score, 2),
+                    candle_quality_score=round(row.candle_quality_score, 2),
+                    cost_center_shift_score=round(row.cost_center_shift_score, 2),
+                    weekly_context_score=round(row.weekly_context_score, 2),
+                    weekly_context_multiplier=round(row.weekly_context_multiplier, 4),
                     health_score=round(row.health_score, 2),
                     event_score=round(row.event_score, 2),
+                    risk_score=round(row.risk_score, 2),
+                    confirmation_status=self._normalize_confirmation_status(row.confirmation_status),
                     event_grade=self._normalize_event_grade(row.event_grade),  # type: ignore[arg-type]
+                    phase_context_score=round(row.phase_context_score, 2),
+                    event_recency_score=round(row.event_recency_score, 2),
                     exit_reason=exit_reason,
+                    delay_entry_days=max(1, int(row.delay_entry_days)),
+                    delay_window_days=max(0, int(row.delay_window_days)),
                     quantity=shares,
                     entry_price=round(row.entry_price, 4),
                     exit_price=round(exit_price, 4),
@@ -1479,10 +1686,20 @@ class BacktestEngine:
                         entry_signal=row.entry_signal,
                         entry_phase=row.entry_phase,
                         entry_quality_score=round(row.entry_quality_score, 2),
+                        candle_quality_score=round(row.candle_quality_score, 2),
+                        cost_center_shift_score=round(row.cost_center_shift_score, 2),
+                        weekly_context_score=round(row.weekly_context_score, 2),
+                        weekly_context_multiplier=round(row.weekly_context_multiplier, 4),
                         health_score=round(row.health_score, 2),
                         event_score=round(row.event_score, 2),
+                        risk_score=round(row.risk_score, 2),
+                        confirmation_status=self._normalize_confirmation_status(row.confirmation_status),
                         event_grade=self._normalize_event_grade(row.event_grade),  # type: ignore[arg-type]
+                        phase_context_score=round(row.phase_context_score, 2),
+                        event_recency_score=round(row.event_recency_score, 2),
                         exit_reason=row.exit_reason,
+                        delay_entry_days=max(1, int(row.delay_entry_days)),
+                        delay_window_days=max(0, int(row.delay_window_days)),
                         quantity=shares,
                         entry_price=round(row.entry_price, 4),
                         exit_price=round(row.exit_price, 4),

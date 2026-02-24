@@ -174,3 +174,78 @@ def test_store_signal_age_uses_trading_day_diff_with_missing_calendar_days(monke
     assert len(resp.items) == 1
     # trading days: 2026-01-06 -> 2026-01-09 -> 2026-01-12 => age=2
     assert resp.items[0].signal_age_days == 2
+
+
+def test_store_respects_key_event_confirmation_strategy_override(monkeypatch) -> None:
+    symbol = "sz300750"
+    row = _build_row(symbol)
+    candles = [
+        CandlePoint(time="2026-01-02", open=10.0, high=10.2, low=9.8, close=10.1, volume=100000, amount=1_000_000.0),
+        CandlePoint(time="2026-01-05", open=10.1, high=10.3, low=9.9, close=10.2, volume=100000, amount=1_000_000.0),
+        CandlePoint(time="2026-01-06", open=10.2, high=10.4, low=10.0, close=10.3, volume=100000, amount=1_000_000.0),
+    ]
+
+    def fake_resolve_signal_candidates(
+        *,
+        mode,
+        run_id,
+        trend_step="auto",
+        as_of_date=None,
+    ):
+        _ = (mode, run_id, trend_step, as_of_date)
+        return [row], None, "mock-run", "2026-01-06"
+
+    def fake_snapshot(*args, **kwargs):
+        _ = (args, kwargs)
+        return {
+            "events": ["SOS"],
+            "risk_events": [],
+            "event_dates": {"SOS": "2026-01-02"},
+            "event_chain": [{"event": "SOS", "date": "2026-01-02", "category": "accumulation"}],
+            "sequence_ok": True,
+            "entry_quality_score": 85.0,
+            "trigger_date": "2026-01-02",
+            "signal": "SOS",
+            "phase": "吸筹D",
+            "phase_hint": "测试信号",
+            "structure_hhh": "HH|HL|HC",
+            "event_strength_score": 76.0,
+            "event_score": 72.0,
+            "event_grade": "A",
+            "health_score": 78.0,
+            "phase_score": 72.0,
+            "structure_score": 68.0,
+            "trend_score": 66.0,
+            "volatility_score": 64.0,
+            "event_confirmation_map": {"SOS": "pending"},
+            "confirmation_status": "partial",
+        }
+
+    monkeypatch.setattr(store, "_resolve_signal_candidates", fake_resolve_signal_candidates)
+    monkeypatch.setattr(store, "_calc_wyckoff_snapshot", fake_snapshot)
+    monkeypatch.setattr(store, "_ensure_candles", lambda raw_symbol: list(candles) if raw_symbol == symbol else [])
+    store._signals_cache.clear()
+
+    # v2 default requires key-event confirmation.
+    strict_resp = store.get_signals(
+        mode="trend_pool",
+        run_id="mock-run",
+        as_of_date="2026-01-06",
+        refresh=True,
+        strategy_id="wyckoff_trend_v2",
+        min_score=0.0,
+        min_event_count=0,
+    )
+    assert strict_resp.items == []
+
+    # v1 keeps legacy behavior and does not enforce key-event confirmation by default.
+    legacy_resp = store.get_signals(
+        mode="trend_pool",
+        run_id="mock-run",
+        as_of_date="2026-01-06",
+        refresh=True,
+        strategy_id="wyckoff_trend_v1",
+        min_score=0.0,
+        min_event_count=0,
+    )
+    assert len(legacy_resp.items) == 1

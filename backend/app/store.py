@@ -312,6 +312,11 @@ class InMemoryStore:
         normalized_minimum = cls._normalize_event_grade(minimum)
         return cls._EVENT_GRADE_RANK.get(normalized_grade, 1) >= cls._EVENT_GRADE_RANK.get(normalized_minimum, 1)
 
+    @staticmethod
+    def _normalize_confirmation_status(raw: Any) -> str:
+        text = str(raw or "").strip().lower()
+        return text if text in {"confirmed", "partial", "unconfirmed", "risk_blocked"} else "unconfirmed"
+
     def _resolve_strategy_runtime(
         self,
         *,
@@ -399,15 +404,26 @@ class InMemoryStore:
         strategy_params: dict[str, Any],
         strategy_params_hash: str,
         strategy_note: str,
+        execution_path: Literal["matrix", "legacy"] | None = None,
     ) -> BacktestResponse:
         notes = list(result.notes)
         if strategy_note and strategy_note not in notes:
             notes.insert(0, strategy_note)
+        path_text = str(execution_path or "").strip().lower()
+        if path_text not in {"matrix", "legacy"}:
+            result_path = str(result.execution_path or "").strip().lower()
+            if result_path in {"matrix", "legacy"}:
+                path_text = result_path
+            elif any("矩阵引擎已启用" in str(item) for item in notes):
+                path_text = "matrix"
+            else:
+                path_text = "legacy"
         updates: dict[str, Any] = {
             "strategy_id": str(strategy_meta.get("strategy_id") or "wyckoff_trend_v1"),
             "strategy_version": str(strategy_meta.get("version") or "1.0.0"),
             "strategy_params": dict(strategy_params),
             "strategy_params_hash": str(strategy_params_hash),
+            "execution_path": path_text,
         }
         if notes != result.notes:
             updates["notes"] = notes
@@ -416,23 +432,44 @@ class InMemoryStore:
     def list_strategies(self) -> StrategyCatalogResponse:
         items: list[StrategyDescriptor] = []
         for descriptor in self._strategy_registry.list():
-            items.append(
-                StrategyDescriptor(
-                    strategy_id=str(descriptor.strategy_id),  # type: ignore[arg-type]
-                    name=str(descriptor.name),
-                    version=str(descriptor.version),
-                    enabled=bool(descriptor.enabled),
-                    is_default=bool(descriptor.is_default),
-                    capabilities=StrategyCapabilities(
-                        supports_matrix=bool(descriptor.capabilities.supports_matrix),
-                        supports_signal_age_filter=bool(descriptor.capabilities.supports_signal_age_filter),
-                        supports_entry_delay=bool(descriptor.capabilities.supports_entry_delay),
-                    ),
-                    strategy_params_schema=dict(descriptor.params_schema),
-                    strategy_params_defaults=dict(descriptor.default_params),
-                )
-            )
+            items.append(self._to_strategy_descriptor_model(descriptor))
         return StrategyCatalogResponse(items=items)
+
+    @staticmethod
+    def _to_strategy_descriptor_model(descriptor: Any) -> StrategyDescriptor:
+        return StrategyDescriptor(
+            strategy_id=str(descriptor.strategy_id),  # type: ignore[arg-type]
+            name=str(descriptor.name),
+            version=str(descriptor.version),
+            enabled=bool(descriptor.enabled),
+            is_default=bool(descriptor.is_default),
+            capabilities=StrategyCapabilities(
+                supports_matrix=bool(descriptor.capabilities.supports_matrix),
+                supports_signal_age_filter=bool(descriptor.capabilities.supports_signal_age_filter),
+                supports_entry_delay=bool(descriptor.capabilities.supports_entry_delay),
+            ),
+            strategy_params_schema=dict(descriptor.params_schema),
+            strategy_params_defaults=dict(descriptor.default_params),
+        )
+
+    def update_strategy(
+        self,
+        *,
+        strategy_id: str,
+        enabled: bool | None = None,
+        is_default: bool | None = None,
+        version: str | None = None,
+    ) -> StrategyDescriptor:
+        try:
+            descriptor = self._strategy_registry.update_descriptor(
+                strategy_id=strategy_id,
+                enabled=enabled,
+                is_default=is_default,
+                version=version,
+            )
+        except ValueError as exc:
+            raise BacktestValidationError("STRATEGY_NOT_FOUND", str(exc)) from exc
+        return self._to_strategy_descriptor_model(descriptor)
 
     @classmethod
     def _resolve_app_state_path(cls, app_state_path: str | None = None) -> Path:
@@ -3966,6 +4003,7 @@ class InMemoryStore:
         *,
         mode: SignalScanMode,
         strategy_id: str,
+        strategy_version: str,
         strategy_params_hash: str,
         run_id: str | None,
         trend_step: TrendPoolStep,
@@ -3982,6 +4020,7 @@ class InMemoryStore:
         payload = {
             "mode": mode,
             "strategy_id": str(strategy_id).strip(),
+            "strategy_version": str(strategy_version).strip(),
             "strategy_params_hash": str(strategy_params_hash).strip(),
             "run_id": run_id or "",
             "trend_step": trend_step,
@@ -4024,6 +4063,9 @@ class InMemoryStore:
             str(strategy_meta["strategy_id"]),
             normalized_strategy_params,
         )
+        strategy_capabilities = strategy_meta.get("capabilities", {}) if isinstance(strategy_meta, dict) else {}
+        strategy_supports_signal_age_filter = bool(strategy_capabilities.get("supports_signal_age_filter", True))
+        capability_notes: list[str] = []
         if "min_score" in strategy_signal_overrides:
             min_score = float(strategy_signal_overrides["min_score"])
         if "min_event_count" in strategy_signal_overrides:
@@ -4039,6 +4081,9 @@ class InMemoryStore:
             min(100.0, float(strategy_signal_overrides.get("event_score_min", 0.0) or 0.0)),
         )
         strategy_event_grade_min = self._normalize_event_grade(strategy_signal_overrides.get("event_grade_min", "C"))
+        strategy_require_key_event_confirmation = bool(
+            strategy_signal_overrides.get("require_key_event_confirmation", False)
+        )
 
         candidates, degraded_reason, resolved_run_id, resolved_as_of_date = self._resolve_signal_candidates(
             mode=mode,
@@ -4046,19 +4091,29 @@ class InMemoryStore:
             trend_step=trend_step,
             as_of_date=as_of_date,
         )
-        normalized_signal_age_min = max(0, int(signal_age_min))
-        normalized_signal_age_max = (
+        requested_signal_age_min = max(0, int(signal_age_min))
+        requested_signal_age_max = (
             max(0, int(signal_age_max))
             if signal_age_max is not None
             else None
         )
         if (
-            normalized_signal_age_max is not None
-            and normalized_signal_age_max < normalized_signal_age_min
+            requested_signal_age_max is not None
+            and requested_signal_age_max < requested_signal_age_min
         ):
-            normalized_signal_age_min, normalized_signal_age_max = (
-                normalized_signal_age_max,
-                normalized_signal_age_min,
+            requested_signal_age_min, requested_signal_age_max = (
+                requested_signal_age_max,
+                requested_signal_age_min,
+            )
+        normalized_signal_age_min = requested_signal_age_min
+        normalized_signal_age_max = requested_signal_age_max
+        if (not strategy_supports_signal_age_filter) and (
+            requested_signal_age_min > 0 or requested_signal_age_max is not None
+        ):
+            normalized_signal_age_min = 0
+            normalized_signal_age_max = None
+            capability_notes.append(
+                f"策略 {strategy_meta.get('strategy_id')} 不支持 signal_age 过滤，已忽略 signal_age_min/max。"
             )
         allowed_markets = {"sh", "sz", "bj"}
         normalized_market_filters = list(dict.fromkeys(item for item in (market_filters or []) if item in allowed_markets))
@@ -4070,10 +4125,23 @@ class InMemoryStore:
         )
         if normalized_board_filters:
             candidates = [row for row in candidates if self._row_matches_board_filters(row, normalized_board_filters)]
+        strategy_id_text = str(strategy_meta["strategy_id"])
+        before_strategy_universe_count = len(candidates)
+        candidates = self._strategy_registry.build_universe(
+            strategy_id=strategy_id_text,
+            candidates=candidates,
+            params=normalized_strategy_params,
+            mode="signals",
+        )
+        if len(candidates) != before_strategy_universe_count:
+            capability_notes.append(
+                f"策略候选池过滤: {before_strategy_universe_count} -> {len(candidates)}（strategy_id={strategy_id_text}）。"
+            )
         source_count = len(candidates)
         cache_key = self._signals_cache_key(
             mode=mode,
             strategy_id=str(strategy_meta["strategy_id"]),
+            strategy_version=str(strategy_meta.get("version") or "1.0.0"),
             strategy_params_hash=strategy_params_hash,
             run_id=resolved_run_id if mode == "trend_pool" else run_id,
             trend_step=trend_step if mode == "trend_pool" else "auto",
@@ -4092,6 +4160,10 @@ class InMemoryStore:
         cached = self._signals_cache.get(cache_key)
         if not refresh and cached and now_ts - cached[0] <= cache_ttl_sec:
             cached_payload = cached[1]
+            cached_notes = list(cached_payload.notes)
+            for note in capability_notes:
+                if note not in cached_notes:
+                    cached_notes.insert(0, note)
             return cached_payload.model_copy(
                 update={
                     "cache_hit": True,
@@ -4103,6 +4175,7 @@ class InMemoryStore:
                     "strategy_version": str(strategy_meta.get("version") or cached_payload.strategy_version),
                     "strategy_params": dict(normalized_strategy_params),
                     "strategy_params_hash": str(strategy_params_hash),
+                    "notes": cached_notes,
                 }
             )
 
@@ -4110,6 +4183,10 @@ class InMemoryStore:
             cached_disk_payload = self._load_signals_disk_cache(cache_key)
             if cached_disk_payload is not None:
                 self._signals_cache[cache_key] = (now_ts, cached_disk_payload)
+                cached_notes = list(cached_disk_payload.notes)
+                for note in capability_notes:
+                    if note not in cached_notes:
+                        cached_notes.insert(0, note)
                 return cached_disk_payload.model_copy(
                     update={
                         "cache_hit": True,
@@ -4121,17 +4198,26 @@ class InMemoryStore:
                         "strategy_version": str(strategy_meta.get("version") or cached_disk_payload.strategy_version),
                         "strategy_params": dict(normalized_strategy_params),
                         "strategy_params_hash": str(strategy_params_hash),
+                        "notes": cached_notes,
                     }
                 )
 
         items: list[SignalResult] = []
         seen_symbols: set[str] = set()
         resolved_signal_as_of_date = resolved_as_of_date
+        row_by_symbol = {str(row.symbol).strip().lower(): row for row in candidates}
 
         for row in candidates:
             if row.symbol in seen_symbols:
                 continue
             snapshot = self._calc_wyckoff_snapshot(row, window_days=window_days, as_of_date=resolved_as_of_date)
+            if not self._strategy_registry.generate_signals(
+                strategy_id=strategy_id_text,
+                row=row,
+                snapshot=snapshot,
+                params=normalized_strategy_params,
+            ):
+                continue
             events = snapshot["events"] if isinstance(snapshot["events"], list) else []
             risk_events = snapshot["risk_events"] if isinstance(snapshot["risk_events"], list) else []
             raw_event_dates = snapshot.get("event_dates")
@@ -4176,6 +4262,15 @@ class InMemoryStore:
                 or 0.0
             )
             event_grade = self._normalize_event_grade(snapshot.get("event_grade", "C"))
+            raw_event_confirmation_map = snapshot.get("event_confirmation_map")
+            event_confirmation_map: dict[str, str] = {}
+            if isinstance(raw_event_confirmation_map, dict):
+                for event_name, status in raw_event_confirmation_map.items():
+                    name_text = str(event_name).strip()
+                    status_text = str(status).strip().lower()
+                    if not name_text or status_text not in {"confirmed", "pending", "failed"}:
+                        continue
+                    event_confirmation_map[name_text] = status_text
             total_event_count = len(event_chain) if event_chain else len(events) + len(risk_events)
 
             if total_event_count < min_event_count:
@@ -4189,6 +4284,13 @@ class InMemoryStore:
             if event_score < strategy_event_score_min:
                 continue
             if not self._event_grade_meets_threshold(grade=event_grade, minimum=strategy_event_grade_min):
+                continue
+            primary_event_name = str(snapshot.get("signal", "")).strip()
+            if (
+                strategy_require_key_event_confirmation
+                and primary_event_name in {"SOS", "LPS", "Spring", "JOC"}
+                and event_confirmation_map.get(primary_event_name, "pending") != "confirmed"
+            ):
                 continue
 
             signal_tags: list[str] = []
@@ -4282,13 +4384,43 @@ class InMemoryStore:
                     event_position_score=float(snapshot.get("event_position_score", 0.0) or 0.0),
                     event_vol_price_score=float(snapshot.get("event_vol_price_score", 0.0) or 0.0),
                     event_confirmation_score=float(snapshot.get("event_confirmation_score", 0.0) or 0.0),
+                    candle_quality_score=float(snapshot.get("candle_quality_score", 0.0) or 0.0),
+                    cost_center_shift_score=float(snapshot.get("cost_center_shift_score", 0.0) or 0.0),
+                    weekly_context_score=float(snapshot.get("weekly_context_score", 0.0) or 0.0),
+                    weekly_context_multiplier=float(snapshot.get("weekly_context_multiplier", 1.0) or 1.0),
+                    event_recency_score=float(snapshot.get("event_recency_score", 0.0) or 0.0),
+                    phase_context_score=float(snapshot.get("phase_context_score", 0.0) or 0.0),
+                    risk_score=float(snapshot.get("risk_score", 0.0) or 0.0),
+                    confirmation_status=self._normalize_confirmation_status(
+                        snapshot.get("confirmation_status", "unconfirmed")
+                    ),  # type: ignore[arg-type]
+                    event_confirmation_map=event_confirmation_map,
                     event_grade_map=event_grade_map,
                 )
             )
             seen_symbols.add(row.symbol)
 
-        def _signal_rank_score(item: SignalResult) -> float:
+        def _base_signal_rank_score(item: SignalResult) -> float:
             return max(0.0, min(100.0, float(item.health_score) * 0.45 + float(item.event_score) * 0.55))
+
+        def _signal_rank_score(item: SignalResult) -> float:
+            base_score = _base_signal_rank_score(item)
+            row = row_by_symbol.get(str(item.symbol).strip().lower())
+            if row is None:
+                return base_score
+            return max(
+                0.0,
+                min(
+                    100.0,
+                    self._strategy_registry.rank_signals(
+                        strategy_id=strategy_id_text,
+                        signal=item,
+                        row=row,
+                        params=normalized_strategy_params,
+                        fallback_score=base_score,
+                    ),
+                ),
+            )
 
         items.sort(
             key=lambda item: (
@@ -4315,6 +4447,7 @@ class InMemoryStore:
             strategy_version=str(strategy_meta.get("version") or "1.0.0"),
             strategy_params=dict(normalized_strategy_params),
             strategy_params_hash=str(strategy_params_hash),
+            notes=capability_notes,
         )
         self._signals_cache[cache_key] = (now_ts, payload)
         if self._is_signals_disk_cache_enabled():
@@ -5285,6 +5418,7 @@ class InMemoryStore:
             "health_score_min": round(float(payload.health_score_min), 3),
             "event_score_min": round(float(payload.event_score_min), 3),
             "event_grade_min": payload.event_grade_min,
+            "execution_path_preference": payload.execution_path_preference,
             "matrix_event_semantic_version": payload.matrix_event_semantic_version,
             "enforce_t1": bool(payload.enforce_t1),
             "entry_delay_days": int(payload.entry_delay_days),
@@ -5296,10 +5430,11 @@ class InMemoryStore:
             f"参数快照摘要: {digest} "
             f"(mode={payload.mode}, roll={payload.pool_roll_mode}, window={payload.window_days}, "
             f"min_score={payload.min_score}, min_event_count={payload.min_event_count}, "
-            f"strategy={payload.strategy_id}, "
-            f"entry_delay_days={payload.entry_delay_days}, "
-            f"semantic={payload.matrix_event_semantic_version}, "
-            f"max_symbols={payload.max_symbols}, run_id={(resolved_run_id or payload.run_id or 'none')})"
+                f"strategy={payload.strategy_id}, "
+                f"entry_delay_days={payload.entry_delay_days}, "
+                f"path={payload.execution_path_preference}, "
+                f"semantic={payload.matrix_event_semantic_version}, "
+                f"max_symbols={payload.max_symbols}, run_id={(resolved_run_id or payload.run_id or 'none')})"
         )
 
     def _resolve_backtest_trend_pool_params(
@@ -5632,6 +5767,113 @@ class InMemoryStore:
     def _is_backtest_matrix_engine_enabled(self) -> bool:
         configured = bool(getattr(self._config, "backtest_matrix_engine_enabled", False))
         return self._env_flag("TDX_TREND_BACKTEST_MATRIX_ENGINE", configured)
+
+    def _is_backtest_matrix_diff_guard_enabled(self) -> bool:
+        return self._env_flag("TDX_TREND_BACKTEST_MATRIX_DIFF_GUARD", False)
+
+    @staticmethod
+    def _backtest_matrix_diff_guard_trade_count_ratio_max() -> float:
+        raw = os.getenv("TDX_TREND_BACKTEST_MATRIX_DIFF_TRADE_COUNT_RATIO_MAX", "").strip()
+        if not raw:
+            return 0.35
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 0.35
+
+    @staticmethod
+    def _backtest_matrix_diff_guard_total_return_abs_max() -> float:
+        raw = os.getenv("TDX_TREND_BACKTEST_MATRIX_DIFF_TOTAL_RETURN_ABS_MAX", "").strip()
+        if not raw:
+            return 0.12
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 0.12
+
+    @staticmethod
+    def _backtest_matrix_diff_guard_win_rate_abs_max() -> float:
+        raw = os.getenv("TDX_TREND_BACKTEST_MATRIX_DIFF_WIN_RATE_ABS_MAX", "").strip()
+        if not raw:
+            return 0.15
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 0.15
+
+    @staticmethod
+    def _backtest_matrix_diff_guard_max_drawdown_abs_max() -> float:
+        raw = os.getenv("TDX_TREND_BACKTEST_MATRIX_DIFF_MAX_DRAWDOWN_ABS_MAX", "").strip()
+        if not raw:
+            return 0.15
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return 0.15
+
+    def _evaluate_backtest_matrix_legacy_diff(
+        self,
+        *,
+        matrix_result: BacktestResponse,
+        legacy_result: BacktestResponse,
+    ) -> tuple[bool, str]:
+        matrix_stats = matrix_result.stats
+        legacy_stats = legacy_result.stats
+        matrix_trade_count = max(0, int(matrix_stats.trade_count))
+        legacy_trade_count = max(0, int(legacy_stats.trade_count))
+        trade_delta_ratio = abs(matrix_trade_count - legacy_trade_count) / float(max(1, legacy_trade_count))
+        total_return_delta = abs(float(matrix_stats.total_return) - float(legacy_stats.total_return))
+        win_rate_delta = abs(float(matrix_stats.win_rate) - float(legacy_stats.win_rate))
+        max_drawdown_delta = abs(float(matrix_stats.max_drawdown) - float(legacy_stats.max_drawdown))
+
+        trade_ratio_max = self._backtest_matrix_diff_guard_trade_count_ratio_max()
+        total_return_abs_max = self._backtest_matrix_diff_guard_total_return_abs_max()
+        win_rate_abs_max = self._backtest_matrix_diff_guard_win_rate_abs_max()
+        max_drawdown_abs_max = self._backtest_matrix_diff_guard_max_drawdown_abs_max()
+
+        exceeded_reasons: list[str] = []
+        if trade_delta_ratio > trade_ratio_max:
+            exceeded_reasons.append(f"trade_ratio {trade_delta_ratio:.3f}>{trade_ratio_max:.3f}")
+        if total_return_delta > total_return_abs_max:
+            exceeded_reasons.append(f"total_return {total_return_delta:.4f}>{total_return_abs_max:.4f}")
+        if win_rate_delta > win_rate_abs_max:
+            exceeded_reasons.append(f"win_rate {win_rate_delta:.4f}>{win_rate_abs_max:.4f}")
+        if max_drawdown_delta > max_drawdown_abs_max:
+            exceeded_reasons.append(f"max_drawdown {max_drawdown_delta:.4f}>{max_drawdown_abs_max:.4f}")
+
+        summary = (
+            "矩阵偏差守卫检查："
+            f"trade_ratio={trade_delta_ratio:.3f}，"
+            f"total_return_delta={total_return_delta:.4f}，"
+            f"win_rate_delta={win_rate_delta:.4f}，"
+            f"max_drawdown_delta={max_drawdown_delta:.4f}"
+        )
+        if exceeded_reasons:
+            return True, f"{summary}；超阈值[{'; '.join(exceeded_reasons)}]"
+        return False, f"{summary}；在阈值内"
+
+    def _run_backtest_legacy_shadow_for_matrix_diff_guard(
+        self,
+        *,
+        payload: BacktestRunRequest,
+    ) -> BacktestResponse:
+        shadow_payload = payload.model_copy(
+            update={
+                "execution_path_preference": "legacy",
+                "enable_advanced_analysis": False,
+            }
+        )
+        return self.run_backtest(shadow_payload)
+
+    @staticmethod
+    def _strip_forced_legacy_note(notes: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw_note in notes:
+            note = str(raw_note)
+            if "execution_path_preference=legacy" in note:
+                continue
+            out.append(note)
+        return out
 
     @staticmethod
     def _build_backtest_matrix_windows(payload: BacktestRunRequest) -> tuple[int, ...]:
@@ -6639,7 +6881,13 @@ class InMemoryStore:
             return False
         return True
 
-    def _build_backtest_result_cache_key(self, payload: BacktestRunRequest) -> str:
+    def _build_backtest_result_cache_key(
+        self,
+        payload: BacktestRunRequest,
+        *,
+        strategy_version: str,
+        strategy_params_hash: str,
+    ) -> str:
         payload_raw = payload.model_dump(exclude_none=True)
         board_filters = payload_raw.get("board_filters")
         if isinstance(board_filters, list):
@@ -6663,6 +6911,10 @@ class InMemoryStore:
                 "wyckoff_data_version": str(self._wyckoff_event_data_version).strip(),
                 "matrix_enabled": bool(self._is_backtest_matrix_engine_enabled()),
             },
+            "strategy": {
+                "strategy_version": str(strategy_version).strip(),
+                "strategy_params_hash": str(strategy_params_hash).strip(),
+            },
         }
         raw = json.dumps(payload_meta, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
@@ -6670,12 +6922,22 @@ class InMemoryStore:
     def _backtest_result_cache_file(self, cache_key: str) -> Path:
         return self._resolve_backtest_result_cache_dir() / f"{cache_key}.json"
 
-    def _load_backtest_result_cache(self, payload: BacktestRunRequest) -> BacktestResponse | None:
+    def _load_backtest_result_cache(
+        self,
+        payload: BacktestRunRequest,
+        *,
+        strategy_version: str,
+        strategy_params_hash: str,
+    ) -> BacktestResponse | None:
         if not self._is_backtest_result_cache_enabled():
             return None
         if not self._is_backtest_result_cache_eligible(payload):
             return None
-        cache_key = self._build_backtest_result_cache_key(payload)
+        cache_key = self._build_backtest_result_cache_key(
+            payload,
+            strategy_version=strategy_version,
+            strategy_params_hash=strategy_params_hash,
+        )
         path = self._backtest_result_cache_file(cache_key)
         if not path.exists():
             return None
@@ -6698,12 +6960,23 @@ class InMemoryStore:
         except Exception:
             return None
 
-    def _save_backtest_result_cache(self, payload: BacktestRunRequest, result: BacktestResponse) -> bool:
+    def _save_backtest_result_cache(
+        self,
+        payload: BacktestRunRequest,
+        result: BacktestResponse,
+        *,
+        strategy_version: str,
+        strategy_params_hash: str,
+    ) -> bool:
         if not self._is_backtest_result_cache_enabled():
             return False
         if not self._is_backtest_result_cache_eligible(payload):
             return False
-        cache_key = self._build_backtest_result_cache_key(payload)
+        cache_key = self._build_backtest_result_cache_key(
+            payload,
+            strategy_version=strategy_version,
+            strategy_params_hash=strategy_params_hash,
+        )
         path = self._backtest_result_cache_file(cache_key)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -7449,6 +7722,18 @@ class InMemoryStore:
                 entry_delay_days=2,
                 matrix_event_semantic_version="aligned_wyckoff_v2",
             ),
+            BacktestABVariantConfig(
+                label="delay_2_matrix_path",
+                entry_delay_days=2,
+                matrix_event_semantic_version="aligned_wyckoff_v2",
+                execution_path_preference="matrix",
+            ),
+            BacktestABVariantConfig(
+                label="delay_2_legacy_path",
+                entry_delay_days=2,
+                matrix_event_semantic_version="aligned_wyckoff_v2",
+                execution_path_preference="legacy",
+            ),
         ]
 
     @staticmethod
@@ -7518,6 +7803,8 @@ class InMemoryStore:
             parts.append(f"event>={float(variant_payload.event_score_min):.1f}")
         if str(variant_payload.event_grade_min) != str(base_payload.event_grade_min):
             parts.append(f"grade>={str(variant_payload.event_grade_min)}")
+        if str(variant_payload.execution_path_preference) != str(base_payload.execution_path_preference):
+            parts.append(f"path={str(variant_payload.execution_path_preference)}")
         if str(variant_payload.matrix_event_semantic_version) != str(base_payload.matrix_event_semantic_version):
             parts.append(f"semantic={str(variant_payload.matrix_event_semantic_version)}")
         if str(variant_payload.strategy_id) != str(base_payload.strategy_id):
@@ -7548,6 +7835,8 @@ class InMemoryStore:
                 updates["event_score_min"] = float(config.event_score_min)
             if config.event_grade_min is not None:
                 updates["event_grade_min"] = str(config.event_grade_min)
+            if config.execution_path_preference is not None:
+                updates["execution_path_preference"] = str(config.execution_path_preference)
             if config.matrix_event_semantic_version is not None:
                 updates["matrix_event_semantic_version"] = str(config.matrix_event_semantic_version)
             if config.rank_weight_health is not None:
@@ -7610,6 +7899,7 @@ class InMemoryStore:
                         error=None,
                         stats=result.stats,
                         risk_metrics=result.risk_metrics,
+                        execution_path=result.execution_path,
                         candidate_count=int(result.candidate_count),
                         trade_count=trade_count,
                         utad_exit_ratio=round(float(utad_exit_ratio), 6),
@@ -7639,6 +7929,16 @@ class InMemoryStore:
             for row in succeeded:
                 if row.variant_id == baseline.variant_id or row.stats is None:
                     continue
+                baseline_expectancy = (
+                    float(baseline.risk_metrics.expectancy)
+                    if baseline.risk_metrics is not None
+                    else 0.0
+                )
+                row_expectancy = (
+                    float(row.risk_metrics.expectancy)
+                    if row.risk_metrics is not None
+                    else 0.0
+                )
                 comparisons.append(
                     BacktestABComparisonRow(
                         baseline_variant_id=str(baseline.variant_id),
@@ -7647,7 +7947,9 @@ class InMemoryStore:
                         total_return_delta=round(float(row.stats.total_return) - float(baseline.stats.total_return), 6),
                         win_rate_delta=round(float(row.stats.win_rate) - float(baseline.stats.win_rate), 6),
                         max_drawdown_delta=round(float(row.stats.max_drawdown) - float(baseline.stats.max_drawdown), 6),
+                        trade_count_delta=int(row.trade_count) - int(baseline.trade_count),
                         utad_exit_ratio_delta=round(float(row.utad_exit_ratio) - float(baseline.utad_exit_ratio), 6),
+                        expectancy_delta=round(float(row_expectancy) - float(baseline_expectancy), 6),
                         max_consecutive_losses_delta=int(row.max_consecutive_losses) - int(baseline.max_consecutive_losses),
                     )
                 )
@@ -8353,12 +8655,31 @@ class InMemoryStore:
             strategy_id=str(strategy_meta["strategy_id"]),
             normalized_strategy_params=normalized_strategy_params,
         )
+        payload = self._strategy_registry.entry_policy(
+            strategy_id=str(strategy_meta["strategy_id"]),
+            payload=payload,
+            params=normalized_strategy_params,
+        )
+        payload = self._strategy_registry.exit_policy(
+            strategy_id=str(strategy_meta["strategy_id"]),
+            payload=payload,
+            params=normalized_strategy_params,
+        )
         strategy_note = self._build_strategy_snapshot_note(
             strategy_meta=strategy_meta,
             strategy_params_hash=strategy_params_hash,
             strategy_params=normalized_strategy_params,
         )
-        strategy_supports_matrix = bool(strategy_meta.get("capabilities", {}).get("supports_matrix", False))
+        strategy_capabilities = strategy_meta.get("capabilities", {}) if isinstance(strategy_meta, dict) else {}
+        strategy_supports_matrix = bool(strategy_capabilities.get("supports_matrix", False))
+        strategy_supports_entry_delay = bool(strategy_capabilities.get("supports_entry_delay", True))
+        capability_notes: list[str] = []
+        requested_entry_delay_days = int(payload.entry_delay_days)
+        if (not strategy_supports_entry_delay) and requested_entry_delay_days != 1:
+            payload = payload.model_copy(update={"entry_delay_days": 1, "delay_invalidation_enabled": False})
+            capability_notes.append(
+                f"策略 {strategy_meta.get('strategy_id')} 不支持延迟入场，已强制 entry_delay_days=1。"
+            )
         board_filters = [item for item in payload.board_filters if item in {"main", "gem", "star", "beijing", "st"}]
         if control_callback is not None:
             control_callback()
@@ -8422,10 +8743,17 @@ class InMemoryStore:
                 "高级分析完成，正在汇总结果...",
             )
 
-        cached_result = self._load_backtest_result_cache(payload)
+        cached_result = self._load_backtest_result_cache(
+            payload,
+            strategy_version=str(strategy_meta.get("version") or "1.0.0"),
+            strategy_params_hash=str(strategy_params_hash),
+        )
         if cached_result is not None:
             _emit_progress(payload.date_to, 1, 1, "回测结果缓存命中，直接返回。")
             cached_notes = list(cached_result.notes)
+            for note in capability_notes:
+                if note not in cached_notes:
+                    cached_notes.insert(0, note)
             cache_note = "回测结果缓存命中：复用本地持久化结果。"
             if cache_note not in cached_notes:
                 cached_notes.insert(0, cache_note)
@@ -8447,7 +8775,12 @@ class InMemoryStore:
                         ),
                     )
                     _finish_advanced_progress()
-                    self._save_backtest_result_cache(payload, cached_result)
+                    self._save_backtest_result_cache(
+                        payload,
+                        cached_result,
+                        strategy_version=str(strategy_meta.get("version") or "1.0.0"),
+                        strategy_params_hash=str(strategy_params_hash),
+                    )
                 except Exception as exc:  # noqa: BLE001
                     notes = list(cached_result.notes)
                     notes.append(f"高级分析失败，已返回主回测结果：{exc}")
@@ -8458,15 +8791,24 @@ class InMemoryStore:
                 strategy_params=normalized_strategy_params,
                 strategy_params_hash=strategy_params_hash,
                 strategy_note=strategy_note,
+                execution_path=None,
             )
             return cached_result
 
         matrix_fallback_note: str | None = None
+        execution_path_preference = str(payload.execution_path_preference or "auto").strip().lower()
+        if execution_path_preference not in {"auto", "matrix", "legacy"}:
+            execution_path_preference = "auto"
+            payload = payload.model_copy(update={"execution_path_preference": "auto"})
+        force_matrix_path = execution_path_preference == "matrix"
+        force_legacy_path = execution_path_preference == "legacy"
         matrix_supported = (
             payload.mode in {"full_market", "trend_pool"}
             and payload.pool_roll_mode in {"daily", "weekly", "position"}
         )
-        if self._is_backtest_matrix_engine_enabled() and matrix_supported and strategy_supports_matrix:
+        matrix_engine_enabled = bool(self._is_backtest_matrix_engine_enabled())
+        can_try_matrix = matrix_engine_enabled and matrix_supported and strategy_supports_matrix and (not force_legacy_path)
+        if can_try_matrix:
             try:
                 matrix_result = self._run_backtest_matrix(
                     payload=payload,
@@ -8474,6 +8816,76 @@ class InMemoryStore:
                     progress_callback=_emit_progress,
                     control_callback=control_callback,
                 )
+                guard_note: str | None = None
+                guard_enabled = self._is_backtest_matrix_diff_guard_enabled() and (not force_matrix_path)
+                if guard_enabled:
+                    try:
+                        legacy_shadow_result = self._run_backtest_legacy_shadow_for_matrix_diff_guard(payload=payload)
+                        should_fallback, guard_note = self._evaluate_backtest_matrix_legacy_diff(
+                            matrix_result=matrix_result,
+                            legacy_result=legacy_shadow_result,
+                        )
+                        if should_fallback:
+                            fallback_notes = self._strip_forced_legacy_note(list(legacy_shadow_result.notes))
+                            fallback_guard_note = f"矩阵/旧路径偏差超阈值，已自动回退旧路径。{guard_note}"
+                            if fallback_guard_note not in fallback_notes:
+                                fallback_notes.insert(0, fallback_guard_note)
+                            fallback_result = legacy_shadow_result.model_copy(
+                                update={
+                                    "notes": fallback_notes,
+                                    "execution_path": "legacy",
+                                }
+                            )
+                            if payload.enable_advanced_analysis and (
+                                fallback_result.risk_metrics is None
+                                or fallback_result.stability_diagnostics is None
+                                or fallback_result.monte_carlo is None
+                            ):
+                                try:
+                                    _start_advanced_progress()
+                                    fallback_result = self._enrich_backtest_advanced_analysis(
+                                        payload=payload,
+                                        result=fallback_result,
+                                        control_callback=control_callback,
+                                        analysis_progress_callback=(
+                                            _advance_advanced_progress if advanced_slots_total > 0 else None
+                                        ),
+                                    )
+                                    _finish_advanced_progress()
+                                except Exception as exc:  # noqa: BLE001
+                                    notes = list(fallback_result.notes)
+                                    notes.append(f"高级分析失败，已返回主回测结果：{exc}")
+                                    fallback_result = fallback_result.model_copy(update={"notes": notes})
+                            if capability_notes:
+                                notes = list(fallback_result.notes)
+                                for note in capability_notes:
+                                    if note not in notes:
+                                        notes.insert(0, note)
+                                if notes != fallback_result.notes:
+                                    fallback_result = fallback_result.model_copy(update={"notes": notes})
+                            fallback_result = self._apply_strategy_metadata_to_backtest_result(
+                                fallback_result,
+                                strategy_meta=strategy_meta,
+                                strategy_params=normalized_strategy_params,
+                                strategy_params_hash=strategy_params_hash,
+                                strategy_note=strategy_note,
+                                execution_path="legacy",
+                            )
+                            self._save_backtest_result_cache(
+                                payload,
+                                fallback_result,
+                                strategy_version=str(strategy_meta.get("version") or "1.0.0"),
+                                strategy_params_hash=str(strategy_params_hash),
+                            )
+                            return fallback_result
+                    except Exception as exc:  # noqa: BLE001
+                        guard_note = f"矩阵偏差守卫执行失败，已保留矩阵结果：{exc}"
+                if guard_note:
+                    notes = list(matrix_result.notes)
+                    if guard_note not in notes:
+                        notes.insert(0, guard_note)
+                    if notes != matrix_result.notes:
+                        matrix_result = matrix_result.model_copy(update={"notes": notes})
                 if payload.enable_advanced_analysis:
                     try:
                         _start_advanced_progress()
@@ -8490,23 +8902,53 @@ class InMemoryStore:
                         notes = list(matrix_result.notes)
                         notes.append(f"高级分析失败，已返回主回测结果：{exc}")
                         matrix_result = matrix_result.model_copy(update={"notes": notes})
+                if capability_notes:
+                    notes = list(matrix_result.notes)
+                    for note in capability_notes:
+                        if note not in notes:
+                            notes.insert(0, note)
+                    if notes != matrix_result.notes:
+                        matrix_result = matrix_result.model_copy(update={"notes": notes})
                 matrix_result = self._apply_strategy_metadata_to_backtest_result(
                     matrix_result,
                     strategy_meta=strategy_meta,
                     strategy_params=normalized_strategy_params,
                     strategy_params_hash=strategy_params_hash,
                     strategy_note=strategy_note,
+                    execution_path="matrix",
                 )
-                self._save_backtest_result_cache(payload, matrix_result)
+                self._save_backtest_result_cache(
+                    payload,
+                    matrix_result,
+                    strategy_version=str(strategy_meta.get("version") or "1.0.0"),
+                    strategy_params_hash=str(strategy_params_hash),
+                )
                 return matrix_result
             except BacktestTaskCancelledError:
                 raise
             except Exception as exc:
-                matrix_fallback_note = f"矩阵引擎执行失败，已回退旧路径：{exc}"
-        elif (not strategy_supports_matrix) and matrix_supported:
-            matrix_fallback_note = (
-                f"策略 {strategy_meta.get('strategy_id')} 不支持矩阵执行，已回退旧路径。"
-            )
+                matrix_fallback_note = (
+                    f"矩阵引擎执行失败（pref={execution_path_preference}），已回退旧路径：{exc}"
+                )
+        else:
+            if force_legacy_path:
+                matrix_fallback_note = "已按参数强制使用旧路径执行（execution_path_preference=legacy）。"
+            elif force_matrix_path:
+                reason_parts: list[str] = []
+                if not matrix_engine_enabled:
+                    reason_parts.append("矩阵引擎未启用")
+                if not matrix_supported:
+                    reason_parts.append("当前模式不支持矩阵路径")
+                if not strategy_supports_matrix:
+                    reason_parts.append(f"策略 {strategy_meta.get('strategy_id')} 不支持矩阵执行")
+                reason_text = "，".join(reason_parts) if reason_parts else "未知原因"
+                matrix_fallback_note = (
+                    f"已请求矩阵路径（execution_path_preference=matrix），但{reason_text}，已回退旧路径。"
+                )
+            elif (not strategy_supports_matrix) and matrix_supported:
+                matrix_fallback_note = (
+                    f"策略 {strategy_meta.get('strategy_id')} 不支持矩阵执行，已回退旧路径。"
+                )
 
         degraded_reason: str | None = None
         resolved_run_id: str | None = None
@@ -8521,6 +8963,8 @@ class InMemoryStore:
             ) = self._resolve_backtest_trend_pool_params(payload.run_id)
 
         pool_notes: list[str] = []
+        if capability_notes:
+            pool_notes.extend(capability_notes)
         if matrix_fallback_note:
             pool_notes.append(matrix_fallback_note)
         if trend_pool_fallback_note:
@@ -8746,8 +9190,14 @@ class InMemoryStore:
             strategy_params=normalized_strategy_params,
             strategy_params_hash=strategy_params_hash,
             strategy_note=strategy_note,
+            execution_path="legacy",
         )
-        self._save_backtest_result_cache(payload, result)
+        self._save_backtest_result_cache(
+            payload,
+            result,
+            strategy_version=str(strategy_meta.get("version") or "1.0.0"),
+            strategy_params_hash=str(strategy_params_hash),
+        )
         return result
 
     def _estimate_backtest_progress_total_dates(self, payload: BacktestRunRequest) -> int:

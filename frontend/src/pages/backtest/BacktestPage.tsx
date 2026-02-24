@@ -408,6 +408,13 @@ function buildBacktestReportWorkbookBuffer(
       date_to: runResult.range.date_to,
       mode: runRequest.mode,
       pool_roll_mode: runRequest.pool_roll_mode,
+      execution_path: runResult.execution_path ?? 'unknown',
+      strategy_id: runResult.strategy_id ?? runRequest.strategy_id ?? '',
+      strategy_version: runResult.strategy_version ?? '',
+      strategy_params_hash: runResult.strategy_params_hash ?? '',
+      entry_delay_days: runRequest.entry_delay_days,
+      delay_invalidation_enabled: runRequest.delay_invalidation_enabled,
+      matrix_event_semantic_version: runRequest.matrix_event_semantic_version,
       trade_count: runResult.stats.trade_count,
       win_count: runResult.stats.win_count,
       loss_count: runResult.stats.loss_count,
@@ -596,6 +603,16 @@ function buildBacktestReportHtml(
         <td>${escapeHtml(trade.entry_date)}</td>
         <td>${escapeHtml(trade.exit_date)}</td>
         <td>${escapeHtml(formatEventSequence(trade.entry_signal))}</td>
+        <td>${Number(trade.candle_quality_score ?? 0).toFixed(2)}</td>
+        <td>${Number(trade.cost_center_shift_score ?? 0).toFixed(2)}</td>
+        <td>${Number(trade.weekly_context_score ?? 0).toFixed(2)}</td>
+        <td>${Number(trade.weekly_context_multiplier ?? 1).toFixed(4)}</td>
+        <td>${Number(trade.health_score ?? 0).toFixed(2)}</td>
+        <td>${Number(trade.event_score ?? 0).toFixed(2)}</td>
+        <td>${Number(trade.risk_score ?? 0).toFixed(2)}</td>
+        <td>${escapeHtml(String(trade.confirmation_status ?? 'unconfirmed'))}</td>
+        <td>${Number(trade.delay_entry_days ?? 1)}</td>
+        <td>${Number(trade.delay_window_days ?? 0)}</td>
         <td>${escapeHtml(exitDisplay)}</td>
         <td>${trade.quantity}</td>
         <td>${trade.entry_price}</td>
@@ -666,6 +683,15 @@ function buildBacktestReportHtml(
     .join('\n')
   const walkForwardNotes = (walkForward?.notes ?? []).map((note) => `<li>${escapeHtml(note)}</li>`).join('\n')
   const generatedAt = dayjs().format('YYYY-MM-DD HH:mm:ss')
+  const executionPathText =
+    runResult.execution_path === 'matrix'
+      ? 'matrix'
+      : runResult.execution_path === 'legacy'
+        ? 'legacy'
+        : 'unknown'
+  const strategyIdText = String(runResult.strategy_id || runRequest.strategy_id || '').trim() || 'unknown'
+  const strategyVersionText = String(runResult.strategy_version || '').trim() || 'unknown'
+  const strategyParamsHashText = String(runResult.strategy_params_hash || '').trim() || 'unknown'
   const advancedSection = `
   <h2>高级分析</h2>
   ${riskMetrics
@@ -788,6 +814,11 @@ function buildBacktestReportHtml(
   <div class="meta">
     <div>区间：${escapeHtml(runResult.range.date_from)} ~ ${escapeHtml(runResult.range.date_to)}</div>
     <div>模式：${escapeHtml(runRequest.mode)} / ${escapeHtml(runRequest.pool_roll_mode)}</div>
+    <div>执行路径：${escapeHtml(executionPathText)}</div>
+    <div>策略：${escapeHtml(strategyIdText)} @ ${escapeHtml(strategyVersionText)}</div>
+    <div>参数哈希：${escapeHtml(strategyParamsHashText)}</div>
+    <div>延迟入场：T+${Math.max(1, Number(runRequest.entry_delay_days ?? 1))}</div>
+    <div>延迟窗口失效保护：${runRequest.delay_invalidation_enabled ? 'on' : 'off'}</div>
     <div>交易数：${runResult.stats.trade_count}</div>
     <div>胜率：${runResult.stats.win_rate}</div>
     <div>总收益：${runResult.stats.total_return}</div>
@@ -804,7 +835,8 @@ function buildBacktestReportHtml(
     <thead>
       <tr>
         <th>symbol</th><th>name</th><th>signal_date</th><th>entry_date</th><th>exit_date</th>
-        <th>entry_signal</th><th>exit_reason</th><th>quantity</th><th>entry_price</th><th>exit_price</th>
+        <th>entry_signal</th><th>candle_q</th><th>cost_shift</th><th>weekly_ctx</th><th>weekly_mult</th><th>health</th><th>event</th><th>risk</th><th>confirm</th><th>delay_days</th><th>delay_window</th>
+        <th>exit_reason</th><th>quantity</th><th>entry_price</th><th>exit_price</th>
         <th>holding_days</th><th>pnl_amount</th><th>pnl_ratio</th>
       </tr>
     </thead>
@@ -940,7 +972,8 @@ function loadBacktestDraft(): BacktestFormDraft {
     }
     const boardFilters = sanitizeBoardFilters(merged.board_filters)
     merged.board_filters = boardFilters.length > 0 ? boardFilters : defaults.board_filters
-    merged.strategy_id = merged.strategy_id === 'wyckoff_trend_v2' ? 'wyckoff_trend_v2' : 'wyckoff_trend_v1'
+    const mergedStrategyId = String(merged.strategy_id || '').trim()
+    merged.strategy_id = mergedStrategyId || 'wyckoff_trend_v1'
     merged.strategy_params = normalizeStrategyParams(merged.strategy_params)
     if (!['daily', 'weekly', 'position'].includes(String(merged.pool_roll_mode))) {
       merged.pool_roll_mode = defaults.pool_roll_mode
@@ -1372,6 +1405,24 @@ const tradeColumns: ColumnsType<BacktestTrade> = [
     render: (value: number) => value.toFixed(1),
   },
   {
+    title: '筹码分',
+    dataIndex: 'cost_center_shift_score',
+    width: 92,
+    render: (value: number | undefined) => Number(value ?? 0).toFixed(1),
+  },
+  {
+    title: '周线分',
+    dataIndex: 'weekly_context_score',
+    width: 92,
+    render: (value: number | undefined) => Number(value ?? 0).toFixed(1),
+  },
+  {
+    title: '周乘数',
+    dataIndex: 'weekly_context_multiplier',
+    width: 88,
+    render: (value: number | undefined) => Number(value ?? 1).toFixed(3),
+  },
+  {
     title: '离场事件/原因',
     dataIndex: 'exit_reason',
     width: 180,
@@ -1619,6 +1670,9 @@ export function BacktestPage() {
     () => strategyItems.find((item) => item.strategy_id === strategyId) ?? null,
     [strategyId, strategyItems],
   )
+  const strategySupportsMatrix = selectedStrategy?.capabilities?.supports_matrix !== false
+  const strategySupportsSignalAgeFilter = selectedStrategy?.capabilities?.supports_signal_age_filter !== false
+  const strategySupportsEntryDelay = selectedStrategy?.capabilities?.supports_entry_delay !== false
   const strategyParamsSchema = useMemo(
     () => parseStrategyParamSchema(selectedStrategy?.strategy_params_schema ?? {}),
     [selectedStrategy?.strategy_params_schema],
@@ -1662,6 +1716,12 @@ export function BacktestPage() {
       return JSON.stringify(next) === JSON.stringify(normalizedPrevious) ? previous : next
     })
   }, [selectedStrategy?.strategy_id, strategyParamsDefaults, strategyParamsSchema])
+
+  useEffect(() => {
+    if (strategySupportsEntryDelay) return
+    setEntryDelayDays((previous) => (previous === 1 ? previous : 1))
+    setDelayInvalidationEnabled((previous) => (previous ? false : previous))
+  }, [strategySupportsEntryDelay])
 
   useEffect(() => {
     setSharedStrategyParams(strategyId, strategyParamsPayload)
@@ -3314,6 +3374,16 @@ export function BacktestPage() {
           value === 'succeeded' ? <Tag color="success">成功</Tag> : <Tag color="error">失败</Tag>,
       },
       {
+        title: '执行路径',
+        width: 106,
+        render: (_value, row) =>
+          row.execution_path ? (
+            <Tag color={row.execution_path === 'matrix' ? 'processing' : 'default'}>{row.execution_path}</Tag>
+          ) : (
+            '--'
+          ),
+      },
+      {
         title: '总收益',
         width: 110,
         render: (_value, row) => (row.stats ? formatPct(row.stats.total_return) : '--'),
@@ -3375,9 +3445,19 @@ export function BacktestPage() {
         render: (_value, row) => formatPct(row.max_drawdown_delta),
       },
       {
+        title: '交易数Δ',
+        dataIndex: 'trade_count_delta',
+        width: 96,
+      },
+      {
         title: 'UTAD占比Δ',
         width: 120,
         render: (_value, row) => formatPct(row.utad_exit_ratio_delta),
+      },
+      {
+        title: 'ExpectancyΔ',
+        width: 116,
+        render: (_value, row) => formatPct(row.expectancy_delta),
       },
       {
         title: '最大连亏Δ',
@@ -3484,11 +3564,22 @@ export function BacktestPage() {
               title={selectedStrategy ? `策略：${selectedStrategy.name}` : '策略信息'}
               description={
                 selectedStrategy
-                  ? `id=${selectedStrategy.strategy_id}, version=${selectedStrategy.version}`
+                  ? `id=${selectedStrategy.strategy_id}, version=${selectedStrategy.version}, cap=matrix:${strategySupportsMatrix ? 1 : 0}|age:${strategySupportsSignalAgeFilter ? 1 : 0}|delay:${strategySupportsEntryDelay ? 1 : 0}`
                   : '未加载到策略目录，先按默认策略继续。'
               }
             />
           </Col>
+
+          {!strategySupportsEntryDelay ? (
+            <Col xs={24}>
+              <Alert
+                type="warning"
+                showIcon
+                title="当前策略不支持延迟入场"
+                description="已自动固定为 entry_delay_days=1，并禁用延迟窗口失效保护。"
+              />
+            </Col>
+          ) : null}
 
           {strategyParamEntries.length > 0 ? (
             <Col xs={24}>
@@ -3840,6 +3931,7 @@ export function BacktestPage() {
                 min={1}
                 max={5}
                 value={entryDelayDays}
+                disabled={!strategySupportsEntryDelay}
                 onChange={(value) => setEntryDelayDays(Number(value || TRADE_BACKTEST_DEFAULTS.entryDelayDays))}
                 style={{ width: '100%' }}
               />
@@ -3848,7 +3940,11 @@ export function BacktestPage() {
           <Col xs={24} md={6}>
             <Space orientation="vertical">
               <span>延迟窗口失效保护</span>
-              <Switch checked={delayInvalidationEnabled} onChange={setDelayInvalidationEnabled} />
+              <Switch
+                checked={delayInvalidationEnabled}
+                disabled={!strategySupportsEntryDelay}
+                onChange={setDelayInvalidationEnabled}
+              />
             </Space>
           </Col>
           <Col xs={24} md={6}>
@@ -4620,6 +4716,21 @@ export function BacktestPage() {
 
       {result ? (
         <>
+          <Alert
+            type="info"
+            showIcon
+            title="执行路径与策略快照"
+            description={(
+              <Space wrap>
+                <Tag color={result.execution_path === 'matrix' ? 'processing' : 'default'}>
+                  {`path=${result.execution_path ?? 'unknown'}`}
+                </Tag>
+                <Tag>{`strategy=${result.strategy_id ?? 'unknown'}@${result.strategy_version ?? 'unknown'}`}</Tag>
+                <Tag>{`params=${result.strategy_params_hash || 'unknown'}`}</Tag>
+              </Space>
+            )}
+          />
+
           <Row gutter={[12, 12]}>
             <Col xs={12} md={6}>
               <Card>

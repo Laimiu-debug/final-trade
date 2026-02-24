@@ -190,6 +190,12 @@ def test_backtest_run_trend_pool_smoke() -> None:
     assert isinstance(body.get("regime_breakdown"), list)
     assert isinstance(body.get("monte_carlo"), dict)
     assert "walk_forward" in body
+    if body["trades"]:
+        first = body["trades"][0]
+        assert "candle_quality_score" in first
+        assert "cost_center_shift_score" in first
+        assert "weekly_context_score" in first
+        assert "weekly_context_multiplier" in first
 
 
 def test_backtest_experiment_ab_endpoint_reports_baseline_and_deltas(
@@ -296,7 +302,9 @@ def test_backtest_experiment_ab_endpoint_reports_baseline_and_deltas(
     assert comparisons_by_label["delay_2"]["total_return_delta"] == pytest.approx(0.05, abs=1e-6)
     assert comparisons_by_label["delay_2"]["win_rate_delta"] == pytest.approx(0.13, abs=1e-6)
     assert comparisons_by_label["delay_2"]["max_drawdown_delta"] == pytest.approx(0.05, abs=1e-6)
+    assert comparisons_by_label["delay_2"]["trade_count_delta"] == 0
     assert comparisons_by_label["delay_2"]["utad_exit_ratio_delta"] == pytest.approx(-0.333333, abs=1e-6)
+    assert comparisons_by_label["delay_2"]["expectancy_delta"] == pytest.approx(0.0, abs=1e-9)
     assert comparisons_by_label["delay_2"]["max_consecutive_losses_delta"] == -1
 
 
@@ -376,6 +384,90 @@ def test_backtest_plateau_endpoint_handles_truncation_and_failures(monkeypatch: 
     assert any("参数评估失败" in note for note in body["notes"])
     assert any("低胜率惩罚" in note for note in body["notes"])
     assert sum(1 for point in body["points"] if point.get("error")) >= 1
+
+
+def test_backtest_experiment_ab_supports_execution_path_preference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_run_backtest(payload: BacktestRunRequest) -> BacktestResponse:
+        pref = str(payload.execution_path_preference)
+        if pref == "legacy":
+            execution_path = "legacy"
+            total_return = 0.06
+            win_rate = 0.48
+            expectancy = 0.012
+        else:
+            execution_path = "matrix"
+            total_return = 0.10
+            win_rate = 0.56
+            expectancy = 0.018
+
+        trade = BacktestTrade(
+            symbol="sz300750",
+            name="mock",
+            signal_date=payload.date_from,
+            entry_date=payload.date_from,
+            exit_date=payload.date_to,
+            entry_signal="SOS",
+            entry_phase="吸筹D",
+            exit_reason="TAKE_PROFIT",
+            quantity=100,
+            entry_price=100.0,
+            exit_price=103.0,
+            holding_days=5,
+            pnl_amount=300.0,
+            pnl_ratio=0.03,
+        )
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=win_rate,
+                total_return=total_return,
+                max_drawdown=-0.09,
+                avg_pnl_ratio=0.03,
+                trade_count=1,
+                win_count=1,
+                loss_count=0,
+                profit_factor=2.0,
+            ),
+            trades=[trade],
+            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+            notes=[],
+            candidate_count=8,
+            skipped_count=1,
+            fill_rate=0.875,
+            max_concurrent_positions=1,
+            risk_metrics=BacktestRiskMetrics(expectancy=expectancy, max_consecutive_losses=0),
+            execution_path=execution_path,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
+
+    payload = {
+        "base_payload": {
+            "mode": "full_market",
+            "pool_roll_mode": "daily",
+            "date_from": "2025-01-02",
+            "date_to": "2025-01-31",
+            "execution_path_preference": "auto",
+        },
+        "auto_generate_default_matrix": False,
+        "variants": [
+            {"label": "legacy_path", "execution_path_preference": "legacy"},
+        ],
+    }
+    resp = client.post("/api/backtest/experiments/ab", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    variants_by_label = {str(item["label"]): item for item in body["variants"]}
+    assert variants_by_label["baseline"]["run_request"]["execution_path_preference"] == "auto"
+    assert variants_by_label["baseline"]["execution_path"] == "matrix"
+    assert variants_by_label["legacy_path"]["run_request"]["execution_path_preference"] == "legacy"
+    assert variants_by_label["legacy_path"]["execution_path"] == "legacy"
+
+    comparisons_by_label = {str(item["label"]): item for item in body["comparisons"]}
+    assert comparisons_by_label["legacy_path"]["total_return_delta"] == pytest.approx(-0.04, abs=1e-6)
+    assert comparisons_by_label["legacy_path"]["expectancy_delta"] == pytest.approx(-0.006, abs=1e-6)
 
 
 def test_backtest_plateau_endpoint_lhs_sampling_is_repeatable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1136,7 +1228,260 @@ def test_backtest_run_full_market_daily_matrix_path(monkeypatch: pytest.MonkeyPa
     body = resp.json()
     assert body["range"]["date_from"] == date_from
     assert body["range"]["date_to"] == date_to
+    assert body["execution_path"] == "matrix"
     assert any("矩阵引擎已启用" in note for note in body["notes"])
+
+
+def test_backtest_run_matrix_diff_guard_falls_back_to_legacy_when_deviation_exceeds_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-10]
+    date_to = dates[-6]
+
+    def _fake_matrix_run(
+        *,
+        payload: BacktestRunRequest,
+        board_filters: list[str],
+        progress_callback=None,  # noqa: ANN001
+        control_callback=None,  # noqa: ANN001
+    ) -> BacktestResponse:
+        _ = (board_filters, progress_callback, control_callback)
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.72,
+                total_return=0.28,
+                max_drawdown=-0.03,
+                avg_pnl_ratio=0.04,
+                trade_count=20,
+                win_count=14,
+                loss_count=6,
+                profit_factor=2.0,
+            ),
+            trades=[],
+            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+            notes=["矩阵引擎已启用：mock"],
+            candidate_count=50,
+            skipped_count=10,
+            fill_rate=0.4,
+            max_concurrent_positions=4,
+        )
+
+    def _fake_legacy_shadow(*, payload: BacktestRunRequest) -> BacktestResponse:
+        _ = payload
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.41,
+                total_return=0.05,
+                max_drawdown=-0.11,
+                avg_pnl_ratio=0.01,
+                trade_count=6,
+                win_count=2,
+                loss_count=4,
+                profit_factor=0.9,
+            ),
+            trades=[],
+            range=ReviewRange(date_from=date_from, date_to=date_to, date_axis="sell"),
+            notes=[
+                "已按参数强制使用旧路径执行（execution_path_preference=legacy）。",
+                "legacy-shadow",
+            ],
+            candidate_count=30,
+            skipped_count=12,
+            fill_rate=0.2,
+            max_concurrent_positions=2,
+        )
+
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_ENGINE", "1")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_RESULT_CACHE", "0")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_DIFF_GUARD", "1")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_DIFF_TRADE_COUNT_RATIO_MAX", "0.10")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_DIFF_TOTAL_RETURN_ABS_MAX", "0.02")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_DIFF_WIN_RATE_ABS_MAX", "0.02")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_DIFF_MAX_DRAWDOWN_ABS_MAX", "0.02")
+    monkeypatch.setattr(store, "_run_backtest_matrix", _fake_matrix_run)
+    monkeypatch.setattr(store, "_run_backtest_legacy_shadow_for_matrix_diff_guard", _fake_legacy_shadow)
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "daily",
+        "date_from": date_from,
+        "date_to": date_to,
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+        "enable_advanced_analysis": False,
+    }
+    resp = client.post("/api/backtest/run", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["execution_path"] == "legacy"
+    assert body["stats"]["trade_count"] == 6
+    assert any("矩阵/旧路径偏差超阈值" in str(note) for note in body["notes"])
+    assert all("execution_path_preference=legacy" not in str(note) for note in body["notes"])
+
+
+def test_backtest_run_matrix_diff_guard_keeps_matrix_when_within_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-10]
+    date_to = dates[-6]
+    guard_call_counter = {"count": 0}
+
+    def _fake_matrix_run(
+        *,
+        payload: BacktestRunRequest,
+        board_filters: list[str],
+        progress_callback=None,  # noqa: ANN001
+        control_callback=None,  # noqa: ANN001
+    ) -> BacktestResponse:
+        _ = (board_filters, progress_callback, control_callback)
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.58,
+                total_return=0.12,
+                max_drawdown=-0.08,
+                avg_pnl_ratio=0.02,
+                trade_count=10,
+                win_count=6,
+                loss_count=4,
+                profit_factor=1.4,
+            ),
+            trades=[],
+            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+            notes=["矩阵引擎已启用：mock"],
+            candidate_count=40,
+            skipped_count=8,
+            fill_rate=0.35,
+            max_concurrent_positions=3,
+        )
+
+    def _fake_legacy_shadow(*, payload: BacktestRunRequest) -> BacktestResponse:
+        _ = payload
+        guard_call_counter["count"] += 1
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.57,
+                total_return=0.11,
+                max_drawdown=-0.085,
+                avg_pnl_ratio=0.02,
+                trade_count=9,
+                win_count=5,
+                loss_count=4,
+                profit_factor=1.3,
+            ),
+            trades=[],
+            range=ReviewRange(date_from=date_from, date_to=date_to, date_axis="sell"),
+            notes=["legacy-shadow"],
+            candidate_count=39,
+            skipped_count=9,
+            fill_rate=0.33,
+            max_concurrent_positions=3,
+        )
+
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_ENGINE", "1")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_RESULT_CACHE", "0")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_DIFF_GUARD", "1")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_DIFF_TRADE_COUNT_RATIO_MAX", "1.00")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_DIFF_TOTAL_RETURN_ABS_MAX", "1.00")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_DIFF_WIN_RATE_ABS_MAX", "1.00")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_DIFF_MAX_DRAWDOWN_ABS_MAX", "1.00")
+    monkeypatch.setattr(store, "_run_backtest_matrix", _fake_matrix_run)
+    monkeypatch.setattr(store, "_run_backtest_legacy_shadow_for_matrix_diff_guard", _fake_legacy_shadow)
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "daily",
+        "date_from": date_from,
+        "date_to": date_to,
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+        "enable_advanced_analysis": False,
+    }
+    resp = client.post("/api/backtest/run", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["execution_path"] == "matrix"
+    assert body["stats"]["trade_count"] == 10
+    assert guard_call_counter["count"] == 1
+    assert any("矩阵偏差守卫检查" in str(note) for note in body["notes"])
+    assert any("在阈值内" in str(note) for note in body["notes"])
+
+
+def test_backtest_run_full_market_daily_legacy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-10]
+    date_to = dates[-6]
+
+    def _fake_universe(*args, **kwargs):  # noqa: ANN002, ANN003
+        scan_dates = store._build_backtest_scan_dates(date_from, date_to)
+        allowed = {day: {"sz300750"} for day in scan_dates}
+        return ["sz300750"], allowed, ["mock legacy universe"], scan_dates, scan_dates
+
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_ENGINE", "0")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_RESULT_CACHE", "0")
+    monkeypatch.setattr(store, "_build_full_market_rolling_universe", _fake_universe)
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "daily",
+        "date_from": date_from,
+        "date_to": date_to,
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+    }
+
+    resp = client.post("/api/backtest/run", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["range"]["date_from"] == date_from
+    assert body["range"]["date_to"] == date_to
+    assert body["execution_path"] == "legacy"
+    assert all("矩阵引擎已启用" not in note for note in body["notes"])
+
+
+def test_backtest_run_forces_t1_when_strategy_disables_entry_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    dates = _load_symbol_dates("sz300750")
+    date_from = dates[-10]
+    date_to = dates[-6]
+    registry = store._strategy_registry
+    original = registry._strategies["wyckoff_trend_v1"]
+    downgraded = replace(
+        original,
+        capabilities=replace(
+            original.capabilities,
+            supports_entry_delay=False,
+        ),
+    )
+    monkeypatch.setitem(registry._strategies, "wyckoff_trend_v1", downgraded)
+    monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_ENGINE", "0")
+    monkeypatch.setenv("TDX_TREND_BACKTEST_RESULT_CACHE", "0")
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "daily",
+        "date_from": date_from,
+        "date_to": date_to,
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+        "strategy_id": "wyckoff_trend_v1",
+        "entry_delay_days": 3,
+        "delay_invalidation_enabled": True,
+    }
+
+    resp = client.post("/api/backtest/run", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["execution_path"] == "legacy"
+    assert any("不支持延迟入场" in str(note) for note in body["notes"])
 
 
 def test_backtest_run_matrix_signal_runtime_cache_reuses_signals(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1272,6 +1617,7 @@ def test_backtest_run_full_market_position_matrix_path(monkeypatch: pytest.Monke
     body = resp.json()
     assert body["range"]["date_from"] == date_from
     assert body["range"]["date_to"] == date_to
+    assert body["execution_path"] == "matrix"
     assert any("矩阵引擎已启用" in note for note in body["notes"])
     assert any("持仓触发滚动预演(轻量)" in note for note in body["notes"])
 
@@ -1306,6 +1652,7 @@ def test_backtest_run_full_market_weekly_matrix_path(monkeypatch: pytest.MonkeyP
     body = resp.json()
     assert body["range"]["date_from"] == date_from
     assert body["range"]["date_to"] == date_to
+    assert body["execution_path"] == "matrix"
     assert any("矩阵引擎已启用" in note for note in body["notes"])
 
 
@@ -1357,6 +1704,7 @@ def test_backtest_run_trend_pool_weekly_matrix_path(monkeypatch: pytest.MonkeyPa
     body = resp.json()
     assert body["range"]["date_from"] == date_from
     assert body["range"]["date_to"] == date_to
+    assert body["execution_path"] == "matrix"
     assert any("矩阵引擎已启用" in note for note in body["notes"])
     assert any("使用筛选任务: mock-run" in note for note in body["notes"])
 
@@ -1607,10 +1955,12 @@ def test_backtest_result_cache_reuses_persisted_result(
 
     first = store.run_backtest(payload)
     assert call_counter["matrix"] == 1
+    assert first.execution_path == "matrix"
     assert all("回测结果缓存命中" not in note for note in first.notes)
 
     second = store.run_backtest(payload)
     assert call_counter["matrix"] == 1
+    assert second.execution_path == "matrix"
     assert any("回测结果缓存命中" in note for note in second.notes)
 
 

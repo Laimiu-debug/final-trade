@@ -141,6 +141,8 @@ def test_legacy_entry_delay_days_controls_entry_date_and_price(entry_delay_days:
     assert trade.signal_date == signal_day
     assert trade.entry_date == dates[expected_entry_index]
     assert trade.entry_price == pytest.approx(candles[expected_entry_index].open, rel=1e-9)
+    assert trade.delay_entry_days == entry_delay_days
+    assert trade.delay_window_days == max(0, entry_delay_days - 1)
 
 
 @pytest.mark.parametrize("entry_delay_days", [1, 2, 3])
@@ -234,6 +236,8 @@ def test_matrix_entry_delay_days_controls_entry_date_and_price(entry_delay_days:
     assert trade.signal_date == dates[0]
     assert trade.entry_date == dates[expected_entry_index]
     assert trade.entry_price == pytest.approx(float(open_px[expected_entry_index][0]), rel=1e-9)
+    assert trade.delay_entry_days == entry_delay_days
+    assert trade.delay_window_days == max(0, entry_delay_days - 1)
 
 
 def test_matrix_and_legacy_match_on_trade_timeline_for_same_signal_case() -> None:
@@ -722,6 +726,136 @@ def test_matrix_delay_invalidation_by_sell_signal() -> None:
     assert any("delay_invalidated_by_sell_signal" in note for note in result.notes)
 
 
+def test_matrix_aligned_semantic_delay_invalidation_by_risk_event() -> None:
+    dates = _build_trading_days("2025-01-02", 8)
+    symbols = ["sh600001"]
+    t, n = len(dates), len(symbols)
+
+    open_px = [[10.0 + idx * 0.1] for idx in range(t)]
+    high_px = [[10.4 + idx * 0.1] for idx in range(t)]
+    low_px = [[9.6 + idx * 0.1] for idx in range(t)]
+    close_px = [[10.1 + idx * 0.1] for idx in range(t)]
+    volume = [[100000.0] for _ in range(t)]
+    valid = [[True] for _ in range(t)]
+
+    buy = [[False] for _ in range(t)]
+    buy[0][0] = True
+
+    sell = [[False] for _ in range(t)]
+    sell[6][0] = True
+
+    score = [[0.0] for _ in range(t)]
+    score[0][0] = 88.0
+
+    bundle = MatrixBundle(
+        dates=list(dates),
+        symbols=list(symbols),
+        open=np.asarray(open_px, dtype=np.float64),
+        high=np.asarray(high_px, dtype=np.float64),
+        low=np.asarray(low_px, dtype=np.float64),
+        close=np.asarray(close_px, dtype=np.float64),
+        volume=np.asarray(volume, dtype=np.float64),
+        valid_mask=np.asarray(valid, dtype=bool),
+    )
+    signals = BacktestSignalMatrix(
+        s1=np.zeros((t, n), dtype=bool),
+        s2=np.zeros((t, n), dtype=bool),
+        s3=np.zeros((t, n), dtype=bool),
+        s4=np.zeros((t, n), dtype=bool),
+        s5=np.asarray(buy, dtype=bool),
+        s6=np.zeros((t, n), dtype=bool),
+        s7=np.zeros((t, n), dtype=bool),
+        s8=np.zeros((t, n), dtype=bool),
+        s9=np.zeros((t, n), dtype=bool),
+        in_pool=np.asarray(buy, dtype=bool),
+        buy_signal=np.asarray(buy, dtype=bool),
+        sell_signal=np.asarray(sell, dtype=bool),
+        score=np.asarray(score, dtype=np.float64),
+    )
+
+    signal_day = dates[0]
+    risk_day = dates[1]
+
+    def _calc_snapshot(_row: dict[str, str], _window_days: int, as_of_date: str | None) -> dict[str, object]:
+        day = str(as_of_date or "")
+        event_dates: dict[str, str] = {}
+        event_chain: list[dict[str, str]] = []
+        risk_events: list[str] = []
+        if day == signal_day:
+            event_dates["E"] = day
+            event_chain.append({"event": "E"})
+        if day == risk_day:
+            event_dates["UTAD"] = day
+            risk_events = ["UTAD"]
+        return {
+            "event_dates": event_dates,
+            "event_chain": event_chain,
+            "events": [],
+            "risk_events": risk_events,
+            "sequence_ok": True,
+            "entry_quality_score": 88.0,
+            "phase": "阶段未明",
+            "structure_hhh": "HH|HL|-",
+            "trend_score": 70.0,
+            "volatility_score": 65.0,
+            "health_score": 75.0,
+            "event_score": 72.0,
+            "event_grade": "B",
+        }
+
+    engine = BacktestEngine(
+        get_candles=lambda _: [],
+        build_row=lambda symbol, as_of_date=None: {"symbol": symbol, "as_of_date": as_of_date},
+        calc_snapshot=_calc_snapshot,
+        resolve_symbol_name=lambda raw_symbol: raw_symbol,
+    )
+    base_payload = BacktestRunRequest(
+        mode="full_market",
+        pool_roll_mode="daily",
+        date_from=dates[0],
+        date_to=dates[-1],
+        window_days=60,
+        min_score=0.0,
+        require_sequence=False,
+        min_event_count=1,
+        entry_events=["E"],
+        exit_events=["X"],
+        initial_capital=100000.0,
+        position_pct=1.0,
+        max_positions=1,
+        stop_loss=0.0,
+        take_profit=0.0,
+        max_hold_days=60,
+        fee_bps=0.0,
+        prioritize_signals=True,
+        priority_mode="balanced",
+        priority_topk_per_day=0,
+        enforce_t1=True,
+        entry_delay_days=3,
+        delay_invalidation_enabled=True,
+        max_symbols=20,
+        matrix_event_semantic_version="matrix_v1",
+    )
+    aligned_payload = base_payload.model_copy(update={"matrix_event_semantic_version": "aligned_wyckoff_v2"})
+
+    result_v1 = engine.run(
+        payload=base_payload,
+        symbols=list(symbols),
+        matrix_bundle=bundle,
+        matrix_signals=signals,
+    )
+    result_aligned = engine.run(
+        payload=aligned_payload,
+        symbols=list(symbols),
+        matrix_bundle=bundle,
+        matrix_signals=signals,
+    )
+
+    assert len(result_v1.trades) == 1
+    assert len(result_aligned.trades) == 0
+    assert any("delay_invalidated_by_risk_event" in note for note in result_aligned.notes)
+
+
 def test_balanced_priority_prefers_health_event_composite_rank() -> None:
     dates = _build_trading_days("2025-01-02", 34)
     signal_day = dates[0]
@@ -892,6 +1026,88 @@ def test_event_grade_gate_blocks_low_grade_entry() -> None:
 
     assert result.trades == []
     assert result.candidate_count == 0
+
+
+def test_require_key_event_confirmation_blocks_unconfirmed_entries() -> None:
+    dates = _build_trading_days("2025-01-02", 34)
+    symbol = "sh600001"
+    signal_day = dates[0]
+    exit_day = dates[25]
+    candles_by_symbol = {symbol: _build_linear_candles(dates, start=10.0, step=0.2)}
+    confirmation_state = {"value": "partial"}
+
+    def _get_candles(raw_symbol: str) -> list[CandlePoint]:
+        return list(candles_by_symbol.get(raw_symbol, []))
+
+    def _build_row(raw_symbol: str, as_of_date: str | None) -> dict[str, str] | None:
+        if as_of_date is None:
+            return None
+        return {"symbol": raw_symbol, "as_of_date": as_of_date}
+
+    def _calc_snapshot(_row: dict[str, str], _window_days: int, as_of_date: str | None) -> dict[str, object]:
+        day = str(as_of_date or "")
+        event_dates: dict[str, str] = {}
+        event_chain: list[dict[str, str]] = []
+        if day == signal_day:
+            event_dates["E"] = day
+            event_chain = [{"event": "E"}]
+        if day == exit_day:
+            event_dates["X"] = day
+        return {
+            "event_dates": event_dates,
+            "event_chain": event_chain,
+            "events": [],
+            "risk_events": [],
+            "sequence_ok": True,
+            "entry_quality_score": 88.0,
+            "phase": "闃舵鏈槑",
+            "structure_hhh": "HH|HL|-",
+            "trend_score": 78.0,
+            "volatility_score": 75.0,
+            "health_score": 85.0,
+            "event_score": 84.0,
+            "event_grade": "A",
+            "confirmation_status": str(confirmation_state["value"]),
+        }
+
+    engine = BacktestEngine(
+        get_candles=_get_candles,
+        build_row=_build_row,
+        calc_snapshot=_calc_snapshot,
+        resolve_symbol_name=lambda raw_symbol: raw_symbol,
+    )
+    payload = BacktestRunRequest(
+        mode="full_market",
+        pool_roll_mode="daily",
+        date_from=dates[0],
+        date_to=dates[-1],
+        window_days=60,
+        min_score=0.0,
+        require_sequence=False,
+        min_event_count=1,
+        entry_events=["E"],
+        exit_events=["X"],
+        initial_capital=100000.0,
+        position_pct=1.0,
+        max_positions=1,
+        stop_loss=0.0,
+        take_profit=0.0,
+        max_hold_days=60,
+        fee_bps=0.0,
+        prioritize_signals=True,
+        priority_mode="balanced",
+        priority_topk_per_day=0,
+        event_grade_min="B",
+        require_key_event_confirmation=True,
+        enforce_t1=True,
+        max_symbols=20,
+    )
+    blocked = engine.run(payload=payload, symbols=[symbol])
+    assert blocked.trades == []
+
+    confirmation_state["value"] = "confirmed"
+    passed = engine.run(payload=payload, symbols=[symbol])
+    assert len(passed.trades) == 1
 
 
 def test_matrix_semantic_alignment_toggle_changes_candidate_filtering() -> None:
