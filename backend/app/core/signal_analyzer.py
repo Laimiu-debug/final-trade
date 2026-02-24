@@ -87,6 +87,72 @@ class SignalAnalyzer:
             return "B"
         return "C"
 
+    @classmethod
+    def _calculate_dimension_weighted_event_score(
+        cls,
+        *,
+        dimensions: list[dict[str, object]],
+        metric_values: dict[str, float],
+    ) -> tuple[float | None, list[dict[str, object]]]:
+        weighted_sum = 0.0
+        total_weight = 0.0
+        breakdown: list[dict[str, object]] = []
+        for index, raw_dim in enumerate(dimensions):
+            if not isinstance(raw_dim, dict):
+                continue
+            enabled = bool(raw_dim.get("enabled", True))
+            if not enabled:
+                continue
+            metric_key = str(raw_dim.get("metric_key", "")).strip()
+            if not metric_key:
+                continue
+            if metric_key not in metric_values:
+                continue
+            try:
+                weight = float(raw_dim.get("weight", 1.0))
+            except Exception:
+                weight = 1.0
+            weight = max(0.0, weight)
+            if weight <= 0.0:
+                continue
+            invert = bool(raw_dim.get("invert", False))
+            metric_score = cls.clamp_score(float(metric_values.get(metric_key, 0.0)))
+            effective_score = cls.clamp_score(100.0 - metric_score) if invert else metric_score
+            weighted_sum += effective_score * weight
+            total_weight += weight
+            breakdown.append(
+                {
+                    "dimension_id": str(raw_dim.get("dimension_id", "")).strip() or f"dim_{index + 1}",
+                    "label": str(raw_dim.get("label", "")).strip() or metric_key,
+                    "metric_key": metric_key,
+                    "metric_score": round(metric_score, 2),
+                    "effective_score": round(effective_score, 2),
+                    "weight": round(weight, 6),
+                    "invert": invert,
+                }
+            )
+        if total_weight <= 0.0:
+            return None, breakdown
+        return cls.clamp_score(weighted_sum / total_weight), breakdown
+
+    @staticmethod
+    def _extract_event_rule_values(
+        event_judgment_profile: dict[str, object] | None,
+    ) -> dict[str, object]:
+        profile = event_judgment_profile if isinstance(event_judgment_profile, dict) else {}
+        raw_rule_values = profile.get("rule_values")
+        if not isinstance(raw_rule_values, list):
+            return {}
+        out: dict[str, object] = {}
+        for item in raw_rule_values:
+            if not isinstance(item, dict):
+                continue
+            rule_key = str(item.get("rule_key", "")).strip()
+            if not rule_key:
+                continue
+            out[rule_key] = item.get("value")
+        return out
+
     @staticmethod
     def phase_hint(phase: str) -> str:
         """Get human-readable hint for a phase."""
@@ -552,6 +618,8 @@ class SignalAnalyzer:
         row: ScreenerResult,
         candles: list[CandlePoint],
         window_days: int,
+        *,
+        event_judgment_profile: dict[str, object] | None = None,
     ) -> dict:
         """
         Calculate Wyckoff analysis snapshot for a stock.
@@ -604,8 +672,21 @@ class SignalAnalyzer:
         ret20 = (latest_close - closes[-21]) / max(closes[-21], 0.01) if len(closes) > 20 else ret10
 
         # Detect events
+        event_rule_values = cls._extract_event_rule_values(event_judgment_profile)
         event_dates, event_chain = cls._detect_wyckoff_events(
-            highs, lows, closes, volumes, dates, ma20, avg_v5, avg_v20, row, tr_pos, ret10, opens_list
+            highs,
+            lows,
+            closes,
+            volumes,
+            dates,
+            ma20,
+            avg_v5,
+            avg_v20,
+            row,
+            tr_pos,
+            ret10,
+            opens_list,
+            event_rule_values=event_rule_values,
         )
         event_confirmation_map = cls._evaluate_event_confirmation_map(
             event_dates=event_dates,
@@ -697,6 +778,7 @@ class SignalAnalyzer:
             weekly_context_score=weekly_context_score,
             weekly_context_multiplier=weekly_context_multiplier,
             event_confirmation_map=event_confirmation_map,
+            event_judgment_profile=event_judgment_profile,
         )
 
         # Determine primary signal
@@ -847,6 +929,7 @@ class SignalAnalyzer:
             "weekly_context_score": 0.0,
             "weekly_context_multiplier": 1.0,
             "risk_score": 0.0,
+            "event_dimension_breakdown": [],
             "confirmation_status": "unconfirmed",
             "event_grade_map": {},
             "entry_quality_score": 0.0,
@@ -867,6 +950,7 @@ class SignalAnalyzer:
         tr_pos: float,
         ret10: float,
         opens: list[float],
+        event_rule_values: dict[str, object] | None = None,
     ) -> tuple[dict[str, str], list[dict[str, str]]]:
         """Detect Wyckoff events from price and volume data."""
         event_dates: dict[str, str] = {}
@@ -959,17 +1043,157 @@ class SignalAnalyzer:
                 "category": category,
             })
 
-        lookback_start = max(0, last_idx - 40)
+        rules = event_rule_values if isinstance(event_rule_values, dict) else {}
+
+        def rule_bool(key: str, default: bool) -> bool:
+            raw_value = rules.get(key, default)
+            if isinstance(raw_value, bool):
+                return raw_value
+            if isinstance(raw_value, (int, float)):
+                return bool(raw_value)
+            if isinstance(raw_value, str):
+                text = raw_value.strip().lower()
+                if text in {"1", "true", "yes", "y", "on"}:
+                    return True
+                if text in {"0", "false", "no", "n", "off"}:
+                    return False
+            return bool(default)
+
+        def rule_float(
+            key: str,
+            default: float,
+            *,
+            min_value: float | None = None,
+            max_value: float | None = None,
+        ) -> float:
+            raw_value = rules.get(key, default)
+            try:
+                value = float(raw_value)
+            except Exception:
+                value = float(default)
+            if min_value is not None:
+                value = max(float(min_value), value)
+            if max_value is not None:
+                value = min(float(max_value), value)
+            return float(value)
+
+        def rule_int(
+            key: str,
+            default: int,
+            *,
+            min_value: int | None = None,
+            max_value: int | None = None,
+        ) -> int:
+            raw_value = rules.get(key, default)
+            try:
+                value = int(round(float(raw_value)))
+            except Exception:
+                value = int(default)
+            if min_value is not None:
+                value = max(int(min_value), value)
+            if max_value is not None:
+                value = min(int(max_value), value)
+            return int(value)
+
+        lookback_core_days = rule_int("lookback_core_days", 40, min_value=20, max_value=120)
+        sc_scan_lookback_days = rule_int("sc_scan_lookback_days", 35, min_value=5, max_value=120)
+        bc_scan_lookback_days = rule_int("bc_scan_lookback_days", 35, min_value=5, max_value=120)
+        pattern_window_days = rule_int("pattern_window_days", 28, min_value=8, max_value=80)
+        pattern_extra_spring_days = rule_int("pattern_extra_spring_days", 8, min_value=0, max_value=30)
+        ps_window_before_sc_days = rule_int("ps_window_before_sc_days", 25, min_value=3, max_value=80)
+        ar_window_after_sc_days = rule_int("ar_window_after_sc_days", 18, min_value=3, max_value=80)
+        st_window_after_ar_days = rule_int("st_window_after_ar_days", 12, min_value=3, max_value=80)
+        st_window_after_sc_days = rule_int("st_window_after_sc_days", 18, min_value=3, max_value=80)
+        lps_window_after_anchor_days = rule_int("lps_window_after_anchor_days", 12, min_value=3, max_value=60)
+        lps_anchor_max_gap_days = rule_int("lps_anchor_max_gap_days", 6, min_value=1, max_value=30)
+        psy_window_before_bc_days = rule_int("psy_window_before_bc_days", 20, min_value=3, max_value=80)
+        ard_window_after_bc_days = rule_int("ard_window_after_bc_days", 18, min_value=3, max_value=80)
+        std_window_after_bc_days = rule_int("std_window_after_bc_days", 24, min_value=3, max_value=120)
+        lpsy_window_after_anchor_days = rule_int("lpsy_window_after_anchor_days", 16, min_value=3, max_value=120)
+        lpsy_short_window_days = rule_int("lpsy_short_window_days", 5, min_value=2, max_value=20)
+        lpsy_long_window_days = max(
+            lpsy_short_window_days + 1,
+            rule_int("lpsy_long_window_days", 10, min_value=4, max_value=40),
+        )
+
+        sc_anchor_tr_pos_max = rule_float("sc_anchor_tr_pos_max", 0.45, min_value=0.05, max_value=0.95)
+        sc_anchor_close_open_max = rule_float("sc_anchor_close_open_max", 1.02, min_value=0.7, max_value=1.5)
+        sc_anchor_vol_ratio_min = rule_float("sc_anchor_vol_ratio_min", 1.2, min_value=0.1, max_value=5.0)
+        sc_close_near_low_ratio_max = rule_float("sc_close_near_low_ratio_max", 0.38, min_value=0.0, max_value=1.0)
+        sc_tr_pos_max = rule_float("sc_tr_pos_max", 0.55, min_value=0.05, max_value=0.99)
+        sc_vol_ratio_min = rule_float("sc_vol_ratio_min", 1.05, min_value=0.1, max_value=5.0)
+        ps_tr_pos_max = rule_float("ps_tr_pos_max", 0.42, min_value=0.05, max_value=0.95)
+        ps_vol_ratio_min = rule_float("ps_vol_ratio_min", 1.08, min_value=0.1, max_value=5.0)
+        ps_close_ma20_max = rule_float("ps_close_ma20_max", 1.02, min_value=0.6, max_value=1.6)
+        ar_rebound_min = rule_float("ar_rebound_min", 1.05, min_value=0.8, max_value=2.0)
+        st_low_near_sc_tol = rule_float("st_low_near_sc_tol", 0.04, min_value=0.0, max_value=0.4)
+        st_vol_vs_sc_max = rule_float("st_vol_vs_sc_max", 0.85, min_value=0.05, max_value=2.0)
+        spring_break_prior_low_max = rule_float("spring_break_prior_low_max", 0.985, min_value=0.6, max_value=1.2)
+        spring_close_reclaim_min = rule_float("spring_close_reclaim_min", 1.0, min_value=0.6, max_value=1.4)
+        spring_vol_ratio_min = rule_float("spring_vol_ratio_min", 1.15, min_value=0.1, max_value=5.0)
+        tso_break_prior_low_max = rule_float("tso_break_prior_low_max", 0.99, min_value=0.6, max_value=1.3)
+        tso_close_reclaim_min = rule_float("tso_close_reclaim_min", 1.0, min_value=0.6, max_value=1.4)
+        tso_vol_ratio_min = rule_float("tso_vol_ratio_min", 1.0, min_value=0.1, max_value=5.0)
+        sos_close_ma20_min = rule_float("sos_close_ma20_min", 1.01, min_value=0.6, max_value=1.5)
+        sos_ret10_min = rule_float("sos_ret10_min", 0.05, min_value=-0.8, max_value=1.2)
+        sos_vol_ratio_min = rule_float("sos_vol_ratio_min", 1.05, min_value=0.1, max_value=5.0)
+        joc_close_break_prior_high_min = rule_float("joc_close_break_prior_high_min", 1.005, min_value=0.6, max_value=1.5)
+        joc_vol_ratio_min = rule_float("joc_vol_ratio_min", 1.2, min_value=0.1, max_value=5.0)
+        lps_close_ma20_min = rule_float("lps_close_ma20_min", 0.995, min_value=0.6, max_value=1.5)
+        lps_vol_vs_prev5_max = rule_float("lps_vol_vs_prev5_max", 0.95, min_value=0.05, max_value=2.0)
+        bc_anchor_tr_pos_min = rule_float("bc_anchor_tr_pos_min", 0.62, min_value=0.0, max_value=1.0)
+        bc_anchor_close_open_min = rule_float("bc_anchor_close_open_min", 0.98, min_value=0.5, max_value=1.5)
+        bc_anchor_vol_ratio_min = rule_float("bc_anchor_vol_ratio_min", 1.2, min_value=0.1, max_value=5.0)
+        bc_anchor_high_prior_high_min = rule_float("bc_anchor_high_prior_high_min", 0.995, min_value=0.6, max_value=1.5)
+        bc_close_near_high_ratio_max = rule_float("bc_close_near_high_ratio_max", 0.32, min_value=0.0, max_value=1.0)
+        bc_tr_pos_min = rule_float("bc_tr_pos_min", 0.58, min_value=0.0, max_value=1.0)
+        bc_vol_ratio_min = rule_float("bc_vol_ratio_min", 1.05, min_value=0.1, max_value=5.0)
+        bc_high_recent_high_min = rule_float("bc_high_recent_high_min", 0.995, min_value=0.6, max_value=1.5)
+        psy_tr_pos_min = rule_float("psy_tr_pos_min", 0.62, min_value=0.0, max_value=1.0)
+        psy_vol_ratio_min = rule_float("psy_vol_ratio_min", 1.05, min_value=0.1, max_value=5.0)
+        psy_close_ma20_min = rule_float("psy_close_ma20_min", 0.98, min_value=0.6, max_value=1.5)
+        ard_decline_close_bc_max = rule_float("ard_decline_close_bc_max", 0.94, min_value=0.2, max_value=1.2)
+        std_high_near_bc_tol = rule_float("std_high_near_bc_tol", 0.04, min_value=0.0, max_value=0.4)
+        std_vol_vs_bc_max = rule_float("std_vol_vs_bc_max", 0.9, min_value=0.05, max_value=2.0)
+        std_close_high_max = rule_float("std_close_high_max", 0.985, min_value=0.5, max_value=1.5)
+        utad_high_break_prior_high_min = rule_float("utad_high_break_prior_high_min", 1.01, min_value=0.6, max_value=1.8)
+        utad_close_back_below_prior_high_max = rule_float("utad_close_back_below_prior_high_max", 1.0, min_value=0.6, max_value=1.8)
+        utad_upper_shadow_min = rule_float("utad_upper_shadow_min", 0.5, min_value=0.0, max_value=1.0)
+        utad_vol_ratio_min = rule_float("utad_vol_ratio_min", 1.2, min_value=0.1, max_value=5.0)
+        sow_ret10_max = rule_float("sow_ret10_max", -0.05, min_value=-1.0, max_value=1.0)
+        sow_close_ma20_max = rule_float("sow_close_ma20_max", 0.995, min_value=0.6, max_value=1.5)
+        sow_vol_ratio_min = rule_float("sow_vol_ratio_min", 1.1, min_value=0.1, max_value=5.0)
+        lpsy_close_ma20_max = rule_float("lpsy_close_ma20_max", 1.0, min_value=0.6, max_value=1.5)
+        lpsy_lower_high_max = rule_float("lpsy_lower_high_max", 0.99, min_value=0.6, max_value=1.5)
+
+        enable_ps = rule_bool("enable_ps", True)
+        enable_sc = rule_bool("enable_sc", True)
+        enable_ar = rule_bool("enable_ar", True)
+        enable_st = rule_bool("enable_st", True)
+        enable_tso = rule_bool("enable_tso", True)
+        enable_spring = rule_bool("enable_spring", True)
+        enable_sos = rule_bool("enable_sos", True)
+        enable_joc = rule_bool("enable_joc", True)
+        enable_lps = rule_bool("enable_lps", True)
+        enable_psy = rule_bool("enable_psy", True)
+        enable_bc = rule_bool("enable_bc", True)
+        enable_ar_d = rule_bool("enable_ar_d", True)
+        enable_st_d = rule_bool("enable_st_d", True)
+        enable_utad = rule_bool("enable_utad", True)
+        enable_sow = rule_bool("enable_sow", True)
+        enable_lpsy = rule_bool("enable_lpsy", True)
+
+        lookback_start = max(0, last_idx - lookback_core_days)
 
         # SC anchor: prefer high-volume, low-position climax-like bars in the recent window.
-        look_sc_start = max(0, len(closes) - 35)
+        look_sc_start = max(0, len(closes) - sc_scan_lookback_days)
         sc_idx = latest_index_where(
             look_sc_start,
             last_idx,
             lambda idx: (
-                tr_pos_at(idx) <= 0.45
-                and closes[idx] <= opens[idx] * 1.02
-                and vol_ratio_at(idx, 20) >= 1.2
+                tr_pos_at(idx) <= sc_anchor_tr_pos_max
+                and closes[idx] <= opens[idx] * sc_anchor_close_open_max
+                and vol_ratio_at(idx, 20) >= sc_anchor_vol_ratio_min
             ),
         )
         if sc_idx is None:
@@ -978,51 +1202,55 @@ class SignalAnalyzer:
                 key=lambda idx: volumes[look_sc_start + idx],
             )
         sc_range = max(highs[sc_idx] - lows[sc_idx], 0.01)
-        sc_close_near_low = closes[sc_idx] <= lows[sc_idx] + sc_range * 0.38
-        sc_condition = sc_close_near_low and tr_pos_at(sc_idx) <= 0.55 and vol_ratio_at(sc_idx, 20) >= 1.05
-        push_event("SC", sc_condition, sc_idx)
+        sc_close_near_low = closes[sc_idx] <= lows[sc_idx] + sc_range * sc_close_near_low_ratio_max
+        sc_condition = sc_close_near_low and tr_pos_at(sc_idx) <= sc_tr_pos_max and vol_ratio_at(sc_idx, 20) >= sc_vol_ratio_min
+        push_event("SC", enable_sc and sc_condition, sc_idx)
 
         # PS / SC / AR / ST (Accumulation Phase A)
         ps_idx = latest_index_where(
-            max(0, sc_idx - 25),
+            max(0, sc_idx - ps_window_before_sc_days),
             max(0, sc_idx - 1),
-            lambda idx: tr_pos_at(idx) <= 0.42 and vol_ratio_at(idx, 20) >= 1.08 and closes[idx] <= ma_at(idx) * 1.02,
+            lambda idx: (
+                tr_pos_at(idx) <= ps_tr_pos_max
+                and vol_ratio_at(idx, 20) >= ps_vol_ratio_min
+                and closes[idx] <= ma_at(idx) * ps_close_ma20_max
+            ),
         )
-        push_event("PS", ps_idx is not None, ps_idx)
+        push_event("PS", enable_ps and (ps_idx is not None), ps_idx)
 
         ar_idx: int | None = None
         if "SC" in event_dates and sc_idx < last_idx - 1:
-            rebound_scan_end = min(last_idx, sc_idx + 18)
+            rebound_scan_end = min(last_idx, sc_idx + ar_window_after_sc_days)
             rebound_slice = closes[sc_idx + 1:rebound_scan_end + 1]
             rebound_max = max(rebound_slice) if rebound_slice else closes[sc_idx]
-            if rebound_max >= closes[sc_idx] * 1.05:
+            if rebound_max >= closes[sc_idx] * ar_rebound_min:
                 ar_idx = sc_idx + rebound_slice.index(rebound_max) + 1
-                push_event("AR", True, ar_idx)
+                push_event("AR", enable_ar, ar_idx)
 
         st_idx: int | None = None
         if "SC" in event_dates and sc_idx < last_idx:
             sc_low = lows[sc_idx]
             st_start = (ar_idx + 1) if ar_idx is not None else (sc_idx + 2)
-            st_end = min(last_idx, (ar_idx + 12) if ar_idx is not None else (sc_idx + 18))
+            st_end = min(last_idx, (ar_idx + st_window_after_ar_days) if ar_idx is not None else (sc_idx + st_window_after_sc_days))
             for idx in range(st_start, st_end + 1):
-                near_sc_low = abs(lows[idx] - sc_low) / max(sc_low, 0.01) <= 0.04
-                lower_volume = volumes[idx] <= volumes[sc_idx] * 0.85
+                near_sc_low = abs(lows[idx] - sc_low) / max(sc_low, 0.01) <= st_low_near_sc_tol
+                lower_volume = volumes[idx] <= volumes[sc_idx] * st_vol_vs_sc_max
                 if near_sc_low and lower_volume:
                     st_idx = idx
                     break
-            push_event("ST", st_idx is not None, st_idx)
+            push_event("ST", enable_st and (st_idx is not None), st_idx)
 
         # TSO / Spring / SOS / JOC / LPS (Accumulation Phases B-E)
         pattern_seed = max([idx for idx in (st_idx, ar_idx, sc_idx) if idx is not None], default=lookback_start)
         pattern_start = max(1, pattern_seed + 1)
-        pattern_end = min(last_idx, pattern_start + 28)
+        pattern_end = min(last_idx, pattern_start + pattern_window_days)
         spring_idx = first_index_where(
             pattern_start,
-            min(last_idx, pattern_end + 8),
+            min(last_idx, pattern_end + pattern_extra_spring_days),
             lambda idx: (
-                lows[idx] < prior_low_at(idx, 20) * 0.985
-                and closes[idx] > prior_low_at(idx, 20)
-                and vol_ratio_at(idx, 20) >= 1.15
+                lows[idx] < prior_low_at(idx, 20) * spring_break_prior_low_max
+                and closes[idx] > prior_low_at(idx, 20) * spring_close_reclaim_min
+                and vol_ratio_at(idx, 20) >= spring_vol_ratio_min
             ),
         )
         tso_end = (spring_idx - 1) if spring_idx is not None else pattern_end
@@ -1030,22 +1258,13 @@ class SignalAnalyzer:
             pattern_start,
             tso_end,
             lambda idx: (
-                lows[idx] < prior_low_at(idx, 20) * 0.99
-                and closes[idx] > prior_low_at(idx, 20)
-                and vol_ratio_at(idx, 20) >= 1.0
+                lows[idx] < prior_low_at(idx, 20) * tso_break_prior_low_max
+                and closes[idx] > prior_low_at(idx, 20) * tso_close_reclaim_min
+                and vol_ratio_at(idx, 20) >= tso_vol_ratio_min
             ),
         )
-        push_event(
-            "TSO",
-            tso_idx is not None,
-            tso_idx,
-        )
-
-        push_event(
-            "Spring",
-            spring_idx is not None,
-            spring_idx,
-        )
+        push_event("TSO", enable_tso and (tso_idx is not None), tso_idx)
+        push_event("Spring", enable_spring and (spring_idx is not None), spring_idx)
 
         base_idx = max(
             [idx for idx in (spring_idx, tso_idx, st_idx, ar_idx, sc_idx) if idx is not None],
@@ -1056,58 +1275,50 @@ class SignalAnalyzer:
             signal_start,
             last_idx,
             lambda idx: (
-                closes[idx] > ma_at(idx) * 1.01
-                and ret_at(idx, 10) > 0.05
-                and vol_ratio_at(idx, 20) >= 1.05
+                closes[idx] > ma_at(idx) * sos_close_ma20_min
+                and ret_at(idx, 10) > sos_ret10_min
+                and vol_ratio_at(idx, 20) >= sos_vol_ratio_min
             ),
         )
-        push_event(
-            "SOS",
-            sos_idx is not None,
-            sos_idx,
-        )
+        push_event("SOS", enable_sos and (sos_idx is not None), sos_idx)
 
         joc_start = max(signal_start, (sos_idx + 1) if sos_idx is not None else signal_start)
         joc_idx = first_index_where(
             joc_start,
             last_idx,
-            lambda idx: idx > 0 and closes[idx] >= prior_high_at(idx, 20) * 1.005 and vol_ratio_at(idx, 20) >= 1.2,
+            lambda idx: (
+                idx > 0
+                and closes[idx] >= prior_high_at(idx, 20) * joc_close_break_prior_high_min
+                and vol_ratio_at(idx, 20) >= joc_vol_ratio_min
+            ),
         )
-        push_event(
-            "JOC",
-            joc_idx is not None,
-            joc_idx,
-        )
+        push_event("JOC", enable_joc and (joc_idx is not None), joc_idx)
 
         lps_idx: int | None = None
         lps_anchor_idx = max([idx for idx in (sos_idx, joc_idx) if idx is not None], default=-1)
         if lps_anchor_idx >= 0 and lps_anchor_idx < last_idx:
-            lps_end = min(last_idx, lps_anchor_idx + 12)
+            lps_end = min(last_idx, lps_anchor_idx + lps_window_after_anchor_days)
             lps_idx = first_index_where(
                 lps_anchor_idx + 1,
                 lps_end,
                 lambda idx: (
-                    closes[idx] > ma_at(idx) * 0.995
-                    and volumes[idx] <= max(vol_avg_at(idx - 1, 5), 1.0) * 0.95
-                    and (idx - lps_anchor_idx) <= 6
+                    closes[idx] > ma_at(idx) * lps_close_ma20_min
+                    and volumes[idx] <= max(vol_avg_at(idx - 1, 5), 1.0) * lps_vol_vs_prev5_max
+                    and (idx - lps_anchor_idx) <= lps_anchor_max_gap_days
                 ),
             )
-        push_event(
-            "LPS",
-            lps_idx is not None,
-            lps_idx,
-        )
+        push_event("LPS", enable_lps and (lps_idx is not None), lps_idx)
 
         # Distribution early events: PSY / BC / AR(d) / ST(d)
-        look_bc_start = max(0, len(closes) - 35)
+        look_bc_start = max(0, len(closes) - bc_scan_lookback_days)
         bc_idx = latest_index_where(
             look_bc_start,
             last_idx,
             lambda idx: (
-                tr_pos_at(idx) >= 0.62
-                and closes[idx] >= opens[idx] * 0.98
-                and vol_ratio_at(idx, 20) >= 1.2
-                and highs[idx] >= prior_high_at(idx, 20) * 0.995
+                tr_pos_at(idx) >= bc_anchor_tr_pos_min
+                and closes[idx] >= opens[idx] * bc_anchor_close_open_min
+                and vol_ratio_at(idx, 20) >= bc_anchor_vol_ratio_min
+                and highs[idx] >= prior_high_at(idx, 20) * bc_anchor_high_prior_high_min
             ),
         )
         if bc_idx is None:
@@ -1116,45 +1327,48 @@ class SignalAnalyzer:
                 key=lambda idx: volumes[look_bc_start + idx],
             )
         bc_range = max(highs[bc_idx] - lows[bc_idx], 0.01)
-        bc_close_near_high = closes[bc_idx] >= highs[bc_idx] - bc_range * 0.32
+        bc_close_near_high = closes[bc_idx] >= highs[bc_idx] - bc_range * bc_close_near_high_ratio_max
         bc_condition = (
             bc_close_near_high
-            and tr_pos_at(bc_idx) >= 0.58
-            and vol_ratio_at(bc_idx, 20) >= 1.05
-            and highs[bc_idx] >= max(highs[max(0, bc_idx - 20):bc_idx + 1]) * 0.995
+            and tr_pos_at(bc_idx) >= bc_tr_pos_min
+            and vol_ratio_at(bc_idx, 20) >= bc_vol_ratio_min
+            and highs[bc_idx] >= max(highs[max(0, bc_idx - 20):bc_idx + 1]) * bc_high_recent_high_min
         )
 
         psy_idx = first_index_where(
-            max(0, bc_idx - 20),
+            max(0, bc_idx - psy_window_before_bc_days),
             max(0, bc_idx - 1),
-            lambda idx: tr_pos_at(idx) >= 0.62 and vol_ratio_at(idx, 20) >= 1.05 and closes[idx] >= ma_at(idx) * 0.98,
+            lambda idx: (
+                tr_pos_at(idx) >= psy_tr_pos_min
+                and vol_ratio_at(idx, 20) >= psy_vol_ratio_min
+                and closes[idx] >= ma_at(idx) * psy_close_ma20_min
+            ),
         ) if bc_idx > 0 else None
-        push_event("PSY", psy_idx is not None, psy_idx, category="distributionRisk")
-
-        push_event("BC", bc_condition, bc_idx, category="distributionRisk")
+        push_event("PSY", enable_psy and (psy_idx is not None), psy_idx, category="distributionRisk")
+        push_event("BC", enable_bc and bc_condition, bc_idx, category="distributionRisk")
 
         ar_d_idx: int | None = None
         if "BC" in event_dates and bc_idx < last_idx - 1:
-            decline_scan_end = min(last_idx, bc_idx + 18)
+            decline_scan_end = min(last_idx, bc_idx + ard_window_after_bc_days)
             decline_slice = closes[bc_idx + 1:decline_scan_end + 1]
             decline_min = min(decline_slice) if decline_slice else closes[bc_idx]
-            if decline_min <= closes[bc_idx] * 0.94:
+            if decline_min <= closes[bc_idx] * ard_decline_close_bc_max:
                 ar_d_idx = bc_idx + decline_slice.index(decline_min) + 1
-                push_event("AR(d)", True, ar_d_idx, category="distributionRisk")
+                push_event("AR(d)", enable_ar_d, ar_d_idx, category="distributionRisk")
 
         st_d_idx: int | None = None
         if "BC" in event_dates and bc_idx < last_idx:
             bc_high = highs[bc_idx]
             st_d_start = (ar_d_idx + 1) if ar_d_idx is not None else (bc_idx + 2)
-            st_d_end = min(last_idx, bc_idx + 24)
+            st_d_end = min(last_idx, bc_idx + std_window_after_bc_days)
             for idx in range(st_d_start, st_d_end + 1):
-                near_bc_high = abs(highs[idx] - bc_high) / max(bc_high, 0.01) <= 0.04
-                lower_volume = volumes[idx] <= volumes[bc_idx] * 0.9
-                close_weak = closes[idx] <= highs[idx] * 0.985
+                near_bc_high = abs(highs[idx] - bc_high) / max(bc_high, 0.01) <= std_high_near_bc_tol
+                lower_volume = volumes[idx] <= volumes[bc_idx] * std_vol_vs_bc_max
+                close_weak = closes[idx] <= highs[idx] * std_close_high_max
                 if near_bc_high and lower_volume and close_weak:
                     st_d_idx = idx
                     break
-            push_event("ST(d)", st_d_idx is not None, st_d_idx, category="distributionRisk")
+            push_event("ST(d)", enable_st_d and (st_d_idx is not None), st_d_idx, category="distributionRisk")
 
         # Risk-side events (Distribution)
         utad_start = max(
@@ -1166,18 +1380,13 @@ class SignalAnalyzer:
             last_idx,
             lambda idx: (
                 idx > 0
-                and highs[idx] >= prior_high_at(idx, 20) * 1.01
-                and closes[idx] < prior_high_at(idx, 20)
-                and upper_shadow_ratio_at(idx) >= 0.5
-                and vol_ratio_at(idx, 20) >= 1.2
+                and highs[idx] >= prior_high_at(idx, 20) * utad_high_break_prior_high_min
+                and closes[idx] < prior_high_at(idx, 20) * utad_close_back_below_prior_high_max
+                and upper_shadow_ratio_at(idx) >= utad_upper_shadow_min
+                and vol_ratio_at(idx, 20) >= utad_vol_ratio_min
             ),
         )
-        push_event(
-            "UTAD",
-            utad_idx is not None,
-            utad_idx,
-            category="distributionRisk",
-        )
+        push_event("UTAD", enable_utad and (utad_idx is not None), utad_idx, category="distributionRisk")
 
         sow_start = max(
             lookback_start,
@@ -1186,34 +1395,31 @@ class SignalAnalyzer:
         sow_idx = first_index_where(
             sow_start,
             last_idx,
-            lambda idx: ret_at(idx, 10) <= -0.05 and closes[idx] < ma_at(idx) * 0.995 and vol_ratio_at(idx, 20) >= 1.1,
+            lambda idx: (
+                ret_at(idx, 10) <= sow_ret10_max
+                and closes[idx] < ma_at(idx) * sow_close_ma20_max
+                and vol_ratio_at(idx, 20) >= sow_vol_ratio_min
+            ),
         )
-        push_event(
-            "SOW",
-            sow_idx is not None,
-            sow_idx,
-            category="distributionRisk",
-        )
+        push_event("SOW", enable_sow and (sow_idx is not None), sow_idx, category="distributionRisk")
 
         lpsy_anchor_idx = max([idx for idx in (sow_idx, utad_idx) if idx is not None], default=-1)
         lpsy_idx: int | None = None
         if lpsy_anchor_idx >= 0 and lpsy_anchor_idx < last_idx:
-            lpsy_end = min(last_idx, lpsy_anchor_idx + 16)
+            lpsy_end = min(last_idx, lpsy_anchor_idx + lpsy_window_after_anchor_days)
             lpsy_idx = first_index_where(
                 lpsy_anchor_idx + 1,
                 lpsy_end,
                 lambda idx: (
-                    closes[idx] < ma_at(idx)
-                    and max(highs[max(0, idx - 4):idx + 1])
-                    <= max(highs[max(0, idx - 9):max(0, idx - 4)] or highs[max(0, idx - 4):idx + 1]) * 0.99
+                    closes[idx] < ma_at(idx) * lpsy_close_ma20_max
+                    and max(highs[max(0, idx - lpsy_short_window_days + 1):idx + 1])
+                    <= max(
+                        highs[max(0, idx - lpsy_long_window_days + 1):max(0, idx - lpsy_short_window_days + 1)]
+                        or highs[max(0, idx - lpsy_short_window_days + 1):idx + 1]
+                    ) * lpsy_lower_high_max
                 ),
             )
-        push_event(
-            "LPSY",
-            lpsy_idx is not None,
-            lpsy_idx,
-            category="distributionRisk",
-        )
+        push_event("LPSY", enable_lpsy and (lpsy_idx is not None), lpsy_idx, category="distributionRisk")
 
         event_chain.sort(
             key=lambda item: (
@@ -1339,6 +1545,7 @@ class SignalAnalyzer:
         weekly_context_score: float | None = None,
         weekly_context_multiplier: float | None = None,
         event_confirmation_map: dict[str, str] | None = None,
+        event_judgment_profile: dict[str, object] | None = None,
     ) -> dict:
         """Calculate various analysis scores."""
         # Phase score
@@ -1472,7 +1679,7 @@ class SignalAnalyzer:
             + normalized_cost_center_shift * 0.10
             - risk_score * 0.28
         )
-        event_score_raw = cls.clamp_score(
+        legacy_event_score_raw = cls.clamp_score(
             background_score * 0.22
             + position_score * 0.16
             + vol_price_score * 0.18
@@ -1484,6 +1691,32 @@ class SignalAnalyzer:
             + normalized_weekly_context * 0.04
             - risk_score * 0.20
         )
+        event_score_raw = legacy_event_score_raw
+        event_dimension_breakdown: list[dict[str, object]] = []
+        profile = event_judgment_profile if isinstance(event_judgment_profile, dict) else {}
+        profile_mode = str(profile.get("score_mode", "legacy_formula")).strip().lower()
+        if profile_mode == "dimension_weighted":
+            metric_values = {
+                "event_background_score": float(background_score),
+                "event_position_score": float(position_score),
+                "event_vol_price_score": float(vol_price_score),
+                "event_confirmation_score": float(confirmation_score),
+                "phase_context_score": float(computed_phase_context_score),
+                "event_recency_score": float(event_recency_score),
+                "candle_quality_score": float(normalized_candle_quality),
+                "cost_center_shift_score": float(normalized_cost_center_shift),
+                "weekly_context_score": float(normalized_weekly_context),
+                "risk_score": float(risk_score),
+                "event_strength_score": float(event_strength_score),
+            }
+            dimensions_raw = profile.get("dimensions")
+            dimensions = dimensions_raw if isinstance(dimensions_raw, list) else []
+            custom_event_score_raw, event_dimension_breakdown = cls._calculate_dimension_weighted_event_score(
+                dimensions=[item for item in dimensions if isinstance(item, dict)],
+                metric_values=metric_values,
+            )
+            if custom_event_score_raw is not None:
+                event_score_raw = cls.clamp_score(custom_event_score_raw)
         if key_failed > 0:
             event_score_raw -= min(18.0, float(key_failed) * 8.0)
         if key_pending > 0:
@@ -1585,6 +1818,7 @@ class SignalAnalyzer:
             "weekly_context_score": round(normalized_weekly_context, 2),
             "weekly_context_multiplier": round(resolved_weekly_multiplier, 4),
             "risk_score": round(risk_score, 2),
+            "event_dimension_breakdown": event_dimension_breakdown,
             "confirmation_status": confirmation_status,
             "event_confirmation_map": key_confirm_map,
             "event_grade_map": event_grade_map,

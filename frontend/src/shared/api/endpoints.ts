@@ -53,6 +53,11 @@ import type {
   StockAnalysis,
   StockAnnotation,
   StrategyCatalogResponse,
+  EventJudgmentCatalogResponse,
+  EventJudgmentProfile,
+  EventJudgmentProfileApplyRequest,
+  EventJudgmentProfileDeleteResponse,
+  EventJudgmentProfileUpsertRequest,
   StrategyId,
   SystemStorageStatus,
   TradeFillTagAssignment,
@@ -299,6 +304,37 @@ export function runBacktestABExperiment(payload: BacktestABExperimentRequest) {
 
 export function getStrategies() {
   return apiRequest<StrategyCatalogResponse>('/api/strategies', {
+    timeoutMs: 45_000,
+  })
+}
+
+export function getEventJudgmentProfiles() {
+  return apiRequest<EventJudgmentCatalogResponse>('/api/event-judgment/profiles', {
+    timeoutMs: 45_000,
+  })
+}
+
+export function upsertEventJudgmentProfile(payload: EventJudgmentProfileUpsertRequest) {
+  return apiRequest<EventJudgmentProfile>('/api/event-judgment/profiles', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 45_000,
+  })
+}
+
+export function applyEventJudgmentProfile(payload: EventJudgmentProfileApplyRequest) {
+  return apiRequest<EventJudgmentCatalogResponse>('/api/event-judgment/profiles/apply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 45_000,
+  })
+}
+
+export function deleteEventJudgmentProfile(profileId: string) {
+  return apiRequest<EventJudgmentProfileDeleteResponse>(`/api/event-judgment/profiles/${encodeURIComponent(profileId)}`, {
+    method: 'DELETE',
     timeoutMs: 45_000,
   })
 }

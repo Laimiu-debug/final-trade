@@ -30,6 +30,7 @@ import {
   getScreenerRun,
   getSignals,
   getStrategiesStore,
+  getEventJudgmentCatalogStore,
   getSystemStorageStore,
   getWeeklyReviewStore,
   getWeeklyReviewsStore,
@@ -45,6 +46,9 @@ import {
   updateReviewFillTagStore,
   upsertDailyReviewStore,
   upsertWeeklyReviewStore,
+  upsertEventJudgmentProfileStore,
+  applyEventJudgmentProfileStore,
+  deleteEventJudgmentProfileStore,
 } from '@/mocks/data'
 import type {
   AIProviderTestRequest,
@@ -63,6 +67,8 @@ import type {
   ScreenerParams,
   StockAnnotation,
   TradeFillTagUpdateRequest,
+  EventJudgmentProfileUpsertRequest,
+  EventJudgmentProfileApplyRequest,
   WeeklyReviewPayload,
 } from '@/types/contracts'
 
@@ -208,6 +214,28 @@ export const handlers = [
   http.get('/api/strategies', async () => {
     await delay(80)
     return HttpResponse.json(getStrategiesStore())
+  }),
+
+  http.get('/api/event-judgment/profiles', async () => {
+    await delay(80)
+    return HttpResponse.json(getEventJudgmentCatalogStore())
+  }),
+
+  http.post('/api/event-judgment/profiles', async ({ request }) => {
+    await delay(100)
+    const payload = (await request.json()) as EventJudgmentProfileUpsertRequest
+    return HttpResponse.json(upsertEventJudgmentProfileStore(payload))
+  }),
+
+  http.post('/api/event-judgment/profiles/apply', async ({ request }) => {
+    await delay(80)
+    const payload = (await request.json()) as EventJudgmentProfileApplyRequest
+    return HttpResponse.json(applyEventJudgmentProfileStore(payload))
+  }),
+
+  http.delete('/api/event-judgment/profiles/:profileId', async ({ params }) => {
+    await delay(60)
+    return HttpResponse.json(deleteEventJudgmentProfileStore(String(params.profileId || '')))
   }),
 
   http.post('/api/backtest/run', async ({ request }) => {

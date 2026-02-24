@@ -673,6 +673,7 @@ export function StrategyCenterPage() {
                 <Link to="/screener">选股漏斗</Link>
                 <Link to="/signals">待买信号</Link>
                 <Link to="/backtest">策略回测</Link>
+                <Link to="/strategy/events">事件判别中心</Link>
               </Space>
             }
           />

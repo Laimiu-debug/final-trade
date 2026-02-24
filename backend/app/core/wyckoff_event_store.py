@@ -11,8 +11,11 @@ from threading import RLock
 from typing import Any
 
 
-def build_wyckoff_params_hash(window_days: int) -> str:
-    payload = {"window_days": int(window_days)}
+def build_wyckoff_params_hash(window_days: int, *, profile_hash: str = "") -> str:
+    payload = {
+        "window_days": int(window_days),
+        "profile_hash": str(profile_hash or "").strip(),
+    }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
 

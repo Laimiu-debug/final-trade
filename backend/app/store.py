@@ -101,6 +101,14 @@ from .models import (
     StrategyCatalogResponse,
     StrategyCapabilities,
     StrategyDescriptor,
+    EventJudgmentCatalogResponse,
+    EventJudgmentDimension,
+    EventJudgmentMetricOption,
+    EventJudgmentProfile,
+    EventJudgmentRuleOption,
+    EventJudgmentRuleValue,
+    EventJudgmentProfileDeleteResponse,
+    EventJudgmentProfileUpsertRequest,
     TrendPoolStep,
     SystemStorageStatus,
     SimFillsResponse,
@@ -196,6 +204,7 @@ class InMemoryStore:
     _BACKTEST_REPORT_META_SCHEMA_VERSION = 1
     _BACKTEST_REPORT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{4,96}$")
     _EVENT_GRADE_RANK = {"C": 1, "B": 2, "A": 3}
+    _EVENT_JUDGMENT_DEFAULT_PROFILE_ID = "system_legacy_formula_v1"
     _BACKTEST_MATRIX_TIMING_RE = re.compile(
         r"耗时\[建矩阵=(?P<matrix>[\d.]+)s,\s*算信号=(?P<signal>[\d.]+)s,\s*撮合=(?P<match>[\d.]+)s,\s*总计=(?P<total>[\d.]+)s\]"
     )
@@ -271,6 +280,16 @@ class InMemoryStore:
             "last_backfill_quality_score_outliers": 0,
             "last_backfill_quality_date_misaligned": 0,
         }
+        self._event_judgment_metric_options = self._build_event_judgment_metric_options()
+        self._event_judgment_rule_options = self._build_event_judgment_rule_options()
+        self._event_judgment_rule_option_map = {
+            str(item.get("rule_key", "")).strip(): dict(item)
+            for item in self._event_judgment_rule_options
+            if str(item.get("rule_key", "")).strip()
+        }
+        self._event_judgment_system_profiles = self._build_event_judgment_system_profiles()
+        self._event_judgment_custom_profiles: dict[str, dict[str, Any]] = {}
+        self._active_event_judgment_profile_id = self._default_event_judgment_profile_id()
         self._app_state_path = self._resolve_app_state_path(app_state_path)
         self._load_or_init_app_state()
         self._sim_engine = SimAccountEngine(
@@ -429,6 +448,763 @@ class InMemoryStore:
             updates["notes"] = notes
         return result.model_copy(update=updates)
 
+    @classmethod
+    def _default_event_judgment_profile_id(cls) -> str:
+        return str(cls._EVENT_JUDGMENT_DEFAULT_PROFILE_ID)
+
+    @staticmethod
+    def _build_event_judgment_metric_options() -> list[dict[str, str]]:
+        return [
+            {
+                "metric_key": "event_background_score",
+                "label": "背景分",
+                "description": "趋势背景与风险环境（高分更优）",
+            },
+            {
+                "metric_key": "event_position_score",
+                "label": "位置分",
+                "description": "事件发生位置是否处于理想区间（高分更优）",
+            },
+            {
+                "metric_key": "event_vol_price_score",
+                "label": "量价分",
+                "description": "量价协同与主导方向（高分更优）",
+            },
+            {
+                "metric_key": "event_confirmation_score",
+                "label": "确认分",
+                "description": "序列与关键确认状态（高分更优）",
+            },
+            {
+                "metric_key": "phase_context_score",
+                "label": "阶段语境分",
+                "description": "前置事件完整度与阶段一致性（高分更优）",
+            },
+            {
+                "metric_key": "event_recency_score",
+                "label": "新鲜度分",
+                "description": "事件时间衰减后的有效性（高分更优）",
+            },
+            {
+                "metric_key": "candle_quality_score",
+                "label": "K线质量分",
+                "description": "事件K线形态质量（高分更优）",
+            },
+            {
+                "metric_key": "cost_center_shift_score",
+                "label": "筹码迁移分",
+                "description": "筹码重心迁移质量（高分更优）",
+            },
+            {
+                "metric_key": "weekly_context_score",
+                "label": "周线语境分",
+                "description": "周线环境对日线事件的放大质量（高分更优）",
+            },
+            {
+                "metric_key": "risk_score",
+                "label": "风险分",
+                "description": "风险越高分越高，通常建议勾选反向（invert）",
+            },
+        ]
+
+    @staticmethod
+    def _build_event_judgment_rule_options() -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = [
+            # Core windows
+            {"rule_key": "lookback_core_days", "label": "核心回看天数", "category": "基础窗口", "value_type": "integer", "default": 40, "min": 20, "max": 120, "step": 1, "description": "事件搜索起始窗口（天）"},
+            {"rule_key": "sc_scan_lookback_days", "label": "SC搜索窗口", "category": "基础窗口", "value_type": "integer", "default": 35, "min": 15, "max": 120, "step": 1, "description": "近期SC锚点搜索窗口（天）"},
+            {"rule_key": "bc_scan_lookback_days", "label": "BC搜索窗口", "category": "基础窗口", "value_type": "integer", "default": 35, "min": 15, "max": 120, "step": 1, "description": "近期BC锚点搜索窗口（天）"},
+            {"rule_key": "pattern_window_days", "label": "中后期模式窗口", "category": "基础窗口", "value_type": "integer", "default": 28, "min": 10, "max": 80, "step": 1, "description": "TSO/Spring基础窗口（天）"},
+            {"rule_key": "pattern_extra_spring_days", "label": "Spring额外窗口", "category": "基础窗口", "value_type": "integer", "default": 8, "min": 0, "max": 30, "step": 1, "description": "Spring额外搜索扩展窗口（天）"},
+            # Event switches
+            {"rule_key": "enable_ps", "label": "启用PS", "category": "PS", "value_type": "boolean", "default": True, "description": "是否启用PS事件"},
+            {"rule_key": "enable_sc", "label": "启用SC", "category": "SC", "value_type": "boolean", "default": True, "description": "是否启用SC事件"},
+            {"rule_key": "enable_ar", "label": "启用AR", "category": "AR", "value_type": "boolean", "default": True, "description": "是否启用AR事件"},
+            {"rule_key": "enable_st", "label": "启用ST", "category": "ST", "value_type": "boolean", "default": True, "description": "是否启用ST事件"},
+            {"rule_key": "enable_tso", "label": "启用TSO", "category": "TSO", "value_type": "boolean", "default": True, "description": "是否启用TSO事件"},
+            {"rule_key": "enable_spring", "label": "启用Spring", "category": "Spring", "value_type": "boolean", "default": True, "description": "是否启用Spring事件"},
+            {"rule_key": "enable_sos", "label": "启用SOS", "category": "SOS", "value_type": "boolean", "default": True, "description": "是否启用SOS事件"},
+            {"rule_key": "enable_joc", "label": "启用JOC", "category": "JOC", "value_type": "boolean", "default": True, "description": "是否启用JOC事件"},
+            {"rule_key": "enable_lps", "label": "启用LPS", "category": "LPS", "value_type": "boolean", "default": True, "description": "是否启用LPS事件"},
+            {"rule_key": "enable_psy", "label": "启用PSY", "category": "PSY", "value_type": "boolean", "default": True, "description": "是否启用PSY风险事件"},
+            {"rule_key": "enable_bc", "label": "启用BC", "category": "BC", "value_type": "boolean", "default": True, "description": "是否启用BC风险事件"},
+            {"rule_key": "enable_ar_d", "label": "启用AR(d)", "category": "AR(d)", "value_type": "boolean", "default": True, "description": "是否启用AR(d)风险事件"},
+            {"rule_key": "enable_st_d", "label": "启用ST(d)", "category": "ST(d)", "value_type": "boolean", "default": True, "description": "是否启用ST(d)风险事件"},
+            {"rule_key": "enable_utad", "label": "启用UTAD", "category": "UTAD", "value_type": "boolean", "default": True, "description": "是否启用UTAD风险事件"},
+            {"rule_key": "enable_sow", "label": "启用SOW", "category": "SOW", "value_type": "boolean", "default": True, "description": "是否启用SOW风险事件"},
+            {"rule_key": "enable_lpsy", "label": "启用LPSY", "category": "LPSY", "value_type": "boolean", "default": True, "description": "是否启用LPSY风险事件"},
+            # SC / PS / AR / ST
+            {"rule_key": "sc_anchor_tr_pos_max", "label": "SC锚点位置上限", "category": "SC", "value_type": "number", "default": 0.45, "min": 0.1, "max": 0.9, "step": 0.005, "description": "SC锚点TR位置最大值"},
+            {"rule_key": "sc_anchor_close_open_max", "label": "SC锚点收开比上限", "category": "SC", "value_type": "number", "default": 1.02, "min": 0.9, "max": 1.15, "step": 0.001, "description": "SC锚点 close <= open * 阈值"},
+            {"rule_key": "sc_anchor_vol_ratio_min", "label": "SC锚点量比下限", "category": "SC", "value_type": "number", "default": 1.2, "min": 0.5, "max": 3.0, "step": 0.01, "description": "SC锚点成交量相对阈值"},
+            {"rule_key": "sc_close_near_low_ratio_max", "label": "SC收盘贴近低点上限", "category": "SC", "value_type": "number", "default": 0.38, "min": 0.05, "max": 0.9, "step": 0.005, "description": "SC收盘到低点距离占K线范围上限"},
+            {"rule_key": "sc_tr_pos_max", "label": "SC位置上限", "category": "SC", "value_type": "number", "default": 0.55, "min": 0.15, "max": 0.95, "step": 0.005, "description": "SC最终判定TR位置上限"},
+            {"rule_key": "sc_vol_ratio_min", "label": "SC量比下限", "category": "SC", "value_type": "number", "default": 1.05, "min": 0.5, "max": 3.0, "step": 0.01, "description": "SC最终判定量比下限"},
+            {"rule_key": "ps_window_before_sc_days", "label": "PS向前搜索窗口", "category": "PS", "value_type": "integer", "default": 25, "min": 5, "max": 80, "step": 1, "description": "PS在SC前搜索天数"},
+            {"rule_key": "ps_tr_pos_max", "label": "PS位置上限", "category": "PS", "value_type": "number", "default": 0.42, "min": 0.1, "max": 0.9, "step": 0.005, "description": "PS的TR位置上限"},
+            {"rule_key": "ps_vol_ratio_min", "label": "PS量比下限", "category": "PS", "value_type": "number", "default": 1.08, "min": 0.5, "max": 3.0, "step": 0.01, "description": "PS量比下限"},
+            {"rule_key": "ps_close_ma20_max", "label": "PS收盘相对MA20上限", "category": "PS", "value_type": "number", "default": 1.02, "min": 0.85, "max": 1.2, "step": 0.001, "description": "PS条件 close <= MA20 * 阈值"},
+            {"rule_key": "ar_window_after_sc_days", "label": "AR向后搜索窗口", "category": "AR", "value_type": "integer", "default": 18, "min": 3, "max": 60, "step": 1, "description": "AR在SC后搜索天数"},
+            {"rule_key": "ar_rebound_min", "label": "AR反弹下限", "category": "AR", "value_type": "number", "default": 1.05, "min": 1.0, "max": 1.5, "step": 0.001, "description": "AR反弹阈值：反弹高点 >= SC收盘 * 阈值"},
+            {"rule_key": "st_window_after_ar_days", "label": "ST在AR后窗口", "category": "ST", "value_type": "integer", "default": 12, "min": 3, "max": 50, "step": 1, "description": "AR存在时ST搜索窗口"},
+            {"rule_key": "st_window_after_sc_days", "label": "ST在SC后窗口", "category": "ST", "value_type": "integer", "default": 18, "min": 3, "max": 60, "step": 1, "description": "AR缺失时ST搜索窗口"},
+            {"rule_key": "st_low_near_sc_tol", "label": "ST贴近SC低点容差", "category": "ST", "value_type": "number", "default": 0.04, "min": 0.0, "max": 0.25, "step": 0.001, "description": "ST低点接近SC低点的最大偏离"},
+            {"rule_key": "st_vol_vs_sc_max", "label": "ST相对SC量比上限", "category": "ST", "value_type": "number", "default": 0.85, "min": 0.1, "max": 1.5, "step": 0.005, "description": "ST成交量 <= SC成交量 * 阈值"},
+            # TSO / Spring / SOS / JOC / LPS
+            {"rule_key": "tso_break_prior_low_max", "label": "TSO下破比例上限", "category": "TSO", "value_type": "number", "default": 0.99, "min": 0.85, "max": 1.05, "step": 0.001, "description": "TSO条件 low < prior_low * 阈值"},
+            {"rule_key": "tso_close_reclaim_min", "label": "TSO收盘收复下限", "category": "TSO", "value_type": "number", "default": 1.0, "min": 0.9, "max": 1.1, "step": 0.001, "description": "TSO条件 close > prior_low * 阈值"},
+            {"rule_key": "tso_vol_ratio_min", "label": "TSO量比下限", "category": "TSO", "value_type": "number", "default": 1.0, "min": 0.5, "max": 3.0, "step": 0.01, "description": "TSO量比下限"},
+            {"rule_key": "spring_break_prior_low_max", "label": "Spring下破比例上限", "category": "Spring", "value_type": "number", "default": 0.985, "min": 0.8, "max": 1.05, "step": 0.001, "description": "Spring条件 low < prior_low * 阈值"},
+            {"rule_key": "spring_close_reclaim_min", "label": "Spring收盘收复下限", "category": "Spring", "value_type": "number", "default": 1.0, "min": 0.9, "max": 1.1, "step": 0.001, "description": "Spring条件 close > prior_low * 阈值"},
+            {"rule_key": "spring_vol_ratio_min", "label": "Spring量比下限", "category": "Spring", "value_type": "number", "default": 1.15, "min": 0.5, "max": 3.5, "step": 0.01, "description": "Spring量比下限"},
+            {"rule_key": "sos_close_ma20_min", "label": "SOS收盘相对MA20下限", "category": "SOS", "value_type": "number", "default": 1.01, "min": 0.9, "max": 1.3, "step": 0.001, "description": "SOS条件 close > MA20 * 阈值"},
+            {"rule_key": "sos_ret10_min", "label": "SOS十日涨幅下限", "category": "SOS", "value_type": "number", "default": 0.05, "min": -0.1, "max": 0.5, "step": 0.001, "description": "SOS条件 ret10 > 阈值"},
+            {"rule_key": "sos_vol_ratio_min", "label": "SOS量比下限", "category": "SOS", "value_type": "number", "default": 1.05, "min": 0.5, "max": 3.5, "step": 0.01, "description": "SOS量比下限"},
+            {"rule_key": "joc_close_break_prior_high_min", "label": "JOC突破比例下限", "category": "JOC", "value_type": "number", "default": 1.005, "min": 0.95, "max": 1.2, "step": 0.001, "description": "JOC条件 close >= prior_high * 阈值"},
+            {"rule_key": "joc_vol_ratio_min", "label": "JOC量比下限", "category": "JOC", "value_type": "number", "default": 1.2, "min": 0.5, "max": 4.0, "step": 0.01, "description": "JOC量比下限"},
+            {"rule_key": "lps_window_after_anchor_days", "label": "LPS搜索窗口", "category": "LPS", "value_type": "integer", "default": 12, "min": 3, "max": 40, "step": 1, "description": "LPS在SOS/JOC后搜索窗口"},
+            {"rule_key": "lps_anchor_max_gap_days", "label": "LPS距锚点最大天数", "category": "LPS", "value_type": "integer", "default": 6, "min": 1, "max": 30, "step": 1, "description": "LPS距SOS/JOC锚点的最大间隔"},
+            {"rule_key": "lps_close_ma20_min", "label": "LPS收盘相对MA20下限", "category": "LPS", "value_type": "number", "default": 0.995, "min": 0.85, "max": 1.2, "step": 0.001, "description": "LPS条件 close > MA20 * 阈值"},
+            {"rule_key": "lps_vol_vs_prev5_max", "label": "LPS相对前5日均量上限", "category": "LPS", "value_type": "number", "default": 0.95, "min": 0.1, "max": 1.5, "step": 0.005, "description": "LPS成交量 <= 前5日均量 * 阈值"},
+            # PSY / BC / AR(d) / ST(d)
+            {"rule_key": "bc_anchor_tr_pos_min", "label": "BC锚点位置下限", "category": "BC", "value_type": "number", "default": 0.62, "min": 0.1, "max": 0.98, "step": 0.005, "description": "BC锚点TR位置最小值"},
+            {"rule_key": "bc_anchor_close_open_min", "label": "BC锚点收开比下限", "category": "BC", "value_type": "number", "default": 0.98, "min": 0.8, "max": 1.2, "step": 0.001, "description": "BC锚点 close >= open * 阈值"},
+            {"rule_key": "bc_anchor_vol_ratio_min", "label": "BC锚点量比下限", "category": "BC", "value_type": "number", "default": 1.2, "min": 0.5, "max": 4.0, "step": 0.01, "description": "BC锚点量比下限"},
+            {"rule_key": "bc_anchor_high_prior_high_min", "label": "BC锚点突破比例下限", "category": "BC", "value_type": "number", "default": 0.995, "min": 0.9, "max": 1.2, "step": 0.001, "description": "BC锚点 high >= prior_high * 阈值"},
+            {"rule_key": "bc_close_near_high_ratio_max", "label": "BC收盘贴近高点上限", "category": "BC", "value_type": "number", "default": 0.32, "min": 0.05, "max": 0.9, "step": 0.005, "description": "BC收盘到高点距离占K线范围上限"},
+            {"rule_key": "bc_tr_pos_min", "label": "BC位置下限", "category": "BC", "value_type": "number", "default": 0.58, "min": 0.05, "max": 0.98, "step": 0.005, "description": "BC最终判定TR位置下限"},
+            {"rule_key": "bc_vol_ratio_min", "label": "BC量比下限", "category": "BC", "value_type": "number", "default": 1.05, "min": 0.5, "max": 4.0, "step": 0.01, "description": "BC最终判定量比下限"},
+            {"rule_key": "bc_high_recent_high_min", "label": "BC近期新高比例下限", "category": "BC", "value_type": "number", "default": 0.995, "min": 0.9, "max": 1.2, "step": 0.001, "description": "BC条件 high >= 最近高点 * 阈值"},
+            {"rule_key": "psy_window_before_bc_days", "label": "PSY向前搜索窗口", "category": "PSY", "value_type": "integer", "default": 20, "min": 5, "max": 60, "step": 1, "description": "PSY在BC前搜索天数"},
+            {"rule_key": "psy_tr_pos_min", "label": "PSY位置下限", "category": "PSY", "value_type": "number", "default": 0.62, "min": 0.1, "max": 0.98, "step": 0.005, "description": "PSY TR位置下限"},
+            {"rule_key": "psy_vol_ratio_min", "label": "PSY量比下限", "category": "PSY", "value_type": "number", "default": 1.05, "min": 0.5, "max": 4.0, "step": 0.01, "description": "PSY量比下限"},
+            {"rule_key": "psy_close_ma20_min", "label": "PSY收盘相对MA20下限", "category": "PSY", "value_type": "number", "default": 0.98, "min": 0.8, "max": 1.2, "step": 0.001, "description": "PSY条件 close >= MA20 * 阈值"},
+            {"rule_key": "ard_window_after_bc_days", "label": "AR(d)向后搜索窗口", "category": "AR(d)", "value_type": "integer", "default": 18, "min": 3, "max": 60, "step": 1, "description": "AR(d)在BC后搜索天数"},
+            {"rule_key": "ard_decline_close_bc_max", "label": "AR(d)回落比例上限", "category": "AR(d)", "value_type": "number", "default": 0.94, "min": 0.5, "max": 1.0, "step": 0.001, "description": "AR(d)条件 最低收盘 <= BC收盘 * 阈值"},
+            {"rule_key": "std_window_after_bc_days", "label": "ST(d)搜索窗口", "category": "ST(d)", "value_type": "integer", "default": 24, "min": 3, "max": 80, "step": 1, "description": "ST(d)在BC后搜索窗口"},
+            {"rule_key": "std_high_near_bc_tol", "label": "ST(d)贴近BC高点容差", "category": "ST(d)", "value_type": "number", "default": 0.04, "min": 0.0, "max": 0.3, "step": 0.001, "description": "ST(d)高点接近BC高点的最大偏离"},
+            {"rule_key": "std_vol_vs_bc_max", "label": "ST(d)相对BC量比上限", "category": "ST(d)", "value_type": "number", "default": 0.9, "min": 0.1, "max": 2.0, "step": 0.005, "description": "ST(d)成交量 <= BC成交量 * 阈值"},
+            {"rule_key": "std_close_high_max", "label": "ST(d)收盘贴高上限", "category": "ST(d)", "value_type": "number", "default": 0.985, "min": 0.7, "max": 1.1, "step": 0.001, "description": "ST(d)条件 close <= high * 阈值"},
+            # UTAD / SOW / LPSY
+            {"rule_key": "utad_high_break_prior_high_min", "label": "UTAD假突破比例下限", "category": "UTAD", "value_type": "number", "default": 1.01, "min": 0.95, "max": 1.3, "step": 0.001, "description": "UTAD条件 high >= prior_high * 阈值"},
+            {"rule_key": "utad_close_back_below_prior_high_max", "label": "UTAD回落比例上限", "category": "UTAD", "value_type": "number", "default": 1.0, "min": 0.8, "max": 1.2, "step": 0.001, "description": "UTAD条件 close < prior_high * 阈值"},
+            {"rule_key": "utad_upper_shadow_min", "label": "UTAD上影占比下限", "category": "UTAD", "value_type": "number", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.005, "description": "UTAD上影线占K线范围最小值"},
+            {"rule_key": "utad_vol_ratio_min", "label": "UTAD量比下限", "category": "UTAD", "value_type": "number", "default": 1.2, "min": 0.5, "max": 4.0, "step": 0.01, "description": "UTAD量比下限"},
+            {"rule_key": "sow_ret10_max", "label": "SOW十日涨幅上限", "category": "SOW", "value_type": "number", "default": -0.05, "min": -0.6, "max": 0.1, "step": 0.001, "description": "SOW条件 ret10 <= 阈值"},
+            {"rule_key": "sow_close_ma20_max", "label": "SOW收盘相对MA20上限", "category": "SOW", "value_type": "number", "default": 0.995, "min": 0.7, "max": 1.2, "step": 0.001, "description": "SOW条件 close < MA20 * 阈值"},
+            {"rule_key": "sow_vol_ratio_min", "label": "SOW量比下限", "category": "SOW", "value_type": "number", "default": 1.1, "min": 0.5, "max": 4.0, "step": 0.01, "description": "SOW量比下限"},
+            {"rule_key": "lpsy_window_after_anchor_days", "label": "LPSY搜索窗口", "category": "LPSY", "value_type": "integer", "default": 16, "min": 3, "max": 80, "step": 1, "description": "LPSY在SOW/UTAD后搜索窗口"},
+            {"rule_key": "lpsy_close_ma20_max", "label": "LPSY收盘相对MA20上限", "category": "LPSY", "value_type": "number", "default": 1.0, "min": 0.7, "max": 1.2, "step": 0.001, "description": "LPSY条件 close < MA20 * 阈值"},
+            {"rule_key": "lpsy_short_window_days", "label": "LPSY短高点窗口", "category": "LPSY", "value_type": "integer", "default": 5, "min": 2, "max": 20, "step": 1, "description": "LPSY最近高点窗口（短）"},
+            {"rule_key": "lpsy_long_window_days", "label": "LPSY长高点窗口", "category": "LPSY", "value_type": "integer", "default": 10, "min": 4, "max": 40, "step": 1, "description": "LPSY历史高点窗口（长）"},
+            {"rule_key": "lpsy_lower_high_max", "label": "LPSY次高点比例上限", "category": "LPSY", "value_type": "number", "default": 0.99, "min": 0.7, "max": 1.1, "step": 0.001, "description": "LPSY条件 近期高点 <= 更早高点 * 阈值"},
+        ]
+        options: list[dict[str, Any]] = []
+        for raw in specs:
+            rule_key = str(raw.get("rule_key", "")).strip()
+            if not rule_key:
+                continue
+            value_type = str(raw.get("value_type", "number")).strip().lower()
+            if value_type not in {"number", "integer", "boolean"}:
+                value_type = "number"
+            min_value = raw.get("min")
+            max_value = raw.get("max")
+            default_value = raw.get("default")
+            recommended_min = raw.get("recommended_min")
+            recommended_max = raw.get("recommended_max")
+            if value_type in {"number", "integer"} and isinstance(default_value, (int, float)):
+                default_num = float(default_value)
+                min_num = float(min_value) if isinstance(min_value, (int, float)) else None
+                max_num = float(max_value) if isinstance(max_value, (int, float)) else None
+                if recommended_min is None and recommended_max is None and min_num is not None and max_num is not None and max_num > min_num:
+                    spread = (max_num - min_num) * 0.30
+                    recommended_min = max(min_num, default_num - spread)
+                    recommended_max = min(max_num, default_num + spread)
+            options.append(
+                {
+                    "rule_key": rule_key,
+                    "label": str(raw.get("label", "")).strip() or rule_key,
+                    "description": str(raw.get("description", "")).strip(),
+                    "category": str(raw.get("category", "")).strip() or "其他",
+                    "value_type": value_type,
+                    "min_value": min_value,
+                    "max_value": max_value,
+                    "step": raw.get("step"),
+                    "recommended_min": recommended_min,
+                    "recommended_max": recommended_max,
+                    "risk_hint_low": str(raw.get("risk_hint_low", "")).strip()
+                    or "低于推荐区间，可能放宽或扭曲判别灵敏度，请结合信号数量与回测稳定性评估。",
+                    "risk_hint_high": str(raw.get("risk_hint_high", "")).strip()
+                    or "高于推荐区间，可能导致条件过严或漏判，请结合胜率与覆盖率权衡。",
+                    "default_value": default_value,
+                }
+            )
+        return options
+
+    def _default_event_judgment_rule_values(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for item in self._event_judgment_rule_options:
+            rule_key = str(item.get("rule_key", "")).strip()
+            if not rule_key:
+                continue
+            out.append(
+                {
+                    "rule_key": rule_key,
+                    "value": item.get("default_value"),
+                }
+            )
+        return out
+
+    def _build_event_judgment_system_profiles(self) -> dict[str, dict[str, Any]]:
+        now_text = self._now_datetime()
+        default_rule_values = self._default_event_judgment_rule_values()
+        return {
+            "system_legacy_formula_v1": {
+                "profile_id": "system_legacy_formula_v1",
+                "name": "系统预设：经典综合判别",
+                "description": "保持当前版本历史公式，兼容旧结果。",
+                "score_mode": "legacy_formula",
+                "is_system": True,
+                "updated_at": now_text,
+                "dimensions": [],
+                "rule_values": [dict(item) for item in default_rule_values],
+            },
+            "system_3d_core_v1": {
+                "profile_id": "system_3d_core_v1",
+                "name": "系统预设：三维核心",
+                "description": "背景 + 位置 + 量价 三维判别。",
+                "score_mode": "dimension_weighted",
+                "is_system": True,
+                "updated_at": now_text,
+                "dimensions": [
+                    {
+                        "dimension_id": "dim_background",
+                        "label": "背景分",
+                        "metric_key": "event_background_score",
+                        "weight": 0.34,
+                        "invert": False,
+                        "enabled": True,
+                    },
+                    {
+                        "dimension_id": "dim_position",
+                        "label": "位置分",
+                        "metric_key": "event_position_score",
+                        "weight": 0.33,
+                        "invert": False,
+                        "enabled": True,
+                    },
+                    {
+                        "dimension_id": "dim_vol_price",
+                        "label": "量价分",
+                        "metric_key": "event_vol_price_score",
+                        "weight": 0.33,
+                        "invert": False,
+                        "enabled": True,
+                    },
+                ],
+                "rule_values": [dict(item) for item in default_rule_values],
+            },
+            "system_6d_confirmation_v1": {
+                "profile_id": "system_6d_confirmation_v1",
+                "name": "系统预设：六维确认增强",
+                "description": "背景/位置/量价/确认/语境/新鲜度 六维综合。",
+                "score_mode": "dimension_weighted",
+                "is_system": True,
+                "updated_at": now_text,
+                "dimensions": [
+                    {
+                        "dimension_id": "dim_background",
+                        "label": "背景分",
+                        "metric_key": "event_background_score",
+                        "weight": 0.22,
+                        "invert": False,
+                        "enabled": True,
+                    },
+                    {
+                        "dimension_id": "dim_position",
+                        "label": "位置分",
+                        "metric_key": "event_position_score",
+                        "weight": 0.14,
+                        "invert": False,
+                        "enabled": True,
+                    },
+                    {
+                        "dimension_id": "dim_vol_price",
+                        "label": "量价分",
+                        "metric_key": "event_vol_price_score",
+                        "weight": 0.20,
+                        "invert": False,
+                        "enabled": True,
+                    },
+                    {
+                        "dimension_id": "dim_confirmation",
+                        "label": "确认分",
+                        "metric_key": "event_confirmation_score",
+                        "weight": 0.18,
+                        "invert": False,
+                        "enabled": True,
+                    },
+                    {
+                        "dimension_id": "dim_context",
+                        "label": "阶段语境分",
+                        "metric_key": "phase_context_score",
+                        "weight": 0.14,
+                        "invert": False,
+                        "enabled": True,
+                    },
+                    {
+                        "dimension_id": "dim_recency",
+                        "label": "新鲜度分",
+                        "metric_key": "event_recency_score",
+                        "weight": 0.12,
+                        "invert": False,
+                        "enabled": True,
+                    },
+                ],
+                "rule_values": [dict(item) for item in default_rule_values],
+            },
+        }
+
+    def _normalize_event_judgment_dimension(self, raw: Any, *, fallback_id: str) -> dict[str, Any] | None:
+        if not isinstance(raw, dict):
+            return None
+        metric_key = str(raw.get("metric_key", "")).strip()
+        supported_metrics = {str(item.get("metric_key", "")).strip() for item in self._event_judgment_metric_options}
+        if metric_key not in supported_metrics:
+            return None
+        try:
+            weight = float(raw.get("weight", 1.0))
+        except Exception:
+            weight = 1.0
+        weight = max(0.0, min(10.0, weight))
+        dimension_id = str(raw.get("dimension_id", "")).strip() or fallback_id
+        label = str(raw.get("label", "")).strip() or metric_key
+        invert = bool(raw.get("invert", False))
+        enabled = bool(raw.get("enabled", True))
+        return {
+            "dimension_id": dimension_id[:64],
+            "label": label[:64],
+            "metric_key": metric_key,
+            "weight": round(weight, 6),
+            "invert": invert,
+            "enabled": enabled,
+        }
+
+    def _normalize_event_judgment_rule_value(self, raw: Any) -> dict[str, Any] | None:
+        payload = raw if isinstance(raw, dict) else {}
+        rule_key = str(payload.get("rule_key", "")).strip()
+        if not rule_key:
+            return None
+        option = self._event_judgment_rule_option_map.get(rule_key)
+        if not isinstance(option, dict):
+            return None
+        value_type = str(option.get("value_type", "number")).strip().lower()
+        default_value = option.get("default_value")
+        candidate = payload.get("value", default_value)
+        min_value = option.get("min_value")
+        max_value = option.get("max_value")
+
+        if value_type == "boolean":
+            if isinstance(candidate, str):
+                normalized_text = candidate.strip().lower()
+                if normalized_text in {"1", "true", "yes", "y", "on"}:
+                    normalized_value: bool | int | float = True
+                elif normalized_text in {"0", "false", "no", "n", "off"}:
+                    normalized_value = False
+                else:
+                    normalized_value = bool(default_value)
+            else:
+                normalized_value = bool(candidate)
+            return {
+                "rule_key": rule_key[:96],
+                "value": bool(normalized_value),
+            }
+
+        if value_type == "integer":
+            try:
+                parsed_int = int(round(float(candidate)))
+            except Exception:
+                parsed_int = int(round(float(default_value or 0)))
+            if isinstance(min_value, (int, float)):
+                parsed_int = max(int(round(float(min_value))), parsed_int)
+            if isinstance(max_value, (int, float)):
+                parsed_int = min(int(round(float(max_value))), parsed_int)
+            return {
+                "rule_key": rule_key[:96],
+                "value": int(parsed_int),
+            }
+
+        try:
+            parsed_float = float(candidate)
+        except Exception:
+            parsed_float = float(default_value or 0.0)
+        if isinstance(min_value, (int, float)):
+            parsed_float = max(float(min_value), parsed_float)
+        if isinstance(max_value, (int, float)):
+            parsed_float = min(float(max_value), parsed_float)
+        return {
+            "rule_key": rule_key[:96],
+            "value": round(float(parsed_float), 6),
+        }
+
+    def _normalize_event_judgment_rule_values(
+        self,
+        raw_values: Any,
+        *,
+        fallback_values: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        resolved: dict[str, dict[str, Any]] = {}
+        for item in self._default_event_judgment_rule_values():
+            normalized = self._normalize_event_judgment_rule_value(item)
+            if normalized is None:
+                continue
+            resolved[str(normalized.get("rule_key", ""))] = normalized
+
+        def merge(values: Any) -> None:
+            if not isinstance(values, list):
+                return
+            for raw in values:
+                item = raw
+                if not isinstance(item, dict) and hasattr(item, "model_dump"):
+                    try:
+                        item = item.model_dump()  # type: ignore[assignment]
+                    except Exception:
+                        item = None
+                normalized = self._normalize_event_judgment_rule_value(item)
+                if normalized is None:
+                    continue
+                resolved[str(normalized.get("rule_key", ""))] = normalized
+
+        merge(fallback_values)
+        merge(raw_values)
+
+        ordered: list[dict[str, Any]] = []
+        for option in self._event_judgment_rule_options:
+            rule_key = str(option.get("rule_key", "")).strip()
+            if not rule_key:
+                continue
+            normalized = resolved.get(rule_key)
+            if normalized is None:
+                continue
+            ordered.append(dict(normalized))
+        return ordered
+
+    def _normalize_event_judgment_profile(
+        self,
+        raw: Any,
+        *,
+        is_system: bool,
+        fallback_profile_id: str,
+        fallback_name: str,
+        fallback_updated_at: str,
+        fallback_rule_values: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        payload = raw if isinstance(raw, dict) else {}
+        profile_id = str(payload.get("profile_id", "")).strip() or fallback_profile_id
+        name = str(payload.get("name", "")).strip() or fallback_name
+        description = str(payload.get("description", "")).strip()
+        score_mode = str(payload.get("score_mode", "dimension_weighted")).strip().lower()
+        if score_mode not in {"legacy_formula", "dimension_weighted"}:
+            score_mode = "dimension_weighted"
+        if score_mode == "legacy_formula":
+            dimensions: list[dict[str, Any]] = []
+        else:
+            dimensions = []
+            raw_dimensions = payload.get("dimensions")
+            if isinstance(raw_dimensions, list):
+                for index, item in enumerate(raw_dimensions):
+                    normalized = self._normalize_event_judgment_dimension(
+                        item,
+                        fallback_id=f"dim_{index + 1}",
+                    )
+                    if normalized is None:
+                        continue
+                    dimensions.append(normalized)
+            dimensions = dimensions[:24]
+        rule_values = self._normalize_event_judgment_rule_values(
+            payload.get("rule_values"),
+            fallback_values=fallback_rule_values,
+        )
+        updated_at = str(payload.get("updated_at", "")).strip() or fallback_updated_at
+        return {
+            "profile_id": profile_id[:64],
+            "name": name[:64],
+            "description": description[:200],
+            "score_mode": score_mode,
+            "is_system": bool(is_system),
+            "updated_at": updated_at,
+            "dimensions": dimensions,
+            "rule_values": rule_values,
+        }
+
+    def _event_judgment_profile_exists(self, profile_id: str) -> bool:
+        profile_key = str(profile_id).strip()
+        return profile_key in self._event_judgment_system_profiles or profile_key in self._event_judgment_custom_profiles
+
+    def _resolve_event_judgment_profile(self, profile_id: str) -> dict[str, Any] | None:
+        profile_key = str(profile_id).strip()
+        if not profile_key:
+            return None
+        if profile_key in self._event_judgment_custom_profiles:
+            return dict(self._event_judgment_custom_profiles[profile_key])
+        if profile_key in self._event_judgment_system_profiles:
+            return dict(self._event_judgment_system_profiles[profile_key])
+        return None
+
+    def _active_event_judgment_profile(self) -> dict[str, Any]:
+        active = self._resolve_event_judgment_profile(self._active_event_judgment_profile_id)
+        if active is not None:
+            return active
+        fallback_id = self._default_event_judgment_profile_id()
+        fallback = self._resolve_event_judgment_profile(fallback_id)
+        if fallback is not None:
+            self._active_event_judgment_profile_id = fallback_id
+            return fallback
+        first_system = next(iter(self._event_judgment_system_profiles.values()), None)
+        if isinstance(first_system, dict):
+            self._active_event_judgment_profile_id = str(first_system.get("profile_id") or fallback_id)
+            return dict(first_system)
+        self._active_event_judgment_profile_id = fallback_id
+        return {
+            "profile_id": fallback_id,
+            "name": "系统预设",
+            "description": "",
+            "score_mode": "legacy_formula",
+            "is_system": True,
+            "updated_at": self._now_datetime(),
+            "dimensions": [],
+            "rule_values": self._default_event_judgment_rule_values(),
+        }
+
+    def _active_event_judgment_profile_hash(self) -> str:
+        profile = self._active_event_judgment_profile()
+        payload = {
+            "profile_id": str(profile.get("profile_id", "")).strip(),
+            "score_mode": str(profile.get("score_mode", "")).strip(),
+            "dimensions": profile.get("dimensions") if isinstance(profile.get("dimensions"), list) else [],
+            "rule_values": profile.get("rule_values") if isinstance(profile.get("rule_values"), list) else [],
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _all_event_judgment_profiles(self) -> list[dict[str, Any]]:
+        profiles: list[dict[str, Any]] = []
+        for profile in self._event_judgment_system_profiles.values():
+            profiles.append(dict(profile))
+        custom_items = sorted(
+            self._event_judgment_custom_profiles.values(),
+            key=lambda item: (
+                str(item.get("updated_at", "")),
+                str(item.get("name", "")),
+            ),
+            reverse=True,
+        )
+        for profile in custom_items:
+            profiles.append(dict(profile))
+        return profiles
+
+    def _to_event_judgment_profile_model(self, payload: dict[str, Any]) -> EventJudgmentProfile:
+        dimensions: list[EventJudgmentDimension] = []
+        raw_dimensions = payload.get("dimensions")
+        if isinstance(raw_dimensions, list):
+            for item in raw_dimensions:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    dimensions.append(EventJudgmentDimension(**item))
+                except Exception:
+                    continue
+        rule_values: list[EventJudgmentRuleValue] = []
+        raw_rule_values = payload.get("rule_values")
+        if isinstance(raw_rule_values, list):
+            for item in raw_rule_values:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    rule_values.append(EventJudgmentRuleValue(**item))
+                except Exception:
+                    continue
+        return EventJudgmentProfile(
+            profile_id=str(payload.get("profile_id", "")).strip() or "unknown",
+            name=str(payload.get("name", "")).strip() or "未命名",
+            description=str(payload.get("description", "")).strip(),
+            score_mode=(
+                "legacy_formula"
+                if str(payload.get("score_mode", "")).strip() == "legacy_formula"
+                else "dimension_weighted"
+            ),
+            is_system=bool(payload.get("is_system", False)),
+            updated_at=str(payload.get("updated_at", "")).strip() or self._now_datetime(),
+            dimensions=dimensions,
+            rule_values=rule_values,
+        )
+
+    def _build_event_judgment_catalog_response(self) -> EventJudgmentCatalogResponse:
+        metrics = [
+            EventJudgmentMetricOption(
+                metric_key=str(item.get("metric_key", "")).strip(),
+                label=str(item.get("label", "")).strip() or str(item.get("metric_key", "")).strip(),
+                description=str(item.get("description", "")).strip(),
+            )
+            for item in self._event_judgment_metric_options
+            if str(item.get("metric_key", "")).strip()
+        ]
+        rule_options = [
+            EventJudgmentRuleOption(
+                rule_key=str(item.get("rule_key", "")).strip(),
+                label=str(item.get("label", "")).strip() or str(item.get("rule_key", "")).strip(),
+                description=str(item.get("description", "")).strip(),
+                category=str(item.get("category", "")).strip(),
+                value_type=(
+                    "integer"
+                    if str(item.get("value_type", "")).strip() == "integer"
+                    else "boolean"
+                    if str(item.get("value_type", "")).strip() == "boolean"
+                    else "number"
+                ),
+                min_value=(
+                    float(item.get("min_value"))
+                    if isinstance(item.get("min_value"), (int, float))
+                    else None
+                ),
+                max_value=(
+                    float(item.get("max_value"))
+                    if isinstance(item.get("max_value"), (int, float))
+                    else None
+                ),
+                step=(
+                    float(item.get("step"))
+                    if isinstance(item.get("step"), (int, float))
+                    else None
+                ),
+                recommended_min=(
+                    float(item.get("recommended_min"))
+                    if isinstance(item.get("recommended_min"), (int, float))
+                    else None
+                ),
+                recommended_max=(
+                    float(item.get("recommended_max"))
+                    if isinstance(item.get("recommended_max"), (int, float))
+                    else None
+                ),
+                risk_hint_low=str(item.get("risk_hint_low", "")).strip(),
+                risk_hint_high=str(item.get("risk_hint_high", "")).strip(),
+                default_value=item.get("default_value"),
+            )
+            for item in self._event_judgment_rule_options
+            if str(item.get("rule_key", "")).strip()
+        ]
+        profiles = [self._to_event_judgment_profile_model(item) for item in self._all_event_judgment_profiles()]
+        active_id = str(self._active_event_judgment_profile_id or "").strip()
+        if not active_id or not any(item.profile_id == active_id for item in profiles):
+            fallback_id = self._default_event_judgment_profile_id()
+            if any(item.profile_id == fallback_id for item in profiles):
+                active_id = fallback_id
+            elif profiles:
+                active_id = profiles[0].profile_id
+            else:
+                active_id = fallback_id
+            self._active_event_judgment_profile_id = active_id
+        return EventJudgmentCatalogResponse(
+            active_profile_id=active_id,
+            metric_options=metrics,
+            rule_options=rule_options,
+            profiles=profiles,
+        )
+
+    def list_event_judgment_profiles(self) -> EventJudgmentCatalogResponse:
+        return self._build_event_judgment_catalog_response()
+
+    def upsert_event_judgment_profile(self, payload: EventJudgmentProfileUpsertRequest) -> EventJudgmentProfile:
+        target_profile_id = str(payload.profile_id or "").strip()
+        if target_profile_id and target_profile_id in self._event_judgment_system_profiles:
+            raise BacktestValidationError("EVENT_JUDGMENT_SYSTEM_READONLY", "系统预设不允许直接覆盖，请另存为自定义模板。")
+
+        source_profile = self._resolve_event_judgment_profile(target_profile_id) if target_profile_id else None
+        if target_profile_id and source_profile is None:
+            raise BacktestValidationError("EVENT_JUDGMENT_PROFILE_NOT_FOUND", f"事件判别模板不存在: {target_profile_id}")
+
+        now_text = self._now_datetime()
+        normalized_dimensions: list[dict[str, Any]] = []
+        for index, item in enumerate(payload.dimensions):
+            normalized = self._normalize_event_judgment_dimension(
+                item.model_dump(),
+                fallback_id=f"dim_{index + 1}",
+            )
+            if normalized is None:
+                continue
+            normalized_dimensions.append(normalized)
+        if not normalized_dimensions:
+            raise BacktestValidationError("EVENT_JUDGMENT_DIMENSIONS_EMPTY", "至少需要一个有效判别维度。")
+        source_rule_values = (
+            source_profile.get("rule_values")
+            if isinstance(source_profile, dict) and isinstance(source_profile.get("rule_values"), list)
+            else None
+        )
+        incoming_rule_values = (
+            [item.model_dump() for item in payload.rule_values]
+            if isinstance(payload.rule_values, list)
+            else None
+        )
+        normalized_rule_values = self._normalize_event_judgment_rule_values(
+            incoming_rule_values,
+            fallback_values=source_rule_values if isinstance(source_rule_values, list) else None,
+        )
+
+        if target_profile_id and target_profile_id in self._event_judgment_custom_profiles:
+            profile_id = target_profile_id
+        else:
+            profile_id = f"ejp_{int(time.time() * 1000):x}_{uuid4().hex[:6]}"
+
+        next_payload = self._normalize_event_judgment_profile(
+            {
+                "profile_id": profile_id,
+                "name": str(payload.name).strip(),
+                "description": str(payload.description or "").strip(),
+                "score_mode": "dimension_weighted",
+                "updated_at": now_text,
+                "dimensions": normalized_dimensions,
+                "rule_values": normalized_rule_values,
+            },
+            is_system=False,
+            fallback_profile_id=profile_id,
+            fallback_name=str(payload.name).strip() or "自定义模板",
+            fallback_updated_at=now_text,
+            fallback_rule_values=source_rule_values if isinstance(source_rule_values, list) else None,
+        )
+        self._event_judgment_custom_profiles[profile_id] = next_payload
+        if bool(payload.make_active):
+            self._active_event_judgment_profile_id = profile_id
+            self._signals_cache.clear()
+        self._persist_app_state()
+        return self._to_event_judgment_profile_model(next_payload)
+
+    def apply_event_judgment_profile(self, profile_id: str) -> EventJudgmentCatalogResponse:
+        normalized_profile_id = str(profile_id or "").strip()
+        if not normalized_profile_id:
+            raise BacktestValidationError("EVENT_JUDGMENT_PROFILE_NOT_FOUND", "事件判别模板不存在。")
+        if not self._event_judgment_profile_exists(normalized_profile_id):
+            raise BacktestValidationError("EVENT_JUDGMENT_PROFILE_NOT_FOUND", f"事件判别模板不存在: {normalized_profile_id}")
+        self._active_event_judgment_profile_id = normalized_profile_id
+        self._signals_cache.clear()
+        self._persist_app_state()
+        return self._build_event_judgment_catalog_response()
+
+    def delete_event_judgment_profile(self, profile_id: str) -> EventJudgmentProfileDeleteResponse:
+        normalized_profile_id = str(profile_id or "").strip()
+        if not normalized_profile_id:
+            raise BacktestValidationError("EVENT_JUDGMENT_PROFILE_NOT_FOUND", "事件判别模板不存在。")
+        if normalized_profile_id in self._event_judgment_system_profiles:
+            raise BacktestValidationError("EVENT_JUDGMENT_SYSTEM_READONLY", "系统预设不允许删除。")
+        if normalized_profile_id not in self._event_judgment_custom_profiles:
+            raise BacktestValidationError("EVENT_JUDGMENT_PROFILE_NOT_FOUND", f"事件判别模板不存在: {normalized_profile_id}")
+        del self._event_judgment_custom_profiles[normalized_profile_id]
+        if self._active_event_judgment_profile_id == normalized_profile_id:
+            self._active_event_judgment_profile_id = self._default_event_judgment_profile_id()
+            self._signals_cache.clear()
+        self._persist_app_state()
+        return EventJudgmentProfileDeleteResponse(success=True, profile_id=normalized_profile_id)
+
     def list_strategies(self) -> StrategyCatalogResponse:
         items: list[StrategyDescriptor] = []
         for descriptor in self._strategy_registry.list():
@@ -563,6 +1339,11 @@ class InMemoryStore:
                 "reason": [item.model_dump() for item in self._review_tags.get("reason", [])],
             },
             "fill_tags": {order_id: item.model_dump() for order_id, item in self._fill_tag_store.items()},
+            "event_judgment": {
+                "active_profile_id": str(self._active_event_judgment_profile_id or "").strip()
+                or self._default_event_judgment_profile_id(),
+                "custom_profiles": list(self._event_judgment_custom_profiles.values()),
+            },
             "audit": {
                 "updated_at": self._now_datetime(),
             },
@@ -670,6 +1451,29 @@ class InMemoryStore:
                     except Exception:
                         continue
                 self._fill_tag_store = restored_fill_tags
+            event_judgment_raw = raw.get("event_judgment")
+            if isinstance(event_judgment_raw, dict):
+                custom_profiles_raw = event_judgment_raw.get("custom_profiles")
+                restored_custom_profiles: dict[str, dict[str, Any]] = {}
+                if isinstance(custom_profiles_raw, list):
+                    for item in custom_profiles_raw:
+                        normalized = self._normalize_event_judgment_profile(
+                            item,
+                            is_system=False,
+                            fallback_profile_id=f"ejp_{uuid4().hex[:12]}",
+                            fallback_name="自定义模板",
+                            fallback_updated_at=self._now_datetime(),
+                        )
+                        profile_id = str(normalized.get("profile_id", "")).strip()
+                        if not profile_id:
+                            continue
+                        restored_custom_profiles[profile_id] = normalized
+                self._event_judgment_custom_profiles = restored_custom_profiles
+                active_profile_id = str(event_judgment_raw.get("active_profile_id", "")).strip()
+                if self._event_judgment_profile_exists(active_profile_id):
+                    self._active_event_judgment_profile_id = active_profile_id
+                else:
+                    self._active_event_judgment_profile_id = self._default_event_judgment_profile_id()
             self._persist_app_state()
         except Exception:
             self._persist_app_state()
@@ -3889,7 +4693,12 @@ class InMemoryStore:
         symbol = str(row.symbol).strip().lower()
         trade_date = str(resolved_as_of_date or "").strip()
         data_source = str(self._config.market_data_source).strip() or "unknown"
-        params_hash = build_wyckoff_params_hash(window_days)
+        event_judgment_profile = self._active_event_judgment_profile()
+        event_judgment_profile_hash = self._active_event_judgment_profile_hash()
+        params_hash = build_wyckoff_params_hash(
+            window_days,
+            profile_hash=event_judgment_profile_hash,
+        )
 
         if symbol and trade_date:
             read_started = time.perf_counter()
@@ -3909,7 +4718,12 @@ class InMemoryStore:
                 return cached
 
         self._bump_wyckoff_metric("cache_misses", 1)
-        snapshot = SignalAnalyzer.calculate_wyckoff_snapshot(row, candles, window_days)
+        snapshot = SignalAnalyzer.calculate_wyckoff_snapshot(
+            row,
+            candles,
+            window_days,
+            event_judgment_profile=event_judgment_profile,
+        )
         quality_flags = self._inspect_wyckoff_snapshot_quality(snapshot, trade_date=trade_date)
         self._record_wyckoff_snapshot_quality(quality_flags)
         if symbol and trade_date:
@@ -4005,6 +4819,7 @@ class InMemoryStore:
         strategy_id: str,
         strategy_version: str,
         strategy_params_hash: str,
+        event_judgment_profile_hash: str,
         run_id: str | None,
         trend_step: TrendPoolStep,
         market_filters: list[Market],
@@ -4022,6 +4837,7 @@ class InMemoryStore:
             "strategy_id": str(strategy_id).strip(),
             "strategy_version": str(strategy_version).strip(),
             "strategy_params_hash": str(strategy_params_hash).strip(),
+            "event_judgment_profile_hash": str(event_judgment_profile_hash).strip(),
             "run_id": run_id or "",
             "trend_step": trend_step,
             "market_filters": market_filters,
@@ -4137,12 +4953,17 @@ class InMemoryStore:
             capability_notes.append(
                 f"策略候选池过滤: {before_strategy_universe_count} -> {len(candidates)}（strategy_id={strategy_id_text}）。"
             )
+        active_event_profile = self._active_event_judgment_profile()
+        active_event_profile_id = str(active_event_profile.get("profile_id", "")).strip() or self._default_event_judgment_profile_id()
+        active_event_profile_hash = self._active_event_judgment_profile_hash()
+        capability_notes.append(f"事件判别模板: id={active_event_profile_id}, hash={active_event_profile_hash}")
         source_count = len(candidates)
         cache_key = self._signals_cache_key(
             mode=mode,
             strategy_id=str(strategy_meta["strategy_id"]),
             strategy_version=str(strategy_meta.get("version") or "1.0.0"),
             strategy_params_hash=strategy_params_hash,
+            event_judgment_profile_hash=active_event_profile_hash,
             run_id=resolved_run_id if mode == "trend_pool" else run_id,
             trend_step=trend_step if mode == "trend_pool" else "auto",
             market_filters=normalized_market_filters,
@@ -6887,6 +7708,7 @@ class InMemoryStore:
         *,
         strategy_version: str,
         strategy_params_hash: str,
+        event_judgment_profile_hash: str,
     ) -> str:
         payload_raw = payload.model_dump(exclude_none=True)
         board_filters = payload_raw.get("board_filters")
@@ -6914,6 +7736,7 @@ class InMemoryStore:
             "strategy": {
                 "strategy_version": str(strategy_version).strip(),
                 "strategy_params_hash": str(strategy_params_hash).strip(),
+                "event_judgment_profile_hash": str(event_judgment_profile_hash).strip(),
             },
         }
         raw = json.dumps(payload_meta, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
@@ -6928,6 +7751,7 @@ class InMemoryStore:
         *,
         strategy_version: str,
         strategy_params_hash: str,
+        event_judgment_profile_hash: str,
     ) -> BacktestResponse | None:
         if not self._is_backtest_result_cache_enabled():
             return None
@@ -6937,6 +7761,7 @@ class InMemoryStore:
             payload,
             strategy_version=strategy_version,
             strategy_params_hash=strategy_params_hash,
+            event_judgment_profile_hash=event_judgment_profile_hash,
         )
         path = self._backtest_result_cache_file(cache_key)
         if not path.exists():
@@ -6967,6 +7792,7 @@ class InMemoryStore:
         *,
         strategy_version: str,
         strategy_params_hash: str,
+        event_judgment_profile_hash: str,
     ) -> bool:
         if not self._is_backtest_result_cache_enabled():
             return False
@@ -6976,6 +7802,7 @@ class InMemoryStore:
             payload,
             strategy_version=strategy_version,
             strategy_params_hash=strategy_params_hash,
+            event_judgment_profile_hash=event_judgment_profile_hash,
         )
         path = self._backtest_result_cache_file(cache_key)
         try:
@@ -8670,10 +9497,18 @@ class InMemoryStore:
             strategy_params_hash=strategy_params_hash,
             strategy_params=normalized_strategy_params,
         )
+        active_event_profile = self._active_event_judgment_profile()
+        active_event_profile_id = (
+            str(active_event_profile.get("profile_id", "")).strip()
+            or self._default_event_judgment_profile_id()
+        )
+        active_event_profile_hash = self._active_event_judgment_profile_hash()
         strategy_capabilities = strategy_meta.get("capabilities", {}) if isinstance(strategy_meta, dict) else {}
         strategy_supports_matrix = bool(strategy_capabilities.get("supports_matrix", False))
         strategy_supports_entry_delay = bool(strategy_capabilities.get("supports_entry_delay", True))
-        capability_notes: list[str] = []
+        capability_notes: list[str] = [
+            f"事件判别模板: id={active_event_profile_id}, hash={active_event_profile_hash}"
+        ]
         requested_entry_delay_days = int(payload.entry_delay_days)
         if (not strategy_supports_entry_delay) and requested_entry_delay_days != 1:
             payload = payload.model_copy(update={"entry_delay_days": 1, "delay_invalidation_enabled": False})
@@ -8747,6 +9582,7 @@ class InMemoryStore:
             payload,
             strategy_version=str(strategy_meta.get("version") or "1.0.0"),
             strategy_params_hash=str(strategy_params_hash),
+            event_judgment_profile_hash=active_event_profile_hash,
         )
         if cached_result is not None:
             _emit_progress(payload.date_to, 1, 1, "回测结果缓存命中，直接返回。")
@@ -8780,6 +9616,7 @@ class InMemoryStore:
                         cached_result,
                         strategy_version=str(strategy_meta.get("version") or "1.0.0"),
                         strategy_params_hash=str(strategy_params_hash),
+                        event_judgment_profile_hash=active_event_profile_hash,
                     )
                 except Exception as exc:  # noqa: BLE001
                     notes = list(cached_result.notes)
@@ -8876,6 +9713,7 @@ class InMemoryStore:
                                 fallback_result,
                                 strategy_version=str(strategy_meta.get("version") or "1.0.0"),
                                 strategy_params_hash=str(strategy_params_hash),
+                                event_judgment_profile_hash=active_event_profile_hash,
                             )
                             return fallback_result
                     except Exception as exc:  # noqa: BLE001
@@ -8922,6 +9760,7 @@ class InMemoryStore:
                     matrix_result,
                     strategy_version=str(strategy_meta.get("version") or "1.0.0"),
                     strategy_params_hash=str(strategy_params_hash),
+                    event_judgment_profile_hash=active_event_profile_hash,
                 )
                 return matrix_result
             except BacktestTaskCancelledError:
@@ -9197,6 +10036,7 @@ class InMemoryStore:
             result,
             strategy_version=str(strategy_meta.get("version") or "1.0.0"),
             strategy_params_hash=str(strategy_params_hash),
+            event_judgment_profile_hash=active_event_profile_hash,
         )
         return result
 
@@ -11376,6 +12216,8 @@ class InMemoryStore:
         quality_score_outliers = 0
         quality_date_misaligned = 0
         loader_error_counter: dict[str, int] = {}
+        event_judgment_profile = self._active_event_judgment_profile()
+        event_judgment_profile_hash = self._active_event_judgment_profile_hash()
 
         for as_of_date in scan_dates:
             input_rows, load_error = load_input_pool_from_tdx(
@@ -11406,7 +12248,10 @@ class InMemoryStore:
                 symbols_scanned += 1
                 data_source = str(self._config.market_data_source).strip() or "unknown"
                 for window_days in window_days_list:
-                    params_hash = build_wyckoff_params_hash(window_days)
+                    params_hash = build_wyckoff_params_hash(
+                        window_days,
+                        profile_hash=event_judgment_profile_hash,
+                    )
                     if not payload.force_rebuild:
                         read_started = time.perf_counter()
                         cached = self._wyckoff_event_store.get_snapshot(
@@ -11433,7 +12278,12 @@ class InMemoryStore:
                     )
                     if not candles or not resolved_as_of_date:
                         continue
-                    snapshot = SignalAnalyzer.calculate_wyckoff_snapshot(row, candles, window_days)
+                    snapshot = SignalAnalyzer.calculate_wyckoff_snapshot(
+                        row,
+                        candles,
+                        window_days,
+                        event_judgment_profile=event_judgment_profile,
+                    )
                     quality_flags = self._inspect_wyckoff_snapshot_quality(
                         snapshot,
                         trade_date=resolved_as_of_date,

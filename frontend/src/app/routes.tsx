@@ -55,6 +55,10 @@ const StrategyCenterPage = lazy(async () => {
   const module = await import('@/pages/strategy/StrategyCenterPage')
   return { default: module.StrategyCenterPage }
 })
+const EventJudgmentPage = lazy(async () => {
+  const module = await import('@/pages/strategy/EventJudgmentPage')
+  return { default: module.EventJudgmentPage }
+})
 
 const routeLoadingFallback = (
   <div style={{ minHeight: 240, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -72,6 +76,7 @@ export function AppRoutes() {
           <Route path="/stocks/:symbol/chart" element={<ChartPage />} />
           <Route path="/signals" element={<SignalsPage />} />
           <Route path="/strategy" element={<StrategyCenterPage />} />
+          <Route path="/strategy/events" element={<EventJudgmentPage />} />
           <Route path="/trade" element={<TradePage />} />
           <Route path="/backtest" element={<BacktestPage />} />
           <Route path="/portfolio" element={<PortfolioPage />} />

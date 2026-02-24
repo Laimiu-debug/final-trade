@@ -60,6 +60,11 @@ from .models import (
     SignalScanMode,
     StrategyCatalogResponse,
     StrategyDescriptor,
+    EventJudgmentCatalogResponse,
+    EventJudgmentProfile,
+    EventJudgmentProfileApplyRequest,
+    EventJudgmentProfileDeleteResponse,
+    EventJudgmentProfileUpsertRequest,
     StrategyUpdateRequest,
     TrendPoolStep,
     ScreenerParams,
@@ -246,6 +251,43 @@ def patch_strategy(strategy_id: str, payload: StrategyUpdateRequest) -> Strategy
         )
     except BacktestValidationError as exc:
         return error_response(400, exc.code, str(exc))
+
+
+@app.get("/api/event-judgment/profiles", response_model=EventJudgmentCatalogResponse)
+def get_event_judgment_profiles() -> EventJudgmentCatalogResponse:
+    return store.list_event_judgment_profiles()
+
+
+@app.post("/api/event-judgment/profiles", response_model=EventJudgmentProfile)
+def post_event_judgment_profile(payload: EventJudgmentProfileUpsertRequest) -> EventJudgmentProfile | JSONResponse:
+    try:
+        return store.upsert_event_judgment_profile(payload)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "EVENT_JUDGMENT_INVALID", str(exc))
+
+
+@app.post("/api/event-judgment/profiles/apply", response_model=EventJudgmentCatalogResponse)
+def post_event_judgment_profile_apply(
+    payload: EventJudgmentProfileApplyRequest,
+) -> EventJudgmentCatalogResponse | JSONResponse:
+    try:
+        return store.apply_event_judgment_profile(payload.profile_id)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "EVENT_JUDGMENT_INVALID", str(exc))
+
+
+@app.delete("/api/event-judgment/profiles/{profile_id}", response_model=EventJudgmentProfileDeleteResponse)
+def delete_event_judgment_profile(profile_id: str) -> EventJudgmentProfileDeleteResponse | JSONResponse:
+    try:
+        return store.delete_event_judgment_profile(profile_id)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "EVENT_JUDGMENT_INVALID", str(exc))
 
 
 @app.post("/api/backtest/run", response_model=BacktestResponse)

@@ -21,6 +21,7 @@ const navItems: ItemType[] = [
   { key: '/screener', icon: <FilterIcon />, label: '选股漏斗' },
   { key: '/signals', icon: <AimOutlined />, label: '待买信号' },
   { key: '/strategy', icon: <ControlOutlined />, label: '策略中心' },
+  { key: '/strategy/events', icon: <ControlOutlined />, label: '事件判别' },
   { key: '/trade', icon: <SwapOutlined />, label: '模拟交易' },
   { key: '/backtest', icon: <LineChartOutlined />, label: '策略回测' },
   { key: '/portfolio', icon: <LineChartOutlined />, label: '持仓管理' },
@@ -37,6 +38,7 @@ function FilterIcon() {
 
 function resolveSelected(pathname: string) {
   if (pathname.startsWith('/stocks/')) return '/screener'
+  if (pathname.startsWith('/strategy/events')) return '/strategy/events'
   if (pathname.startsWith('/review/share')) return '/review/share'
   if (pathname.startsWith('/review/news')) return '/review/news'
   return pathname
@@ -153,6 +155,7 @@ export function AppShell() {
           <Space size={18}>
             <Link to="/screener">主流程</Link>
             <Link to="/strategy">策略中心</Link>
+            <Link to="/strategy/events">事件判别</Link>
             <Link to="/settings">设置</Link>
             <AreaChartOutlined style={{ color: '#0f8b6f' }} />
           </Space>

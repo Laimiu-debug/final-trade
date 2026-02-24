@@ -264,6 +264,78 @@ class StrategyUpdateRequest(BaseModel):
     version: str | None = Field(default=None, min_length=1, max_length=64)
 
 
+class EventJudgmentMetricOption(BaseModel):
+    metric_key: str = Field(min_length=1, max_length=64)
+    label: str = Field(min_length=1, max_length=64)
+    description: str = Field(default="", max_length=200)
+
+
+class EventJudgmentRuleOption(BaseModel):
+    rule_key: str = Field(min_length=1, max_length=96)
+    label: str = Field(min_length=1, max_length=96)
+    description: str = Field(default="", max_length=240)
+    category: str = Field(default="", max_length=64)
+    value_type: Literal["number", "integer", "boolean"] = "number"
+    min_value: float | None = None
+    max_value: float | None = None
+    step: float | None = None
+    recommended_min: float | None = None
+    recommended_max: float | None = None
+    risk_hint_low: str = Field(default="", max_length=240)
+    risk_hint_high: str = Field(default="", max_length=240)
+    default_value: bool | int | float
+
+
+class EventJudgmentDimension(BaseModel):
+    dimension_id: str = Field(min_length=1, max_length=64)
+    label: str = Field(min_length=1, max_length=64)
+    metric_key: str = Field(min_length=1, max_length=64)
+    weight: float = Field(default=1.0, ge=0.0, le=10.0)
+    invert: bool = False
+    enabled: bool = True
+
+
+class EventJudgmentRuleValue(BaseModel):
+    rule_key: str = Field(min_length=1, max_length=96)
+    value: bool | int | float
+
+
+class EventJudgmentProfile(BaseModel):
+    profile_id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=64)
+    description: str = Field(default="", max_length=200)
+    score_mode: Literal["legacy_formula", "dimension_weighted"] = "dimension_weighted"
+    is_system: bool = False
+    updated_at: str
+    dimensions: list[EventJudgmentDimension] = Field(default_factory=list, max_length=24)
+    rule_values: list[EventJudgmentRuleValue] = Field(default_factory=list, max_length=256)
+
+
+class EventJudgmentCatalogResponse(BaseModel):
+    active_profile_id: str = Field(min_length=1, max_length=64)
+    metric_options: list[EventJudgmentMetricOption] = Field(default_factory=list)
+    rule_options: list[EventJudgmentRuleOption] = Field(default_factory=list)
+    profiles: list[EventJudgmentProfile] = Field(default_factory=list)
+
+
+class EventJudgmentProfileUpsertRequest(BaseModel):
+    profile_id: str | None = Field(default=None, min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=64)
+    description: str | None = Field(default=None, max_length=200)
+    dimensions: list[EventJudgmentDimension] = Field(min_length=1, max_length=24)
+    rule_values: list[EventJudgmentRuleValue] | None = Field(default=None, max_length=256)
+    make_active: bool = True
+
+
+class EventJudgmentProfileApplyRequest(BaseModel):
+    profile_id: str = Field(min_length=1, max_length=64)
+
+
+class EventJudgmentProfileDeleteResponse(BaseModel):
+    success: Literal[True]
+    profile_id: str
+
+
 class SimTradingConfig(BaseModel):
     initial_capital: float = Field(default=1_000_000, gt=0)
     commission_rate: float = Field(default=0.0003, ge=0, le=0.01)

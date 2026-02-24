@@ -46,6 +46,12 @@ import type {
   StockAnalysis,
   StockAnnotation,
   StrategyCatalogResponse,
+  EventJudgmentCatalogResponse,
+  EventJudgmentProfile,
+  EventJudgmentProfileApplyRequest,
+  EventJudgmentProfileDeleteResponse,
+  EventJudgmentRuleValue,
+  EventJudgmentProfileUpsertRequest,
   SystemStorageStatus,
   TradeFillTagAssignment,
   TradeFillTagUpdateRequest,
@@ -180,6 +186,126 @@ const strategyCatalogStore: StrategyCatalogResponse = {
     },
   ],
 }
+
+const eventJudgmentMetricOptions: EventJudgmentCatalogResponse['metric_options'] = [
+  { metric_key: 'event_background_score', label: '背景分', description: '趋势背景与风险环境（高分更优）' },
+  { metric_key: 'event_position_score', label: '位置分', description: '事件发生位置是否处于理想区间（高分更优）' },
+  { metric_key: 'event_vol_price_score', label: '量价分', description: '量价协同与主导方向（高分更优）' },
+  { metric_key: 'event_confirmation_score', label: '确认分', description: '序列与关键确认状态（高分更优）' },
+  { metric_key: 'phase_context_score', label: '阶段语境分', description: '前置事件完整度与阶段一致性（高分更优）' },
+  { metric_key: 'event_recency_score', label: '新鲜度分', description: '事件时间衰减后的有效性（高分更优）' },
+  { metric_key: 'candle_quality_score', label: 'K线质量分', description: '事件K线形态质量（高分更优）' },
+  { metric_key: 'cost_center_shift_score', label: '筹码迁移分', description: '筹码重心迁移质量（高分更优）' },
+  { metric_key: 'weekly_context_score', label: '周线语境分', description: '周线环境对日线事件的放大质量（高分更优）' },
+  { metric_key: 'risk_score', label: '风险分', description: '风险越高分越高，通常建议勾选反向（invert）' },
+]
+
+const eventJudgmentRuleOptions: EventJudgmentCatalogResponse['rule_options'] = [
+  { rule_key: 'lookback_core_days', label: '核心回看天数', description: '事件搜索起始窗口（天）', category: '基础窗口', value_type: 'integer', min_value: 20, max_value: 120, step: 1, default_value: 40 },
+  { rule_key: 'sc_scan_lookback_days', label: 'SC搜索窗口', description: 'SC锚点搜索窗口（天）', category: '基础窗口', value_type: 'integer', min_value: 15, max_value: 120, step: 1, default_value: 35 },
+  { rule_key: 'bc_scan_lookback_days', label: 'BC搜索窗口', description: 'BC锚点搜索窗口（天）', category: '基础窗口', value_type: 'integer', min_value: 15, max_value: 120, step: 1, default_value: 35 },
+  { rule_key: 'pattern_window_days', label: '中后期模式窗口', description: 'TSO/Spring 搜索窗口（天）', category: '基础窗口', value_type: 'integer', min_value: 10, max_value: 80, step: 1, default_value: 28 },
+  { rule_key: 'pattern_extra_spring_days', label: 'Spring额外窗口', description: 'Spring 额外扩展窗口（天）', category: '基础窗口', value_type: 'integer', min_value: 0, max_value: 30, step: 1, default_value: 8 },
+  { rule_key: 'enable_sc', label: '启用SC', description: '是否启用SC事件', category: 'SC', value_type: 'boolean', default_value: true },
+  { rule_key: 'enable_ps', label: '启用PS', description: '是否启用PS事件', category: 'PS', value_type: 'boolean', default_value: true },
+  { rule_key: 'enable_ar', label: '启用AR', description: '是否启用AR事件', category: 'AR', value_type: 'boolean', default_value: true },
+  { rule_key: 'enable_st', label: '启用ST', description: '是否启用ST事件', category: 'ST', value_type: 'boolean', default_value: true },
+  { rule_key: 'enable_spring', label: '启用Spring', description: '是否启用Spring事件', category: 'Spring', value_type: 'boolean', default_value: true },
+  { rule_key: 'enable_tso', label: '启用TSO', description: '是否启用TSO事件', category: 'TSO', value_type: 'boolean', default_value: true },
+  { rule_key: 'enable_sos', label: '启用SOS', description: '是否启用SOS事件', category: 'SOS', value_type: 'boolean', default_value: true },
+  { rule_key: 'enable_joc', label: '启用JOC', description: '是否启用JOC事件', category: 'JOC', value_type: 'boolean', default_value: true },
+  { rule_key: 'enable_lps', label: '启用LPS', description: '是否启用LPS事件', category: 'LPS', value_type: 'boolean', default_value: true },
+  { rule_key: 'enable_utad', label: '启用UTAD', description: '是否启用UTAD风险事件', category: 'UTAD', value_type: 'boolean', default_value: true },
+  { rule_key: 'enable_sow', label: '启用SOW', description: '是否启用SOW风险事件', category: 'SOW', value_type: 'boolean', default_value: true },
+  { rule_key: 'enable_lpsy', label: '启用LPSY', description: '是否启用LPSY风险事件', category: 'LPSY', value_type: 'boolean', default_value: true },
+  { rule_key: 'sc_anchor_tr_pos_max', label: 'SC锚点位置上限', description: 'SC锚点TR位置最大值', category: 'SC', value_type: 'number', min_value: 0.1, max_value: 0.9, step: 0.005, default_value: 0.45 },
+  { rule_key: 'sc_anchor_vol_ratio_min', label: 'SC锚点量比下限', description: 'SC锚点量比下限', category: 'SC', value_type: 'number', min_value: 0.5, max_value: 3, step: 0.01, default_value: 1.2 },
+  { rule_key: 'ps_vol_ratio_min', label: 'PS量比下限', description: 'PS量比下限', category: 'PS', value_type: 'number', min_value: 0.5, max_value: 3, step: 0.01, default_value: 1.08 },
+  { rule_key: 'ar_rebound_min', label: 'AR反弹下限', description: 'AR反弹阈值', category: 'AR', value_type: 'number', min_value: 1, max_value: 1.5, step: 0.001, default_value: 1.05 },
+  { rule_key: 'st_low_near_sc_tol', label: 'ST贴近SC低点容差', description: 'ST低点贴近SC低点容差', category: 'ST', value_type: 'number', min_value: 0, max_value: 0.25, step: 0.001, default_value: 0.04 },
+  { rule_key: 'spring_break_prior_low_max', label: 'Spring下破比例上限', description: 'Spring条件 low < prior_low * 阈值', category: 'Spring', value_type: 'number', min_value: 0.8, max_value: 1.05, step: 0.001, default_value: 0.985 },
+  { rule_key: 'sos_ret10_min', label: 'SOS十日涨幅下限', description: 'SOS条件 ret10 > 阈值', category: 'SOS', value_type: 'number', min_value: -0.1, max_value: 0.5, step: 0.001, default_value: 0.05 },
+  { rule_key: 'joc_close_break_prior_high_min', label: 'JOC突破比例下限', description: 'JOC条件 close >= prior_high * 阈值', category: 'JOC', value_type: 'number', min_value: 0.95, max_value: 1.2, step: 0.001, default_value: 1.005 },
+  { rule_key: 'lps_vol_vs_prev5_max', label: 'LPS相对前5日均量上限', description: 'LPS量比上限', category: 'LPS', value_type: 'number', min_value: 0.1, max_value: 1.5, step: 0.005, default_value: 0.95 },
+  { rule_key: 'utad_upper_shadow_min', label: 'UTAD上影占比下限', description: 'UTAD上影线占比最小值', category: 'UTAD', value_type: 'number', min_value: 0, max_value: 1, step: 0.005, default_value: 0.5 },
+  { rule_key: 'sow_ret10_max', label: 'SOW十日涨幅上限', description: 'SOW条件 ret10 <= 阈值', category: 'SOW', value_type: 'number', min_value: -0.6, max_value: 0.1, step: 0.001, default_value: -0.05 },
+  { rule_key: 'lpsy_lower_high_max', label: 'LPSY次高点比例上限', description: 'LPSY次高点比例上限', category: 'LPSY', value_type: 'number', min_value: 0.7, max_value: 1.1, step: 0.001, default_value: 0.99 },
+]
+
+function defaultEventRuleValues(): EventJudgmentRuleValue[] {
+  return eventJudgmentRuleOptions.map((item) => ({
+    rule_key: item.rule_key,
+    value: item.default_value,
+  }))
+}
+
+const eventJudgmentSystemProfiles: EventJudgmentProfile[] = [
+  {
+    profile_id: 'system_legacy_formula_v1',
+    name: '系统预设：经典综合判别',
+    description: '保持当前版本历史公式，兼容旧结果。',
+    score_mode: 'legacy_formula',
+    is_system: true,
+    updated_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    dimensions: [],
+    rule_values: defaultEventRuleValues(),
+  },
+  {
+    profile_id: 'system_3d_core_v1',
+    name: '系统预设：三维核心',
+    description: '背景 + 位置 + 量价 三维判别。',
+    score_mode: 'dimension_weighted',
+    is_system: true,
+    updated_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    dimensions: [
+      {
+        dimension_id: 'dim_background',
+        label: '背景分',
+        metric_key: 'event_background_score',
+        weight: 0.34,
+        invert: false,
+        enabled: true,
+      },
+      {
+        dimension_id: 'dim_position',
+        label: '位置分',
+        metric_key: 'event_position_score',
+        weight: 0.33,
+        invert: false,
+        enabled: true,
+      },
+      {
+        dimension_id: 'dim_vol_price',
+        label: '量价分',
+        metric_key: 'event_vol_price_score',
+        weight: 0.33,
+        invert: false,
+        enabled: true,
+      },
+    ],
+    rule_values: defaultEventRuleValues(),
+  },
+  {
+    profile_id: 'system_6d_confirmation_v1',
+    name: '系统预设：六维确认增强',
+    description: '背景/位置/量价/确认/语境/新鲜度 六维综合。',
+    score_mode: 'dimension_weighted',
+    is_system: true,
+    updated_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    dimensions: [
+      { dimension_id: 'dim_background', label: '背景分', metric_key: 'event_background_score', weight: 0.22, invert: false, enabled: true },
+      { dimension_id: 'dim_position', label: '位置分', metric_key: 'event_position_score', weight: 0.14, invert: false, enabled: true },
+      { dimension_id: 'dim_vol_price', label: '量价分', metric_key: 'event_vol_price_score', weight: 0.2, invert: false, enabled: true },
+      { dimension_id: 'dim_confirmation', label: '确认分', metric_key: 'event_confirmation_score', weight: 0.18, invert: false, enabled: true },
+      { dimension_id: 'dim_context', label: '阶段语境分', metric_key: 'phase_context_score', weight: 0.14, invert: false, enabled: true },
+      { dimension_id: 'dim_recency', label: '新鲜度分', metric_key: 'event_recency_score', weight: 0.12, invert: false, enabled: true },
+    ],
+    rule_values: defaultEventRuleValues(),
+  },
+]
+
+let eventJudgmentCustomProfiles: EventJudgmentProfile[] = []
+let eventJudgmentActiveProfileId = 'system_legacy_formula_v1'
 
 const marketNewsSeed: MarketNewsResponse['items'] = [
   {
@@ -579,6 +705,109 @@ export function getStrategiesStore(): StrategyCatalogResponse {
       strategy_params_defaults: { ...item.strategy_params_defaults },
     })),
   }
+}
+
+function listEventJudgmentProfilesStore(): EventJudgmentProfile[] {
+  return [
+    ...eventJudgmentSystemProfiles.map((item) => ({
+      ...item,
+      dimensions: item.dimensions.map((dim) => ({ ...dim })),
+      rule_values: item.rule_values.map((rule) => ({ ...rule })),
+    })),
+    ...eventJudgmentCustomProfiles.map((item) => ({
+      ...item,
+      dimensions: item.dimensions.map((dim) => ({ ...dim })),
+      rule_values: item.rule_values.map((rule) => ({ ...rule })),
+    })),
+  ]
+}
+
+export function getEventJudgmentCatalogStore(): EventJudgmentCatalogResponse {
+  const profiles = listEventJudgmentProfilesStore()
+  const activeExists = profiles.some((item) => item.profile_id === eventJudgmentActiveProfileId)
+  const activeProfileId = activeExists
+    ? eventJudgmentActiveProfileId
+    : (profiles[0]?.profile_id || 'system_legacy_formula_v1')
+  eventJudgmentActiveProfileId = activeProfileId
+  return {
+    active_profile_id: activeProfileId,
+    metric_options: eventJudgmentMetricOptions.map((item) => ({ ...item })),
+    rule_options: eventJudgmentRuleOptions.map((item) => ({ ...item })),
+    profiles,
+  }
+}
+
+export function upsertEventJudgmentProfileStore(payload: EventJudgmentProfileUpsertRequest): EventJudgmentProfile {
+  const name = String(payload.name || '').trim() || '自定义模板'
+  const description = String(payload.description || '').trim()
+  const dimensions = (Array.isArray(payload.dimensions) ? payload.dimensions : []).map((item, index) => ({
+    dimension_id: String(item.dimension_id || `dim_${index + 1}`),
+    label: String(item.label || item.metric_key || `维度${index + 1}`),
+    metric_key: String(item.metric_key || ''),
+    weight: Number(item.weight ?? 1),
+    invert: Boolean(item.invert),
+    enabled: Boolean(item.enabled),
+  }))
+  const baseRuleMap = new Map<string, number | boolean>()
+  eventJudgmentRuleOptions.forEach((item) => {
+    baseRuleMap.set(item.rule_key, item.default_value)
+  })
+  const sourceProfile = listEventJudgmentProfilesStore().find((item) => item.profile_id === String(payload.profile_id || '').trim())
+  if (sourceProfile) {
+    sourceProfile.rule_values.forEach((item) => {
+      baseRuleMap.set(item.rule_key, item.value)
+    })
+  }
+  if (Array.isArray(payload.rule_values)) {
+    payload.rule_values.forEach((item) => {
+      baseRuleMap.set(String(item.rule_key || '').trim(), item.value)
+    })
+  }
+  const ruleValues: EventJudgmentRuleValue[] = eventJudgmentRuleOptions
+    .map((item) => ({
+      rule_key: item.rule_key,
+      value: baseRuleMap.get(item.rule_key) ?? item.default_value,
+    }))
+    .filter((item) => item.rule_key.length > 0)
+  const now = dayjs().format('YYYY-MM-DD HH:mm:ss')
+  const profileId = String(payload.profile_id || '').trim() || `ejp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+  const next: EventJudgmentProfile = {
+    profile_id: profileId,
+    name,
+    description,
+    score_mode: 'dimension_weighted',
+    is_system: false,
+    updated_at: now,
+    dimensions,
+    rule_values: ruleValues,
+  }
+  eventJudgmentCustomProfiles = [next, ...eventJudgmentCustomProfiles.filter((item) => item.profile_id !== profileId)]
+  if (payload.make_active !== false) {
+    eventJudgmentActiveProfileId = profileId
+  }
+  return {
+    ...next,
+    dimensions: next.dimensions.map((item) => ({ ...item })),
+    rule_values: next.rule_values.map((item) => ({ ...item })),
+  }
+}
+
+export function applyEventJudgmentProfileStore(payload: EventJudgmentProfileApplyRequest): EventJudgmentCatalogResponse {
+  const profileId = String(payload.profile_id || '').trim()
+  const exists = listEventJudgmentProfilesStore().some((item) => item.profile_id === profileId)
+  if (exists) {
+    eventJudgmentActiveProfileId = profileId
+  }
+  return getEventJudgmentCatalogStore()
+}
+
+export function deleteEventJudgmentProfileStore(profileIdRaw: string): EventJudgmentProfileDeleteResponse {
+  const profileId = String(profileIdRaw || '').trim()
+  eventJudgmentCustomProfiles = eventJudgmentCustomProfiles.filter((item) => item.profile_id !== profileId)
+  if (eventJudgmentActiveProfileId === profileId) {
+    eventJudgmentActiveProfileId = 'system_legacy_formula_v1'
+  }
+  return { success: true, profile_id: profileId }
 }
 
 export function getCandlePayload(symbol: string) {

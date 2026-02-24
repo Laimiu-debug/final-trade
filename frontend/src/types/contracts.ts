@@ -679,6 +679,78 @@ export interface StrategyCatalogResponse {
   items: StrategyDescriptor[]
 }
 
+export interface EventJudgmentMetricOption {
+  metric_key: string
+  label: string
+  description: string
+}
+
+export interface EventJudgmentRuleOption {
+  rule_key: string
+  label: string
+  description: string
+  category: string
+  value_type: 'number' | 'integer' | 'boolean'
+  min_value?: number | null
+  max_value?: number | null
+  step?: number | null
+  recommended_min?: number | null
+  recommended_max?: number | null
+  risk_hint_low?: string
+  risk_hint_high?: string
+  default_value: number | boolean
+}
+
+export interface EventJudgmentDimension {
+  dimension_id: string
+  label: string
+  metric_key: string
+  weight: number
+  invert: boolean
+  enabled: boolean
+}
+
+export interface EventJudgmentRuleValue {
+  rule_key: string
+  value: number | boolean
+}
+
+export interface EventJudgmentProfile {
+  profile_id: string
+  name: string
+  description: string
+  score_mode: 'legacy_formula' | 'dimension_weighted'
+  is_system: boolean
+  updated_at: string
+  dimensions: EventJudgmentDimension[]
+  rule_values: EventJudgmentRuleValue[]
+}
+
+export interface EventJudgmentCatalogResponse {
+  active_profile_id: string
+  metric_options: EventJudgmentMetricOption[]
+  rule_options: EventJudgmentRuleOption[]
+  profiles: EventJudgmentProfile[]
+}
+
+export interface EventJudgmentProfileUpsertRequest {
+  profile_id?: string
+  name: string
+  description?: string
+  dimensions: EventJudgmentDimension[]
+  rule_values?: EventJudgmentRuleValue[]
+  make_active?: boolean
+}
+
+export interface EventJudgmentProfileApplyRequest {
+  profile_id: string
+}
+
+export interface EventJudgmentProfileDeleteResponse {
+  success: true
+  profile_id: string
+}
+
 export interface BacktestABVariantConfig {
   label?: string
   entry_delay_days?: number

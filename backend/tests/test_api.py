@@ -653,6 +653,211 @@ def test_strategy_update_endpoint_rejects_empty_payload() -> None:
     assert body["code"] == "STRATEGY_UPDATE_EMPTY"
 
 
+def test_event_judgment_profiles_endpoint_supports_crud() -> None:
+    list_resp = client.get("/api/event-judgment/profiles")
+    assert list_resp.status_code == 200
+    list_body = list_resp.json()
+    assert isinstance(list_body.get("profiles"), list)
+    assert isinstance(list_body.get("rule_options"), list)
+    assert len(list_body.get("rule_options") or []) > 0
+    first_rule = (list_body.get("rule_options") or [])[0]
+    assert isinstance(first_rule, dict)
+    assert "risk_hint_low" in first_rule
+    assert "risk_hint_high" in first_rule
+    assert any(
+        str(item.get("profile_id")) == "system_legacy_formula_v1"
+        for item in list_body.get("profiles", [])
+    )
+
+    create_resp = client.post(
+        "/api/event-judgment/profiles",
+        json={
+            "name": "测试模板-四维",
+            "description": "用于接口回归测试",
+            "dimensions": [
+                {
+                    "dimension_id": "dim_bg",
+                    "label": "背景分",
+                    "metric_key": "event_background_score",
+                    "weight": 0.4,
+                    "invert": False,
+                    "enabled": True,
+                },
+                {
+                    "dimension_id": "dim_pos",
+                    "label": "位置分",
+                    "metric_key": "event_position_score",
+                    "weight": 0.3,
+                    "invert": False,
+                    "enabled": True,
+                },
+                {
+                    "dimension_id": "dim_vol",
+                    "label": "量价分",
+                    "metric_key": "event_vol_price_score",
+                    "weight": 0.2,
+                    "invert": False,
+                    "enabled": True,
+                },
+                {
+                    "dimension_id": "dim_confirm",
+                    "label": "确认分",
+                    "metric_key": "event_confirmation_score",
+                    "weight": 0.1,
+                    "invert": False,
+                    "enabled": True,
+                },
+            ],
+            "rule_values": [
+                {"rule_key": "sos_ret10_min", "value": 0.08},
+                {"rule_key": "enable_sow", "value": False},
+            ],
+            "make_active": True,
+        },
+    )
+    assert create_resp.status_code == 200
+    created = create_resp.json()
+    created_profile_id = str(created.get("profile_id") or "").strip()
+    assert created_profile_id
+    assert created["is_system"] is False
+    assert created["score_mode"] == "dimension_weighted"
+    assert isinstance(created.get("rule_values"), list)
+    assert len(created.get("rule_values") or []) > 0
+    created_rule_map = {
+        str(item.get("rule_key")): item.get("value")
+        for item in created.get("rule_values", [])
+        if isinstance(item, dict)
+    }
+    assert float(created_rule_map.get("sos_ret10_min")) == pytest.approx(0.08)
+    assert bool(created_rule_map.get("enable_sow")) is False
+
+    try:
+        apply_resp = client.post(
+            "/api/event-judgment/profiles/apply",
+            json={"profile_id": created_profile_id},
+        )
+        assert apply_resp.status_code == 200
+        assert apply_resp.json().get("active_profile_id") == created_profile_id
+    finally:
+        delete_resp = client.delete(f"/api/event-judgment/profiles/{created_profile_id}")
+        assert delete_resp.status_code == 200
+        fallback_resp = client.get("/api/event-judgment/profiles")
+        assert fallback_resp.status_code == 200
+        assert fallback_resp.json().get("active_profile_id") != created_profile_id
+
+
+def test_signals_cache_isolated_by_event_judgment_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    dates = _load_symbol_dates("sz300750")
+    as_of_trade_date = dates[-1]
+    trigger_date = dates[-3]
+    row = store._build_row_from_candles("sz300750", as_of_date=as_of_trade_date)
+    assert row is not None
+
+    call_counter = {"count": 0}
+
+    def fake_resolve_signal_candidates(
+        *,
+        mode: str,
+        run_id: str | None,
+        trend_step: str = "auto",
+        as_of_date: str | None = None,
+    ):
+        _ = (mode, trend_step)
+        return [row], None, run_id or "mock-run", as_of_date or as_of_trade_date
+
+    def fake_calc_wyckoff_snapshot(
+        candidate_row,
+        window_days: int,
+        *,
+        as_of_date: str | None = None,
+    ) -> dict[str, object]:
+        _ = (candidate_row, window_days, as_of_date)
+        call_counter["count"] += 1
+        return {
+            "events": ["SC", "AR", "ST", "SOS"],
+            "risk_events": [],
+            "event_dates": {"SC": trigger_date, "AR": trigger_date, "ST": trigger_date, "SOS": trigger_date},
+            "event_chain": [{"event": "SOS", "date": trigger_date, "category": "accumulation"}],
+            "sequence_ok": True,
+            "entry_quality_score": 82.0,
+            "phase": "吸筹D",
+            "signal": "SOS",
+            "trigger_date": trigger_date,
+            "phase_hint": "测试信号",
+            "structure_hhh": "HH|HL|HC",
+            "event_strength_score": 70.0,
+            "phase_score": 72.0,
+            "structure_score": 68.0,
+            "trend_score": 66.0,
+            "volatility_score": 64.0,
+        }
+
+    monkeypatch.setattr(store, "_resolve_signal_candidates", fake_resolve_signal_candidates)
+    monkeypatch.setattr(store, "_calc_wyckoff_snapshot", fake_calc_wyckoff_snapshot)
+    monkeypatch.setenv("TDX_TREND_SIGNALS_DISK_CACHE", "0")
+    store._signals_cache.clear()
+
+    base_params = {
+        "mode": "trend_pool",
+        "run_id": "mock-run",
+        "as_of_date": as_of_trade_date,
+        "window_days": "60",
+        "min_score": "0",
+        "require_sequence": "false",
+        "min_event_count": "0",
+    }
+
+    apply_legacy_resp = client.post(
+        "/api/event-judgment/profiles/apply",
+        json={"profile_id": "system_legacy_formula_v1"},
+    )
+    assert apply_legacy_resp.status_code == 200
+
+    resp1 = client.get("/api/signals", params=base_params)
+    assert resp1.status_code == 200
+    assert resp1.json().get("cache_hit") is False
+
+    resp2 = client.get("/api/signals", params=base_params)
+    assert resp2.status_code == 200
+    assert resp2.json().get("cache_hit") is True
+
+    create_resp = client.post(
+        "/api/event-judgment/profiles",
+        json={
+            "name": "测试模板-缓存隔离",
+            "dimensions": [
+                {
+                    "dimension_id": "dim_bg",
+                    "label": "背景分",
+                    "metric_key": "event_background_score",
+                    "weight": 1.0,
+                    "invert": False,
+                    "enabled": True,
+                },
+            ],
+            "make_active": True,
+        },
+    )
+    assert create_resp.status_code == 200
+    custom_profile_id = str(create_resp.json().get("profile_id") or "").strip()
+    assert custom_profile_id
+
+    try:
+        resp3 = client.get("/api/signals", params=base_params)
+        assert resp3.status_code == 200
+        assert resp3.json().get("cache_hit") is False
+        assert call_counter["count"] == 2
+    finally:
+        cleanup_apply = client.post(
+            "/api/event-judgment/profiles/apply",
+            json={"profile_id": "system_legacy_formula_v1"},
+        )
+        assert cleanup_apply.status_code == 200
+        cleanup_delete = client.delete(f"/api/event-judgment/profiles/{custom_profile_id}")
+        assert cleanup_delete.status_code == 200
+        store._signals_cache.clear()
+
+
 def test_signals_endpoint_rejects_unknown_strategy() -> None:
     resp = client.get("/api/signals", params={"strategy_id": "unknown_strategy"})
     assert resp.status_code == 400
