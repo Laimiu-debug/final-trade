@@ -1223,3 +1223,75 @@ def test_matrix_semantic_alignment_toggle_changes_candidate_filtering() -> None:
 
     assert len(result_v1.trades) == 1
     assert result_aligned.trades == []
+
+
+def test_score_only_strategy_enters_without_wyckoff_entry_event() -> None:
+    dates = _build_trading_days("2025-01-02", 34)
+    symbol = "sh600001"
+    signal_day = dates[0]
+    candles = _build_linear_candles(dates, start=10.0, step=0.2)
+
+    def _get_candles(raw_symbol: str) -> list[CandlePoint]:
+        return list(candles) if raw_symbol == symbol else []
+
+    def _build_row(raw_symbol: str, as_of_date: str | None) -> dict[str, str] | None:
+        if raw_symbol != symbol or as_of_date is None:
+            return None
+        return {"symbol": raw_symbol, "as_of_date": as_of_date}
+
+    def _calc_snapshot(_row: dict[str, str], _window_days: int, as_of_date: str | None) -> dict[str, object]:
+        day = str(as_of_date or "")
+        entry_score = 90.0 if day == signal_day else 20.0
+        return {
+            "event_dates": {},
+            "event_chain": [],
+            "events": [],
+            "risk_events": [],
+            "sequence_ok": True,
+            "entry_quality_score": entry_score,
+            "phase": "闃舵鏈槑",
+            "structure_hhh": "HH|HL|-",
+            "trend_score": 72.0,
+            "volatility_score": 68.0,
+            "health_score": 65.0,
+            "event_score": 63.0,
+            "event_grade": "C",
+        }
+
+    engine = BacktestEngine(
+        get_candles=_get_candles,
+        build_row=_build_row,
+        calc_snapshot=_calc_snapshot,
+        resolve_symbol_name=lambda raw_symbol: raw_symbol,
+    )
+    payload = BacktestRunRequest(
+        mode="full_market",
+        pool_roll_mode="daily",
+        strategy_id="score_only_rank_v1",
+        date_from=dates[0],
+        date_to=dates[-1],
+        window_days=60,
+        min_score=80.0,
+        require_sequence=False,
+        min_event_count=0,
+        entry_events=["Spring", "SOS", "JOC", "LPS"],
+        exit_events=["UTAD", "SOW", "LPSY"],
+        initial_capital=100000.0,
+        position_pct=1.0,
+        max_positions=1,
+        stop_loss=0.0,
+        take_profit=0.0,
+        max_hold_days=8,
+        fee_bps=0.0,
+        prioritize_signals=True,
+        priority_mode="balanced",
+        priority_topk_per_day=0,
+        enforce_t1=True,
+        max_symbols=20,
+    )
+
+    result = engine.run(payload=payload, symbols=[symbol])
+
+    assert len(result.trades) == 1
+    assert result.trades[0].signal_date == signal_day
+    assert result.trades[0].entry_signal == "SCORE"

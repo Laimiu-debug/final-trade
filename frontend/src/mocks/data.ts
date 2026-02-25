@@ -184,6 +184,36 @@ const strategyCatalogStore: StrategyCatalogResponse = {
         require_key_event_confirmation: false,
       },
     },
+    {
+      strategy_id: 'score_only_rank_v1',
+      name: '评分买入V1',
+      version: '1.0.0-alpha',
+      enabled: true,
+      is_default: false,
+      capabilities: {
+        supports_matrix: false,
+        supports_signal_age_filter: true,
+        supports_entry_delay: true,
+      },
+      strategy_params_schema: {
+        min_score: { type: 'number', title: '评分下限', minimum: 0, maximum: 100, default: 60 },
+        min_event_count: { type: 'integer', title: '最小事件数', minimum: 0, maximum: 12, default: 0 },
+        require_sequence: { type: 'boolean', title: '要求事件序列', default: false },
+        health_score_min: { type: 'number', title: '健康分下限', minimum: 0, maximum: 100, default: 0 },
+        event_score_min: { type: 'number', title: '事件分下限', minimum: 0, maximum: 100, default: 0 },
+        event_grade_min: { type: 'enum', title: '事件等级下限', options: ['A', 'B', 'C'], default: 'C' },
+        require_key_event_confirmation: { type: 'boolean', title: '关键事件确认必需', default: false },
+      },
+      strategy_params_defaults: {
+        min_score: 60,
+        min_event_count: 0,
+        require_sequence: false,
+        health_score_min: 0,
+        event_score_min: 0,
+        event_grade_min: 'C',
+        require_key_event_confirmation: false,
+      },
+    },
   ],
 }
 

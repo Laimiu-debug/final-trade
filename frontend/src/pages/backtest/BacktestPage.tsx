@@ -2081,6 +2081,41 @@ export function BacktestPage() {
     },
   })
 
+  const exportPlateauTradesMutation = useMutation({
+    mutationFn: async (payload: { row: BacktestPlateauTableRow; runRequest: BacktestRunRequest }) => {
+      const runResult = await runBacktest(payload.runRequest)
+      const workbookBuffer = buildBacktestReportWorkbookBuffer(payload.runRequest, runResult)
+      const blob = new Blob([workbookBuffer], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      })
+      const dateFrom = String(runResult.range.date_from || '').replaceAll('-', '')
+      const dateTo = String(runResult.range.date_to || '').replaceAll('-', '')
+      const fileBaseName = [
+        'plateau_trades',
+        `rank${payload.row.__rank}`,
+        `score${payload.row.score.toFixed(3)}`,
+        dateFrom || 'from',
+        dateTo || 'to',
+        dayjs().format('YYYYMMDD_HHmmss'),
+      ]
+        .join('_')
+        .replace(/[^0-9A-Za-z_.-]/g, '_')
+      const fileName = `${fileBaseName}.xlsx`
+      downloadBlob(fileName, blob)
+      return {
+        fileName,
+        tradeCount: runResult.trades.length,
+        rank: payload.row.__rank,
+      }
+    },
+    onSuccess: (payload) => {
+      message.success(`第${payload.rank}名交易记录已导出：${payload.fileName}（${payload.tradeCount} 笔）`)
+    },
+    onError: (error) => {
+      message.error(`导出交易记录失败：${formatApiError(error)}`)
+    },
+  })
+
   const importReportMutation = useMutation({
     mutationFn: importBacktestReportPackage,
     onSuccess: (payload) => {
@@ -2651,6 +2686,36 @@ export function BacktestPage() {
     message.success(`${prefix}：信号窗口=${point.params.window_days}，最低评分=${point.params.min_score.toFixed(2)}`)
   }
 
+  function buildBacktestPayloadFromPlateauPoint(point: BacktestPlateauPoint): BacktestRunRequest | null {
+    if (point.error) {
+      message.warning('该参数组评估失败，无法导出交易记录')
+      return null
+    }
+    const basePayload = plateauResult?.base_payload
+    if (!basePayload) {
+      message.warning('当前收益平原结果缺少基础参数，无法导出交易记录')
+      return null
+    }
+    return {
+      ...basePayload,
+      window_days: Number(point.params.window_days),
+      min_score: Number(point.params.min_score),
+      stop_loss: Number(point.params.stop_loss),
+      take_profit: Number(point.params.take_profit),
+      max_positions: Number(point.params.max_positions),
+      position_pct: Number(point.params.position_pct),
+      max_symbols: Number(point.params.max_symbols),
+      priority_topk_per_day: Number(point.params.priority_topk_per_day),
+    }
+  }
+
+  function handleExportPlateauPointTrades(row: BacktestPlateauTableRow) {
+    if (exportPlateauTradesMutation.isPending) return
+    const runRequest = buildBacktestPayloadFromPlateauPoint(row)
+    if (!runRequest) return
+    exportPlateauTradesMutation.mutate({ row, runRequest })
+  }
+
   const taskRunning = taskStatus?.status === 'running' || taskStatus?.status === 'pending' || taskStatus?.status === 'paused'
   const runLoading = startTaskMutation.isPending
   const plateauLoading = startPlateauTaskMutation.isPending
@@ -2834,36 +2899,49 @@ export function BacktestPage() {
       title: '操作',
       key: 'action',
       width: 240,
-      render: (_value, row) => (
-        <Space size={6}>
-          <Button
-            size="small"
-            disabled={Boolean(row.error)}
-            onClick={() => applyPlateauPointToForm(row, `第${row.__rank}名`)}
-          >
-            回填
-          </Button>
-          <Button
-            size="small"
-            disabled={Boolean(row.error)}
-            onClick={() => savePlateauPreset(row, `第${row.__rank}名`)}
-          >
-            保存
-          </Button>
-          <Button
-            size="small"
-            type="primary"
-            ghost
-            loading={plateauExportingRowKey === row.__rowKey}
-            disabled={Boolean(row.error) || (plateauExportingRowKey !== null && plateauExportingRowKey !== row.__rowKey)}
-            onClick={() => {
-              void handleExportPlateauTradeRecords(row)
-            }}
-          >
-            导出交易记录
-          </Button>
-        </Space>
-      ),
+      render: (_value, row) => {
+        const exportingCurrentRow =
+          plateauExportingRowKey === row.__rowKey
+          || (exportPlateauTradesMutation.isPending
+            && exportPlateauTradesMutation.variables?.row.__rowKey === row.__rowKey)
+        const exportingOtherRow =
+          (plateauExportingRowKey !== null && plateauExportingRowKey !== row.__rowKey)
+          || (exportPlateauTradesMutation.isPending && !exportingCurrentRow)
+        return (
+          <Space size={6}>
+            <Button
+              size="small"
+              disabled={Boolean(row.error)}
+              onClick={() => applyPlateauPointToForm(row, `第${row.__rank}名`)}
+            >
+              回填
+            </Button>
+            <Button
+              size="small"
+              disabled={Boolean(row.error)}
+              onClick={() => savePlateauPreset(row, `第${row.__rank}名`)}
+            >
+              保存
+            </Button>
+            <Button
+              size="small"
+              type="primary"
+              ghost
+              loading={exportingCurrentRow}
+              disabled={Boolean(row.error) || exportingOtherRow}
+              onClick={() => {
+                if (mode === 'trend_pool') {
+                  void handleExportPlateauTradeRecords(row)
+                  return
+                }
+                handleExportPlateauPointTrades(row)
+              }}
+            >
+              导出交易记录
+            </Button>
+          </Space>
+        )
+      },
     },
   ]
   const plateauScoreBarOption = useMemo(() => {

@@ -615,6 +615,7 @@ def test_strategy_catalog_endpoint() -> None:
     assert "wyckoff_trend_v1" in ids
     assert "wyckoff_trend_v2" in ids
     assert "relative_strength_breakout_v1" in ids
+    assert "score_only_rank_v1" in ids
 
 
 def test_strategy_update_endpoint_supports_default_and_version_switch() -> None:

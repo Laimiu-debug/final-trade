@@ -40,7 +40,7 @@ def _build_row(symbol: str, **overrides: object) -> ScreenerResult:
     return ScreenerResult(**payload)
 
 
-def _build_signal(symbol: str, *, health: float, event: float) -> SignalResult:
+def _build_signal(symbol: str, *, health: float, event: float, quality: float = 0.0) -> SignalResult:
     return SignalResult(
         symbol=symbol,
         name=symbol,
@@ -50,6 +50,7 @@ def _build_signal(symbol: str, *, health: float, event: float) -> SignalResult:
         expire_date="2025-01-12",
         trigger_reason="test",
         priority=2,
+        entry_quality_score=quality,
         health_score=health,
         event_score=event,
     )
@@ -58,6 +59,7 @@ def _build_signal(symbol: str, *, health: float, event: float) -> SignalResult:
 def test_registry_contains_relative_strength_strategy() -> None:
     registry = StrategyRegistry()
     assert registry.get("relative_strength_breakout_v1") is not None
+    assert registry.get("score_only_rank_v1") is not None
 
 
 def test_relative_strength_plugin_filters_signal_universe() -> None:
@@ -115,3 +117,24 @@ def test_relative_strength_plugin_rank_uses_strength_metrics() -> None:
     )
     assert strong_rank > weak_rank
 
+
+def test_score_only_plugin_rank_prefers_entry_quality_score() -> None:
+    registry = StrategyRegistry()
+    row = _build_row("sz300750")
+    strong = _build_signal("sz300750", health=40.0, event=40.0, quality=92.0)
+    weak = _build_signal("sz300750", health=90.0, event=90.0, quality=55.0)
+    strong_rank = registry.rank_signals(
+        strategy_id="score_only_rank_v1",
+        signal=strong,
+        row=row,
+        params={"min_score": 50.0},
+        fallback_score=70.0,
+    )
+    weak_rank = registry.rank_signals(
+        strategy_id="score_only_rank_v1",
+        signal=weak,
+        row=row,
+        params={"min_score": 50.0},
+        fallback_score=70.0,
+    )
+    assert strong_rank > weak_rank

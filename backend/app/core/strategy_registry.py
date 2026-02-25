@@ -8,6 +8,7 @@ from typing import Any
 from .strategy_plugins import (
     BaseStrategyPlugin,
     RelativeStrengthBreakoutPlugin,
+    ScoreOnlyRankPlugin,
     StrategyPlugin,
     WyckoffTrendPlugin,
 )
@@ -295,11 +296,81 @@ class StrategyRegistry:
             },
         )
         self._strategies[v3.strategy_id] = v3
+        v4_schema: dict[str, dict[str, Any]] = {
+            "min_score": {
+                "type": "number",
+                "title": "Score threshold",
+                "minimum": 0.0,
+                "maximum": 100.0,
+                "default": 60.0,
+            },
+            "min_event_count": {
+                "type": "integer",
+                "title": "Minimum event count",
+                "minimum": 0,
+                "maximum": 12,
+                "default": 0,
+            },
+            "require_sequence": {
+                "type": "boolean",
+                "title": "Require event sequence",
+                "default": False,
+            },
+            "health_score_min": {
+                "type": "number",
+                "title": "Health score min",
+                "minimum": 0.0,
+                "maximum": 100.0,
+                "default": 0.0,
+            },
+            "event_score_min": {
+                "type": "number",
+                "title": "Event score min",
+                "minimum": 0.0,
+                "maximum": 100.0,
+                "default": 0.0,
+            },
+            "event_grade_min": {
+                "type": "enum",
+                "title": "Event grade min",
+                "options": ["A", "B", "C"],
+                "default": "C",
+            },
+            "require_key_event_confirmation": {
+                "type": "boolean",
+                "title": "Require key event confirmation",
+                "default": False,
+            },
+        }
+        v4 = StrategyDescriptor(
+            strategy_id="score_only_rank_v1",
+            name="ScoreOnlyRank V1",
+            version="1.0.0-alpha",
+            enabled=True,
+            is_default=False,
+            capabilities=StrategyCapabilities(
+                supports_matrix=False,
+                supports_signal_age_filter=True,
+                supports_entry_delay=True,
+            ),
+            params_schema=v4_schema,
+            default_params={
+                "min_score": 60.0,
+                "min_event_count": 0,
+                "require_sequence": False,
+                "health_score_min": 0.0,
+                "event_score_min": 0.0,
+                "event_grade_min": "C",
+                "require_key_event_confirmation": False,
+            },
+        )
+        self._strategies[v4.strategy_id] = v4
 
         self._plugins = {
             v1.strategy_id: WyckoffTrendPlugin(v1.strategy_id),
             v2.strategy_id: WyckoffTrendPlugin(v2.strategy_id),
             v3.strategy_id: RelativeStrengthBreakoutPlugin(),
+            v4.strategy_id: ScoreOnlyRankPlugin(),
         }
 
     @property

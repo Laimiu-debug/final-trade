@@ -60,6 +60,7 @@ DELAY_SKIP_REASON_RISK_EVENT = "delay_invalidated_by_risk_event"
 DELAY_SKIP_REASON_SELL_SIGNAL = "delay_invalidated_by_sell_signal"
 EVENT_GRADE_RANK: dict[str, int] = {"C": 1, "B": 2, "A": 3}
 MATRIX_SEMANTIC_ALIGNED = "aligned_wyckoff_v2"
+SCORE_ONLY_STRATEGY_ID = "score_only_rank_v1"
 
 
 @dataclass
@@ -196,6 +197,10 @@ class BacktestEngine:
     @staticmethod
     def _resolve_entry_index(signal_index: int, payload: BacktestRunRequest) -> int:
         return int(signal_index) + max(1, int(payload.entry_delay_days))
+
+    @staticmethod
+    def _is_score_only_strategy(payload: BacktestRunRequest) -> bool:
+        return str(payload.strategy_id).strip().lower() == SCORE_ONLY_STRATEGY_ID
 
     @staticmethod
     def _normalize_event_grade(raw: Any) -> str:
@@ -827,6 +832,7 @@ class BacktestEngine:
         risk_events_by_index: dict[int, list[str]] = {}
         t1_no_sellable_skips = 0
         delay_skip_reasons = self._build_delay_skip_counter()
+        score_only_strategy = self._is_score_only_strategy(payload)
 
         for idx in in_range_indexes:
             if control_callback is not None:
@@ -868,7 +874,10 @@ class BacktestEngine:
             if day_risk_events:
                 risk_events_by_index[idx] = day_risk_events
             if not day_entry_events:
-                continue
+                if score_only_strategy:
+                    day_entry_events = ["SCORE"]
+                else:
+                    continue
 
             event_count = self._normalize_event_count(snapshot)
             sequence_ok = bool(snapshot.get("sequence_ok"))
@@ -907,11 +916,14 @@ class BacktestEngine:
 
             entry_phase = str(snapshot.get("phase", "闃舵鏈槑"))
             structure_hhh = str(snapshot.get("structure_hhh", "-"))
-            final_rank_score = self._compute_final_rank_score(
-                payload=payload,
-                health_score=health_score,
-                event_score=event_score,
-            )
+            if score_only_strategy:
+                final_rank_score = max(0.0, min(100.0, float(entry_quality_score)))
+            else:
+                final_rank_score = self._compute_final_rank_score(
+                    payload=payload,
+                    health_score=health_score,
+                    event_score=event_score,
+                )
             entry_meta_by_index[idx] = {
                 "entry_signal": " / ".join(day_entry_events),
                 "entry_phase": entry_phase,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Protocol
 
 from ..models import BacktestRunRequest, ScreenerResult, SignalResult
@@ -115,6 +116,54 @@ class WyckoffTrendPlugin(BaseStrategyPlugin):
         self.strategy_id = str(strategy_id).strip() or "wyckoff_trend_v1"
 
 
+class ScoreOnlyRankPlugin(BaseStrategyPlugin):
+    strategy_id = "score_only_rank_v1"
+
+    @staticmethod
+    def _safe_float(params: dict[str, Any], key: str, fallback: float) -> float:
+        try:
+            value = float(params.get(key, fallback))
+        except Exception:
+            return float(fallback)
+        if not math.isfinite(value):
+            return float(fallback)
+        return float(value)
+
+    def generate_signals(
+        self,
+        *,
+        row: ScreenerResult,
+        snapshot: dict[str, Any],
+        params: dict[str, Any],
+    ) -> bool:
+        _ = row
+        min_score = self._safe_float(params, "min_score", 55.0)
+        try:
+            entry_quality_score = float(snapshot.get("entry_quality_score", 0.0) or 0.0)
+        except Exception:
+            entry_quality_score = 0.0
+        if not math.isfinite(entry_quality_score):
+            entry_quality_score = 0.0
+        return entry_quality_score >= float(min_score)
+
+    def rank_signals(
+        self,
+        *,
+        signal: SignalResult,
+        row: ScreenerResult,
+        params: dict[str, Any],
+        fallback_score: float,
+    ) -> float:
+        _ = row, params
+        try:
+            quality = float(signal.entry_quality_score)
+        except Exception:
+            quality = float(fallback_score)
+        if not math.isfinite(quality):
+            quality = float(fallback_score)
+        return _clamp_score(quality)
+
+
 class RelativeStrengthBreakoutPlugin(BaseStrategyPlugin):
     strategy_id = "relative_strength_breakout_v1"
 
@@ -202,4 +251,3 @@ class RelativeStrengthBreakoutPlugin(BaseStrategyPlugin):
             + structure_score * w_structure
         ) / weight_sum
         return _clamp_score(score)
-
