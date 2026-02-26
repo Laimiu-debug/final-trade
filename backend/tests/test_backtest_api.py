@@ -24,6 +24,7 @@ os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_READ_ONLY", "0")
 
 from app.main import app
 import app.store as store_module
+from app.core.backtest_engine import CandidateTrade
 from app.models import (
     BacktestResponse,
     BacktestRiskMetrics,
@@ -749,6 +750,177 @@ def test_backtest_plateau_task_supports_pause_resume_cancel(monkeypatch: pytest.
 
     final_task = _wait_backtest_plateau_task(task_id)
     assert final_task["status"] == "cancelled"
+
+
+def test_backtest_plateau_replay_reuses_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TDX_TREND_BACKTEST_PLATEAU_WORKERS", "4")
+    run_calls = 0
+    candidate_build_calls = 0
+    replay_calls = 0
+
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
+        nonlocal run_calls
+        _ = (progress_callback, prebuilt_universe)
+        if control_callback is not None:
+            control_callback()
+        run_calls += 1
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.55,
+                total_return=0.12,
+                max_drawdown=-0.08,
+                avg_pnl_ratio=0.03,
+                trade_count=6,
+                win_count=4,
+                loss_count=2,
+                profit_factor=1.6,
+            ),
+            trades=[],
+            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+            notes=[],
+            candidate_count=10,
+            skipped_count=1,
+            fill_rate=0.9,
+            max_concurrent_positions=int(payload.max_positions),
+        )
+
+    def _fake_build_universe(payload, board_filters, *, control_callback=None):  # noqa: ANN001
+        _ = (payload, board_filters)
+        if control_callback is not None:
+            control_callback()
+        return (
+            ["sz300750"],
+            {"2025-01-02": {"sz300750"}},
+            ["mock prebuilt universe"],
+        )
+
+    def _fake_run_candidates_only(  # noqa: ANN001
+        self,
+        *,
+        payload,
+        symbols,
+        allowed_symbols_by_date=None,
+        apply_priority_topk=True,
+        control_callback=None,
+    ):
+        nonlocal candidate_build_calls
+        _ = (self, payload, symbols, allowed_symbols_by_date, apply_priority_topk)
+        if control_callback is not None:
+            control_callback()
+        candidate_build_calls += 1
+        return [
+            CandidateTrade(
+                symbol="sz300750",
+                signal_date="2025-01-02",
+                entry_date="2025-01-03",
+                exit_date="2025-01-10",
+                entry_signal="SOS",
+                entry_phase="吸筹D",
+                entry_quality_score=78.0,
+                candle_quality_score=78.0,
+                cost_center_shift_score=78.0,
+                weekly_context_score=60.0,
+                weekly_context_multiplier=1.0,
+                entry_phase_score=2.0,
+                entry_events_weight=3.0,
+                entry_structure_score=2,
+                entry_trend_score=70.0,
+                entry_volatility_score=55.0,
+                health_score=70.0,
+                event_score=68.0,
+                risk_score=20.0,
+                confirmation_status="confirmed",
+                event_grade="A",
+                phase_context_score=60.0,
+                event_recency_score=50.0,
+                delay_entry_days=1,
+                delay_window_days=0,
+                final_rank_score=72.0,
+                entry_price=100.0,
+                exit_price=105.0,
+                holding_days=5,
+                exit_reason="take_profit",
+            )
+        ]
+
+    def _fake_replay_portfolio(self, *, candidates, payload):  # noqa: ANN001
+        nonlocal replay_calls
+        _ = self
+        replay_calls += 1
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.5,
+                total_return=0.08,
+                max_drawdown=0.0,
+                avg_pnl_ratio=0.02,
+                trade_count=1,
+                win_count=1,
+                loss_count=0,
+                profit_factor=2.0,
+            ),
+            trades=[],
+            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+            notes=[],
+            candidate_count=len(candidates),
+            skipped_count=0,
+            fill_rate=1.0,
+            max_concurrent_positions=int(payload.max_positions),
+        )
+
+    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
+    monkeypatch.setattr(store, "_build_backtest_universe_for_plateau", _fake_build_universe)
+    monkeypatch.setattr(store_module.BacktestEngine, "run_candidates_only", _fake_run_candidates_only)
+    monkeypatch.setattr(store_module.BacktestEngine, "replay_portfolio", _fake_replay_portfolio)
+
+    payload = {
+        "base_payload": {
+            "mode": "full_market",
+            "run_id": "",
+            "trend_step": "auto",
+            "pool_roll_mode": "daily",
+            "board_filters": [],
+            "date_from": "2025-01-02",
+            "date_to": "2025-02-28",
+            "window_days": 60,
+            "min_score": 55,
+            "require_sequence": False,
+            "min_event_count": 1,
+            "entry_events": ["Spring", "SOS", "JOC", "LPS"],
+            "exit_events": ["UTAD", "SOW", "LPSY"],
+            "initial_capital": 1_000_000,
+            "position_pct": 0.2,
+            "max_positions": 5,
+            "stop_loss": 0.05,
+            "take_profit": 0.2,
+            "max_hold_days": 30,
+            "fee_bps": 8.0,
+            "prioritize_signals": True,
+            "priority_mode": "balanced",
+            "priority_topk_per_day": 10,
+            "enforce_t1": True,
+            "max_symbols": 100,
+        },
+        "sampling_mode": "grid",
+        "window_days_list": [60],
+        "min_score_list": [55],
+        "stop_loss_list": [0.05],
+        "take_profit_list": [0.2],
+        "max_positions_list": [3, 5, 8],
+        "position_pct_list": [0.2],
+        "max_symbols_list": [100],
+        "priority_topk_per_day_list": [10],
+        "max_points": 3,
+    }
+
+    resp = client.post("/api/backtest/plateau", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["evaluated_combinations"] == 3
+    assert run_calls == 1
+    assert candidate_build_calls == 1
+    assert replay_calls == 2
+    assert any("候选重放复用" in note for note in body["notes"])
 
 
 def test_backtest_run_requires_existing_run_when_run_missing() -> None:

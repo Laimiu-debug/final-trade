@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from itertools import product
 from pathlib import Path
-from threading import RLock, Thread, local
+from threading import Event, RLock, Thread, local
 from typing import Any, Callable, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -154,7 +154,7 @@ from .tdx_loader import (
 from .utils.text_utils import TextProcessor, URLUtils
 from .core.signal_analyzer import SignalAnalyzer, WYCKOFF_ACC_EVENTS, WYCKOFF_RISK_EVENTS, WYCKOFF_EVENT_ORDER
 from .core.ai_analyzer import AIAnalyzer, create_ai_analyzer
-from .core.backtest_engine import BacktestEngine
+from .core.backtest_engine import BacktestEngine, CandidateTrade
 from .core.backtest_matrix_engine import BacktestMatrixEngine, MatrixBundle
 from .core.backtest_signal_matrix import BacktestSignalMatrix, compute_backtest_signal_matrix
 from .core.strategy_registry import StrategyRegistry
@@ -8806,6 +8806,7 @@ class InMemoryStore:
             index: int,
             params: BacktestPlateauParams,
             universe: tuple[list[str], dict[str, set[str]] | None, list[str]] | None = None,
+            cached_candidates: list[CandidateTrade] | None = None,
         ) -> tuple[int, BacktestPlateauPoint, bool]:
             if control_callback is not None:
                 control_callback()
@@ -8824,6 +8825,26 @@ class InMemoryStore:
                 deep=True,
             )
             try:
+                if cached_candidates is not None:
+                    result = _plateau_engine.replay_portfolio(
+                        candidates=cached_candidates,
+                        payload=run_payload,
+                    )
+                    return (
+                        index,
+                        BacktestPlateauPoint(
+                            params=params,
+                            stats=result.stats,
+                            candidate_count=int(result.candidate_count),
+                            skipped_count=int(result.skipped_count),
+                            fill_rate=float(result.fill_rate),
+                            max_concurrent_positions=int(result.max_concurrent_positions),
+                            score=self._backtest_plateau_score(result),
+                            cache_hit=True,
+                            error=None,
+                        ),
+                        False,
+                    )
                 result = self.run_backtest(
                     run_payload,
                     control_callback=control_callback,
@@ -8937,44 +8958,201 @@ class InMemoryStore:
         indexed_params = list(enumerate(params_to_evaluate))
         indexed_params.sort(key=lambda item: (item[1].window_days, item[1].max_symbols))
 
-        if worker_count <= 1 or len(params_to_evaluate) <= 1:
-            for orig_idx, params in indexed_params:
-                universe = universe_by_max_symbols.get(int(params.max_symbols)) if can_prebuild else None
-                idx_out, point, failed = _evaluate_single_point(orig_idx, params, universe)
-                _record_eval_result(idx_out, point, failed)
-        else:
+        _plateau_engine = BacktestEngine(
+            get_candles=self._ensure_candles,
+            build_row=self._build_row_from_candles,
+            calc_snapshot=lambda row, window_days, as_of_date: self._calc_wyckoff_snapshot(
+                row, window_days=window_days, as_of_date=as_of_date,
+            ),
+            resolve_symbol_name=self._resolve_symbol_name,
+        )
+
+        def _candidate_cache_key(p: BacktestPlateauParams) -> tuple:
+            return (int(p.window_days), float(p.min_score), float(p.stop_loss), float(p.take_profit), int(p.max_symbols))
+
+        from collections import defaultdict as _ddict
+
+        groups_by_ckey: dict[tuple, list[tuple[int, BacktestPlateauParams]]] = _ddict(list)
+        for orig_idx, params in indexed_params:
+            groups_by_ckey[_candidate_cache_key(params)].append((orig_idx, params))
+
+        primary_plan: list[tuple[int, BacktestPlateauParams, tuple]] = []
+        replay_plan: list[tuple[int, BacktestPlateauParams, tuple]] = []
+        for ckey, group in groups_by_ckey.items():
+            primary_plan.append((group[0][0], group[0][1], ckey))
+            for orig_idx, params in group[1:]:
+                replay_plan.append((orig_idx, params, ckey))
+
+        reuse_groups = sum(1 for group in groups_by_ckey.values() if len(group) > 1)
+        reuse_points = len(replay_plan)
+        if reuse_points > 0 and progress_callback is not None:
+            progress_callback(
+                0,
+                int(total_to_evaluate),
+                f"候选交易缓存优化：{reuse_groups} 组共享候选，{reuse_points} 个点可快速重放",
+            )
+
+        candidate_cache: dict[tuple, list[CandidateTrade]] = {}
+        candidate_cache_failed: set[tuple] = set()
+        candidate_cache_building: dict[tuple, Event] = {}
+        candidate_cache_lock = RLock()
+
+        def _build_candidates_for_key(
+            ckey: tuple,
+            params: BacktestPlateauParams,
+            universe: tuple[list[str], dict[str, set[str]] | None, list[str]] | None,
+        ) -> list[CandidateTrade] | None:
+            run_payload = base.model_copy(
+                update={
+                    "window_days": params.window_days,
+                    "min_score": params.min_score,
+                    "stop_loss": params.stop_loss,
+                    "take_profit": params.take_profit,
+                    "max_positions": params.max_positions,
+                    "position_pct": params.position_pct,
+                    "max_symbols": params.max_symbols,
+                    "priority_topk_per_day": params.priority_topk_per_day,
+                    "enable_advanced_analysis": False,
+                },
+                deep=True,
+            )
+            _ = ckey
+            try:
+                symbols_for_run = universe[0] if universe else []
+                allowed_for_run = universe[1] if universe else None
+                if not symbols_for_run:
+                    return None
+                return _plateau_engine.run_candidates_only(
+                    payload=run_payload,
+                    symbols=symbols_for_run,
+                    allowed_symbols_by_date=allowed_for_run,
+                    apply_priority_topk=False,
+                    control_callback=control_callback,
+                )
+            except BacktestTaskCancelledError:
+                raise
+            except Exception:
+                return None
+
+        def _get_or_build_candidates(
+            params: BacktestPlateauParams,
+            universe: tuple[list[str], dict[str, set[str]] | None, list[str]] | None,
+        ) -> list[CandidateTrade] | None:
+            ckey = _candidate_cache_key(params)
+            while True:
+                owner = False
+                wait_event: Event | None = None
+                with candidate_cache_lock:
+                    cached = candidate_cache.get(ckey)
+                    if cached is not None:
+                        return cached
+                    if ckey in candidate_cache_failed:
+                        return None
+                    wait_event = candidate_cache_building.get(ckey)
+                    if wait_event is None:
+                        wait_event = Event()
+                        candidate_cache_building[ckey] = wait_event
+                        owner = True
+
+                if owner:
+                    built: list[CandidateTrade] | None = None
+                    cancelled = False
+                    try:
+                        built = _build_candidates_for_key(ckey, params, universe)
+                    except BacktestTaskCancelledError:
+                        cancelled = True
+                        raise
+                    finally:
+                        with candidate_cache_lock:
+                            if built is not None:
+                                candidate_cache[ckey] = built
+                                candidate_cache_failed.discard(ckey)
+                            elif not cancelled:
+                                candidate_cache_failed.add(ckey)
+                            event = candidate_cache_building.pop(ckey, None)
+                            if event is not None:
+                                event.set()
+                    return built
+
+                if wait_event is None:
+                    continue
+                while True:
+                    if control_callback is not None:
+                        control_callback()
+                    if wait_event.wait(timeout=0.1):
+                        break
+
+        def _evaluate_replay_point(
+            orig_idx: int,
+            params: BacktestPlateauParams,
+            universe: tuple[list[str], dict[str, set[str]] | None, list[str]] | None,
+        ) -> tuple[int, BacktestPlateauPoint, bool]:
+            cached = _get_or_build_candidates(params, universe)
+            if cached is not None:
+                return _evaluate_single_point(orig_idx, params, universe, cached_candidates=cached)
+            return _evaluate_single_point(orig_idx, params, universe)
+
+        def _run_plan_parallel(
+            plan: list[tuple[int, BacktestPlateauParams, tuple]],
+            evaluator: Callable[
+                [int, BacktestPlateauParams, tuple[list[str], dict[str, set[str]] | None, list[str]] | None],
+                tuple[int, BacktestPlateauPoint, bool],
+            ],
+        ) -> None:
+            nonlocal cancelled_exc
+            if not plan:
+                return
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                future_to_index: dict[Any, int] = {}
-                pending = iter(indexed_params)
+                future_to_meta: dict[Any, tuple[int, BacktestPlateauParams, tuple]] = {}
+                pending = iter(plan)
 
                 def _submit_next() -> None:
+                    if cancelled_exc is not None:
+                        return
                     try:
-                        orig_idx, params = next(pending)
+                        orig_idx, params, ckey = next(pending)
                     except StopIteration:
                         return
                     universe = universe_by_max_symbols.get(int(params.max_symbols)) if can_prebuild else None
-                    future = executor.submit(_evaluate_single_point, orig_idx, params, universe)
-                    future_to_index[future] = orig_idx
+                    future = executor.submit(evaluator, orig_idx, params, universe)
+                    future_to_meta[future] = (orig_idx, params, ckey)
 
-                for _ in range(worker_count):
+                for _ in range(min(worker_count, len(plan))):
                     _submit_next()
 
-                while future_to_index:
-                    done_future = next(as_completed(list(future_to_index.keys())))
-                    fallback_index = future_to_index.pop(done_future)
+                while future_to_meta:
+                    done_future = next(as_completed(list(future_to_meta.keys())))
+                    fallback_idx, fallback_params, _ = future_to_meta.pop(done_future)
                     try:
                         idx_out, point, failed = done_future.result()
                     except BacktestTaskCancelledError as exc:
                         cancelled_exc = exc
-                        for pending_future in list(future_to_index.keys()):
+                        for pending_future in list(future_to_meta.keys()):
                             pending_future.cancel()
                         break
                     except Exception as exc:  # noqa: BLE001
-                        idx_out = int(fallback_index)
-                        point = _build_failed_point(params_to_evaluate[idx_out], exc)
+                        idx_out = int(fallback_idx)
+                        point = _build_failed_point(fallback_params, exc)
                         failed = True
                     _record_eval_result(idx_out, point, failed)
                     _submit_next()
+
+        if worker_count <= 1 or len(params_to_evaluate) <= 1:
+            for orig_idx, params, _ in primary_plan:
+                universe = universe_by_max_symbols.get(int(params.max_symbols)) if can_prebuild else None
+                idx_out, point, failed = _evaluate_single_point(orig_idx, params, universe)
+                _record_eval_result(idx_out, point, failed)
+            for orig_idx, params, _ in replay_plan:
+                universe = universe_by_max_symbols.get(int(params.max_symbols)) if can_prebuild else None
+                idx_out, point, failed = _evaluate_replay_point(orig_idx, params, universe)
+                _record_eval_result(idx_out, point, failed)
+        else:
+            _run_plan_parallel(
+                primary_plan,
+                lambda idx, params, universe: _evaluate_single_point(idx, params, universe),
+            )
+            if cancelled_exc is None:
+                _run_plan_parallel(replay_plan, _evaluate_replay_point)
 
         if cancelled_exc is not None:
             raise cancelled_exc
@@ -9008,6 +9186,8 @@ class InMemoryStore:
                 )
             notes.append(f"参考网格组合规模（按列表离散值估算）: {grid_total_combinations}。")
         notes.append(f"收益平原并行评估线程数: {worker_count}。")
+        if reuse_points > 0:
+            notes.append(f"候选重放复用: {reuse_groups} 组共享，复用点位 {reuse_points}。")
         if can_prebuild and universe_by_max_symbols:
             notes.append(
                 f"候选池预构建优化: {len(universe_by_max_symbols)} 个不同 max_symbols 值共享候选池，"
@@ -13427,6 +13607,3 @@ class InMemoryStore:
 
 
 store = InMemoryStore()
-
-
-

@@ -2066,5 +2066,278 @@ class BacktestEngine:
             max_concurrent_positions=max_concurrent_positions,
         )
 
+    # ------------------------------------------------------------------
+    # Plateau 优化：候选交易复用 + 仅重放组合模拟
+    # ------------------------------------------------------------------
+
+    def run_candidates_only(
+        self,
+        *,
+        payload: BacktestRunRequest,
+        symbols: list[str],
+        allowed_symbols_by_date: dict[str, set[str]] | None = None,
+        apply_priority_topk: bool = True,
+        control_callback: Callable[[], None] | None = None,
+    ) -> list[CandidateTrade]:
+        """Build and return sorted candidate trades without portfolio simulation.
+
+        Used by plateau evaluation to cache candidates across parameter
+        combinations that share the same candidate-generation key.
+        """
+        start_dt = self._parse_date(payload.date_from)
+        end_dt = self._parse_date(payload.date_to)
+        if start_dt is None or end_dt is None:
+            raise ValueError("date_from/date_to 必须是 YYYY-MM-DD")
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+        start_date = start_dt.strftime("%Y-%m-%d")
+        end_date = end_dt.strftime("%Y-%m-%d")
+
+        candidates: list[CandidateTrade] = []
+        for symbol in symbols:
+            if control_callback is not None:
+                control_callback()
+            rows, _, _ = self._build_candidates_for_symbol(
+                symbol,
+                payload,
+                start_date,
+                end_date,
+                allowed_symbols_by_date=allowed_symbols_by_date,
+                allow_reentry_after_skipped=payload.pool_roll_mode == "position",
+                control_callback=control_callback,
+            )
+            candidates.extend(rows)
+
+        if payload.prioritize_signals:
+            candidates.sort(
+                key=lambda row: self._candidate_sort_key(row, priority_mode=payload.priority_mode),
+            )
+        else:
+            candidates.sort(key=lambda row: (row.entry_date, row.symbol, row.exit_date))
+
+        if apply_priority_topk and payload.prioritize_signals and payload.priority_topk_per_day > 0:
+            kept: list[CandidateTrade] = []
+            day_counter: dict[str, int] = defaultdict(int)
+            for row in candidates:
+                if day_counter[row.signal_date] >= payload.priority_topk_per_day:
+                    continue
+                kept.append(row)
+                day_counter[row.signal_date] += 1
+            candidates = kept
+
+        return candidates
+
+    def replay_portfolio(
+        self,
+        *,
+        candidates: list[CandidateTrade],
+        payload: BacktestRunRequest,
+    ) -> BacktestResponse:
+        """Run portfolio simulation on pre-built candidates (no signal detection).
+
+        This is the fast path for plateau evaluation: candidates are built once
+        and then replayed with different (max_positions, position_pct,
+        priority_topk_per_day) combinations.
+        """
+        start_dt = self._parse_date(payload.date_from)
+        end_dt = self._parse_date(payload.date_to)
+        if start_dt is None or end_dt is None:
+            raise ValueError("date_from/date_to 必须是 YYYY-MM-DD")
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+        start_date = start_dt.strftime("%Y-%m-%d")
+        end_date = end_dt.strftime("%Y-%m-%d")
+
+        # Re-apply topk filter with the current payload's priority_topk_per_day
+        effective_candidates = candidates
+        if payload.prioritize_signals and payload.priority_topk_per_day > 0:
+            kept: list[CandidateTrade] = []
+            day_counter: dict[str, int] = defaultdict(int)
+            for row in candidates:
+                if day_counter[row.signal_date] >= payload.priority_topk_per_day:
+                    continue
+                kept.append(row)
+                day_counter[row.signal_date] += 1
+            effective_candidates = kept
+
+        candidate_count = len(effective_candidates)
+        fee_rate = max(0.0, float(payload.fee_bps)) / 10000.0
+
+        cash = float(payload.initial_capital)
+        equity = float(payload.initial_capital)
+        max_concurrent_positions = 0
+        active_positions: list[dict[str, float | str]] = []
+        executed: list[BacktestTrade] = []
+        skip_reasons: dict[str, int] = {
+            "max_positions": 0,
+            "insufficient_cash": 0,
+            "invalid_price": 0,
+            "duplicate_symbol": 0,
+        }
+        active_symbols: set[str] = set()
+
+        def release_until(current_entry_date: str) -> None:
+            nonlocal cash, equity, active_positions, active_symbols
+            if not active_positions:
+                return
+            remaining: list[dict[str, float | str]] = []
+            for item in active_positions:
+                exit_date = str(item.get("exit_date", ""))
+                if exit_date < current_entry_date:
+                    cash += float(item.get("exit_amount", 0.0))
+                    equity += float(item.get("pnl_amount", 0.0))
+                    sym = str(item.get("symbol", "")).strip().lower()
+                    if sym:
+                        active_symbols.discard(sym)
+                else:
+                    remaining.append(item)
+            active_positions = remaining
+
+        for row in effective_candidates:
+            release_until(row.entry_date)
+
+            if row.symbol in active_symbols:
+                skip_reasons["duplicate_symbol"] += 1
+                continue
+            if len(active_positions) >= payload.max_positions:
+                skip_reasons["max_positions"] += 1
+                continue
+
+            entry_exec = float(row.entry_price) * (1 + fee_rate)
+            exit_exec = float(row.exit_price) * (1 - fee_rate)
+            if not math.isfinite(entry_exec) or not math.isfinite(exit_exec) or entry_exec <= 0:
+                skip_reasons["invalid_price"] += 1
+                continue
+
+            allocation = min(cash, max(0.0, equity * payload.position_pct))
+            shares = int(math.floor(allocation / entry_exec / 100.0)) * 100
+            if shares <= 0:
+                skip_reasons["insufficient_cash"] += 1
+                continue
+
+            invested = shares * entry_exec
+            if invested <= 0 or invested > cash + 1e-9:
+                skip_reasons["insufficient_cash"] += 1
+                continue
+
+            exit_amount = shares * exit_exec
+            pnl_amount = exit_amount - invested
+            pnl_ratio = pnl_amount / invested if invested > 0 else 0.0
+            cash -= invested
+
+            active_positions.append({
+                "symbol": row.symbol,
+                "exit_date": row.exit_date,
+                "exit_amount": float(exit_amount),
+                "pnl_amount": float(pnl_amount),
+            })
+            active_symbols.add(row.symbol)
+            max_concurrent_positions = max(max_concurrent_positions, len(active_positions))
+
+            executed.append(BacktestTrade(
+                symbol=row.symbol,
+                name=self._resolve_symbol_name(row.symbol),
+                signal_date=row.signal_date,
+                entry_date=row.entry_date,
+                exit_date=row.exit_date,
+                entry_signal=row.entry_signal,
+                entry_phase=row.entry_phase,
+                entry_quality_score=round(row.entry_quality_score, 2),
+                candle_quality_score=round(row.candle_quality_score, 2),
+                cost_center_shift_score=round(row.cost_center_shift_score, 2),
+                weekly_context_score=round(row.weekly_context_score, 2),
+                weekly_context_multiplier=round(row.weekly_context_multiplier, 4),
+                health_score=round(row.health_score, 2),
+                event_score=round(row.event_score, 2),
+                risk_score=round(row.risk_score, 2),
+                confirmation_status=self._normalize_confirmation_status(row.confirmation_status),
+                event_grade=self._normalize_event_grade(row.event_grade),
+                phase_context_score=round(row.phase_context_score, 2),
+                event_recency_score=round(row.event_recency_score, 2),
+                exit_reason=row.exit_reason,
+                delay_entry_days=max(1, int(row.delay_entry_days)),
+                delay_window_days=max(0, int(row.delay_window_days)),
+                quantity=shares,
+                entry_price=round(row.entry_price, 4),
+                exit_price=round(row.exit_price, 4),
+                holding_days=row.holding_days,
+                pnl_amount=round(pnl_amount, 4),
+                pnl_ratio=round(pnl_ratio, 6),
+            ))
+
+        if active_positions:
+            for item in sorted(active_positions, key=lambda r: str(r.get("exit_date", ""))):
+                cash += float(item.get("exit_amount", 0.0))
+                equity += float(item.get("pnl_amount", 0.0))
+
+        skipped_count = int(sum(skip_reasons.values()))
+        fill_rate = (len(executed) / candidate_count) if candidate_count > 0 else 0.0
+        trade_count = len(executed)
+        win_count = sum(1 for t in executed if t.pnl_amount > 0)
+        loss_count = sum(1 for t in executed if t.pnl_amount < 0)
+        gross_profit = sum(t.pnl_amount for t in executed if t.pnl_amount > 0)
+        gross_loss = sum(t.pnl_amount for t in executed if t.pnl_amount < 0)
+        avg_pnl_ratio = (sum(t.pnl_ratio for t in executed) / trade_count) if trade_count > 0 else 0.0
+        win_rate = (win_count / trade_count) if trade_count > 0 else 0.0
+        total_pnl = sum(t.pnl_amount for t in executed)
+        final_equity = float(payload.initial_capital) + total_pnl
+        total_return = (final_equity / payload.initial_capital - 1) if payload.initial_capital > 0 else 0.0
+        if gross_loss < 0:
+            profit_factor = gross_profit / abs(gross_loss)
+        elif gross_profit > 0:
+            profit_factor = math.inf
+        else:
+            profit_factor = 0.0
+
+        notes: list[str] = [f"plateau replay: candidates={candidate_count}, portfolio_only=True"]
+        monthly_agg: dict[str, dict[str, float]] = defaultdict(lambda: {"pnl": 0.0, "count": 0.0})
+        for t in executed:
+            month = t.exit_date[:7]
+            monthly_agg[month]["pnl"] += t.pnl_amount
+            monthly_agg[month]["count"] += 1.0
+        monthly_returns = [
+            MonthlyReturnPoint(
+                month=m,
+                return_ratio=round(v["pnl"] / payload.initial_capital, 6) if payload.initial_capital > 0 else 0.0,
+                pnl_amount=round(v["pnl"], 4),
+                trade_count=int(v["count"]),
+            )
+            for m, v in sorted(monthly_agg.items())
+        ]
+        stats = ReviewStats(
+            win_rate=round(win_rate, 6),
+            total_return=round(total_return, 6),
+            max_drawdown=0.0,
+            avg_pnl_ratio=round(avg_pnl_ratio, 6),
+            trade_count=trade_count,
+            win_count=win_count,
+            loss_count=loss_count,
+            profit_factor=round(profit_factor, 6) if math.isfinite(profit_factor) else 999.0,
+        )
+        cost_snapshot = SimTradingConfig(
+            initial_capital=float(payload.initial_capital),
+            commission_rate=min(0.01, fee_rate),
+            min_commission=0.0,
+            stamp_tax_rate=0.0,
+            transfer_fee_rate=0.0,
+            slippage_rate=0.0,
+        )
+        return BacktestResponse(
+            stats=stats,
+            trades=executed,
+            equity_curve=[],
+            drawdown_curve=[],
+            monthly_returns=monthly_returns,
+            top_trades=sorted(executed, key=lambda t: t.pnl_amount, reverse=True)[:10],
+            bottom_trades=sorted(executed, key=lambda t: t.pnl_amount)[:10],
+            cost_snapshot=cost_snapshot,
+            range=ReviewRange(date_from=start_date, date_to=end_date, date_axis="sell"),
+            notes=notes,
+            candidate_count=candidate_count,
+            skipped_count=skipped_count,
+            fill_rate=round(fill_rate, 6),
+            max_concurrent_positions=max_concurrent_positions,
+        )
+
 
 
