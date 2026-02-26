@@ -35,7 +35,7 @@ def _build_row(symbol: str, **overrides: object) -> ScreenerResult:
         "has_divergence_5d": False,
         "has_upper_shadow_risk": False,
         "ai_confidence": 0.7,
-        "theme_stage": "发酵中",
+        "theme_stage": "Unknown",
         "trend_class": "A",
         "stage": "Mid",
         "labels": [],
@@ -47,7 +47,7 @@ def _build_row(symbol: str, **overrides: object) -> ScreenerResult:
     return ScreenerResult(**payload)
 
 
-def test_screener_filters_use_soft_then_hard_overheat_gate() -> None:
+def test_screener_filters_follow_step3_risk_flags() -> None:
     params = ScreenerParams(
         markets=["sh", "sz"],
         mode="strict",
@@ -66,12 +66,14 @@ def test_screener_filters_use_soft_then_hard_overheat_gate() -> None:
         has_divergence_5d=True,
         has_upper_shadow_risk=True,
     )
+    step_configs = InMemoryStore._resolve_screener_step_configs(params)
 
     _step1, _step2, step3, _step4 = InMemoryStore._run_screener_filters_for_backtest(
         [base, soft_risk, hard_risk],
-        params,
+        mode=params.mode,
+        step_configs=step_configs,
     )
     symbols = [row.symbol for row in step3]
     assert "sz300750" in symbols
-    assert "sz300751" in symbols
+    assert "sz300751" not in symbols
     assert "sz300752" not in symbols

@@ -91,6 +91,11 @@ const WYCKOFF_EVENT_GUIDE = {
   risk: ['PSY', 'BC', 'AR(d)', 'ST(d)', 'UTAD', 'SOW', 'LPSY'],
 }
 
+const ACCUMULATION_EVENT_CODES = new Set(['PS', 'SC', 'AR', 'ST', 'TSO', 'SPRING', 'SOS', 'JOC', 'LPS'])
+const DISTRIBUTION_EVENT_CODES = new Set(['UTAD', 'SOW', 'LPSY', 'PSY', 'BC', 'AR(D)', 'ST(D)'])
+const CREEK_EVENT_CODES = new Set(['AR', 'ST', 'TSO', 'JOC', 'LPS'])
+const ICE_EVENT_CODES = new Set(['AR(D)', 'ST(D)', 'LPSY', 'SOW'])
+
 const WYCKOFF_EVENT_CN_MAP: Record<string, string> = {
   PS: '\u521d\u59cb\u652f\u6491',
   SC: '\u5356\u51fa\u9ad8\u6f6e',
@@ -167,7 +172,12 @@ function resolveSignalShape(signal: SignalType) {
 }
 
 function normalizeEventCode(event: string) {
-  return event.trim().replace(/\s+/g, '').toUpperCase()
+  const compact = event.trim().replace(/[\s_-]+/g, '').toUpperCase()
+  if (compact === 'SPRING' || compact === 'SP') return 'SPRING'
+  if (compact === 'ARD' || compact === 'AR(D)') return 'AR(D)'
+  if (compact === 'STD' || compact === 'ST(D)') return 'ST(D)'
+  if (compact === 'JUMPACROSSCREEK') return 'JOC'
+  return compact
 }
 
 function formatEventGuideWithZh(codes: string[]) {
@@ -181,11 +191,72 @@ function formatEventGuideWithZh(codes: string[]) {
 
 function resolveEventCategory(eventCode: string): EventCategory {
   const normalized = normalizeEventCode(eventCode)
-  const accumulationEvents = new Set(['PS', 'SC', 'AR', 'ST', 'TSO', 'SPRING', 'SOS', 'JOC', 'LPS'])
-  const distributionRiskEvents = new Set(['UTAD', 'SOW', 'LPSY', 'PSY', 'BC', 'AR(D)', 'ST(D)'])
-  if (accumulationEvents.has(normalized)) return 'accumulation'
-  if (distributionRiskEvents.has(normalized)) return 'distributionRisk'
+  if (ACCUMULATION_EVENT_CODES.has(normalized)) return 'accumulation'
+  if (DISTRIBUTION_EVENT_CODES.has(normalized)) return 'distributionRisk'
   return 'other'
+}
+
+function buildWyckoffBoundaryLine(
+  points: EventPointDraft[],
+  options: {
+    allowedCodes: Set<string>
+    anchor: 'high' | 'low'
+    lineName: string
+    color: string
+  },
+) {
+  const {
+    allowedCodes,
+    anchor,
+    lineName,
+    color,
+  } = options
+  const picked = points
+    .filter((item) => item.anchor === anchor && allowedCodes.has(normalizeEventCode(item.eventCode)))
+    .map((item) => ({
+      date: item.dateKey,
+      price: Number(item.value[1]),
+    }))
+    .filter((item) => Number.isFinite(item.price) && item.price > 0)
+  if (picked.length < 2) return null
+
+  const dedupByDate = new Map<string, number>()
+  for (const item of picked) {
+    const previous = dedupByDate.get(item.date)
+    if (previous === undefined) {
+      dedupByDate.set(item.date, item.price)
+      continue
+    }
+    if (anchor === 'high') {
+      dedupByDate.set(item.date, Math.max(previous, item.price))
+    } else {
+      dedupByDate.set(item.date, Math.min(previous, item.price))
+    }
+  }
+  const ordered = Array.from(dedupByDate.entries()).map(([date, price]) => ({ date, price }))
+  if (ordered.length < 2) return null
+
+  const start = ordered[0]
+  const end = ordered[ordered.length - 1]
+  if (!start || !end) return null
+  return {
+    tooltipText: `${lineName}: 基于 ${ordered.length} 个威科夫事件点自动计算`,
+    data: [
+      {
+        name: lineName,
+        coord: [start.date, start.price],
+        symbol: 'none',
+        lineStyle: { color, width: 1.8, type: 'dashed' },
+        label: { show: true, formatter: lineName, color },
+        tooltipText: `${lineName}: 基于 ${ordered.length} 个威科夫事件点自动计算`,
+      },
+      {
+        coord: [end.date, end.price],
+        symbol: 'none',
+      },
+    ] as const,
+    legendItem: { label: `${lineName}(自动)`, color, symbol: 'line' as const },
+  }
 }
 
 function resolveEventColor(category: EventCategory) {
@@ -273,9 +344,14 @@ function toStackedMarkPoints(points: MarkPointDraft[]) {
   for (const group of grouped.values()) {
     const offsets = buildStackOffsetsAbove(group.length)
     group.forEach((point, index) => {
-      const { dateKey: _dateKey, ...rest } = point
       stacked.push({
-        ...rest,
+        name: point.name,
+        coord: point.coord,
+        value: point.value,
+        symbol: point.symbol,
+        symbolSize: point.symbolSize,
+        tooltipText: point.tooltipText,
+        itemStyle: point.itemStyle,
         symbolOffset: [0, offsets[index]],
       })
     })
@@ -305,9 +381,11 @@ function toStackedEventPoints(points: EventPointDraft[]) {
     const anchor = group[0].anchor
     const offsets = anchor === 'high' ? buildStackOffsetsAbove(group.length) : buildStackOffsetsBelow(group.length)
     group.forEach((point, index) => {
-      const { dateKey: _dateKey, category, anchor: _anchor, ...rest } = point
-      byCategory[category].push({
-        ...rest,
+      byCategory[point.category].push({
+        value: point.value,
+        eventCode: point.eventCode,
+        tooltipText: point.tooltipText,
+        itemStyle: point.itemStyle,
         symbolOffset: [0, offsets[index]],
       })
     })
@@ -436,7 +514,15 @@ export function KLineChart({
       const mappedEventHint = mappedEventDate === eventDateSource ? '' : ` -> ${mappedEventDate}`
       eventTimelineIndexes.push(eventIndex)
 
-      const anchor = category === 'distributionRisk' ? 'high' : 'low'
+      const normalizedEventCode = normalizeEventCode(eventCode)
+      const anchor =
+        CREEK_EVENT_CODES.has(normalizedEventCode)
+          ? 'high'
+          : ICE_EVENT_CODES.has(normalizedEventCode)
+            ? 'low'
+            : category === 'distributionRisk'
+              ? 'high'
+              : 'low'
       const anchorPrice = anchor === 'high' ? candles[eventIndex].high : candles[eventIndex].low
       const eventDisplayName = resolveEventDisplayName(eventCode)
       eventPointDrafts.push({
@@ -577,10 +663,24 @@ export function KLineChart({
   const eventPointsByCategory = toStackedEventPoints(eventPointDrafts)
   const unknownEventCodes = Array.from(unknownEventCodeSet).sort((a, b) => a.localeCompare(b, 'zh-CN'))
   const unknownPhaseNames = Array.from(unknownPhaseNameSet).sort((a, b) => a.localeCompare(b, 'zh-CN'))
+  const creekLine = buildWyckoffBoundaryLine(eventPointDrafts, {
+    allowedCodes: CREEK_EVENT_CODES,
+    anchor: 'high',
+    lineName: '小溪线',
+    color: '#0f8b6f',
+  })
+  const iceLine = buildWyckoffBoundaryLine(eventPointDrafts, {
+    allowedCodes: ICE_EVENT_CODES,
+    anchor: 'low',
+    lineName: '冰线',
+    color: '#2458d3',
+  })
 
   const markLineData = [
     resolveDateMarkLine(manualStartDate, xData, '\u4eba\u5de5\u542f\u52a8\u65e5', '#13c2c2'),
     resolveDateMarkLine(aiBreakoutDate, xData, 'AI\u8d77\u7206\u65e5', '#fa8c16'),
+    creekLine?.data,
+    iceLine?.data,
   ].filter(Boolean)
   const primaryLegendItems: LegendItem[] = [
     { label: '\u65e5K', color: '#ce5649', symbol: 'line' },
@@ -625,6 +725,12 @@ export function KLineChart({
   }
   if (phaseLegendFlags.stats) {
     annotationLegendItems.push({ label: '\u7edf\u8ba1\u533a\u95f4', color: 'rgba(250, 173, 20, 0.50)', symbol: 'area' })
+  }
+  if (creekLine) {
+    annotationLegendItems.push(creekLine.legendItem)
+  }
+  if (iceLine) {
+    annotationLegendItems.push(iceLine.legendItem)
   }
 
   const option = {
@@ -761,6 +867,10 @@ export function KLineChart({
             color: '#2f5452',
             backgroundColor: 'rgba(255,255,255,0.7)',
             padding: [2, 6],
+          },
+          tooltip: {
+            formatter: (params: { data?: { tooltipText?: string; name?: string }; name?: string }) =>
+              params.data?.tooltipText ?? params.data?.name ?? params.name ?? '',
           },
           data: markLineData,
         },

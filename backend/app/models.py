@@ -38,6 +38,48 @@ class DataProviderStatus(BaseModel):
     refreshed_at: str
 
 
+class ScreenerStep1Config(BaseModel):
+    top_n: int = Field(default=500, ge=100, le=2000)
+    turnover_threshold: float = Field(default=0.05, ge=0.01, le=0.2)
+    amount_threshold: float = Field(default=5e8, ge=5e7, le=5e9)
+    amplitude_threshold: float = Field(default=0.03, ge=0.01, le=0.15)
+
+
+class ScreenerStep2Config(BaseModel):
+    retrace_min: float = Field(default=0.05, ge=0.0, le=0.8)
+    retrace_max: float = Field(default=0.25, ge=0.0, le=0.8)
+    max_pullback_days: int = Field(default=3, ge=0, le=30)
+    min_ma10_above_ma20_days: int = Field(default=5, ge=0, le=40)
+    min_ma5_above_ma10_days: int = Field(default=3, ge=0, le=40)
+    max_price_vs_ma20: float = Field(default=0.08, ge=0.0, le=0.5)
+    require_above_ma20: bool = True
+    allow_b_trend: bool = False
+
+
+class ScreenerStep3Config(BaseModel):
+    min_vol_slope20: float = Field(default=0.05, ge=0.0, le=2.0)
+    min_up_down_volume_ratio: float = Field(default=1.3, ge=0.0, le=20.0)
+    max_pullback_volume_ratio: float = Field(default=0.9, ge=0.0, le=5.0)
+    allow_blowoff_top: bool = False
+    allow_divergence_5d: bool = False
+    allow_upper_shadow_risk: bool = False
+    allow_degraded: bool = False
+
+
+class ScreenerStep4Config(BaseModel):
+    final_top_n: int = Field(default=8, ge=1, le=500)
+    min_ai_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    allowed_theme_stages: list[ThemeStage] = Field(default_factory=lambda: ["发酵中", "高潮"], min_length=1)
+    allow_degraded: bool = True
+
+
+class ScreenerStepConfigs(BaseModel):
+    step1: ScreenerStep1Config = Field(default_factory=ScreenerStep1Config)
+    step2: ScreenerStep2Config = Field(default_factory=ScreenerStep2Config)
+    step3: ScreenerStep3Config = Field(default_factory=ScreenerStep3Config)
+    step4: ScreenerStep4Config = Field(default_factory=ScreenerStep4Config)
+
+
 class ScreenerParams(BaseModel):
     markets: list[Market] = Field(min_length=1)
     mode: ScreenerMode
@@ -47,6 +89,7 @@ class ScreenerParams(BaseModel):
     turnover_threshold: float = Field(ge=0.01, le=0.2)
     amount_threshold: float = Field(ge=5e7, le=5e9)
     amplitude_threshold: float = Field(ge=0.01, le=0.15)
+    step_configs: ScreenerStepConfigs | None = None
 
 
 class ScreenerResult(BaseModel):
@@ -106,6 +149,7 @@ class ScreenerRunDetail(BaseModel):
     created_at: str
     as_of_date: str | None = None
     params: ScreenerParams
+    step_configs: ScreenerStepConfigs = Field(default_factory=ScreenerStepConfigs)
     step_summary: ScreenerStepSummary
     step_pools: ScreenerStepPools
     results: list[ScreenerResult]

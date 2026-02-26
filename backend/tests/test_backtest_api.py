@@ -751,7 +751,7 @@ def test_backtest_plateau_task_supports_pause_resume_cancel(monkeypatch: pytest.
     assert final_task["status"] == "cancelled"
 
 
-def test_backtest_run_falls_back_when_run_missing() -> None:
+def test_backtest_run_requires_existing_run_when_run_missing() -> None:
     dates = _load_symbol_dates("sz300750")
     date_from = dates[-35]
     date_to = dates[-8]
@@ -765,10 +765,10 @@ def test_backtest_run_falls_back_when_run_missing() -> None:
         "date_to": date_to,
     }
     resp = client.post("/api/backtest/run", json=payload)
-    assert resp.status_code == 200
+    assert resp.status_code == 400
     body = resp.json()
-    assert isinstance(body["trades"], list)
-    assert any("已改用系统筛选参数重建滚动池" in note for note in body["notes"])
+    message_text = str(body.get("message", ""))
+    assert "筛选任务 missing-run-id 不存在或已失效" in message_text
 
 
 def test_backtest_run_respects_board_filters() -> None:
@@ -1023,6 +1023,8 @@ def test_backtest_run_full_market_position_mode() -> None:
 
 
 def test_backtest_task_rejects_when_candle_coverage_insufficient(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TDX_TREND_BACKTEST_TASK_PRECHECK_ASYNC", "0")
+
     def _fake_scan_dates(_: str, __: str) -> list[str]:
         return ["2025-01-02", "2025-01-03"]
 
@@ -1058,6 +1060,8 @@ def test_backtest_task_rejects_when_candle_coverage_insufficient(monkeypatch: py
 
 
 def test_backtest_task_rejects_when_candles_window_too_short(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TDX_TREND_BACKTEST_TASK_PRECHECK_ASYNC", "0")
+
     def _fake_scan_dates(_: str, __: str) -> list[str]:
         return [f"2025-01-{(idx % 28) + 1:02d}" for idx in range(140)]
 
@@ -1656,41 +1660,17 @@ def test_backtest_run_full_market_weekly_matrix_path(monkeypatch: pytest.MonkeyP
     assert any("矩阵引擎已启用" in note for note in body["notes"])
 
 
-def test_backtest_run_trend_pool_weekly_matrix_path(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_backtest_run_trend_pool_weekly_forces_legacy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     dates = _load_symbol_dates("sz300750")
     date_from = dates[-20]
     date_to = dates[-12]
 
-    def _fake_resolve(run_id: str):  # noqa: ANN001
-        params = ScreenerParams(
-            markets=["sh", "sz"],
-            mode="strict",
-            as_of_date=date_to,
-            return_window_days=40,
-            top_n=500,
-            turnover_threshold=0.05,
-            amount_threshold=500000000,
-            amplitude_threshold=0.03,
-        )
-        return params, run_id, None, None
-
-    def _fake_build(*args, **kwargs):  # noqa: ANN002, ANN003
-        scan_dates = store._build_backtest_scan_dates(date_from, date_to)
-        allowed = {day: {"sz300750"} for day in scan_dates}
-        refresh_dates = kwargs.get("refresh_dates")
-        if refresh_dates:
-            refresh_used = list(refresh_dates)
-        else:
-            refresh_used = store._build_weekly_refresh_dates(scan_dates)
-        return ["sz300750"], allowed, ["mock trend_pool matrix universe"], scan_dates, refresh_used
-
     monkeypatch.setenv("TDX_TREND_BACKTEST_MATRIX_ENGINE", "1")
-    monkeypatch.setattr(store, "_resolve_backtest_trend_pool_params", _fake_resolve)
-    monkeypatch.setattr(store, "_build_trend_pool_rolling_universe", _fake_build)
+    run_id = _create_trend_pool_run(date_to)
 
     payload = {
         "mode": "trend_pool",
-        "run_id": "mock-run",
+        "run_id": run_id,
         "pool_roll_mode": "weekly",
         "date_from": date_from,
         "date_to": date_to,
@@ -1704,9 +1684,9 @@ def test_backtest_run_trend_pool_weekly_matrix_path(monkeypatch: pytest.MonkeyPa
     body = resp.json()
     assert body["range"]["date_from"] == date_from
     assert body["range"]["date_to"] == date_to
-    assert body["execution_path"] == "matrix"
-    assert any("矩阵引擎已启用" in note for note in body["notes"])
-    assert any("使用筛选任务: mock-run" in note for note in body["notes"])
+    assert body["execution_path"] == "legacy"
+    assert any("execution_path_preference=legacy" in note for note in body["notes"])
+    assert any(f"使用筛选任务: {run_id}" in note for note in body["notes"])
 
 
 def test_backtest_input_pool_disk_cache_reuses_refresh_day_payload(
@@ -1852,9 +1832,11 @@ def test_trend_pool_rolling_universe_reuses_trend_filter_cache(
 
     def _fake_run_filters(
         rows: list[ScreenerResult],
-        params: ScreenerParams,
+        *,
+        mode: str,
+        step_configs,
     ) -> tuple[list[ScreenerResult], list[ScreenerResult], list[ScreenerResult], list[ScreenerResult]]:
-        _ = params
+        _ = (mode, step_configs)
         calls["filters"] += 1
         return list(rows), list(rows), list(rows), list(rows)
 

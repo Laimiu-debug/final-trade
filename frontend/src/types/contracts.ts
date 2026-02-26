@@ -38,6 +38,49 @@ export interface ScreenerParams {
   turnover_threshold: number
   amount_threshold: number
   amplitude_threshold: number
+  step_configs?: ScreenerStepConfigs
+}
+
+export interface ScreenerStep1Config {
+  top_n: number
+  turnover_threshold: number
+  amount_threshold: number
+  amplitude_threshold: number
+}
+
+export interface ScreenerStep2Config {
+  retrace_min: number
+  retrace_max: number
+  max_pullback_days: number
+  min_ma10_above_ma20_days: number
+  min_ma5_above_ma10_days: number
+  max_price_vs_ma20: number
+  require_above_ma20: boolean
+  allow_b_trend: boolean
+}
+
+export interface ScreenerStep3Config {
+  min_vol_slope20: number
+  min_up_down_volume_ratio: number
+  max_pullback_volume_ratio: number
+  allow_blowoff_top: boolean
+  allow_divergence_5d: boolean
+  allow_upper_shadow_risk: boolean
+  allow_degraded: boolean
+}
+
+export interface ScreenerStep4Config {
+  final_top_n: number
+  min_ai_confidence: number
+  allowed_theme_stages: ThemeStage[]
+  allow_degraded: boolean
+}
+
+export interface ScreenerStepConfigs {
+  step1: ScreenerStep1Config
+  step2: ScreenerStep2Config
+  step3: ScreenerStep3Config
+  step4: ScreenerStep4Config
 }
 
 export interface ScreenerResult {
@@ -101,6 +144,7 @@ export interface ScreenerRunDetail {
   created_at: string
   as_of_date?: string
   params: ScreenerParams
+  step_configs?: ScreenerStepConfigs
   step_summary: ScreenerStepSummary
   step_pools: ScreenerStepPools
   results: ScreenerResult[]

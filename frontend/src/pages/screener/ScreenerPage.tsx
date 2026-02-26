@@ -27,7 +27,7 @@ import type { MenuProps } from 'antd'
 import { Controller, useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { CloudDownloadOutlined, DownOutlined, SettingOutlined, ShoppingCartOutlined, UpOutlined } from '@ant-design/icons'
+import { DownOutlined, SettingOutlined, ShoppingCartOutlined, UpOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import { jsPDF } from 'jspdf'
 import autoTable from 'jspdf-autotable'
@@ -35,7 +35,7 @@ import * as XLSX from 'xlsx'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { DismissibleAlert } from '@/shared/components/DismissibleAlert'
 import { ApiError } from '@/shared/api/client'
-import { getScreenerRun, getStrategies, runScreener, syncMarketData } from '@/shared/api/endpoints'
+import { getScreenerRun, getStrategies, runScreener } from '@/shared/api/endpoints'
 import {
   getSharedLastStrategyId,
   resolveDefaultStrategyId,
@@ -47,6 +47,7 @@ import type {
   ScreenerParams,
   ScreenerPoolKey,
   ScreenerResult,
+  ScreenerStepConfigs,
   ScreenerStepPools,
   StrategyId,
   ThemeStage,
@@ -67,40 +68,7 @@ const formSchema = z.object({
 
 type FormValues = z.infer<typeof formSchema>
 type ScreenerRunMeta = { runId: string; degraded: boolean; degradedReason?: string; asOfDate?: string }
-
-interface StepConfigs {
-  step1: {
-    top_n: number
-    turnover_threshold: number
-    amount_threshold: number
-    amplitude_threshold: number
-  }
-  step2: {
-    retrace_min: number
-    retrace_max: number
-    max_pullback_days: number
-    min_ma10_above_ma20_days: number
-    min_ma5_above_ma10_days: number
-    max_price_vs_ma20: number
-    require_above_ma20: boolean
-    allow_b_trend: boolean
-  }
-  step3: {
-    min_vol_slope20: number
-    min_up_down_volume_ratio: number
-    max_pullback_volume_ratio: number
-    allow_blowoff_top: boolean
-    allow_divergence_5d: boolean
-    allow_upper_shadow_risk: boolean
-    allow_degraded: boolean
-  }
-  step4: {
-    final_top_n: number
-    min_ai_confidence: number
-    allowed_theme_stages: ThemeStage[]
-    allow_degraded: boolean
-  }
-}
+type StepConfigs = ScreenerStepConfigs
 
 const defaultStepConfigs: StepConfigs = {
   step1: {
@@ -136,6 +104,35 @@ const defaultStepConfigs: StepConfigs = {
   },
 }
 
+function mergeStepConfigs(config?: ScreenerStepConfigs): StepConfigs {
+  const step1 = config?.step1
+  const step2 = config?.step2
+  const step3 = config?.step3
+  const step4 = config?.step4
+  return {
+    step1: {
+      ...defaultStepConfigs.step1,
+      ...(step1 ?? {}),
+    },
+    step2: {
+      ...defaultStepConfigs.step2,
+      ...(step2 ?? {}),
+    },
+    step3: {
+      ...defaultStepConfigs.step3,
+      ...(step3 ?? {}),
+    },
+    step4: {
+      ...defaultStepConfigs.step4,
+      ...(step4 ?? {}),
+      allowed_theme_stages:
+        step4?.allowed_theme_stages && step4.allowed_theme_stages.length > 0
+          ? [...step4.allowed_theme_stages]
+          : [...defaultStepConfigs.step4.allowed_theme_stages],
+    },
+  }
+}
+
 const defaultFormValues: FormValues = {
   board_filters: ['main', 'gem', 'star'],
   mode: 'strict',
@@ -161,10 +158,10 @@ const poolStepIndex: Record<ScreenerPoolKey, number> = {
 
 const poolLabelMap: Record<ScreenerPoolKey, string> = {
   input: '输入池',
-  step1: '第1步池',
-  step2: '第2步池',
-  step3: '第3步池',
-  step4: '第4步池',
+  step1: '第1步通过',
+  step2: '第2步通过',
+  step3: '第3步通过',
+  step4: '第4步通过',
   final: '终选池',
 }
 
@@ -885,6 +882,7 @@ export function ScreenerPage() {
   const [runMeta, setRunMeta] = useState<ScreenerRunMeta | undefined>(initialCache.run_meta)
   const [stepConfigs, setStepConfigs] = useState<StepConfigs>(initialCache.step_configs)
   const [runningStep, setRunningStep] = useState<number | null>(null)
+  const [pendingAutoRecomputeStep, setPendingAutoRecomputeStep] = useState<1 | 2 | 3 | 4 | null>(null)
   const [columnOrder, setColumnOrder] = useState<ScreenerColumnKey[]>(initialCache.column_order)
   const [columnVisible, setColumnVisible] = useState<Record<ScreenerColumnKey, boolean>>(
     initialCache.column_visible,
@@ -1002,7 +1000,7 @@ export function ScreenerPage() {
     saveScreenerCache(latestCacheSnapshotRef.current)
   }, [])
 
-  function buildScreenerParams(values: FormValues): ScreenerParams {
+  function buildScreenerParams(values: FormValues, configs: StepConfigs): ScreenerParams {
     const markets = ['sh', 'sz', 'bj'] as const
     const asOfDate = values.as_of_date.trim()
     return {
@@ -1014,12 +1012,21 @@ export function ScreenerPage() {
       turnover_threshold: values.turnover_threshold,
       amount_threshold: values.amount_threshold,
       amplitude_threshold: values.amplitude_threshold,
+      step_configs: {
+        step1: { ...configs.step1 },
+        step2: { ...configs.step2 },
+        step3: { ...configs.step3 },
+        step4: {
+          ...configs.step4,
+          allowed_theme_stages: [...configs.step4.allowed_theme_stages],
+        },
+      },
     }
   }
 
   const loadInputMutation = useMutation({
     mutationFn: async (values: FormValues) => {
-      const params = buildScreenerParams(values)
+      const params = buildScreenerParams(values, stepConfigs)
       const run = await runScreener(params)
       const detail = await getScreenerRun(run.run_id)
       return detail
@@ -1027,6 +1034,7 @@ export function ScreenerPage() {
     onSuccess: (detail, values) => {
       const sourceInputPool = detail.step_pools?.input ?? detail.results
       const inputPool = filterRowsByBoards(sourceInputPool, values.board_filters)
+      const mergedStepConfigs = mergeStepConfigs(detail.step_configs)
       setRawInputPool(sourceInputPool)
       setPools((prev) => ({
         input: inputPool,
@@ -1044,6 +1052,11 @@ export function ScreenerPage() {
         degradedReason: detail.degraded_reason,
         asOfDate: detail.as_of_date ?? undefined,
       })
+      setStepConfigs(mergedStepConfigs)
+      setValue('top_n', mergedStepConfigs.step1.top_n, { shouldDirty: false, shouldValidate: false })
+      setValue('turnover_threshold', mergedStepConfigs.step1.turnover_threshold, { shouldDirty: false, shouldValidate: false })
+      setValue('amount_threshold', mergedStepConfigs.step1.amount_threshold, { shouldDirty: false, shouldValidate: false })
+      setValue('amplitude_threshold', mergedStepConfigs.step1.amplitude_threshold, { shouldDirty: false, shouldValidate: false })
       setInputPoolKey(
         buildInputPoolKey({
           return_window_days: values.return_window_days,
@@ -1051,34 +1064,6 @@ export function ScreenerPage() {
         }),
       )
       message.success(`已加载输入池（当前板块 ${inputPool.length} / 全量 ${sourceInputPool.length}）`)
-    },
-    onError: (error) => {
-      message.error(formatApiErrorMessage(error))
-    },
-  })
-
-  const syncMarketDataMutation = useMutation({
-    mutationFn: () =>
-      syncMarketData({
-        provider: 'baostock',
-        mode: 'incremental',
-        symbols: '',
-        all_market: true,
-        limit: 300,
-        start_date: '',
-        end_date: '',
-        initial_days: 420,
-        sleep_sec: 0.01,
-        out_dir: '',
-      }),
-    onSuccess: (result) => {
-      if (result.ok) {
-        message.success(
-          `Baostock 已更新：成功 ${result.ok_count}，跳过 ${result.skipped_count}，新增 ${result.new_rows_total} 行`,
-        )
-      } else {
-        message.warning(result.message || 'Baostock 同步完成，但存在失败项')
-      }
     },
     onError: (error) => {
       message.error(formatApiErrorMessage(error))
@@ -1187,6 +1172,7 @@ export function ScreenerPage() {
         const boardFilters = getValues('board_filters')
         const inputPool = filterRowsByBoards(sourceInputPool, boardFilters)
         const stepPools = detail.step_pools
+        const mergedStepConfigs = mergeStepConfigs(detail.step_configs)
         setRawInputPool(sourceInputPool)
         setPools((prev) => ({
           input: inputPool,
@@ -1202,6 +1188,11 @@ export function ScreenerPage() {
           degradedReason: detail.degraded_reason,
           asOfDate: detail.as_of_date ?? undefined,
         })
+        setStepConfigs(mergedStepConfigs)
+        setValue('top_n', mergedStepConfigs.step1.top_n, { shouldDirty: false, shouldValidate: false })
+        setValue('turnover_threshold', mergedStepConfigs.step1.turnover_threshold, { shouldDirty: false, shouldValidate: false })
+        setValue('amount_threshold', mergedStepConfigs.step1.amount_threshold, { shouldDirty: false, shouldValidate: false })
+        setValue('amplitude_threshold', mergedStepConfigs.step1.amplitude_threshold, { shouldDirty: false, shouldValidate: false })
         const runWindowDays =
           typeof detail.params?.return_window_days === 'number' && Number.isFinite(detail.params.return_window_days)
             ? detail.params.return_window_days
@@ -1238,7 +1229,7 @@ export function ScreenerPage() {
     return () => {
       cancelled = true
     }
-  }, [getValues, hasAnyPoolData, message, runMeta?.runId])
+  }, [getValues, hasAnyPoolData, message, runMeta?.runId, setValue])
 
   const nextPoolKey = useMemo<ScreenerPoolKey | null>(() => {
     const currentIndex = poolOrder.indexOf(activePool)
@@ -1631,6 +1622,14 @@ export function ScreenerPage() {
   }
 
   function invalidateFrom(step: 1 | 2 | 3 | 4) {
+    const canAutoRecompute = pools.input.length > 0 && executedStep >= step
+    if (canAutoRecompute) {
+      setPendingAutoRecomputeStep((previous) => {
+        if (previous === null) return step
+        return Math.min(previous, step) as 1 | 2 | 3 | 4
+      })
+      return
+    }
     setPools((prev) => {
       if (step === 1) return { ...prev, step1: [], step2: [], step3: [], step4: [] }
       if (step === 2) return { ...prev, step2: [], step3: [], step4: [] }
@@ -1640,6 +1639,31 @@ export function ScreenerPage() {
     setExecutedStep((prev) => Math.min(prev, step - 1))
     setActivePool((prev) => (poolStepIndex[prev] >= step ? previousPoolByStep[step] : prev))
   }
+
+  useEffect(() => {
+    if (pendingAutoRecomputeStep === null) return
+    if (!(pools.input.length > 0 && executedStep >= pendingAutoRecomputeStep)) {
+      setPendingAutoRecomputeStep(null)
+      return
+    }
+    setPools((prev) => {
+      const next: ScreenerStepPools = { ...prev }
+      if (pendingAutoRecomputeStep <= 1) {
+        next.step1 = mergeManualRows(runStep1(prev.input, stepConfigs.step1), prev.step1)
+      }
+      if (pendingAutoRecomputeStep <= 2) {
+        next.step2 = mergeManualRows(runStep2(next.step1, stepConfigs.step2, mode), prev.step2)
+      }
+      if (pendingAutoRecomputeStep <= 3) {
+        next.step3 = mergeManualRows(runStep3(next.step2, stepConfigs.step3), prev.step3)
+      }
+      if (pendingAutoRecomputeStep <= 4) {
+        next.step4 = mergeManualRows(runStep4(next.step3, stepConfigs.step4), prev.step4)
+      }
+      return next
+    })
+    setPendingAutoRecomputeStep(null)
+  }, [executedStep, mode, pendingAutoRecomputeStep, pools.input.length, stepConfigs])
 
   async function executeStep(step: 1 | 2 | 3 | 4) {
     if (step > executedStep + 1) {
@@ -2278,6 +2302,29 @@ export function ScreenerPage() {
         badge="分步运行"
       />
 
+      <Alert
+        type={runMeta?.runId ? (runMeta.degraded ? 'warning' : 'info') : 'warning'}
+        showIcon
+        title={runMeta?.runId ? `Run追踪: ${runMeta.runId}` : 'Run追踪: 暂无 run_id'}
+        description={(
+          <Space wrap>
+            {runMeta?.runId ? (
+              <>
+                <Typography.Text type="secondary">当前漏斗结果固定关联该 run_id。</Typography.Text>
+                <Typography.Text type="secondary">筛选日期: {runMeta.asOfDate ?? '最新'}</Typography.Text>
+                <Typography.Text type="secondary">
+                  状态: {runMeta.degraded ? `降级(${runMeta.degradedReason ?? '未知原因'})` : '正常'}
+                </Typography.Text>
+              </>
+            ) : (
+              <Typography.Text type="secondary">
+                请先点击“加载输入池”运行一次筛选，系统会生成 run_id 并在 Signals/Backtest 页面复用。
+              </Typography.Text>
+            )}
+          </Space>
+        )}
+      />
+
       <Card className="glass-card" variant="borderless">
         <Space orientation="vertical" size={14} style={{ width: '100%' }}>
           <Typography.Text strong>筛选参数</Typography.Text>
@@ -2403,15 +2450,6 @@ export function ScreenerPage() {
 
           <Space>
             <Button
-              icon={<CloudDownloadOutlined />}
-              loading={syncMarketDataMutation.isPending}
-              onClick={() => {
-                void syncMarketDataMutation.mutateAsync()
-              }}
-            >
-              一键增量更新行情（Baostock）
-            </Button>
-            <Button
               loading={loadInputMutation.isPending && runningStep === null}
               onClick={handleSubmit(async (values) => {
                 try {
@@ -2529,13 +2567,7 @@ export function ScreenerPage() {
               >
                 <Space orientation="vertical" size={6} style={{ width: '100%', overflow: 'hidden' }}>
                   <Statistic
-                    title={
-                      poolKey === 'input'
-                        ? '输入池'
-                        : poolKey === 'final'
-                          ? '终选池'
-                          : `第${poolStepIndex[poolKey]}步通过`
-                    }
+                    title={poolLabelMap[poolKey]}
                     value={cardValues[poolKey]}
                   />
                   {poolKey === 'input' ? (
@@ -2698,22 +2730,6 @@ export function ScreenerPage() {
         })}
       </Row>
 
-      {runMeta?.degraded ? (
-        <Alert
-          type="warning"
-          showIcon
-          title="本次筛选包含降级数据"
-          description={runMeta.degradedReason}
-        />
-      ) : null}
-      {runMeta?.asOfDate ? (
-        <Alert
-          type="info"
-          showIcon
-          title={`当前筛选日期: ${runMeta.asOfDate}`}
-          description="该输入池与后续漏斗步骤均基于该日期（及以前）行情数据。"
-        />
-      ) : null}
       {inputPoolOutdated ? (
         <Alert
           type="info"

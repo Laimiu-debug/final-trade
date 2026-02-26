@@ -93,6 +93,11 @@ from .models import (
     ScreenerParams,
     ScreenerResult,
     ScreenerRunDetail,
+    ScreenerStep1Config,
+    ScreenerStep2Config,
+    ScreenerStep3Config,
+    ScreenerStep4Config,
+    ScreenerStepConfigs,
     ScreenerStepPools,
     ScreenerStepSummary,
     SignalScanMode,
@@ -1326,10 +1331,54 @@ class InMemoryStore:
             return cls._resolve_user_path(env_value)
         return Path.home() / ".tdx-trend" / "backtest-reports"
 
+    @staticmethod
+    def _max_persisted_screener_runs() -> int:
+        raw = os.getenv("TDX_TREND_MAX_PERSISTED_SCREENER_RUNS", "").strip()
+        if not raw:
+            return 12
+        try:
+            return max(1, min(200, int(raw)))
+        except Exception:
+            return 12
+
+    def _serialize_screener_runs_for_state(self) -> dict[str, dict[str, Any]]:
+        if not self._run_store:
+            return {}
+        limit = self._max_persisted_screener_runs()
+        ordered_runs = sorted(self._run_store.values(), key=lambda item: item.created_at)
+        selected_runs = ordered_runs[-limit:]
+        out: dict[str, dict[str, Any]] = {}
+        for run in selected_runs:
+            out[str(run.run_id)] = run.model_dump(exclude_none=True)
+        return out
+
+    def _restore_screener_runs_from_state(self, raw_runs: object) -> None:
+        if not isinstance(raw_runs, dict):
+            return
+        restored_runs: list[ScreenerRunDetail] = []
+        for run_id, item in raw_runs.items():
+            if not isinstance(item, dict):
+                continue
+            try:
+                detail = ScreenerRunDetail(**item)
+            except Exception:
+                continue
+            if str(detail.run_id).strip() != str(run_id).strip():
+                detail = detail.model_copy(update={"run_id": str(run_id)})
+            restored_runs.append(detail)
+        if not restored_runs:
+            return
+        restored_runs.sort(key=lambda item: item.created_at)
+        self._run_store = {}
+        self._latest_rows = {}
+        for detail in restored_runs:
+            self._store_screener_run_detail(detail, persist=False)
+
     def _build_app_state_payload(self) -> dict[str, object]:
         return {
             "schema_version": self._APP_STATE_SCHEMA_VERSION,
             "config": self._config.model_dump(),
+            "screener_runs": self._serialize_screener_runs_for_state(),
             "ai_records": [item.model_dump() for item in self._ai_record_store],
             "annotations": {symbol: item.model_dump() for symbol, item in self._annotation_store.items()},
             "daily_reviews": {day: item.model_dump() for day, item in self._daily_review_store.items()},
@@ -1378,6 +1427,7 @@ class InMemoryStore:
             if isinstance(config_raw, dict):
                 merged = {**default_config.model_dump(), **config_raw}
                 self._config = AppConfig(**merged)
+            self._restore_screener_runs_from_state(raw.get("screener_runs"))
             annotations_raw = raw.get("annotations")
             if isinstance(annotations_raw, dict):
                 restored_annotations: dict[str, StockAnnotation] = {}
@@ -4238,7 +4288,7 @@ class InMemoryStore:
     def _build_screener_run_id() -> str:
         return f"{int(datetime.now().timestamp() * 1000)}-{uuid4().hex[:6]}"
 
-    def _store_screener_run_detail(self, detail: ScreenerRunDetail) -> ScreenerRunDetail:
+    def _store_screener_run_detail(self, detail: ScreenerRunDetail, *, persist: bool = True) -> ScreenerRunDetail:
         latest_rows: dict[str, ScreenerResult] = {}
         for row in detail.step_pools.input:
             latest_rows[row.symbol] = row
@@ -4252,6 +4302,8 @@ class InMemoryStore:
             latest_rows[row.symbol] = row
         self._latest_rows = latest_rows
         self._run_store[detail.run_id] = detail
+        if persist:
+            self._persist_app_state()
         return detail
 
     def _is_screener_result_cache_enabled(self) -> bool:
@@ -4366,35 +4418,41 @@ class InMemoryStore:
         run_id: str,
         params: ScreenerParams,
     ) -> ScreenerRunDetail:
+        resolved_step_configs = self._resolve_screener_step_configs(params)
+        normalized_params = self._bind_step_configs_to_screener_params(params, resolved_step_configs)
         return cached_detail.model_copy(
             update={
                 "run_id": run_id,
                 "created_at": self._now_datetime(),
-                "as_of_date": params.as_of_date,
-                "params": params,
+                "as_of_date": normalized_params.as_of_date,
+                "params": normalized_params,
+                "step_configs": resolved_step_configs,
             }
         )
 
     def create_screener_run(self, params: ScreenerParams) -> ScreenerRunDetail:
+        resolved_step_configs = self._resolve_screener_step_configs(params)
+        normalized_params = self._bind_step_configs_to_screener_params(params, resolved_step_configs)
         run_id = self._build_screener_run_id()
-        cached_detail = self._load_screener_result_cache(params)
+        cached_detail = self._load_screener_result_cache(normalized_params)
         if cached_detail is not None:
             detail = self._clone_screener_detail_for_new_run(
                 cached_detail,
                 run_id=run_id,
-                params=params,
+                params=normalized_params,
             )
             return self._store_screener_run_detail(detail)
 
         real_input_pool, real_error, _cache_hit = self._load_input_pool_rows(
-            markets=params.markets,
-            return_window_days=params.return_window_days,
-            as_of_date=params.as_of_date,
+            markets=normalized_params.markets,
+            return_window_days=normalized_params.return_window_days,
+            as_of_date=normalized_params.as_of_date,
         )
         if real_input_pool:
             step1_pool, step2_pool, step3_pool, step4_raw_pool = self._run_screener_filters_for_backtest(
                 rows=real_input_pool,
-                params=params,
+                mode=normalized_params.mode,
+                step_configs=resolved_step_configs,
             )
             step4_pool = [
                 row.model_copy(update={"labels": list({*row.labels, "待买观察"})})
@@ -4405,8 +4463,9 @@ class InMemoryStore:
             detail = ScreenerRunDetail(
                 run_id=run_id,
                 created_at=self._now_datetime(),
-                as_of_date=params.as_of_date,
-                params=params,
+                as_of_date=normalized_params.as_of_date,
+                params=normalized_params,
+                step_configs=resolved_step_configs,
                 step_summary=ScreenerStepSummary(
                     input_count=len(real_input_pool),
                     step1_count=len(step1_pool),
@@ -4425,10 +4484,10 @@ class InMemoryStore:
                 degraded=bool(has_degraded_rows or real_error),
                 degraded_reason=real_error,
             )
-            self._save_screener_result_cache(params, detail)
+            self._save_screener_result_cache(normalized_params, detail)
             return self._store_screener_run_detail(detail)
 
-        mode = params.mode
+        mode = normalized_params.mode
 
         input_count = 5100
         step1_count = 400
@@ -4465,8 +4524,9 @@ class InMemoryStore:
         detail = ScreenerRunDetail(
             run_id=run_id,
             created_at=self._now_datetime(),
-            as_of_date=params.as_of_date,
-            params=params,
+            as_of_date=normalized_params.as_of_date,
+            params=normalized_params,
+            step_configs=resolved_step_configs,
             step_summary=ScreenerStepSummary(
                 input_count=input_count,
                 step1_count=step1_count,
@@ -4606,21 +4666,29 @@ class InMemoryStore:
         latest = max(self._run_store.values(), key=lambda run: run.created_at)
         return latest.run_id
 
-    def _resolve_signal_candidates(
+    @staticmethod
+    def _merge_degraded_reasons(*reasons: str | None) -> str | None:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for raw in reasons:
+            text = str(raw or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            merged.append(text)
+        if not merged:
+            return None
+        return ";".join(merged)
+
+    def _resolve_trend_pool_run_candidates(
         self,
         *,
-        mode: SignalScanMode,
-        run_id: str | None,
-        trend_step: TrendPoolStep = "auto",
-        as_of_date: str | None = None,
-    ) -> tuple[list[ScreenerResult], str | None, str | None, str | None]:
-        if mode == "trend_pool":
-            resolved_run_id = run_id or self._latest_run_id()
-            if not resolved_run_id:
-                return [], "TREND_POOL_RUN_NOT_FOUND", None, as_of_date
-            run = self._run_store.get(resolved_run_id)
-            if run is None:
-                return [], "TREND_POOL_RUN_NOT_FOUND", resolved_run_id, as_of_date
+        run: ScreenerRunDetail,
+        trend_step: TrendPoolStep,
+        as_of_date: str | None,
+    ) -> tuple[list[ScreenerResult], str | None, str | None]:
+        normalized_as_of_date = str(as_of_date or "").strip() or None
+        if (normalized_as_of_date is None) or normalized_as_of_date == run.as_of_date:
             if trend_step == "step4":
                 source = run.step_pools.step4
             elif trend_step == "step3":
@@ -4631,13 +4699,60 @@ class InMemoryStore:
                 source = run.step_pools.step1
             else:
                 source = run.step_pools.step4 or run.step_pools.step3
+            degraded_reason = run.degraded_reason if run.degraded else None
+            return source, degraded_reason, (run.as_of_date or normalized_as_of_date)
+
+        input_rows, load_error, _cache_hit = self._load_input_pool_rows(
+            markets=run.params.markets,
+            return_window_days=run.params.return_window_days,
+            as_of_date=normalized_as_of_date,
+        )
+        if not input_rows:
+            return [], self._merge_degraded_reasons(load_error, run.degraded_reason if run.degraded else None), normalized_as_of_date
+
+        step_configs = run.step_configs if isinstance(run.step_configs, ScreenerStepConfigs) else self._resolve_screener_step_configs(run.params)
+        step1_pool, step2_pool, step3_pool, step4_pool = self._run_screener_filters_for_backtest(
+            input_rows,
+            mode=run.params.mode,
+            step_configs=step_configs,
+        )
+        source = self._select_step_source_for_backtest(
+            trend_step=trend_step,
+            step1_pool=step1_pool,
+            step2_pool=step2_pool,
+            step3_pool=step3_pool,
+            step4_pool=step4_pool,
+        )
+        degraded_reason = self._merge_degraded_reasons(load_error, run.degraded_reason if run.degraded else None)
+        return source, degraded_reason, normalized_as_of_date
+
+    def _resolve_signal_candidates(
+        self,
+        *,
+        mode: SignalScanMode,
+        run_id: str | None,
+        trend_step: TrendPoolStep = "auto",
+        as_of_date: str | None = None,
+    ) -> tuple[list[ScreenerResult], str | None, str | None, str | None]:
+        if mode == "trend_pool":
+            resolved_run_id = str(run_id or "").strip() or None
+            if not resolved_run_id:
+                return [], "TREND_POOL_RUN_NOT_FOUND", None, as_of_date
+            run = self._run_store.get(resolved_run_id)
+            if run is None:
+                return [], "TREND_POOL_RUN_NOT_FOUND", resolved_run_id, as_of_date
+            source, degraded_reason, resolved_as_of_date = self._resolve_trend_pool_run_candidates(
+                run=run,
+                trend_step=trend_step,
+                as_of_date=as_of_date,
+            )
             if not source:
                 if trend_step == "auto":
                     reason = "TREND_POOL_EMPTY"
                 else:
                     reason = f"TREND_POOL_{trend_step.upper()}_EMPTY"
-                return [], reason, resolved_run_id, (as_of_date or run.as_of_date)
-            return source, run.degraded_reason if run.degraded else None, resolved_run_id, (as_of_date or run.as_of_date)
+                return [], reason, resolved_run_id, resolved_as_of_date
+            return source, degraded_reason, resolved_run_id, resolved_as_of_date
 
         source, error, cache_hit = self._load_input_pool_rows(
             markets=self._config.markets,
@@ -4831,6 +4946,9 @@ class InMemoryStore:
         min_event_count: int,
         signal_age_min: int,
         signal_age_max: int | None,
+        backtest_date_from: str | None,
+        backtest_pool_roll_mode: BacktestPoolRollMode | None,
+        backtest_max_symbols: int | None,
     ) -> str:
         payload = {
             "mode": mode,
@@ -4849,6 +4967,9 @@ class InMemoryStore:
             "min_event_count": min_event_count,
             "signal_age_min": int(signal_age_min),
             "signal_age_max": (int(signal_age_max) if signal_age_max is not None else None),
+            "backtest_date_from": str(backtest_date_from or "").strip(),
+            "backtest_pool_roll_mode": str(backtest_pool_roll_mode or "").strip(),
+            "backtest_max_symbols": (int(backtest_max_symbols) if backtest_max_symbols is not None else None),
         }
         return json.dumps(payload, sort_keys=True, ensure_ascii=True)
 
@@ -4870,6 +4991,9 @@ class InMemoryStore:
         min_event_count: int = 1,
         signal_age_min: int = 0,
         signal_age_max: int | None = None,
+        backtest_date_from: str | None = None,
+        backtest_pool_roll_mode: BacktestPoolRollMode | None = None,
+        backtest_max_symbols: int | None = None,
     ) -> SignalsResponse:
         strategy_meta, normalized_strategy_params, strategy_params_hash = self._resolve_strategy_runtime(
             strategy_id=strategy_id,
@@ -4901,12 +5025,19 @@ class InMemoryStore:
             strategy_signal_overrides.get("require_key_event_confirmation", False)
         )
 
-        candidates, degraded_reason, resolved_run_id, resolved_as_of_date = self._resolve_signal_candidates(
-            mode=mode,
-            run_id=run_id,
-            trend_step=trend_step,
-            as_of_date=as_of_date,
+        replay_date_from = str(backtest_date_from or "").strip() or None
+        replay_pool_roll_mode = (
+            backtest_pool_roll_mode
+            if backtest_pool_roll_mode in {"daily", "weekly", "position"}
+            else None
         )
+        replay_max_symbols = None
+        if backtest_max_symbols is not None:
+            try:
+                replay_max_symbols = max(20, min(2000, int(backtest_max_symbols)))
+            except Exception:
+                replay_max_symbols = None
+
         requested_signal_age_min = max(0, int(signal_age_min))
         requested_signal_age_max = (
             max(0, int(signal_age_max))
@@ -4933,12 +5064,87 @@ class InMemoryStore:
             )
         allowed_markets = {"sh", "sz", "bj"}
         normalized_market_filters = list(dict.fromkeys(item for item in (market_filters or []) if item in allowed_markets))
-        if normalized_market_filters:
-            candidates = [row for row in candidates if self._row_matches_market_filters(row, normalized_market_filters)]
         allowed_board_filters = {"main", "gem", "star", "beijing", "st"}
         normalized_board_filters = list(
             dict.fromkeys(item for item in (board_filters or []) if item in allowed_board_filters)
         )
+
+        candidates, degraded_reason, resolved_run_id, resolved_as_of_date = self._resolve_signal_candidates(
+            mode=mode,
+            run_id=run_id,
+            trend_step=trend_step,
+            as_of_date=as_of_date,
+        )
+
+        if mode == "trend_pool" and replay_date_from and replay_pool_roll_mode == "position":
+            replay_as_of_date = str(resolved_as_of_date or as_of_date or "").strip()
+            if replay_as_of_date:
+                replay_start = replay_date_from
+                if replay_start > replay_as_of_date:
+                    replay_start = replay_as_of_date
+                try:
+                    replay_run = self._require_backtest_trend_pool_run(run_id or resolved_run_id)
+                    replay_step_configs = (
+                        replay_run.step_configs
+                        if isinstance(replay_run.step_configs, ScreenerStepConfigs)
+                        else self._resolve_screener_step_configs(replay_run.params)
+                    )
+                    replay_screener_params = self._bind_step_configs_to_screener_params(
+                        replay_run.params,
+                        replay_step_configs,
+                    )
+                    input_rows, load_error, _cache_hit = self._load_input_pool_rows(
+                        markets=replay_screener_params.markets,
+                        return_window_days=replay_screener_params.return_window_days,
+                        as_of_date=replay_start,
+                    )
+                    replay_step1, replay_step2, replay_step3, replay_step4 = self._run_screener_filters_for_backtest(
+                        input_rows,
+                        mode=replay_screener_params.mode,
+                        step_configs=replay_step_configs,
+                    )
+                    replay_source = self._select_step_source_for_backtest(
+                        trend_step=trend_step,
+                        step1_pool=replay_step1,
+                        step2_pool=replay_step2,
+                        step3_pool=replay_step3,
+                        step4_pool=replay_step4,
+                    )
+                    if normalized_board_filters:
+                        replay_source = [
+                            row for row in replay_source
+                            if self._row_matches_board_filters(row, normalized_board_filters)
+                        ]
+                    replay_limit = (
+                        int(replay_max_symbols)
+                        if replay_max_symbols is not None
+                        else max(20, min(2000, len(candidates) if len(candidates) > 0 else 120))
+                    )
+                    replay_candidates: list[ScreenerResult] = []
+                    replay_seen: set[str] = set()
+                    for row in replay_source:
+                        symbol_text = str(row.symbol).strip().lower()
+                        if not symbol_text or symbol_text in replay_seen:
+                            continue
+                        replay_seen.add(symbol_text)
+                        replay_candidates.append(row)
+                        if len(replay_candidates) >= replay_limit:
+                            break
+                    if replay_candidates or not candidates:
+                        candidates = replay_candidates
+                    capability_notes.append(
+                        f"回测复盘口径候选池: roll=position, date_from={replay_start}, symbols={len(candidates)}。"
+                    )
+                    capability_notes.append(
+                        "position 口径使用起始日候选池沿用至刷新日，可能与“按筛选日期重建池”结果不同。"
+                    )
+                    if load_error:
+                        degraded_reason = self._merge_degraded_reasons(degraded_reason, load_error)
+                except Exception as exc:
+                    capability_notes.append(f"回测复盘口径候选池构建失败，已回退按筛选日期重建池：{exc}")
+
+        if normalized_market_filters:
+            candidates = [row for row in candidates if self._row_matches_market_filters(row, normalized_market_filters)]
         if normalized_board_filters:
             candidates = [row for row in candidates if self._row_matches_board_filters(row, normalized_board_filters)]
         strategy_id_text = str(strategy_meta["strategy_id"])
@@ -4975,6 +5181,9 @@ class InMemoryStore:
             min_event_count=min_event_count,
             signal_age_min=normalized_signal_age_min,
             signal_age_max=normalized_signal_age_max,
+            backtest_date_from=replay_date_from,
+            backtest_pool_roll_mode=replay_pool_roll_mode,
+            backtest_max_symbols=replay_max_symbols,
         )
         now_ts = time.time()
         cache_ttl_sec = 180
@@ -5414,35 +5623,88 @@ class InMemoryStore:
         return InMemoryStore._clamp_score_0_100(rank_score)
 
     @staticmethod
+    def _default_screener_step_configs_from_params(params: ScreenerParams) -> ScreenerStepConfigs:
+        return ScreenerStepConfigs(
+            step1=ScreenerStep1Config(
+                top_n=int(params.top_n),
+                turnover_threshold=float(params.turnover_threshold),
+                amount_threshold=float(params.amount_threshold),
+                amplitude_threshold=float(params.amplitude_threshold),
+            ),
+            step2=ScreenerStep2Config(),
+            step3=ScreenerStep3Config(),
+            step4=ScreenerStep4Config(),
+        )
+
+    @classmethod
+    def _resolve_screener_step_configs(cls, params: ScreenerParams) -> ScreenerStepConfigs:
+        base = cls._default_screener_step_configs_from_params(params)
+        provided = params.step_configs
+        if provided is None:
+            return base
+        provided_raw = provided.model_dump(exclude_unset=True, exclude_none=True)
+        if not provided_raw:
+            return base
+        merged = base.model_dump()
+        for key, value in provided_raw.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key].update(value)
+            else:
+                merged[key] = value
+        return ScreenerStepConfigs(**merged)
+
+    @staticmethod
+    def _bind_step_configs_to_screener_params(
+        params: ScreenerParams,
+        step_configs: ScreenerStepConfigs,
+    ) -> ScreenerParams:
+        return params.model_copy(
+            update={
+                "top_n": int(step_configs.step1.top_n),
+                "turnover_threshold": float(step_configs.step1.turnover_threshold),
+                "amount_threshold": float(step_configs.step1.amount_threshold),
+                "amplitude_threshold": float(step_configs.step1.amplitude_threshold),
+                "step_configs": step_configs,
+            }
+        )
+
+    @staticmethod
     def _run_screener_filters_for_backtest(
         rows: list[ScreenerResult],
-        params: ScreenerParams,
+        *,
+        mode: ScreenerMode,
+        step_configs: ScreenerStepConfigs,
     ) -> tuple[list[ScreenerResult], list[ScreenerResult], list[ScreenerResult], list[ScreenerResult]]:
-        step1_pool = sorted(
-            (
-                row
-                for row in rows
-                if row.turnover20 >= params.turnover_threshold
-                and row.amount20 >= params.amount_threshold
-                and row.amplitude20 >= params.amplitude_threshold
-            ),
-            key=lambda row: (
-                InMemoryStore._compute_trend_rank_score(row),
-                row.ret40,
-                row.score,
-            ),
-            reverse=True,
-        )[: params.top_n]
+        step1_cfg = step_configs.step1
+        step2_cfg = step_configs.step2
+        step3_cfg = step_configs.step3
+        step4_cfg = step_configs.step4
+
+        step1_pool = (
+            sorted(
+                (
+                    row
+                    for row in rows
+                    if row.turnover20 >= step1_cfg.turnover_threshold
+                    and row.amount20 >= step1_cfg.amount_threshold
+                    and row.amplitude20 >= step1_cfg.amplitude_threshold
+                ),
+                key=lambda row: row.ret40,
+                reverse=True,
+            )[: step1_cfg.top_n]
+        )
         if len(step1_pool) > 400:
             step1_pool = step1_pool[:400]
 
-        loose_padding = 0.02 if params.mode == "loose" else 0.0
-        loose_days = 1 if params.mode == "loose" else 0
-        retrace_min = max(0.0, 0.05 - loose_padding)
-        retrace_max = min(0.8, 0.25 + loose_padding)
-        max_pullback_days = 3 + loose_days
-        min_ma10_days = max(0, 5 - loose_days)
-        min_ma5_days = max(0, 3 - loose_days)
+        loose_padding = 0.02 if mode == "loose" else 0.0
+        loose_days = 1 if mode == "loose" else 0
+        raw_retrace_min = min(step2_cfg.retrace_min, step2_cfg.retrace_max)
+        raw_retrace_max = max(step2_cfg.retrace_min, step2_cfg.retrace_max)
+        retrace_min = max(0.0, raw_retrace_min - loose_padding)
+        retrace_max = min(0.8, raw_retrace_max + loose_padding)
+        max_pullback_days = int(step2_cfg.max_pullback_days) + loose_days
+        min_ma10_days = max(0, int(step2_cfg.min_ma10_above_ma20_days) - loose_days)
+        min_ma5_days = max(0, int(step2_cfg.min_ma5_above_ma10_days) - loose_days)
 
         step2_pool = [
             row
@@ -5452,74 +5714,34 @@ class InMemoryStore:
             and row.pullback_days <= max_pullback_days
             and row.ma10_above_ma20_days >= min_ma10_days
             and row.ma5_above_ma10_days >= min_ma5_days
-            and abs(row.price_vs_ma20) <= (0.10 + loose_padding)
-            and row.price_vs_ma20 >= 0
-            and row.trend_class != "B"
+            and abs(row.price_vs_ma20) <= float(step2_cfg.max_price_vs_ma20)
+            and ((not step2_cfg.require_above_ma20) or row.price_vs_ma20 >= 0)
+            and (step2_cfg.allow_b_trend or row.trend_class != "B")
         ]
-
-        min_vol_slope = 0.04 if params.mode == "strict" else 0.03
-        min_up_down_volume_ratio = 1.25 if params.mode == "strict" else 1.15
-        max_pullback_volume_ratio = 0.92 if params.mode == "strict" else 0.98
-        min_health_score = 52.0 if params.mode == "strict" else 46.0
-
-        step3_scored: list[tuple[ScreenerResult, float, float, int]] = []
-        for row in step2_pool:
-            if row.degraded:
-                continue
-            if row.vol_slope20 < min_vol_slope:
-                continue
-            if row.up_down_volume_ratio < min_up_down_volume_ratio:
-                continue
-            if row.pullback_volume_ratio > max_pullback_volume_ratio:
-                continue
-
-            health_score = InMemoryStore._compute_trend_health_proxy_score(row)
-            if health_score < min_health_score:
-                continue
-
-            overheat_risk = InMemoryStore._compute_trend_overheat_risk_score(row)
-            hard_risk_flag_count = int(bool(row.has_blowoff_top)) + int(bool(row.has_divergence_5d)) + int(
-                bool(row.has_upper_shadow_risk)
-            )
-            if row.amplitude20 >= 0.11:
-                hard_risk_flag_count += 1
-            if row.price_vs_ma20 >= 0.11:
-                hard_risk_flag_count += 1
-
-            # "先降权后剔除": 多重风险或极端过热时才硬过滤。
-            if hard_risk_flag_count >= 3 or overheat_risk >= 90.0:
-                continue
-            step3_scored.append((row, health_score, overheat_risk, hard_risk_flag_count))
 
         step3_pool = [
             row
-            for row, _health_score, overheat_risk, hard_risk_flag_count in sorted(
-                step3_scored,
-                key=lambda item: (
-                    InMemoryStore._compute_trend_rank_score(item[0]) - item[2] * 0.08 - item[3] * 2.0,
-                    item[1],
-                    item[0].ret40,
-                    item[0].score,
-                ),
-                reverse=True,
-            )
+            for row in step2_pool
+            if row.vol_slope20 >= float(step3_cfg.min_vol_slope20)
+            and row.up_down_volume_ratio >= float(step3_cfg.min_up_down_volume_ratio)
+            and row.pullback_volume_ratio <= float(step3_cfg.max_pullback_volume_ratio)
+            and (step3_cfg.allow_blowoff_top or not row.has_blowoff_top)
+            and (step3_cfg.allow_divergence_5d or not row.has_divergence_5d)
+            and (step3_cfg.allow_upper_shadow_risk or not row.has_upper_shadow_risk)
+            and (step3_cfg.allow_degraded or not row.degraded)
         ]
 
-        step4_source = [
-            row
-            for row in step3_pool
-            if row.ai_confidence >= 0.55 and row.theme_stage in ("发酵中", "高潮")
-        ]
+        step4_source = step3_pool if step4_cfg.allow_degraded else [row for row in step3_pool if not row.degraded]
         step4_pool = sorted(
-            step4_source,
-            key=lambda row: (
-                InMemoryStore._compute_trend_rank_score(row),
-                row.ai_confidence,
-                row.score,
-                row.ret40,
+            (
+                row
+                for row in step4_source
+                if row.ai_confidence >= float(step4_cfg.min_ai_confidence)
+                and row.theme_stage in set(step4_cfg.allowed_theme_stages)
             ),
+            key=lambda row: (row.score + row.ai_confidence * 20.0),
             reverse=True,
-        )[:8]
+        )[: step4_cfg.final_top_n]
 
         return step1_pool, step2_pool, step3_pool, step4_pool
 
@@ -6258,28 +6480,74 @@ class InMemoryStore:
                 f"max_symbols={payload.max_symbols}, run_id={(resolved_run_id or payload.run_id or 'none')})"
         )
 
+    def _require_backtest_trend_pool_run(self, requested_run_id: str | None) -> ScreenerRunDetail:
+        run_id = str(requested_run_id or "").strip()
+        if not run_id:
+            raise ValueError("趋势池回测必须提供 run_id，请先在选股漏斗或 Signals 页面绑定同一个 run_id。")
+        run = self._run_store.get(run_id)
+        if run is None:
+            raise ValueError(f"筛选任务 {run_id} 不存在或已失效，请重新运行选股漏斗并绑定新的 run_id。")
+        return run
+
     def _resolve_backtest_trend_pool_params(
         self,
         requested_run_id: str | None,
     ) -> tuple[ScreenerParams, str | None, str | None, str | None]:
-        run_id = (requested_run_id or "").strip() or None
-        if run_id:
-            run = self._run_store.get(run_id)
-            if run is not None:
-                degraded_reason = run.degraded_reason if run.degraded else None
-                return run.params, run.run_id, degraded_reason, None
-            fallback_note = f"筛选任务 {run_id} 不存在，已改用系统筛选参数重建滚动池。"
-            return self._build_backtest_screener_params_from_config(), None, "TREND_POOL_RUN_NOT_FOUND", fallback_note
+        run = self._require_backtest_trend_pool_run(requested_run_id)
+        step_configs = run.step_configs if isinstance(run.step_configs, ScreenerStepConfigs) else self._resolve_screener_step_configs(run.params)
+        normalized_params = self._bind_step_configs_to_screener_params(run.params, step_configs)
+        degraded_reason = run.degraded_reason if run.degraded else None
+        return normalized_params, run.run_id, degraded_reason, None
 
-        latest_run_id = self._latest_run_id()
-        if latest_run_id:
-            latest_run = self._run_store.get(latest_run_id)
-            if latest_run is not None:
-                degraded_reason = latest_run.degraded_reason if latest_run.degraded else None
-                return latest_run.params, latest_run.run_id, degraded_reason, None
+    def _build_trend_pool_static_universe_from_run(
+        self,
+        *,
+        payload: BacktestRunRequest,
+        run_detail: ScreenerRunDetail,
+        board_filters: list[BoardFilter],
+    ) -> tuple[list[str], dict[str, set[str]], list[str]]:
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        if not scan_dates:
+            return [], {}, ["回测区间内无可扫描交易日。"]
 
-        fallback_note = "未找到可用筛选任务，已改用系统筛选参数重建滚动池。"
-        return self._build_backtest_screener_params_from_config(), None, "TREND_POOL_RUN_NOT_FOUND", fallback_note
+        source_rows = self._select_step_source_for_backtest(
+            trend_step=payload.trend_step,
+            step1_pool=run_detail.step_pools.step1,
+            step2_pool=run_detail.step_pools.step2,
+            step3_pool=run_detail.step_pools.step3,
+            step4_pool=run_detail.step_pools.step4,
+        )
+        original_count = len(source_rows)
+        if board_filters:
+            source_rows = [row for row in source_rows if self._row_matches_board_filters(row, board_filters)]
+
+        symbols: list[str] = []
+        seen_symbols: set[str] = set()
+        for row in source_rows:
+            symbol = str(row.symbol).strip().lower()
+            if not symbol or symbol in seen_symbols:
+                continue
+            seen_symbols.add(symbol)
+            symbols.append(symbol)
+            if len(symbols) >= payload.max_symbols:
+                break
+
+        symbol_set = set(symbols)
+        allowed_symbols_by_date = {scan_date: set(symbol_set) for scan_date in scan_dates}
+        step_label = payload.trend_step if payload.trend_step in {"step1", "step2", "step3", "step4"} else "auto(step4->step3)"
+        notes = [
+            (
+                "候选池构建: 使用筛选任务静态池"
+                f"（run_id={run_detail.run_id}, step={step_label}, as_of_date={run_detail.as_of_date or 'unknown'}）。"
+            ),
+            (
+                f"静态股票池数量: {len(symbols)}（原始 {original_count}，"
+                f"板块过滤后 {len(source_rows)}，单日上限 {payload.max_symbols}）。"
+            ),
+        ]
+        if payload.pool_roll_mode != "daily":
+            notes.append(f"trend_pool 模式固定使用静态池，已忽略 pool_roll_mode={payload.pool_roll_mode}。")
+        return symbols, allowed_symbols_by_date, notes
 
     def _build_trend_pool_rolling_universe(
         self,
@@ -6319,6 +6587,7 @@ class InMemoryStore:
         trend_cache_hit_days = 0
         trend_cache_miss_days = 0
         trend_cache_write_days = 0
+        resolved_step_configs = self._resolve_screener_step_configs(screener_params)
         pending_refresh_dates: list[str] = []
         if trend_cache_enabled:
             for as_of_date in refresh_dates_used:
@@ -6377,7 +6646,8 @@ class InMemoryStore:
 
             step1_pool, step2_pool, step3_pool, step4_pool = self._run_screener_filters_for_backtest(
                 input_rows,
-                screener_params,
+                mode=screener_params.mode,
+                step_configs=resolved_step_configs,
             )
             source = self._select_step_source_for_backtest(
                 trend_step=payload.trend_step,
@@ -7053,7 +7323,7 @@ class InMemoryStore:
         *,
         payload: BacktestRunRequest,
         board_filters: list[BoardFilter],
-        trend_pool_params: ScreenerParams | None,
+        trend_pool_run: ScreenerRunDetail | None,
         progress_callback: Callable[[str, int, int, str], None] | None,
         control_callback: Callable[[], None] | None,
     ) -> tuple[list[str], dict[str, set[str]], list[str], list[str]]:
@@ -7064,8 +7334,12 @@ class InMemoryStore:
             raise ValueError("回测区间内无可扫描交易日。")
 
         if payload.mode == "trend_pool":
-            if trend_pool_params is None:
-                raise ValueError("趋势池筛选参数不可用。")
+            if trend_pool_run is None:
+                raise ValueError("趋势池筛选任务不可用。")
+            screener_params = self._bind_step_configs_to_screener_params(
+                trend_pool_run.params,
+                trend_pool_run.step_configs,
+            )
 
             def _build(
                 refresh_dates: list[str] | None,
@@ -7073,7 +7347,7 @@ class InMemoryStore:
             ) -> tuple[list[str], dict[str, set[str]], list[str], list[str], list[str]]:
                 return self._build_trend_pool_rolling_universe(
                     payload=payload,
-                    screener_params=trend_pool_params,
+                    screener_params=screener_params,
                     board_filters=board_filters,
                     refresh_dates=refresh_dates,
                     progress_callback=cb,
@@ -7145,25 +7419,19 @@ class InMemoryStore:
     ) -> BacktestResponse:
         degraded_reason: str | None = None
         resolved_run_id: str | None = None
-        trend_pool_params: ScreenerParams | None = None
-        trend_pool_fallback_note: str | None = None
+        trend_pool_run: ScreenerRunDetail | None = None
         if payload.mode == "trend_pool":
-            (
-                trend_pool_params,
-                resolved_run_id,
-                degraded_reason,
-                trend_pool_fallback_note,
-            ) = self._resolve_backtest_trend_pool_params(payload.run_id)
+            trend_pool_run = self._require_backtest_trend_pool_run(payload.run_id)
+            resolved_run_id = trend_pool_run.run_id
+            degraded_reason = trend_pool_run.degraded_reason if trend_pool_run.degraded else None
 
         pool_notes: list[str] = []
-        if trend_pool_fallback_note:
-            pool_notes.append(trend_pool_fallback_note)
 
         rolling_start_ts = time.perf_counter()
         rolling_symbols, rolling_allowed_by_date, rolling_notes, scan_dates = self._resolve_matrix_rolling_universe(
             payload=payload,
             board_filters=board_filters,
-            trend_pool_params=trend_pool_params,
+            trend_pool_run=trend_pool_run,
             progress_callback=progress_callback,
             control_callback=control_callback,
         )
@@ -7408,7 +7676,11 @@ class InMemoryStore:
         board_filters = [item for item in payload.board_filters if item in {"main", "gem", "star", "beijing", "st"}]
 
         if payload.mode == "trend_pool":
-            trend_pool_params, _, _, _ = self._resolve_backtest_trend_pool_params(payload.run_id)
+            trend_pool_run = self._require_backtest_trend_pool_run(payload.run_id)
+            trend_pool_params = self._bind_step_configs_to_screener_params(
+                trend_pool_run.params,
+                trend_pool_run.step_configs,
+            )
             seed_symbols, _, _, _, _ = self._build_trend_pool_rolling_universe(
                 payload=payload,
                 screener_params=trend_pool_params,
@@ -7435,7 +7707,8 @@ class InMemoryStore:
         )
 
     def _is_backtest_task_precheck_async_enabled(self) -> bool:
-        return self._env_flag("TDX_TREND_BACKTEST_TASK_PRECHECK_ASYNC", False)
+        # 默认异步预检，避免任务创建接口在冷缓存/大数据量下同步阻塞超时。
+        return self._env_flag("TDX_TREND_BACKTEST_TASK_PRECHECK_ASYNC", True)
 
     @staticmethod
     def _backtest_precheck_cache_ttl_sec() -> float:
@@ -7698,7 +7971,7 @@ class InMemoryStore:
     @staticmethod
     def _is_backtest_result_cache_eligible(payload: BacktestRunRequest) -> bool:
         if payload.mode == "trend_pool" and not str(payload.run_id or "").strip():
-            # 没有显式 run_id 时会回落到 latest_run，结果来源不稳定，不做持久缓存。
+            # trend_pool 回测必须显式绑定 run_id，缺失时不做持久缓存。
             return False
         return True
 
@@ -9637,6 +9910,9 @@ class InMemoryStore:
         if execution_path_preference not in {"auto", "matrix", "legacy"}:
             execution_path_preference = "auto"
             payload = payload.model_copy(update={"execution_path_preference": "auto"})
+        if payload.mode == "trend_pool" and execution_path_preference == "auto":
+            execution_path_preference = "legacy"
+            payload = payload.model_copy(update={"execution_path_preference": "legacy"})
         force_matrix_path = execution_path_preference == "matrix"
         force_legacy_path = execution_path_preference == "legacy"
         matrix_supported = (
@@ -9791,23 +10067,17 @@ class InMemoryStore:
 
         degraded_reason: str | None = None
         resolved_run_id: str | None = None
-        trend_pool_params: ScreenerParams | None = None
-        trend_pool_fallback_note: str | None = None
+        trend_pool_run: ScreenerRunDetail | None = None
         if payload.mode == "trend_pool":
-            (
-                trend_pool_params,
-                resolved_run_id,
-                degraded_reason,
-                trend_pool_fallback_note,
-            ) = self._resolve_backtest_trend_pool_params(payload.run_id)
+            trend_pool_run = self._require_backtest_trend_pool_run(payload.run_id)
+            resolved_run_id = trend_pool_run.run_id
+            degraded_reason = trend_pool_run.degraded_reason if trend_pool_run.degraded else None
 
         pool_notes: list[str] = []
         if capability_notes:
             pool_notes.extend(capability_notes)
         if matrix_fallback_note:
             pool_notes.append(matrix_fallback_note)
-        if trend_pool_fallback_note:
-            pool_notes.append(trend_pool_fallback_note)
 
         symbols: list[str] = []
         allowed_symbols_by_date: dict[str, set[str]] | None = None
@@ -9826,8 +10096,12 @@ class InMemoryStore:
         )
 
         if payload.mode == "trend_pool":
-            if trend_pool_params is None:
-                raise ValueError("趋势池筛选参数不可用。")
+            if trend_pool_run is None:
+                raise ValueError("趋势池筛选任务不可用。")
+            trend_pool_params = self._bind_step_configs_to_screener_params(
+                trend_pool_run.params,
+                trend_pool_run.step_configs,
+            )
             if payload.pool_roll_mode == "position":
                 if not scan_dates:
                     raise ValueError("回测区间内无可扫描交易日。")

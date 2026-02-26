@@ -31,6 +31,7 @@ import {
   cancelBacktestTask,
   deleteBacktestReport,
   getBacktestReport,
+  getLatestScreenerRun,
   getStrategies,
   importBacktestReportPackage,
   listBacktestReports,
@@ -38,6 +39,7 @@ import {
   pauseBacktestTask,
   resumeBacktestPlateauTask,
   resumeBacktestTask,
+  runBacktest,
   runBacktestABExperiment,
   startBacktestPlateauTask,
   startBacktestTask,
@@ -580,6 +582,115 @@ function buildBacktestReportWorkbookBuffer(
     if (plateauNoteRows.length > 0) {
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(plateauNoteRows), 'PlateauNotes')
     }
+  }
+  return XLSX.write(workbook, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer
+}
+
+function buildPlateauTradeExportWorkbookBuffer(
+  runRequest: BacktestRunRequest,
+  runResult: BacktestResponse,
+  point: BacktestPlateauPoint,
+  rank: number,
+): ArrayBuffer {
+  const workbook = XLSX.utils.book_new()
+  const paramsSheet = [
+    { 参数项: '参数组排名', 参数值: `第${rank}名` },
+    { 参数项: '评分', 参数值: Number(point.score.toFixed(3)) },
+    { 参数项: 'run_id', 参数值: runRequest.run_id ?? '' },
+    { 参数项: '回测模式', 参数值: runRequest.mode },
+    { 参数项: '趋势池步骤', 参数值: runRequest.trend_step },
+    { 参数项: '滚动方式', 参数值: runRequest.pool_roll_mode },
+    { 参数项: '策略ID', 参数值: runRequest.strategy_id ?? '' },
+    { 参数项: '策略参数', 参数值: JSON.stringify(runRequest.strategy_params ?? {}, null, 2) },
+    { 参数项: '开始日期', 参数值: runRequest.date_from },
+    { 参数项: '结束日期', 参数值: runRequest.date_to },
+    { 参数项: '窗口天数', 参数值: runRequest.window_days },
+    { 参数项: '最低分', 参数值: runRequest.min_score },
+    { 参数项: '入场事件', 参数值: runRequest.entry_events.join(', ') },
+    { 参数项: '离场事件', 参数值: runRequest.exit_events.join(', ') },
+    { 参数项: '最大持仓数', 参数值: runRequest.max_positions },
+    { 参数项: '单笔仓位(%)', 参数值: Number((runRequest.position_pct * 100).toFixed(2)) },
+    { 参数项: '止损(%)', 参数值: Number((runRequest.stop_loss * 100).toFixed(2)) },
+    { 参数项: '止盈(%)', 参数值: Number((runRequest.take_profit * 100).toFixed(2)) },
+    { 参数项: '最大股票数', 参数值: runRequest.max_symbols },
+    { 参数项: 'TopK/日', 参数值: runRequest.priority_topk_per_day },
+    { 参数项: '执行路径偏好', 参数值: runRequest.execution_path_preference ?? 'legacy' },
+    { 参数项: '事件语义版本', 参数值: runRequest.matrix_event_semantic_version ?? 'aligned_wyckoff_v2' },
+  ]
+  const performanceSheet = [
+    {
+      统计区间: `${runResult.range.date_from} ~ ${runResult.range.date_to}`,
+      执行路径: runResult.execution_path ?? 'unknown',
+      交易数: runResult.stats.trade_count,
+      胜场: runResult.stats.win_count,
+      负场: runResult.stats.loss_count,
+      胜率百分比: Number((runResult.stats.win_rate * 100).toFixed(2)),
+      总收益百分比: Number((runResult.stats.total_return * 100).toFixed(2)),
+      最大回撤百分比: Number((runResult.stats.max_drawdown * 100).toFixed(2)),
+      平均盈亏比百分比: Number((runResult.stats.avg_pnl_ratio * 100).toFixed(2)),
+      盈亏比因子: Number(runResult.stats.profit_factor.toFixed(4)),
+      候选股票数: runResult.candidate_count,
+      跳过数: runResult.skipped_count,
+      成交率百分比: Number((runResult.fill_rate * 100).toFixed(2)),
+      最大并发持仓: runResult.max_concurrent_positions,
+      夏普: Number((runResult.risk_metrics?.sharpe ?? 0).toFixed(4)),
+      索提诺: Number((runResult.risk_metrics?.sortino ?? 0).toFixed(4)),
+      卡玛: Number((runResult.risk_metrics?.calmar ?? 0).toFixed(4)),
+      期望值: Number((runResult.risk_metrics?.expectancy ?? 0).toFixed(4)),
+      稳定性评分: Number((runResult.stability_diagnostics?.stability_score ?? 0).toFixed(4)),
+    },
+  ]
+  const tradeSheet = runResult.trades.map((row, index) => {
+    const parsedExit = parseExitReason(row.exit_reason)
+    return {
+      序号: index + 1,
+      股票代码: row.symbol,
+      股票名称: row.name,
+      信号日期: row.signal_date,
+      入场日期: row.entry_date,
+      离场日期: row.exit_date,
+      入场事件: formatEventSequence(row.entry_signal),
+      入场阶段: row.entry_phase,
+      离场原因: parsedExit.detail ? `${parsedExit.label}:${parsedExit.detail}` : parsedExit.label,
+      数量: row.quantity,
+      买入价: row.entry_price,
+      卖出价: row.exit_price,
+      持仓天数: row.holding_days,
+      盈亏额: row.pnl_amount,
+      盈亏比百分比: Number((row.pnl_ratio * 100).toFixed(2)),
+      质量分: Number((row.entry_quality_score ?? 0).toFixed(2)),
+      健康分: Number((row.health_score ?? 0).toFixed(2)),
+      事件分: Number((row.event_score ?? 0).toFixed(2)),
+      风险分: Number((row.risk_score ?? 0).toFixed(2)),
+      事件等级: row.event_grade ?? 'C',
+      确认状态: row.confirmation_status ?? 'unconfirmed',
+    }
+  })
+  const noteSheet = runResult.notes.map((note, index) => ({ 序号: index + 1, 说明: note }))
+  const equitySheet = runResult.equity_curve.map((row) => ({
+    日期: row.date,
+    权益: row.equity,
+    已实现盈亏: row.realized_pnl,
+  }))
+  const drawdownSheet = runResult.drawdown_curve.map((row) => ({
+    日期: row.date,
+    回撤百分比: Number((row.drawdown * 100).toFixed(2)),
+  }))
+  const monthlySheet = runResult.monthly_returns.map((row) => ({
+    月份: row.month,
+    收益百分比: Number((row.return_ratio * 100).toFixed(2)),
+    盈亏额: row.pnl_amount,
+    交易数: row.trade_count,
+  }))
+
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(paramsSheet), '参数快照')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(performanceSheet), '绩效指标')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(tradeSheet), '交易记录')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(equitySheet), '资金曲线')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(drawdownSheet), '回撤曲线')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(monthlySheet), '月度收益')
+  if (noteSheet.length > 0) {
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(noteSheet), '备注')
   }
   return XLSX.write(workbook, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer
 }
@@ -1581,6 +1692,7 @@ export function BacktestPage() {
   const [plateauCandidatePickRank, setPlateauCandidatePickRank] = useState(1)
   const [plateauSavedPresets, setPlateauSavedPresets] = useState<BacktestPlateauPreset[]>(() => loadBacktestPlateauPresets())
   const [plateauSavedPresetId, setPlateauSavedPresetId] = useState<string | null>(null)
+  const [plateauExportingRowKey, setPlateauExportingRowKey] = useState<string | null>(null)
   const [tradePage, setTradePage] = useState(1)
   const [tradePageSize, setTradePageSize] = useState(initialDraft.trades_page_size)
   const [runError, setRunError] = useState<string | null>(null)
@@ -1867,6 +1979,30 @@ export function BacktestPage() {
       const text = formatApiError(error)
       setAbError(text)
       message.error(text)
+    },
+  })
+
+  const bindLatestRunMutation = useMutation({
+    mutationFn: getLatestScreenerRun,
+    onSuccess: (detail) => {
+      applyRunMeta(detail.run_id, detail.as_of_date)
+      const cached = readScreenerRunMetaFromStorage()
+      if (cached?.boardFilters?.length) {
+        setBoardFilters(cached.boardFilters)
+      }
+      message.success(`已带入后端最新筛选任务：${detail.run_id}`)
+    },
+    onError: (error) => {
+      const cached = readScreenerRunMetaFromStorage()
+      if (cached?.runId) {
+        applyRunMeta(cached.runId, cached.asOfDate)
+        if (cached.boardFilters?.length) {
+          setBoardFilters(cached.boardFilters)
+        }
+        message.warning(`后端最新筛选获取失败，已回退本地缓存：${cached.runId}`)
+        return
+      }
+      message.error(formatApiError(error))
     },
   })
 
@@ -2295,6 +2431,8 @@ export function BacktestPage() {
       enforce_t1: enforceT1,
       entry_delay_days: entryDelayDays,
       delay_invalidation_enabled: delayInvalidationEnabled,
+      execution_path_preference: 'legacy' as const,
+      matrix_event_semantic_version: 'aligned_wyckoff_v2' as const,
       max_symbols: maxSymbols,
       enable_advanced_analysis: enableAdvancedAnalysis,
     }
@@ -2367,16 +2505,8 @@ export function BacktestPage() {
   }
 
   function handleBindLatestRunId() {
-    const cached = readScreenerRunMetaFromStorage()
-    if (cached?.runId) {
-      applyRunMeta(cached.runId, cached.asOfDate)
-      if (cached.boardFilters?.length) {
-        setBoardFilters(cached.boardFilters)
-      }
-      message.success(`已从本地筛选缓存带入任务：${cached.runId}`)
-      return
-    }
-    message.info('未找到本地筛选缓存，请先在“趋势选股”页执行一次选股，或手动填写 run_id。')
+    if (bindLatestRunMutation.isPending) return
+    bindLatestRunMutation.mutate()
   }
 
   function handleRunPlateau() {
@@ -2451,6 +2581,56 @@ export function BacktestPage() {
     }
     setPlateauError(null)
     startPlateauTaskMutation.mutate(payload)
+  }
+
+  async function handleExportPlateauTradeRecords(row: BacktestPlateauTableRow) {
+    if (row.error) {
+      message.warning('该参数组评估失败，无法导出交易记录')
+      return
+    }
+    if (plateauExportingRowKey) return
+    const cached = readScreenerRunMetaFromStorage()
+    const effectiveBoardFilters = cached?.boardFilters?.length ? cached.boardFilters : boardFilters
+    const shouldApplyBoardFilters = mode === 'trend_pool'
+    if (shouldApplyBoardFilters && effectiveBoardFilters.length === 0) {
+      message.warning('请至少选择一个板块后再导出交易记录')
+      return
+    }
+    if (mode === 'trend_pool' && !runId.trim()) {
+      message.warning('趋势池模式导出交易记录需要绑定 run_id')
+      return
+    }
+    if (cached?.boardFilters?.length) {
+      setBoardFilters(cached.boardFilters)
+    }
+    const payload: BacktestRunRequest = {
+      ...buildBacktestPayload(shouldApplyBoardFilters ? effectiveBoardFilters : undefined),
+      window_days: Number(row.params.window_days),
+      min_score: Number(row.params.min_score),
+      stop_loss: Number(row.params.stop_loss),
+      take_profit: Number(row.params.take_profit),
+      max_positions: Number(row.params.max_positions),
+      position_pct: Number(row.params.position_pct),
+      max_symbols: Number(row.params.max_symbols),
+      priority_topk_per_day: Number(row.params.priority_topk_per_day),
+    }
+    setPlateauExportingRowKey(row.__rowKey)
+    try {
+      const runResult = await runBacktest(payload)
+      const workbookBuffer = buildPlateauTradeExportWorkbookBuffer(payload, runResult, row, row.__rank)
+      const blob = new Blob([workbookBuffer], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      })
+      const safeRunId = (payload.run_id ?? '').trim().replace(/[^0-9a-zA-Z_-]/g, '')
+      const runSuffix = safeRunId ? `_run_${safeRunId.slice(0, 16)}` : ''
+      const fileName = `收益平原第${row.__rank}名_交易记录${runSuffix}_${dayjs().format('YYYYMMDD_HHmmss')}.xlsx`
+      downloadBlob(fileName, blob)
+      message.success(`已导出第${row.__rank}名参数组交易记录：${fileName}`)
+    } catch (error) {
+      message.error(formatApiError(error))
+    } finally {
+      setPlateauExportingRowKey(null)
+    }
   }
 
   function applyPlateauPointToForm(point: BacktestPlateauPoint, rankLabel?: string) {
@@ -2653,7 +2833,7 @@ export function BacktestPage() {
     {
       title: '操作',
       key: 'action',
-      width: 150,
+      width: 240,
       render: (_value, row) => (
         <Space size={6}>
           <Button
@@ -2669,6 +2849,18 @@ export function BacktestPage() {
             onClick={() => savePlateauPreset(row, `第${row.__rank}名`)}
           >
             保存
+          </Button>
+          <Button
+            size="small"
+            type="primary"
+            ghost
+            loading={plateauExportingRowKey === row.__rowKey}
+            disabled={Boolean(row.error) || (plateauExportingRowKey !== null && plateauExportingRowKey !== row.__rowKey)}
+            onClick={() => {
+              void handleExportPlateauTradeRecords(row)
+            }}
+          >
+            导出交易记录
           </Button>
         </Space>
       ),
@@ -3463,7 +3655,7 @@ export function BacktestPage() {
                   onChange={(event) => setRunId(event.target.value)}
                   placeholder="请输入筛选任务 run_id"
                 />
-                <Button onClick={handleBindLatestRunId}>
+                <Button loading={bindLatestRunMutation.isPending} onClick={handleBindLatestRunId}>
                   带入最新筛选
                 </Button>
               </div>

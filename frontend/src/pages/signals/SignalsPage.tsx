@@ -39,6 +39,7 @@ import {
   setSharedStrategyParams,
 } from '@/shared/utils/strategyParams'
 import { upsertPendingBuyDraft } from '@/shared/utils/simPendingOrders'
+import { useBacktestTaskStore } from '@/state/backtestTaskStore'
 import { useUIStore } from '@/state/uiStore'
 import type {
   BoardFilter,
@@ -365,6 +366,8 @@ export function SignalsPage() {
   const { message } = AntdApp.useApp()
   const navigate = useNavigate()
   const setSelectedSymbol = useUIStore((state) => state.setSelectedSymbol)
+  const backtestPayloadById = useBacktestTaskStore((state) => state.payloadById)
+  const backtestTasksById = useBacktestTaskStore((state) => state.tasksById)
   const [searchParams, setSearchParams] = useSearchParams()
   const cachedMode = useMemo(() => loadCachedSignalMode(), [])
   const cachedTrendStep = useMemo(() => loadCachedTrendStep(), [])
@@ -502,6 +505,32 @@ export function SignalsPage() {
     }),
     [strategyParams, strategyParamsDefaults, strategyParamsSchema],
   )
+  const matchedBacktestPayload = useMemo(() => {
+    if (mode !== 'trend_pool' || !runId) return null
+    const strategyText = String(strategyId || '').trim()
+    const entries = Object.entries(backtestPayloadById).filter(([taskId, payload]) => {
+      if (!payload) return false
+      if (payload.mode !== 'trend_pool') return false
+      if (String(payload.run_id ?? '').trim() !== runId) return false
+      if (strategyText && String(payload.strategy_id ?? '').trim() !== strategyText) return false
+      if (!payload.date_from || !payload.date_to || !payload.pool_roll_mode) return false
+      return Boolean(backtestTasksById[taskId])
+    })
+    if (entries.length <= 0) return null
+    entries.sort((left, right) => {
+      const leftTask = backtestTasksById[left[0]]
+      const rightTask = backtestTasksById[right[0]]
+      const leftTs = Date.parse(leftTask?.progress.updated_at || leftTask?.progress.started_at || '')
+      const rightTs = Date.parse(rightTask?.progress.updated_at || rightTask?.progress.started_at || '')
+      return (Number.isFinite(rightTs) ? rightTs : 0) - (Number.isFinite(leftTs) ? leftTs : 0)
+    })
+    return entries[0]?.[1] ?? null
+  }, [backtestPayloadById, backtestTasksById, mode, runId, strategyId])
+  const matchedBacktestDateFrom = String(matchedBacktestPayload?.date_from ?? '').trim()
+  const matchedBacktestDateTo = String(matchedBacktestPayload?.date_to ?? '').trim()
+  const matchedBacktestTrendStep = matchedBacktestPayload?.trend_step
+  const matchedBacktestPoolRollMode = matchedBacktestPayload?.pool_roll_mode
+  const matchedBacktestMaxSymbols = matchedBacktestPayload?.max_symbols
 
   useEffect(() => {
     if (strategyItems.length <= 0) return
@@ -734,6 +763,28 @@ export function SignalsPage() {
     }
   }, [asOfDateTouched, mode, runDetailQuery.data?.as_of_date])
 
+  const normalizedAsOfDate = asOfDate.trim()
+  const replayContext = useMemo(() => {
+    if (mode !== 'trend_pool') return null
+    if (!normalizedAsOfDate) return null
+    if (!matchedBacktestDateFrom || !matchedBacktestDateTo || !matchedBacktestPoolRollMode || !matchedBacktestTrendStep) return null
+    if (normalizedAsOfDate < matchedBacktestDateFrom || normalizedAsOfDate > matchedBacktestDateTo) return null
+    return {
+      dateFrom: matchedBacktestDateFrom,
+      trendStep: matchedBacktestTrendStep,
+      poolRollMode: matchedBacktestPoolRollMode,
+      maxSymbols: typeof matchedBacktestMaxSymbols === 'number' ? matchedBacktestMaxSymbols : undefined,
+    }
+  }, [
+    matchedBacktestDateFrom,
+    matchedBacktestDateTo,
+    matchedBacktestMaxSymbols,
+    matchedBacktestPoolRollMode,
+    matchedBacktestTrendStep,
+    mode,
+    normalizedAsOfDate,
+  ])
+
   const trendPoolReady = mode !== 'trend_pool' || Boolean(runId)
 
   const signalQuery = useQuery({
@@ -746,13 +797,17 @@ export function SignalsPage() {
       JSON.stringify(strategyParamsPayload),
       marketFilters.join(','),
       boardFilters.join(','),
-      asOfDate,
+      normalizedAsOfDate,
       windowDays,
       minScore,
       minEventCount,
       signalAgeMin,
       signalAgeMax ?? -1,
       requireSequence,
+      replayContext?.dateFrom ?? '',
+      replayContext?.trendStep ?? '',
+      replayContext?.poolRollMode ?? '',
+      replayContext?.maxSymbols ?? -1,
       refreshCounter,
     ],
     enabled: trendPoolReady,
@@ -761,11 +816,10 @@ export function SignalsPage() {
       if (shouldRefresh) {
         refreshTrackerRef.current = refreshCounter
       }
-      const normalizedAsOfDate = asOfDate.trim()
       return getSignals({
         mode,
         run_id: mode === 'trend_pool' ? runId : undefined,
-        trend_step: mode === 'trend_pool' ? trendStep : undefined,
+        trend_step: mode === 'trend_pool' ? (replayContext?.trendStep ?? trendStep) : undefined,
         strategy_id: strategyId,
         strategy_params: strategyParamsPayload,
         market_filters: mode === 'full_market' && marketFilters.length > 0 ? marketFilters : undefined,
@@ -778,6 +832,9 @@ export function SignalsPage() {
         min_event_count: minEventCount,
         signal_age_min: signalAgeMin,
         signal_age_max: signalAgeMax ?? undefined,
+        backtest_date_from: replayContext?.dateFrom,
+        backtest_pool_roll_mode: replayContext?.poolRollMode,
+        backtest_max_symbols: replayContext?.maxSymbols,
       })
     },
     staleTime: 30_000,
@@ -1242,17 +1299,35 @@ export function SignalsPage() {
         />
       ) : null}
 
-      {mode === 'trend_pool' && !runId ? (
+      {mode === 'trend_pool' ? (
         <Alert
-          type="warning"
+          type={runId ? 'info' : 'warning'}
           showIcon
-          title="未绑定趋势池筛选任务"
+          title={runId ? `Run追踪: ${runId}` : 'Run追踪: 未绑定 run_id'}
           description={(
             <Space wrap>
-              <Typography.Text type="secondary">
-                当前 URL 缺少 run_id（你现在这个链接就是这种情况）。请先绑定筛选任务后再看趋势池后置信号。
-              </Typography.Text>
-              <Typography.Text type="secondary">建议保持同一域名访问（都用 127.0.0.1 或都用 localhost）。</Typography.Text>
+              {runId ? (
+                <>
+                  <Typography.Text type="secondary">
+                    当前趋势池信号使用该 run_id 的规则快照，并按筛选日期重建候选池。
+                  </Typography.Text>
+                  {replayContext ? (
+                    <Typography.Text type="secondary">
+                      已启用回测复盘口径: step={replayContext.trendStep}，{replayContext.poolRollMode} 滚动，起始日 {replayContext.dateFrom}。
+                    </Typography.Text>
+                  ) : null}
+                  <Typography.Text type="secondary">
+                    筛选日期: {(runDetailQuery.data?.as_of_date ?? signalQuery.data?.as_of_date ?? asOfDate) || '--'}
+                  </Typography.Text>
+                </>
+              ) : (
+                <>
+                  <Typography.Text type="secondary">
+                    当前 URL 缺少 run_id。请先绑定筛选任务后再查看趋势池信号。
+                  </Typography.Text>
+                  <Typography.Text type="secondary">建议保持同一域名访问（都用 127.0.0.1 或都用 localhost）。</Typography.Text>
+                </>
+              )}
               <Button
                 size="small"
                 loading={bindLatestRunMutation.isPending}
@@ -1271,7 +1346,14 @@ export function SignalsPage() {
             </Space>
           )}
         />
-      ) : null}
+      ) : (
+        <Alert
+          type="info"
+          showIcon
+          title="Run追踪: 全市场模式"
+          description="当前为 full_market，不依赖 run_id。切回趋势池模式后需绑定 run_id。"
+        />
+      )}
 
       <Card className="glass-card" variant="borderless">
         <Space orientation="vertical" size={10} style={{ width: '100%' }}>

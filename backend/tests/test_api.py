@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1302,6 +1303,110 @@ def test_signals_endpoint_board_filters(monkeypatch: pytest.MonkeyPatch) -> None
     body_main = resp_main.json()
     assert body_main["source_count"] == 1
     assert {item["symbol"] for item in body_main["items"]} == {"sh600519"}
+
+
+def test_signals_endpoint_replay_position_uses_backtest_seed_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    row_gem = store._build_row_from_candles("sz300497")
+    row_main = store._build_row_from_candles("sh600519")
+    assert row_gem is not None
+    assert row_main is not None
+
+    def fake_resolve_signal_candidates(
+        *,
+        mode: str,
+        run_id: str | None,
+        trend_step: str = "auto",
+        as_of_date: str | None = None,
+    ):
+        _ = (mode, trend_step)
+        return [], None, run_id or "mock-run", as_of_date or "2026-01-20"
+
+    def fake_calc_wyckoff_snapshot(
+        row: ScreenerResult,
+        window_days: int,
+        *,
+        as_of_date: str | None = None,
+    ) -> dict[str, object]:
+        _ = (row, window_days)
+        trigger_date = as_of_date or "2026-01-20"
+        return {
+            "events": ["SC", "AR", "SOS"],
+            "risk_events": [],
+            "event_dates": {"SC": trigger_date, "AR": trigger_date, "SOS": trigger_date},
+            "event_chain": [],
+            "sequence_ok": True,
+            "entry_quality_score": 82.0,
+            "phase": "吸筹D",
+            "signal": "SOS",
+            "trigger_date": trigger_date,
+            "phase_hint": "测试信号",
+            "structure_hhh": "HH|HL|HC",
+            "event_strength_score": 75.0,
+            "phase_score": 74.0,
+            "structure_score": 70.0,
+            "trend_score": 68.0,
+            "volatility_score": 66.0,
+        }
+
+    fake_run = SimpleNamespace(run_id="mock-run", params=SimpleNamespace(), step_configs=object())
+
+    def fake_require_backtest_run(requested_run_id: str | None):
+        _ = requested_run_id
+        return fake_run
+
+    def fake_resolve_step_configs(params):  # noqa: ANN001
+        _ = params
+        return object()
+
+    def fake_bind_step_configs(params, step_configs):  # noqa: ANN001
+        _ = (params, step_configs)
+        return SimpleNamespace(markets=["sh", "sz"], return_window_days=40, mode="strict")
+
+    def fake_load_input_pool_rows(*, markets, return_window_days, as_of_date):  # noqa: ANN001
+        _ = (markets, return_window_days, as_of_date)
+        return [row_gem, row_main], None, True
+
+    def fake_run_filters(rows: list[ScreenerResult], *, mode: str, step_configs):  # noqa: ANN001
+        _ = (mode, step_configs)
+        return list(rows), [], [], []
+
+    def fake_select_step_source(*, trend_step, step1_pool, step2_pool, step3_pool, step4_pool):  # noqa: ANN001
+        _ = (trend_step, step2_pool, step3_pool, step4_pool)
+        return list(step1_pool)
+
+    monkeypatch.setattr(store, "_resolve_signal_candidates", fake_resolve_signal_candidates)
+    monkeypatch.setattr(store, "_calc_wyckoff_snapshot", fake_calc_wyckoff_snapshot)
+    monkeypatch.setattr(store, "_require_backtest_trend_pool_run", fake_require_backtest_run)
+    monkeypatch.setattr(store, "_resolve_screener_step_configs", fake_resolve_step_configs)
+    monkeypatch.setattr(store, "_bind_step_configs_to_screener_params", fake_bind_step_configs)
+    monkeypatch.setattr(store, "_load_input_pool_rows", fake_load_input_pool_rows)
+    monkeypatch.setattr(store, "_run_screener_filters_for_backtest", fake_run_filters)
+    monkeypatch.setattr(store, "_select_step_source_for_backtest", fake_select_step_source)
+    store._signals_cache.clear()
+
+    resp = client.get(
+        "/api/signals",
+        params=[
+            ("mode", "trend_pool"),
+            ("run_id", "mock-run"),
+            ("trend_step", "step1"),
+            ("as_of_date", "2026-01-20"),
+            ("window_days", "70"),
+            ("min_score", "0"),
+            ("require_sequence", "false"),
+            ("min_event_count", "0"),
+            ("refresh", "true"),
+            ("board_filters", "gem"),
+            ("backtest_date_from", "2026-01-01"),
+            ("backtest_pool_roll_mode", "position"),
+            ("backtest_max_symbols", "200"),
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source_count"] == 1
+    assert {item["symbol"] for item in body["items"]} == {"sz300497"}
+    assert any("回测复盘口径候选池" in str(note) for note in (body.get("notes") or []))
 
 
 def test_signals_endpoint_market_filters(monkeypatch: pytest.MonkeyPatch) -> None:

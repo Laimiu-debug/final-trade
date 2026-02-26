@@ -18,6 +18,7 @@ import type {
   BacktestPlateauRunRequest,
   BacktestABExperimentRequest,
   BacktestABExperimentResponse,
+  BacktestPoolRollMode,
   BacktestRunRequest,
   BoardFilter,
   CandlePoint,
@@ -132,6 +133,9 @@ export function getSignals(params?: {
   min_event_count?: number
   signal_age_min?: number
   signal_age_max?: number
+  backtest_date_from?: string
+  backtest_pool_roll_mode?: BacktestPoolRollMode
+  backtest_max_symbols?: number
 }) {
   const query = new URLSearchParams()
   if (params?.mode) query.set('mode', params.mode)
@@ -162,6 +166,11 @@ export function getSignals(params?: {
   }
   if (typeof params?.signal_age_max === 'number') {
     query.set('signal_age_max', String(params.signal_age_max))
+  }
+  if (params?.backtest_date_from) query.set('backtest_date_from', params.backtest_date_from)
+  if (params?.backtest_pool_roll_mode) query.set('backtest_pool_roll_mode', params.backtest_pool_roll_mode)
+  if (typeof params?.backtest_max_symbols === 'number') {
+    query.set('backtest_max_symbols', String(params.backtest_max_symbols))
   }
   const suffix = query.toString()
   const timeoutMs = params?.mode === 'full_market' ? 240_000 : 45_000

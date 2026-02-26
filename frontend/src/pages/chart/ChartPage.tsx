@@ -35,7 +35,7 @@ import { KLineChart } from '@/shared/charts/KLineChart'
 import { PageHeader } from '@/shared/components/PageHeader'
 import { computeCandleRangeStats } from '@/shared/utils/candleStats'
 import { useUIStore } from '@/state/uiStore'
-import type { AIAnalysisRecord, BoardFilter, Market, SignalScanMode, StockAnnotation, TrendPoolStep } from '@/types/contracts'
+import type { AIAnalysisRecord, BoardFilter, Market, SignalScanMode, StockAnnotation, StrategyId, TrendPoolStep } from '@/types/contracts'
 
 const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 'st']
 const ALLOWED_MARKET_FILTERS: Market[] = ['sh', 'sz', 'bj']
@@ -143,6 +143,19 @@ export function ChartPage() {
   const signalRequireSequence = searchParams.get('signal_require_sequence') === 'true'
   const signalMarketFilters = parseSignalMarketFilters(searchParams)
   const signalBoardFilters = parseSignalBoardFilters(searchParams)
+  const signalStrategyIdRaw = (searchParams.get('signal_strategy_id') ?? searchParams.get('strategy_id') ?? '').trim()
+  const signalStrategyId = signalStrategyIdRaw ? (signalStrategyIdRaw as StrategyId) : undefined
+  const signalStrategyParamsRaw = (searchParams.get('signal_strategy_params') ?? searchParams.get('strategy_params') ?? '').trim()
+  const signalStrategyParams = useMemo(() => {
+    if (!signalStrategyParamsRaw) return undefined
+    try {
+      const parsed = JSON.parse(signalStrategyParamsRaw) as unknown
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+      return parsed as Record<string, unknown>
+    } catch {
+      return undefined
+    }
+  }, [signalStrategyParamsRaw])
 
   const candlesQuery = useQuery({
     queryKey: ['candles', symbol],
@@ -171,12 +184,16 @@ export function ChartPage() {
       signalRequireSequence,
       signalMarketFilters.join(','),
       signalBoardFilters.join(','),
+      signalStrategyId ?? '',
+      JSON.stringify(signalStrategyParams ?? {}),
     ],
     queryFn: () =>
       getSignals({
         mode: signalMode,
         run_id: signalRunId,
         trend_step: signalMode === 'trend_pool' ? signalTrendStep : undefined,
+        strategy_id: signalStrategyId,
+        strategy_params: signalStrategyParams,
         market_filters: signalMode === 'full_market' && signalMarketFilters.length > 0 ? signalMarketFilters : undefined,
         board_filters: signalBoardFilters.length > 0 ? signalBoardFilters : undefined,
         as_of_date: signalAsOfDate,

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import type { ReactElement, ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   Alert,
@@ -10,7 +11,6 @@ import {
   Empty,
   Input,
   InputNumber,
-  List,
   Popconfirm,
   Row,
   Select,
@@ -36,6 +36,39 @@ type Draft = {
   description: string
   dimensions: EventJudgmentDimension[]
   rule_values: EventJudgmentRuleValue[]
+}
+
+type CompatListProps<T> = {
+  dataSource: T[]
+  renderItem: (item: T, index: number) => ReactNode
+}
+
+type CompatListItemProps = {
+  actions?: ReactNode[]
+  children: ReactNode
+}
+
+type CompatListComponent = {
+  <T>(props: CompatListProps<T>): ReactElement
+  Item: (props: CompatListItemProps) => ReactElement
+}
+
+const CompatList = (({ dataSource, renderItem }: CompatListProps<unknown>) => (
+  <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+    {dataSource.map((item, index) => (
+      <div key={index}>
+        {renderItem(item, index)}
+      </div>
+    ))}
+  </Space>
+)) as CompatListComponent
+
+CompatList.Item = function CompatListItem({ actions, children }: CompatListItemProps) {
+  return (
+    <Card size="small" actions={actions}>
+      {children}
+    </Card>
+  )
 }
 
 function normalizeBool(v: unknown, fallback: boolean): boolean {
@@ -264,9 +297,9 @@ export function EventJudgmentPage() {
   }
 
   return (
-    <Space direction="vertical" size={16} style={{ width: '100%' }}>
+    <Space orientation="vertical" size={16} style={{ width: '100%' }}>
       <PageHeader title="事件判别中心" subtitle="统一维护维科夫事件评分维度与触发规则阈值。" badge="核心逻辑" />
-      <Alert type="info" showIcon message="执行说明" description={<Space wrap size={8}><Typography.Text type="secondary">当前激活模板会同时影响待买信号与策略回测。</Typography.Text><Link to="/signals">待买信号</Link><Link to="/backtest">策略回测</Link><Link to="/strategy">策略中心</Link></Space>} />
+      <Alert type="info" showIcon title="执行说明" description={<Space wrap size={8}><Typography.Text type="secondary">当前激活模板会同时影响待买信号与策略回测。</Typography.Text><Link to="/signals">待买信号</Link><Link to="/backtest">策略回测</Link><Link to="/strategy">策略中心</Link></Space>} />
 
       <Row gutter={[16, 16]}>
         <Col xs={24} xl={8}>
@@ -285,11 +318,11 @@ export function EventJudgmentPage() {
             })
           }}>新建自定义</Button>}>
             {profiles.length <= 0 ? <Empty description="暂无模板" /> : (
-              <List dataSource={profiles} renderItem={(item) => {
+              <CompatList dataSource={profiles} renderItem={(item) => {
                 const active = item.profile_id === activeProfileId
                 const selected = item.profile_id === selectedProfileId
                 return (
-                  <List.Item actions={[
+                  <CompatList.Item actions={[
                     <Button key="select" size="small" type={selected ? 'primary' : 'default'} ghost={selected} onClick={() => setSelectedProfileId(item.profile_id)}>{selected ? '已选中' : '选择'}</Button>,
                     <Button key="apply" size="small" loading={applying && active} disabled={active} onClick={async () => {
                       setApplying(true)
@@ -307,7 +340,7 @@ export function EventJudgmentPage() {
                       message.success('已删除模板。')
                     }}><Button size="small" danger>删除</Button></Popconfirm> : <span key="sys" />,
                   ]}>
-                    <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                    <Space orientation="vertical" size={2} style={{ width: '100%' }}>
                       <Space wrap size={6}>
                         <Typography.Text strong>{item.name}</Typography.Text>
                         {item.is_system ? <Tag color="blue">系统</Tag> : <Tag color="green">自定义</Tag>}
@@ -315,7 +348,7 @@ export function EventJudgmentPage() {
                       </Space>
                       <Typography.Text type="secondary">维度数：{item.dimensions.length} | 规则数：{item.rule_values.length}</Typography.Text>
                     </Space>
-                  </List.Item>
+                  </CompatList.Item>
                 )
               }} />
             )}
@@ -324,7 +357,7 @@ export function EventJudgmentPage() {
 
         <Col xs={24} xl={16}>
           <Card title="模板编辑" extra={<Space><Button type="primary" loading={saving} onClick={() => { void saveDraft() }}>保存并激活</Button></Space>}>
-            {draft.source_score_mode === 'legacy_formula' ? <Alert type="warning" showIcon message="当前模板为经典公式模式" description="保存时会转换为可编辑的维度加权模板。" style={{ marginBottom: 12 }} /> : null}
+            {draft.source_score_mode === 'legacy_formula' ? <Alert type="warning" showIcon title="当前模板为经典公式模式" description="保存时会转换为可编辑的维度加权模板。" style={{ marginBottom: 12 }} /> : null}
 
             <Row gutter={[12, 12]}>
               <Col xs={24} md={12}><Typography.Text type="secondary">模板名称</Typography.Text><Input value={draft.name} onChange={(e) => setDraft((p) => ({ ...p, name: e.target.value }))} /></Col>
@@ -333,7 +366,7 @@ export function EventJudgmentPage() {
 
             <Divider>评分维度</Divider>
             {draft.dimensions.length <= 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前草稿还没有维度" /> : (
-              <Space direction="vertical" size={10} style={{ width: '100%' }}>
+              <Space orientation="vertical" size={10} style={{ width: '100%' }}>
                 {draft.dimensions.map((d, i) => (
                   <Card key={`${d.dimension_id}-${i}`} size="small">
                     <Row gutter={[8, 8]} align="middle">
@@ -352,7 +385,7 @@ export function EventJudgmentPage() {
 
             <Divider>事件触发规则</Divider>
             {ruleOptions.length <= 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无规则配置项" /> : (
-              <Space direction="vertical" size={12} style={{ width: '100%' }}>
+              <Space orientation="vertical" size={12} style={{ width: '100%' }}>
                 <Card size="small">
                   <Row gutter={[8, 8]}>
                     <Col xs={24} md={8}><Typography.Text type="secondary">按事件筛选</Typography.Text><Select style={{ width: '100%' }} value={ruleCategory} options={categoryOptions} onChange={(v) => setRuleCategory(String(v))} /></Col>
@@ -364,7 +397,7 @@ export function EventJudgmentPage() {
                 {shownGroups.length <= 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有匹配的规则项" /> : null}
                 {shownGroups.map((g) => (
                   <Card key={g.category} size="small" title={g.category}>
-                    <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                    <Space orientation="vertical" size={8} style={{ width: '100%' }}>
                       {g.options.map((o) => {
                         const cur = curRuleMap.get(o.rule_key) ?? o.default_value
                         const base = baseRuleMap.get(o.rule_key) ?? o.default_value

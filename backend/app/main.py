@@ -21,6 +21,7 @@ from .models import (
     BacktestPlateauRunRequest,
     BacktestPlateauResponse,
     BacktestPlateauTaskStatusResponse,
+    BacktestPoolRollMode,
     BacktestTaskStartResponse,
     BacktestTaskStatusResponse,
     BacktestReportBuildRequest,
@@ -199,6 +200,9 @@ def get_signals(
     min_event_count: int = Query(default=1, ge=0, le=12),
     signal_age_min: int = Query(default=0, ge=0, le=240),
     signal_age_max: int | None = Query(default=None, ge=0, le=240),
+    backtest_date_from: str | None = Query(default=None, min_length=10, max_length=10, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    backtest_pool_roll_mode: BacktestPoolRollMode | None = Query(default=None),
+    backtest_max_symbols: int | None = Query(default=None, ge=20, le=2000),
 ) -> SignalsResponse | JSONResponse:
     strategy_params: dict[str, object] | None = None
     if strategy_params_json.strip():
@@ -226,6 +230,9 @@ def get_signals(
             min_event_count=min_event_count,
             signal_age_min=signal_age_min,
             signal_age_max=signal_age_max,
+            backtest_date_from=backtest_date_from,
+            backtest_pool_roll_mode=backtest_pool_roll_mode,
+            backtest_max_symbols=backtest_max_symbols,
         )
     except BacktestValidationError as exc:
         return error_response(400, exc.code, str(exc))
