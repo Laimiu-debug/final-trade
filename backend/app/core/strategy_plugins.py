@@ -164,6 +164,128 @@ class ScoreOnlyRankPlugin(BaseStrategyPlugin):
         return _clamp_score(quality)
 
 
+class MatrixSignalPlugin(BaseStrategyPlugin):
+    """矩阵信号策略插件 — 将 backtest_signal_matrix 的 S1-S9 向量化逻辑
+    适配为逐票评估接口，使其可在策略中心统一管理。
+
+    S1: 波动收敛 (ATR ratio < threshold)
+    S2: 量能萎缩 (vol_ma10/vol_ma60 < threshold)
+    S3: 40日涨幅 top_n (由 build_universe 预筛)
+    S4: 横盘整理 (振幅收敛 + 价格靠近MA20)
+    S5: 突破买入 (创20日新高 + 放量)
+    S6: 均线回踩买入 (站上MA10 + 高于10日低点)
+    S7: 多头排列 (MA10 > MA20 > MA60)
+    S8: 破位卖出 (破20日低点 或 跌破MA20*0.97)
+    S9: 放量下跌 (跌破MA10 + 放量 + 40日负收益)
+    """
+
+    strategy_id = "matrix_signal_v1"
+
+    @staticmethod
+    def _safe_float(params: dict[str, Any], key: str, fallback: float) -> float:
+        try:
+            value = float(params.get(key, fallback))
+        except Exception:
+            return float(fallback)
+        if not __import__("math").isfinite(value):
+            return float(fallback)
+        return float(value)
+
+    def build_universe(
+        self,
+        *,
+        candidates: list[ScreenerResult],
+        params: dict[str, Any],
+        mode: str,
+    ) -> list[ScreenerResult]:
+        """池筛选：pool_score >= min_pool_score 才入池。
+        pool_score = S1 + S2 + S3 + S4 (各 0/1)。
+        S3 由 ret40 排名 top_n 近似。
+        """
+        _ = mode
+        atr_ratio_max = self._safe_float(params, "atr_ratio_max", 0.7)
+        vol_ratio_max = self._safe_float(params, "vol_ratio_max", 0.6)
+        sideways_range_max = self._safe_float(params, "sideways_range_max", 0.18)
+        near_ma20_max = self._safe_float(params, "near_ma20_max", 0.06)
+        min_pool_score = int(self._safe_float(params, "min_pool_score", 2))
+        ret40_top_n = int(self._safe_float(params, "ret40_top_n", 500))
+
+        # 先按 ret40 降序取 top_n 作为 S3 候选
+        sorted_by_ret40 = sorted(candidates, key=lambda r: float(r.ret40), reverse=True)
+        s3_symbols: set[str] = set()
+        for i, row in enumerate(sorted_by_ret40):
+            if i >= ret40_top_n:
+                break
+            s3_symbols.add(row.symbol)
+
+        out: list[ScreenerResult] = []
+        for row in candidates:
+            s1 = 1 if float(row.retrace20) < atr_ratio_max else 0
+            s2 = 1 if float(row.vol_slope20) < vol_ratio_max else 0
+            s3 = 1 if row.symbol in s3_symbols else 0
+            s4 = 1 if (float(row.retrace20) < sideways_range_max and float(row.price_vs_ma20) < near_ma20_max) else 0
+            pool_score = s1 + s2 + s3 + s4
+            if pool_score >= min_pool_score:
+                out.append(row)
+        return out
+
+    def generate_signals(
+        self,
+        *,
+        row: ScreenerResult,
+        snapshot: dict[str, Any],
+        params: dict[str, Any],
+    ) -> bool:
+        """买入信号：(S5 | S6) & in_pool。
+        S5: 突破20日高点 + 放量 (近似: ret40 > 0 且 up_down_volume_ratio > breakout_vol_ratio)
+        S6: 均线回踩 (近似: price_vs_ma20 接近0 且 pullback_days <= max_pullback_days)
+        """
+        _ = snapshot
+        breakout_vol_ratio = self._safe_float(params, "breakout_vol_ratio", 1.2)
+        max_pullback_days = int(self._safe_float(params, "max_pullback_days", 3))
+
+        # S5: 突破买入 — 涨幅为正 + 量比达标
+        s5 = float(row.ret40) > 0 and float(row.up_down_volume_ratio) >= breakout_vol_ratio
+        # S6: 回踩买入 — 价格靠近MA20 + 回调天数有限
+        s6 = abs(float(row.price_vs_ma20)) < 0.06 and int(row.pullback_days) <= max_pullback_days
+        return s5 or s6
+
+    def rank_signals(
+        self,
+        *,
+        signal: SignalResult,
+        row: ScreenerResult,
+        params: dict[str, Any],
+        fallback_score: float,
+    ) -> float:
+        """评分逻辑与矩阵引擎一致：
+        raw_score = pool_score + S5*2.0 + S6*1.5 + S7*1.0
+        score = clamp(raw_score / 8.5 * 100, 0, 100)
+        """
+        atr_ratio_max = self._safe_float(params, "atr_ratio_max", 0.7)
+        vol_ratio_max = self._safe_float(params, "vol_ratio_max", 0.6)
+        sideways_range_max = self._safe_float(params, "sideways_range_max", 0.18)
+        near_ma20_max = self._safe_float(params, "near_ma20_max", 0.06)
+        breakout_vol_ratio = self._safe_float(params, "breakout_vol_ratio", 1.2)
+        max_pullback_days = int(self._safe_float(params, "max_pullback_days", 3))
+
+        s1 = 1.0 if float(row.retrace20) < atr_ratio_max else 0.0
+        s2 = 1.0 if float(row.vol_slope20) < vol_ratio_max else 0.0
+        s4 = 1.0 if (float(row.retrace20) < sideways_range_max and float(row.price_vs_ma20) < near_ma20_max) else 0.0
+        # S3 在 rank 阶段近似为 ret40 > 0
+        s3 = 1.0 if float(row.ret40) > 0 else 0.0
+        pool_score = s1 + s2 + s3 + s4
+
+        s5 = 1.0 if (float(row.ret40) > 0 and float(row.up_down_volume_ratio) >= breakout_vol_ratio) else 0.0
+        s6 = 1.0 if (abs(float(row.price_vs_ma20)) < 0.06 and int(row.pullback_days) <= max_pullback_days) else 0.0
+        # S7: 多头排列 — 近似: MA10 > MA20 天数足够
+        s7 = 1.0 if int(row.ma10_above_ma20_days) >= 5 else 0.0
+
+        raw_score = pool_score + s5 * 2.0 + s6 * 1.5 + s7 * 1.0
+        score = max(0.0, min(100.0, raw_score / 8.5 * 100.0))
+        return score
+
+
 class RelativeStrengthBreakoutPlugin(BaseStrategyPlugin):
     strategy_id = "relative_strength_breakout_v1"
 

@@ -8532,6 +8532,112 @@ class InMemoryStore:
 
         return params[:point_count]
 
+    def _build_backtest_universe_for_plateau(
+        self,
+        payload: BacktestRunRequest,
+        board_filters: list[BoardFilter],
+        *,
+        control_callback: Callable[[], None] | None = None,
+    ) -> tuple[list[str], dict[str, set[str]] | None, list[str]]:
+        """Build rolling universe for a backtest payload, returning (symbols, allowed_by_date, notes).
+
+        Used by run_backtest_plateau to pre-build the universe once per unique
+        max_symbols value, avoiding redundant TDX loading and screener filtering.
+        """
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        if not scan_dates:
+            raise ValueError("回测区间内无可扫描交易日。")
+
+        if payload.mode == "trend_pool":
+            trend_pool_run = self._require_backtest_trend_pool_run(payload.run_id)
+            trend_pool_params = self._bind_step_configs_to_screener_params(
+                trend_pool_run.params,
+                trend_pool_run.step_configs,
+            )
+            if payload.pool_roll_mode == "position":
+                engine = BacktestEngine(
+                    get_candles=self._ensure_candles,
+                    build_row=self._build_row_from_candles,
+                    calc_snapshot=lambda row, window_days, as_of_date: self._calc_wyckoff_snapshot(
+                        row, window_days=window_days, as_of_date=as_of_date,
+                    ),
+                    resolve_symbol_name=self._resolve_symbol_name,
+                )
+                seed_symbols, seed_allowed, _, _, _ = self._build_trend_pool_rolling_universe(
+                    payload=payload, screener_params=trend_pool_params,
+                    board_filters=board_filters, refresh_dates=[scan_dates[0]],
+                    progress_callback=None,
+                )
+                if not seed_symbols:
+                    raise ValueError("回测股票池为空：持仓触发滚动初始池为空。")
+                probe = engine.run(
+                    payload=payload, symbols=seed_symbols,
+                    allowed_symbols_by_date=seed_allowed,
+                    control_callback=control_callback,
+                )
+                refresh_set: set[str] = {scan_dates[0]}
+                for trade in probe.trades:
+                    nd = self._next_scan_date(scan_dates, trade.exit_date)
+                    if nd:
+                        refresh_set.add(nd)
+                symbols, allowed, notes, _, rdu = self._build_trend_pool_rolling_universe(
+                    payload=payload, screener_params=trend_pool_params,
+                    board_filters=board_filters, refresh_dates=sorted(refresh_set),
+                    progress_callback=None,
+                )
+                notes.append(f"持仓触发滚动：首日+卖出后下一交易日刷新，共 {len(rdu)} 次。")
+            else:
+                symbols, allowed, notes, _, _ = self._build_trend_pool_rolling_universe(
+                    payload=payload, screener_params=trend_pool_params,
+                    board_filters=board_filters, refresh_dates=None,
+                    progress_callback=None,
+                )
+            if not symbols:
+                raise ValueError(f"回测股票池为空：{'；'.join(notes) if notes else '滚动筛选结果为空。'}")
+            return symbols, allowed, notes
+
+        if payload.mode == "full_market":
+            if payload.pool_roll_mode == "position":
+                engine = BacktestEngine(
+                    get_candles=self._ensure_candles,
+                    build_row=self._build_row_from_candles,
+                    calc_snapshot=lambda row, window_days, as_of_date: self._calc_wyckoff_snapshot(
+                        row, window_days=window_days, as_of_date=as_of_date,
+                    ),
+                    resolve_symbol_name=self._resolve_symbol_name,
+                )
+                seed_symbols, seed_allowed, _, _, _ = self._build_full_market_rolling_universe(
+                    payload=payload, board_filters=board_filters,
+                    refresh_dates=[scan_dates[0]], progress_callback=None,
+                )
+                if not seed_symbols:
+                    raise ValueError("回测股票池为空：持仓触发滚动初始池为空。")
+                probe = engine.run(
+                    payload=payload, symbols=seed_symbols,
+                    allowed_symbols_by_date=seed_allowed,
+                    control_callback=control_callback,
+                )
+                refresh_set: set[str] = {scan_dates[0]}
+                for trade in probe.trades:
+                    nd = self._next_scan_date(scan_dates, trade.exit_date)
+                    if nd:
+                        refresh_set.add(nd)
+                symbols, allowed, notes, _, rdu = self._build_full_market_rolling_universe(
+                    payload=payload, board_filters=board_filters,
+                    refresh_dates=sorted(refresh_set), progress_callback=None,
+                )
+                notes.append(f"持仓触发滚动：首日+卖出后下一交易日刷新，共 {len(rdu)} 次。")
+            else:
+                symbols, allowed, notes, _, _ = self._build_full_market_rolling_universe(
+                    payload=payload, board_filters=board_filters,
+                    refresh_dates=None, progress_callback=None,
+                )
+            if not symbols:
+                raise ValueError(f"回测股票池为空：{'；'.join(notes) if notes else '滚动筛选结果为空。'}")
+            return symbols, allowed, notes
+
+        raise ValueError(f"不支持的回测模式: {payload.mode}")
+
     def run_backtest_plateau(
         self,
         payload: BacktestPlateauRunRequest,
@@ -8694,6 +8800,7 @@ class InMemoryStore:
         def _evaluate_single_point(
             index: int,
             params: BacktestPlateauParams,
+            universe: tuple[list[str], dict[str, set[str]] | None, list[str]] | None = None,
         ) -> tuple[int, BacktestPlateauPoint, bool]:
             if control_callback is not None:
                 control_callback()
@@ -8715,6 +8822,7 @@ class InMemoryStore:
                 result = self.run_backtest(
                     run_payload,
                     control_callback=control_callback,
+                    prebuilt_universe=universe,
                 )
                 cache_hit = any("回测结果缓存命中" in str(note) for note in result.notes)
                 return (
@@ -8753,22 +8861,60 @@ class InMemoryStore:
                 )
 
         cancelled_exc: BacktestTaskCancelledError | None = None
+
+        # --- Pre-build universes by max_symbols to avoid redundant pool construction ---
+        board_filters_for_prebuild = [
+            item for item in base.board_filters if item in {"main", "gem", "star", "beijing", "st"}
+        ]
+        can_prebuild = base.pool_roll_mode in {"daily", "weekly"}
+        universe_by_max_symbols: dict[int, tuple[list[str], dict[str, set[str]] | None, list[str]]] = {}
+        if can_prebuild:
+            unique_max_symbols = sorted({int(p.max_symbols) for p in params_to_evaluate})
+            for ms_idx, ms_val in enumerate(unique_max_symbols):
+                if control_callback is not None:
+                    control_callback()
+                try:
+                    prebuild_payload = base.model_copy(update={"max_symbols": ms_val}, deep=True)
+                    universe = self._build_backtest_universe_for_plateau(
+                        prebuild_payload,
+                        board_filters_for_prebuild,
+                        control_callback=control_callback,
+                    )
+                    universe_by_max_symbols[ms_val] = universe
+                except BacktestTaskCancelledError:
+                    raise
+                except Exception:
+                    pass  # will fall back to run_backtest building its own universe
+                if progress_callback is not None:
+                    progress_callback(
+                        0,
+                        int(total_to_evaluate),
+                        f"候选池预构建 {ms_idx + 1}/{len(unique_max_symbols)}（max_symbols={ms_val}）",
+                    )
+
+        # Sort params by (window_days, max_symbols) to maximize Wyckoff snapshot cache hits.
+        # The first run for each window_days warms the cache; subsequent runs hit it.
+        indexed_params = list(enumerate(params_to_evaluate))
+        indexed_params.sort(key=lambda item: (item[1].window_days, item[1].max_symbols))
+
         if worker_count <= 1 or len(params_to_evaluate) <= 1:
-            for idx, params in enumerate(params_to_evaluate):
-                idx_out, point, failed = _evaluate_single_point(idx, params)
+            for orig_idx, params in indexed_params:
+                universe = universe_by_max_symbols.get(int(params.max_symbols)) if can_prebuild else None
+                idx_out, point, failed = _evaluate_single_point(orig_idx, params, universe)
                 _record_eval_result(idx_out, point, failed)
         else:
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 future_to_index: dict[Any, int] = {}
-                pending = iter(enumerate(params_to_evaluate))
+                pending = iter(indexed_params)
 
                 def _submit_next() -> None:
                     try:
-                        idx, params = next(pending)
+                        orig_idx, params = next(pending)
                     except StopIteration:
                         return
-                    future = executor.submit(_evaluate_single_point, idx, params)
-                    future_to_index[future] = idx
+                    universe = universe_by_max_symbols.get(int(params.max_symbols)) if can_prebuild else None
+                    future = executor.submit(_evaluate_single_point, orig_idx, params, universe)
+                    future_to_index[future] = orig_idx
 
                 for _ in range(worker_count):
                     _submit_next()
@@ -8822,6 +8968,11 @@ class InMemoryStore:
                 )
             notes.append(f"参考网格组合规模（按列表离散值估算）: {grid_total_combinations}。")
         notes.append(f"收益平原并行评估线程数: {worker_count}。")
+        if can_prebuild and universe_by_max_symbols:
+            notes.append(
+                f"候选池预构建优化: {len(universe_by_max_symbols)} 个不同 max_symbols 值共享候选池，"
+                f"参数按 (window_days, max_symbols) 排序以最大化 snapshot 缓存命中。"
+            )
         if failure_count > 0:
             notes.append(f"有 {failure_count} 组参数评估失败，详情见 points.error。")
         notes.append("评分规则已加入低胜率惩罚：胜率低于45%将额外扣分。")
@@ -9802,6 +9953,7 @@ class InMemoryStore:
         *,
         progress_callback: Callable[[str, int, int, str], None] | None = None,
         control_callback: Callable[[], None] | None = None,
+        prebuilt_universe: tuple[list[str], dict[str, set[str]] | None, list[str]] | None = None,
     ) -> BacktestResponse:
         strategy_meta, normalized_strategy_params, strategy_params_hash = self._resolve_strategy_runtime(
             strategy_id=payload.strategy_id,
@@ -9969,8 +10121,10 @@ class InMemoryStore:
             execution_path_preference = "auto"
             payload = payload.model_copy(update={"execution_path_preference": "auto"})
         if payload.mode == "trend_pool" and execution_path_preference == "auto":
-            execution_path_preference = "legacy"
-            payload = payload.model_copy(update={"execution_path_preference": "legacy"})
+            # 矩阵信号策略本身就是矩阵逻辑，不应降级到 legacy
+            if str(strategy_meta.get("strategy_id", "")).strip() != "matrix_signal_v1":
+                execution_path_preference = "legacy"
+                payload = payload.model_copy(update={"execution_path_preference": "legacy"})
         force_matrix_path = execution_path_preference == "matrix"
         force_legacy_path = execution_path_preference == "legacy"
         matrix_supported = (
@@ -10155,7 +10309,10 @@ class InMemoryStore:
             resolve_symbol_name=self._resolve_symbol_name,
         )
 
-        if payload.mode == "trend_pool":
+        if prebuilt_universe is not None:
+            symbols, allowed_symbols_by_date, prebuilt_notes = prebuilt_universe
+            pool_notes = [*pool_notes, *prebuilt_notes]
+        elif payload.mode == "trend_pool":
             if trend_pool_run is None:
                 raise ValueError("趋势池筛选任务不可用。")
             trend_pool_params = self._bind_step_configs_to_screener_params(

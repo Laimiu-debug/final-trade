@@ -309,7 +309,7 @@ def test_backtest_experiment_ab_endpoint_reports_baseline_and_deltas(
 
 
 def test_backtest_plateau_endpoint_handles_truncation_and_failures(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None):  # noqa: ANN001
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
         _ = (progress_callback, control_callback)
         if float(payload.min_score) >= 58.0:
             raise ValueError("mock failure for plateau")
@@ -471,7 +471,7 @@ def test_backtest_experiment_ab_supports_execution_path_preference(
 
 
 def test_backtest_plateau_endpoint_lhs_sampling_is_repeatable(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None):  # noqa: ANN001
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
         _ = (progress_callback, control_callback)
         score_raw = (
             float(payload.min_score) * 0.4
@@ -569,7 +569,7 @@ def test_backtest_plateau_endpoint_parallel_workers(monkeypatch: pytest.MonkeyPa
     active_workers = 0
     max_active_workers = 0
 
-    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None):  # noqa: ANN001
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
         nonlocal active_workers, max_active_workers
         _ = progress_callback
         if control_callback is not None:
@@ -652,7 +652,7 @@ def test_backtest_plateau_endpoint_parallel_workers(monkeypatch: pytest.MonkeyPa
 
 
 def test_backtest_plateau_task_supports_pause_resume_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None):  # noqa: ANN001
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
         _ = progress_callback
         if control_callback is not None:
             control_callback()
@@ -873,7 +873,7 @@ def test_backtest_task_supports_pause_resume_cancel(monkeypatch: pytest.MonkeyPa
     def _fake_total_dates(payload):  # noqa: ANN001
         return 120
 
-    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None):  # noqa: ANN001
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
         total = 120
         for idx in range(total):
             if control_callback is not None:
@@ -1095,7 +1095,7 @@ def test_backtest_task_records_stage_timings(monkeypatch: pytest.MonkeyPatch) ->
         _ = payload
         return 3
 
-    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None):  # noqa: ANN001
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
         if progress_callback is not None:
             progress_callback(payload.date_from, 1, 3, "mock progress")
             progress_callback(payload.date_to, 3, 3, "mock done")
@@ -1159,7 +1159,7 @@ def test_backtest_task_async_precheck_fails_in_worker(monkeypatch: pytest.Monkey
         call_counter["precheck"] += 1
         raise BacktestValidationError("BACKTEST_DATA_COVERAGE_INSUFFICIENT", "mock coverage insufficient")
 
-    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None):  # noqa: ANN001
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
         _ = (payload, progress_callback, control_callback)
         call_counter["run"] += 1
         return BacktestResponse(

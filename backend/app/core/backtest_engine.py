@@ -61,6 +61,11 @@ DELAY_SKIP_REASON_SELL_SIGNAL = "delay_invalidated_by_sell_signal"
 EVENT_GRADE_RANK: dict[str, int] = {"C": 1, "B": 2, "A": 3}
 MATRIX_SEMANTIC_ALIGNED = "aligned_wyckoff_v2"
 SCORE_ONLY_STRATEGY_ID = "score_only_rank_v1"
+# 不依赖 Wyckoff 入场事件的策略 — 当天无事件时用伪事件 "SCORE" 兜底
+EVENT_INDEPENDENT_STRATEGY_IDS: frozenset[str] = frozenset({
+    "score_only_rank_v1",
+    "matrix_signal_v1",
+})
 
 
 @dataclass
@@ -200,7 +205,7 @@ class BacktestEngine:
 
     @staticmethod
     def _is_score_only_strategy(payload: BacktestRunRequest) -> bool:
-        return str(payload.strategy_id).strip().lower() == SCORE_ONLY_STRATEGY_ID
+        return str(payload.strategy_id).strip().lower() in EVENT_INDEPENDENT_STRATEGY_IDS
 
     @staticmethod
     def _normalize_event_grade(raw: Any) -> str:

@@ -7,6 +7,7 @@ from typing import Any
 
 from .strategy_plugins import (
     BaseStrategyPlugin,
+    MatrixSignalPlugin,
     RelativeStrengthBreakoutPlugin,
     ScoreOnlyRankPlugin,
     StrategyPlugin,
@@ -366,11 +367,147 @@ class StrategyRegistry:
         )
         self._strategies[v4.strategy_id] = v4
 
+        # ── matrix_signal_v1 ──
+        v5_schema: dict[str, dict[str, Any]] = {
+            "atr_ratio_max": {
+                "type": "number",
+                "title": "S1 波动收敛阈值",
+                "minimum": 0.1,
+                "maximum": 2.0,
+                "default": 0.7,
+            },
+            "vol_ratio_max": {
+                "type": "number",
+                "title": "S2 量能萎缩阈值",
+                "minimum": 0.1,
+                "maximum": 2.0,
+                "default": 0.6,
+            },
+            "ret40_top_n": {
+                "type": "integer",
+                "title": "S3 40日涨幅TopN",
+                "minimum": 50,
+                "maximum": 2000,
+                "default": 500,
+            },
+            "sideways_range_max": {
+                "type": "number",
+                "title": "S4 横盘振幅上限",
+                "minimum": 0.05,
+                "maximum": 0.50,
+                "default": 0.18,
+            },
+            "near_ma20_max": {
+                "type": "number",
+                "title": "S4 偏离MA20上限",
+                "minimum": 0.01,
+                "maximum": 0.20,
+                "default": 0.06,
+            },
+            "min_pool_score": {
+                "type": "integer",
+                "title": "入池最低得分(S1-S4)",
+                "minimum": 1,
+                "maximum": 4,
+                "default": 2,
+            },
+            "breakout_vol_ratio": {
+                "type": "number",
+                "title": "S5 突破量比阈值",
+                "minimum": 0.5,
+                "maximum": 3.0,
+                "default": 1.2,
+            },
+            "max_pullback_days": {
+                "type": "integer",
+                "title": "S6 最大回调天数",
+                "minimum": 0,
+                "maximum": 20,
+                "default": 3,
+            },
+            "min_score": {
+                "type": "number",
+                "title": "入场质量分下限",
+                "minimum": 0.0,
+                "maximum": 100.0,
+                "default": 50.0,
+            },
+            "min_event_count": {
+                "type": "integer",
+                "title": "最少事件数",
+                "minimum": 0,
+                "maximum": 12,
+                "default": 0,
+            },
+            "require_sequence": {
+                "type": "boolean",
+                "title": "要求事件序列",
+                "default": False,
+            },
+            "health_score_min": {
+                "type": "number",
+                "title": "健康分下限",
+                "minimum": 0.0,
+                "maximum": 100.0,
+                "default": 0.0,
+            },
+            "event_score_min": {
+                "type": "number",
+                "title": "事件分下限",
+                "minimum": 0.0,
+                "maximum": 100.0,
+                "default": 0.0,
+            },
+            "event_grade_min": {
+                "type": "enum",
+                "title": "事件等级下限",
+                "options": ["A", "B", "C"],
+                "default": "C",
+            },
+            "require_key_event_confirmation": {
+                "type": "boolean",
+                "title": "关键事件确认必需",
+                "default": False,
+            },
+        }
+        v5 = StrategyDescriptor(
+            strategy_id="matrix_signal_v1",
+            name="矩阵信号V1",
+            version="1.0.0-alpha",
+            enabled=True,
+            is_default=False,
+            capabilities=StrategyCapabilities(
+                supports_matrix=True,
+                supports_signal_age_filter=True,
+                supports_entry_delay=True,
+            ),
+            params_schema=v5_schema,
+            default_params={
+                "atr_ratio_max": 0.7,
+                "vol_ratio_max": 0.6,
+                "ret40_top_n": 500,
+                "sideways_range_max": 0.18,
+                "near_ma20_max": 0.06,
+                "min_pool_score": 2,
+                "breakout_vol_ratio": 1.2,
+                "max_pullback_days": 3,
+                "min_score": 50.0,
+                "min_event_count": 0,
+                "require_sequence": False,
+                "health_score_min": 0.0,
+                "event_score_min": 0.0,
+                "event_grade_min": "C",
+                "require_key_event_confirmation": False,
+            },
+        )
+        self._strategies[v5.strategy_id] = v5
+
         self._plugins = {
             v1.strategy_id: WyckoffTrendPlugin(v1.strategy_id),
             v2.strategy_id: WyckoffTrendPlugin(v2.strategy_id),
             v3.strategy_id: RelativeStrengthBreakoutPlugin(),
             v4.strategy_id: ScoreOnlyRankPlugin(),
+            v5.strategy_id: MatrixSignalPlugin(),
         }
 
     @property
@@ -522,6 +659,14 @@ class StrategyRegistry:
             "min_score",
             "min_event_count",
             "require_sequence",
+            "atr_ratio_max",
+            "vol_ratio_max",
+            "ret40_top_n",
+            "sideways_range_max",
+            "near_ma20_max",
+            "min_pool_score",
+            "breakout_vol_ratio",
+            "max_pullback_days",
         }
         return {
             key: value
@@ -539,6 +684,14 @@ class StrategyRegistry:
             "event_score_min",
             "event_grade_min",
             "require_key_event_confirmation",
+            "atr_ratio_max",
+            "vol_ratio_max",
+            "ret40_top_n",
+            "sideways_range_max",
+            "near_ma20_max",
+            "min_pool_score",
+            "breakout_vol_ratio",
+            "max_pullback_days",
         }
         return {
             key: value
