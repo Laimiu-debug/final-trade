@@ -3246,11 +3246,11 @@ class InMemoryStore:
         up_down_volume_ratio = self._safe_mean(up_volumes) / max(self._safe_mean(down_volumes), 1.0)
 
         pullback_days = 0
-        for idx in range(len(closes) - 1, 0, -1):
-            if closes[idx] <= closes[idx - 1]:
-                pullback_days += 1
-            else:
-                break
+        pb_window = min(20, len(closes))
+        if pb_window >= 2:
+            pb_slice = closes[-pb_window:]
+            pb_peak_offset = max(range(len(pb_slice)), key=lambda i: pb_slice[i])
+            pullback_days = len(pb_slice) - 1 - pb_peak_offset
         recent_pullback_volume = volumes[-pullback_days:] if pullback_days > 0 else []
         pullback_volume_ratio = (
             self._safe_mean(recent_pullback_volume) / max(self._safe_mean(volumes[-5:]), 1.0)

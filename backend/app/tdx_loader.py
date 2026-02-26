@@ -440,12 +440,14 @@ def _ma_at(prices: list[float], idx: int, period: int) -> float | None:
 
 
 def _count_pullback_days(closes: list[float]) -> int:
-    days = 0
-    for i in range(len(closes) - 1, 0, -1):
-        if closes[i] <= closes[i - 1]:
-            days += 1
-        else:
-            break
+    """从近20日最高收盘价到最后一天的交易日距离。"""
+    if len(closes) < 2:
+        return 0
+    window = min(20, len(closes))
+    recent = closes[-window:]
+    peak_offset = max(range(len(recent)), key=lambda i: recent[i])
+    # peak_offset 是 recent 内的索引，距离末尾的天数
+    days = len(recent) - 1 - peak_offset
     return days
 
 

@@ -293,15 +293,16 @@ class ScreenerEngine:
         down_volume = sum(volumes[-20:]) - up_volume
         up_down_volume_ratio = up_volume / down_volume if down_volume > 0 else 1.0
 
-        # Pullback metrics
-        pullback_days = 0
+        # Pullback metrics: 从近20日最高收盘价到当前的交易日距离
+        pb_window = min(20, len(candles))
+        pb_closes = [float(candles[len(candles) - pb_window + i].close) for i in range(pb_window)]
+        pb_peak_offset = max(range(len(pb_closes)), key=lambda i: pb_closes[i])
+        pullback_days = len(pb_closes) - 1 - pb_peak_offset
         pullback_volume_sum = 0.0
-        for i in range(len(candles) - 2, max(0, len(candles) - 12), -1):
-            if i > 0 and candles[i].close < candles[i - 1].close:
-                pullback_days += 1
-                pullback_volume_sum += volumes[i]
-            else:
-                break
+        if pullback_days > 0:
+            for i in range(len(candles) - pullback_days, len(candles)):
+                if i > 0 and candles[i].close < candles[i - 1].close:
+                    pullback_volume_sum += volumes[i]
 
         avg_volume = sum(volumes[-20:]) / 20
         pullback_volume_ratio = pullback_volume_sum / avg_volume if avg_volume > 0 else 1.0
