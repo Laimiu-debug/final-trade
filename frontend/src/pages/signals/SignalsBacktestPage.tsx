@@ -346,7 +346,8 @@ export function SignalsBacktestPage() {
       {
         title: '名称',
         dataIndex: 'name',
-        width: 220,
+        width: 190,
+        ellipsis: true,
         sorter: (a, b) => a.name.localeCompare(b.name, 'zh-CN'),
         render: (_, row) => {
           const highlighted = row.record_id === highlightedRecordId
@@ -361,7 +362,7 @@ export function SignalsBacktestPage() {
       {
         title: '信号日',
         dataIndex: 'signal_date',
-        width: 120,
+        width: 110,
         filters: signalDateFilters,
         onFilter: (value, row) => row.signal_date === String(value),
         sorter: (a, b) => toDateValue(a.signal_date) - toDateValue(b.signal_date),
@@ -369,7 +370,8 @@ export function SignalsBacktestPage() {
       {
         title: '策略',
         key: 'strategy',
-        width: 160,
+        width: 136,
+        ellipsis: true,
         filters: strategyFilters,
         onFilter: (value, row) => (row.strategy_name || row.strategy_id) === String(value),
         sorter: (a, b) => (a.strategy_name || a.strategy_id).localeCompare((b.strategy_name || b.strategy_id), 'zh-CN'),
@@ -378,13 +380,13 @@ export function SignalsBacktestPage() {
       {
         title: '股票数',
         dataIndex: 'total_constituents',
-        width: 90,
+        width: 80,
         sorter: (a, b) => a.total_constituents - b.total_constituents,
       },
       {
         title: 'T+1收益',
         key: 't1_return',
-        width: 106,
+        width: 96,
         sorter: (a, b) => a.summary.t1.return_pct - b.summary.t1.return_pct,
         render: (_, row) => (
           <Typography.Text style={{ color: toSignedColor(row.summary.t1.return_pct) }}>
@@ -395,7 +397,7 @@ export function SignalsBacktestPage() {
       {
         title: 'T+2收益',
         key: 't2_return',
-        width: 106,
+        width: 96,
         sorter: (a, b) => a.summary.t2.return_pct - b.summary.t2.return_pct,
         render: (_, row) => (
           <Typography.Text style={{ color: toSignedColor(row.summary.t2.return_pct) }}>
@@ -406,38 +408,38 @@ export function SignalsBacktestPage() {
       {
         title: 'T+1 ETF内胜率',
         key: 't1_stock_win',
-        width: 136,
+        width: 118,
         sorter: (a, b) => a.summary.t1.stock_win_rate - b.summary.t1.stock_win_rate,
         render: (_, row) => toPercent(row.summary.t1.stock_win_rate),
       },
       {
         title: 'T+2 ETF内胜率',
         key: 't2_stock_win',
-        width: 136,
+        width: 118,
         sorter: (a, b) => a.summary.t2.stock_win_rate - b.summary.t2.stock_win_rate,
         render: (_, row) => toPercent(row.summary.t2.stock_win_rate),
       },
       {
         title: '基准收益(T+1/T+2)',
         key: 'benchmark',
-        width: 170,
+        width: 152,
         sorter: (a, b) => a.summary.t1.benchmark_return_pct - b.summary.t1.benchmark_return_pct,
         render: (_, row) => `${toSignedPercent(row.summary.t1.benchmark_return_pct)} / ${toSignedPercent(row.summary.t2.benchmark_return_pct)}`,
       },
       {
         title: '超额(T+1/T+2)',
         key: 'excess',
-        width: 150,
+        width: 136,
         sorter: (a, b) => a.summary.t1.excess_return_pct - b.summary.t1.excess_return_pct,
         render: (_, row) => `${toSignedPercent(row.summary.t1.excess_return_pct)} / ${toSignedPercent(row.summary.t2.excess_return_pct)}`,
       },
       {
         title: '操作',
         key: 'actions',
-        width: 140,
+        width: 120,
         fixed: 'right',
         render: (_, row) => (
-          <Space size={4}>
+          <Space size={2}>
             <Button
               type="link"
               size="small"
@@ -613,16 +615,18 @@ export function SignalsBacktestPage() {
         </Space>
 
         <Table
+          size="small"
           rowKey="record_id"
           style={{ marginTop: 12 }}
           loading={listQuery.isLoading || listQuery.isFetching}
           dataSource={rows}
           columns={columns}
-          scroll={{ x: 1960 }}
+          scroll={{ x: 1480 }}
           pagination={{
             pageSize: 20,
             showSizeChanger: true,
             pageSizeOptions: ['20', '50', '100'],
+            size: 'small',
             showTotal: (total) => `共 ${total} 条`,
           }}
           onRow={(record) => ({
