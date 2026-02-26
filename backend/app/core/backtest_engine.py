@@ -490,6 +490,7 @@ class BacktestEngine:
         take_price = entry_price * (1 + payload.take_profit) if payload.take_profit > 0 else None
         trailing_pct = float(getattr(payload, "trailing_stop_pct", 0.0) or 0.0)
         max_price_since_entry = entry_price
+        trailing_triggered = False
         entry_date = candles[entry_index].time
         last_sellable_index: int | None = None
 
@@ -503,6 +504,11 @@ class BacktestEngine:
                 continue
 
             last_sellable_index = bar_index
+
+            # 回撤触发后，第二天开盘卖出
+            if trailing_triggered:
+                return bar_index, float(bar.open), "trailing_stop"
+
             max_price_since_entry = max(max_price_since_entry, float(bar.high))
 
             if stop_price is not None and float(bar.low) <= stop_price:
@@ -512,8 +518,8 @@ class BacktestEngine:
             if trailing_pct > 0 and max_price_since_entry > entry_price:
                 trailing_trigger = max_price_since_entry * (1 - trailing_pct)
                 if float(bar.low) <= trailing_trigger and trailing_trigger > entry_price:
-                    exit_price = max(float(bar.open), trailing_trigger) if float(bar.open) >= trailing_trigger else trailing_trigger
-                    return bar_index, float(exit_price), "trailing_stop"
+                    trailing_triggered = True
+                    continue
             if bar_index in exit_signal_events_by_index:
                 event_names = [item for item in exit_signal_events_by_index.get(bar_index, []) if item]
                 if event_names:
@@ -525,13 +531,15 @@ class BacktestEngine:
         if payload.enforce_t1 and last_sellable_index is None:
             return None
         fallback_index = last_sellable_index if last_sellable_index is not None else (len(candles) - 1)
-        return fallback_index, float(candles[fallback_index].close), "eod_exit"
+        fallback_reason = "trailing_stop" if trailing_triggered else "eod_exit"
+        return fallback_index, float(candles[fallback_index].close), fallback_reason
 
     @staticmethod
     def _resolve_exit_matrix(
         *,
         entry_index: int,
         entry_price: float,
+        open_col: np.ndarray,
         high_col: np.ndarray,
         low_col: np.ndarray,
         close_col: np.ndarray,
@@ -549,6 +557,7 @@ class BacktestEngine:
         take_price = entry_price * (1 + payload.take_profit) if payload.take_profit > 0 else None
         trailing_pct = float(getattr(payload, "trailing_stop_pct", 0.0) or 0.0)
         max_price_since_entry = entry_price
+        trailing_triggered = False
         last_sellable_index: int | None = None
 
         start_index = entry_index + 1 if payload.enforce_t1 else entry_index
@@ -565,6 +574,13 @@ class BacktestEngine:
             if low_price <= 0 or high_price <= 0 or close_price <= 0:
                 continue
 
+            # 回撤触发后，第二天开盘卖出
+            if trailing_triggered:
+                open_price = float(open_col[bar_index])
+                if math.isfinite(open_price) and open_price > 0:
+                    return bar_index, float(open_price), "trailing_stop"
+                return bar_index, float(close_price), "trailing_stop"
+
             max_price_since_entry = max(max_price_since_entry, high_price)
 
             if stop_price is not None and low_price <= stop_price:
@@ -574,9 +590,8 @@ class BacktestEngine:
             if trailing_pct > 0 and max_price_since_entry > entry_price:
                 trailing_trigger = max_price_since_entry * (1 - trailing_pct)
                 if low_price <= trailing_trigger and trailing_trigger > entry_price:
-                    open_price = float(close_col[bar_index])  # use close as proxy
-                    exit_price = max(open_price, trailing_trigger) if open_price >= trailing_trigger else trailing_trigger
-                    return bar_index, float(exit_price), "trailing_stop"
+                    trailing_triggered = True
+                    continue
             if bool(sell_col[bar_index]):
                 return bar_index, float(close_price), f"event_exit:{BacktestEngine._build_matrix_exit_signal_label(payload)}"
             if (bar_index - entry_index + 1) >= payload.max_hold_days:
@@ -588,7 +603,8 @@ class BacktestEngine:
         fallback_price = float(close_col[fallback_index]) if math.isfinite(float(close_col[fallback_index])) else entry_price
         if fallback_price <= 0:
             fallback_price = entry_price
-        return fallback_index, fallback_price, "eod_exit"
+        fallback_reason = "trailing_stop" if trailing_triggered else "eod_exit"
+        return fallback_index, fallback_price, fallback_reason
 
     def _build_candidates_from_matrix(
         self,
@@ -707,6 +723,7 @@ class BacktestEngine:
                 exit_resolved = self._resolve_exit_matrix(
                     entry_index=entry_index,
                     entry_price=entry_price,
+                    open_col=open_col,
                     high_col=high_col,
                     low_col=low_col,
                     close_col=close_col,
@@ -1374,6 +1391,7 @@ class BacktestEngine:
             exit_resolved = self._resolve_exit_matrix(
                 entry_index=row.entry_index,
                 entry_price=float(row.entry_price),
+                open_col=matrix_bundle.open[:, col],
                 high_col=matrix_bundle.high[:, col],
                 low_col=matrix_bundle.low[:, col],
                 close_col=matrix_bundle.close[:, col],
