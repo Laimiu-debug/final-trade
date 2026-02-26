@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "Bash(git add backend/app/core/backtest_engine.py backend/app/core/strategy_plugins.py backend/app/core/strategy_registry.py backend/tests/test_api.py backend/tests/test_backtest_engine_position.py backend/tests/test_strategy_registry_plugins.py frontend/src/mocks/data.ts frontend/src/pages/backtest/BacktestPage.tsx)",
+      "Bash(git commit -m \"feat: 新增 ScoreOnlyRank 策略与收益平原交易导出功能:*)",
+      "Bash(git push origin main)"
     ]
   }
 }

@@ -767,13 +767,24 @@ export function SignalsPage() {
   const replayContext = useMemo(() => {
     if (mode !== 'trend_pool') return null
     if (!normalizedAsOfDate) return null
-    if (!matchedBacktestDateFrom || !matchedBacktestDateTo || !matchedBacktestPoolRollMode || !matchedBacktestTrendStep) return null
-    if (normalizedAsOfDate < matchedBacktestDateFrom || normalizedAsOfDate > matchedBacktestDateTo) return null
+    // If there's a matched backtest task, use its parameters
+    if (matchedBacktestDateFrom && matchedBacktestDateTo && matchedBacktestPoolRollMode && matchedBacktestTrendStep) {
+      if (normalizedAsOfDate >= matchedBacktestDateFrom && normalizedAsOfDate <= matchedBacktestDateTo) {
+        return {
+          dateFrom: matchedBacktestDateFrom,
+          trendStep: matchedBacktestTrendStep,
+          poolRollMode: matchedBacktestPoolRollMode,
+          maxSymbols: typeof matchedBacktestMaxSymbols === 'number' ? matchedBacktestMaxSymbols : undefined,
+        }
+      }
+    }
+    // Fallback: when user sets as_of_date manually, use daily rolling from that date
+    // so the candidate pool is rebuilt using historical data as of that date
     return {
-      dateFrom: matchedBacktestDateFrom,
-      trendStep: matchedBacktestTrendStep,
-      poolRollMode: matchedBacktestPoolRollMode,
-      maxSymbols: typeof matchedBacktestMaxSymbols === 'number' ? matchedBacktestMaxSymbols : undefined,
+      dateFrom: normalizedAsOfDate,
+      trendStep: trendStep,
+      poolRollMode: 'daily' as const,
+      maxSymbols: undefined,
     }
   }, [
     matchedBacktestDateFrom,
@@ -783,6 +794,7 @@ export function SignalsPage() {
     matchedBacktestTrendStep,
     mode,
     normalizedAsOfDate,
+    trendStep,
   ])
 
   const trendPoolReady = mode !== 'trend_pool' || Boolean(runId)

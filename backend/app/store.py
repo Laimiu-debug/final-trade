@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import base64
 import io
@@ -429,6 +429,7 @@ class InMemoryStore:
         strategy_params_hash: str,
         strategy_note: str,
         execution_path: Literal["matrix", "legacy"] | None = None,
+        effective_payload: BacktestRunRequest | None = None,
     ) -> BacktestResponse:
         notes = list(result.notes)
         if strategy_note and strategy_note not in notes:
@@ -449,6 +450,8 @@ class InMemoryStore:
             "strategy_params_hash": str(strategy_params_hash),
             "execution_path": path_text,
         }
+        if effective_payload is not None:
+            updates["effective_run_request"] = effective_payload.model_copy(deep=True)
         if notes != result.notes:
             updates["notes"] = notes
         return result.model_copy(update=updates)
@@ -4794,6 +4797,85 @@ class InMemoryStore:
         degraded_reason = ";".join(reasons) if reasons else None
         return deduped_rows, degraded_reason, None, as_of_date
 
+    def _build_signal_replay_candidates(
+        self,
+        *,
+        replay_as_of_date: str,
+        replay_date_from: str,
+        replay_pool_roll_mode: str,
+        replay_screener_params: ScreenerParams,
+        replay_trend_step: TrendPoolStep,
+        replay_max_symbols: int,
+        board_filters: list[BoardFilter],
+    ) -> tuple[list[ScreenerResult], str | None]:
+        """Build candidate pool using the same rolling logic as the backtest engine.
+
+        For daily/weekly modes, this computes the correct refresh date for the
+        given as_of_date and rebuilds the pool using that date's data.
+        For position mode, it uses the initial date's pool carried forward.
+        """
+        effective_date_from = replay_date_from
+        if effective_date_from > replay_as_of_date:
+            effective_date_from = replay_as_of_date
+
+        scan_dates = self._build_backtest_scan_dates(effective_date_from, replay_as_of_date)
+        if not scan_dates:
+            return [], None
+
+        refresh_dates_used = self._resolve_backtest_refresh_dates(
+            scan_dates=scan_dates,
+            pool_roll_mode=replay_pool_roll_mode,
+            refresh_dates=None,
+        )
+        if not refresh_dates_used:
+            return [], None
+
+        # Find the effective refresh date for the as_of_date:
+        # it's the latest refresh date <= replay_as_of_date
+        effective_refresh_date = refresh_dates_used[0]
+        for rd in refresh_dates_used:
+            if rd <= replay_as_of_date:
+                effective_refresh_date = rd
+            else:
+                break
+
+        resolved_step_configs = self._resolve_screener_step_configs(replay_screener_params)
+        input_rows, load_error, _cache_hit = self._load_input_pool_rows(
+            markets=replay_screener_params.markets,
+            return_window_days=replay_screener_params.return_window_days,
+            as_of_date=effective_refresh_date,
+        )
+        if not input_rows:
+            return [], load_error
+
+        step1_pool, step2_pool, step3_pool, step4_pool = self._run_screener_filters_for_backtest(
+            input_rows,
+            mode=replay_screener_params.mode,
+            step_configs=resolved_step_configs,
+        )
+        source = self._select_step_source_for_backtest(
+            trend_step=replay_trend_step,
+            step1_pool=step1_pool,
+            step2_pool=step2_pool,
+            step3_pool=step3_pool,
+            step4_pool=step4_pool,
+        )
+        if board_filters:
+            source = [row for row in source if self._row_matches_board_filters(row, board_filters)]
+
+        replay_candidates: list[ScreenerResult] = []
+        seen: set[str] = set()
+        for row in source:
+            symbol_text = str(row.symbol).strip().lower()
+            if not symbol_text or symbol_text in seen:
+                continue
+            seen.add(symbol_text)
+            replay_candidates.append(row)
+            if len(replay_candidates) >= replay_max_symbols:
+                break
+
+        return replay_candidates, load_error
+
     def _calc_wyckoff_snapshot(
         self,
         row: ScreenerResult,
@@ -5076,12 +5158,9 @@ class InMemoryStore:
             as_of_date=as_of_date,
         )
 
-        if mode == "trend_pool" and replay_date_from and replay_pool_roll_mode == "position":
+        if mode == "trend_pool" and replay_date_from and replay_pool_roll_mode in {"daily", "weekly", "position"}:
             replay_as_of_date = str(resolved_as_of_date or as_of_date or "").strip()
             if replay_as_of_date:
-                replay_start = replay_date_from
-                if replay_start > replay_as_of_date:
-                    replay_start = replay_as_of_date
                 try:
                     replay_run = self._require_backtest_trend_pool_run(run_id or resolved_run_id)
                     replay_step_configs = (
@@ -5093,53 +5172,31 @@ class InMemoryStore:
                         replay_run.params,
                         replay_step_configs,
                     )
-                    input_rows, load_error, _cache_hit = self._load_input_pool_rows(
-                        markets=replay_screener_params.markets,
-                        return_window_days=replay_screener_params.return_window_days,
-                        as_of_date=replay_start,
-                    )
-                    replay_step1, replay_step2, replay_step3, replay_step4 = self._run_screener_filters_for_backtest(
-                        input_rows,
-                        mode=replay_screener_params.mode,
-                        step_configs=replay_step_configs,
-                    )
-                    replay_source = self._select_step_source_for_backtest(
-                        trend_step=trend_step,
-                        step1_pool=replay_step1,
-                        step2_pool=replay_step2,
-                        step3_pool=replay_step3,
-                        step4_pool=replay_step4,
-                    )
-                    if normalized_board_filters:
-                        replay_source = [
-                            row for row in replay_source
-                            if self._row_matches_board_filters(row, normalized_board_filters)
-                        ]
                     replay_limit = (
                         int(replay_max_symbols)
                         if replay_max_symbols is not None
                         else max(20, min(2000, len(candidates) if len(candidates) > 0 else 120))
                     )
-                    replay_candidates: list[ScreenerResult] = []
-                    replay_seen: set[str] = set()
-                    for row in replay_source:
-                        symbol_text = str(row.symbol).strip().lower()
-                        if not symbol_text or symbol_text in replay_seen:
-                            continue
-                        replay_seen.add(symbol_text)
-                        replay_candidates.append(row)
-                        if len(replay_candidates) >= replay_limit:
-                            break
+                    replay_candidates, replay_load_error = self._build_signal_replay_candidates(
+                        replay_as_of_date=replay_as_of_date,
+                        replay_date_from=replay_date_from,
+                        replay_pool_roll_mode=replay_pool_roll_mode,
+                        replay_screener_params=replay_screener_params,
+                        replay_trend_step=trend_step,
+                        replay_max_symbols=replay_limit,
+                        board_filters=normalized_board_filters,
+                    )
                     if replay_candidates or not candidates:
                         candidates = replay_candidates
-                    capability_notes.append(
-                        f"回测复盘口径候选池: roll=position, date_from={replay_start}, symbols={len(candidates)}。"
+                    roll_label = {"daily": "每日滚动", "weekly": "每周滚动", "position": "持仓触发滚动"}.get(
+                        replay_pool_roll_mode, replay_pool_roll_mode
                     )
                     capability_notes.append(
-                        "position 口径使用起始日候选池沿用至刷新日，可能与“按筛选日期重建池”结果不同。"
+                        f"回测复盘口径候选池: roll={roll_label}, as_of={replay_as_of_date}, "
+                        f"date_from={replay_date_from}, symbols={len(candidates)}。"
                     )
-                    if load_error:
-                        degraded_reason = self._merge_degraded_reasons(degraded_reason, load_error)
+                    if replay_load_error:
+                        degraded_reason = self._merge_degraded_reasons(degraded_reason, replay_load_error)
                 except Exception as exc:
                     capability_notes.append(f"回测复盘口径候选池构建失败，已回退按筛选日期重建池：{exc}")
 
@@ -9902,6 +9959,7 @@ class InMemoryStore:
                 strategy_params_hash=strategy_params_hash,
                 strategy_note=strategy_note,
                 execution_path=None,
+                effective_payload=payload,
             )
             return cached_result
 
@@ -9983,6 +10041,7 @@ class InMemoryStore:
                                 strategy_params_hash=strategy_params_hash,
                                 strategy_note=strategy_note,
                                 execution_path="legacy",
+                                effective_payload=payload,
                             )
                             self._save_backtest_result_cache(
                                 payload,
@@ -10030,6 +10089,7 @@ class InMemoryStore:
                     strategy_params_hash=strategy_params_hash,
                     strategy_note=strategy_note,
                     execution_path="matrix",
+                    effective_payload=payload,
                 )
                 self._save_backtest_result_cache(
                     payload,
@@ -10304,6 +10364,7 @@ class InMemoryStore:
             strategy_params_hash=strategy_params_hash,
             strategy_note=strategy_note,
             execution_path="legacy",
+            effective_payload=payload,
         )
         self._save_backtest_result_cache(
             payload,

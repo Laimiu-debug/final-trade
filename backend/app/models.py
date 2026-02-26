@@ -688,6 +688,7 @@ class BacktestResponse(BaseModel):
     strategy_version: str = "1.0.0"
     strategy_params: dict[str, Any] = Field(default_factory=dict)
     strategy_params_hash: str = ""
+    effective_run_request: BacktestRunRequest | None = None
 
 
 class BacktestABVariantConfig(BaseModel):

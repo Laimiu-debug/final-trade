@@ -525,6 +525,7 @@ export interface BacktestResponse {
   strategy_version?: string
   strategy_params?: Record<string, unknown>
   strategy_params_hash?: string
+  effective_run_request?: BacktestRunRequest | null
 }
 
 export interface BacktestRiskMetrics {

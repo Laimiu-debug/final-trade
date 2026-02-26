@@ -388,12 +388,17 @@ function resolvePlateauCorrelations(plateauResult?: BacktestPlateauResponse | nu
   return buildPlateauCorrelationsFromPoints(validPoints)
 }
 
+function resolveEffectiveRunRequest(runRequest: BacktestRunRequest, runResult: BacktestResponse): BacktestRunRequest {
+  return runResult.effective_run_request ?? runRequest
+}
+
 function buildBacktestReportWorkbookBuffer(
   runRequest: BacktestRunRequest,
   runResult: BacktestResponse,
   plateauResult?: BacktestPlateauResponse | null,
 ): ArrayBuffer {
   const workbook = XLSX.utils.book_new()
+  const effectiveRunRequest = resolveEffectiveRunRequest(runRequest, runResult)
   const plateauCorrelations = resolvePlateauCorrelations(plateauResult)
   const plateauBestPoint = plateauResult?.best_point ?? null
   const riskMetrics = runResult.risk_metrics ?? null
@@ -405,15 +410,15 @@ function buildBacktestReportWorkbookBuffer(
     {
       date_from: runResult.range.date_from,
       date_to: runResult.range.date_to,
-      mode: runRequest.mode,
-      pool_roll_mode: runRequest.pool_roll_mode,
+      mode: effectiveRunRequest.mode,
+      pool_roll_mode: effectiveRunRequest.pool_roll_mode,
       execution_path: runResult.execution_path ?? 'unknown',
-      strategy_id: runResult.strategy_id ?? runRequest.strategy_id ?? '',
+      strategy_id: runResult.strategy_id ?? effectiveRunRequest.strategy_id ?? '',
       strategy_version: runResult.strategy_version ?? '',
       strategy_params_hash: runResult.strategy_params_hash ?? '',
-      entry_delay_days: runRequest.entry_delay_days,
-      delay_invalidation_enabled: runRequest.delay_invalidation_enabled,
-      matrix_event_semantic_version: runRequest.matrix_event_semantic_version,
+      entry_delay_days: effectiveRunRequest.entry_delay_days,
+      delay_invalidation_enabled: effectiveRunRequest.delay_invalidation_enabled,
+      matrix_event_semantic_version: effectiveRunRequest.matrix_event_semantic_version,
       trade_count: runResult.stats.trade_count,
       win_count: runResult.stats.win_count,
       loss_count: runResult.stats.loss_count,
@@ -441,7 +446,7 @@ function buildBacktestReportWorkbookBuffer(
       walk_forward_oos_pass_rate: walkForward?.oos_pass_rate ?? null,
     },
   ]
-  const paramRows = [runRequest]
+  const paramRows = [effectiveRunRequest]
   const noteRows = runResult.notes.map((item, index) => ({ index: index + 1, note: item }))
   const tradeRows = runResult.trades.map((row) => {
     const parsedExit = parseExitReason(row.exit_reason)
@@ -593,29 +598,30 @@ function buildPlateauTradeExportWorkbookBuffer(
   rank: number,
 ): ArrayBuffer {
   const workbook = XLSX.utils.book_new()
+  const effectiveRunRequest = resolveEffectiveRunRequest(runRequest, runResult)
   const paramsSheet = [
     { 参数项: '参数组排名', 参数值: `第${rank}名` },
     { 参数项: '评分', 参数值: Number(point.score.toFixed(3)) },
-    { 参数项: 'run_id', 参数值: runRequest.run_id ?? '' },
-    { 参数项: '回测模式', 参数值: runRequest.mode },
-    { 参数项: '趋势池步骤', 参数值: runRequest.trend_step },
-    { 参数项: '滚动方式', 参数值: runRequest.pool_roll_mode },
-    { 参数项: '策略ID', 参数值: runRequest.strategy_id ?? '' },
-    { 参数项: '策略参数', 参数值: JSON.stringify(runRequest.strategy_params ?? {}, null, 2) },
-    { 参数项: '开始日期', 参数值: runRequest.date_from },
-    { 参数项: '结束日期', 参数值: runRequest.date_to },
-    { 参数项: '窗口天数', 参数值: runRequest.window_days },
-    { 参数项: '最低分', 参数值: runRequest.min_score },
-    { 参数项: '入场事件', 参数值: runRequest.entry_events.join(', ') },
-    { 参数项: '离场事件', 参数值: runRequest.exit_events.join(', ') },
-    { 参数项: '最大持仓数', 参数值: runRequest.max_positions },
-    { 参数项: '单笔仓位(%)', 参数值: Number((runRequest.position_pct * 100).toFixed(2)) },
-    { 参数项: '止损(%)', 参数值: Number((runRequest.stop_loss * 100).toFixed(2)) },
-    { 参数项: '止盈(%)', 参数值: Number((runRequest.take_profit * 100).toFixed(2)) },
-    { 参数项: '最大股票数', 参数值: runRequest.max_symbols },
-    { 参数项: 'TopK/日', 参数值: runRequest.priority_topk_per_day },
-    { 参数项: '执行路径偏好', 参数值: runRequest.execution_path_preference ?? 'legacy' },
-    { 参数项: '事件语义版本', 参数值: runRequest.matrix_event_semantic_version ?? 'aligned_wyckoff_v2' },
+    { 参数项: 'run_id', 参数值: effectiveRunRequest.run_id ?? '' },
+    { 参数项: '回测模式', 参数值: effectiveRunRequest.mode },
+    { 参数项: '趋势池步骤', 参数值: effectiveRunRequest.trend_step },
+    { 参数项: '滚动方式', 参数值: effectiveRunRequest.pool_roll_mode },
+    { 参数项: '策略ID', 参数值: effectiveRunRequest.strategy_id ?? '' },
+    { 参数项: '策略参数', 参数值: JSON.stringify(effectiveRunRequest.strategy_params ?? {}, null, 2) },
+    { 参数项: '开始日期', 参数值: effectiveRunRequest.date_from },
+    { 参数项: '结束日期', 参数值: effectiveRunRequest.date_to },
+    { 参数项: '窗口天数', 参数值: effectiveRunRequest.window_days },
+    { 参数项: '最低分', 参数值: effectiveRunRequest.min_score },
+    { 参数项: '入场事件', 参数值: effectiveRunRequest.entry_events.join(', ') },
+    { 参数项: '离场事件', 参数值: effectiveRunRequest.exit_events.join(', ') },
+    { 参数项: '最大持仓数', 参数值: effectiveRunRequest.max_positions },
+    { 参数项: '单笔仓位(%)', 参数值: Number((effectiveRunRequest.position_pct * 100).toFixed(2)) },
+    { 参数项: '止损(%)', 参数值: Number((effectiveRunRequest.stop_loss * 100).toFixed(2)) },
+    { 参数项: '止盈(%)', 参数值: Number((effectiveRunRequest.take_profit * 100).toFixed(2)) },
+    { 参数项: '最大股票数', 参数值: effectiveRunRequest.max_symbols },
+    { 参数项: 'TopK/日', 参数值: effectiveRunRequest.priority_topk_per_day },
+    { 参数项: '执行路径偏好', 参数值: effectiveRunRequest.execution_path_preference ?? 'legacy' },
+    { 参数项: '事件语义版本', 参数值: effectiveRunRequest.matrix_event_semantic_version ?? 'aligned_wyckoff_v2' },
   ]
   const performanceSheet = [
     {
@@ -700,6 +706,7 @@ function buildBacktestReportHtml(
   runResult: BacktestResponse,
   plateauResult?: BacktestPlateauResponse | null,
 ): string {
+  const effectiveRunRequest = resolveEffectiveRunRequest(runRequest, runResult)
   const rows = runResult.trades
     .map((trade) => {
       const parsedExit = parseExitReason(trade.exit_reason)
@@ -797,7 +804,7 @@ function buildBacktestReportHtml(
       : runResult.execution_path === 'legacy'
         ? 'legacy'
         : 'unknown'
-  const strategyIdText = String(runResult.strategy_id || runRequest.strategy_id || '').trim() || 'unknown'
+  const strategyIdText = String(runResult.strategy_id || effectiveRunRequest.strategy_id || '').trim() || 'unknown'
   const strategyVersionText = String(runResult.strategy_version || '').trim() || 'unknown'
   const strategyParamsHashText = String(runResult.strategy_params_hash || '').trim() || 'unknown'
   const advancedSection = `
@@ -921,12 +928,12 @@ function buildBacktestReportHtml(
   <div class="block">生成时间：${escapeHtml(generatedAt)}</div>
   <div class="meta">
     <div>区间：${escapeHtml(runResult.range.date_from)} ~ ${escapeHtml(runResult.range.date_to)}</div>
-    <div>模式：${escapeHtml(runRequest.mode)} / ${escapeHtml(runRequest.pool_roll_mode)}</div>
+    <div>模式：${escapeHtml(effectiveRunRequest.mode)} / ${escapeHtml(effectiveRunRequest.pool_roll_mode)}</div>
     <div>执行路径：${escapeHtml(executionPathText)}</div>
     <div>策略：${escapeHtml(strategyIdText)} @ ${escapeHtml(strategyVersionText)}</div>
     <div>参数哈希：${escapeHtml(strategyParamsHashText)}</div>
-    <div>延迟入场：T+${Math.max(1, Number(runRequest.entry_delay_days ?? 1))}</div>
-    <div>延迟窗口失效保护：${runRequest.delay_invalidation_enabled ? 'on' : 'off'}</div>
+    <div>延迟入场：T+${Math.max(1, Number(effectiveRunRequest.entry_delay_days ?? 1))}</div>
+    <div>延迟窗口失效保护：${effectiveRunRequest.delay_invalidation_enabled ? 'on' : 'off'}</div>
     <div>交易数：${runResult.stats.trade_count}</div>
     <div>胜率：${runResult.stats.win_rate}</div>
     <div>总收益：${runResult.stats.total_return}</div>
