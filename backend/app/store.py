@@ -194,7 +194,7 @@ class InMemoryStore:
     _BACKTEST_INPUT_POOL_CACHE_VERSION = "input-pool-v1"
     _SCREENER_RESULT_CACHE_VERSION = "screener-run-v1"
     _SIGNALS_RESULT_CACHE_VERSION = "signals-v1"
-    _BACKTEST_TREND_FILTER_CACHE_VERSION = "trend-filter-v1"
+    _BACKTEST_TREND_FILTER_CACHE_VERSION = "trend-filter-v2"
     _BACKTEST_RESULT_CACHE_VERSION = "backtest-result-v2"
     _BACKTEST_SIGNAL_MATRIX_CACHE_VERSION = "signal-matrix-v1"
     _BACKTEST_PRECHECK_CACHE_VERSION = "precheck-v1"
@@ -6135,12 +6135,13 @@ class InMemoryStore:
         max_symbols: int,
         screener_params: ScreenerParams,
     ) -> str:
+        # max_symbols 不参与 cache key — 缓存存储完整列表，读取时按需截断。
+        _ = max_symbols
         payload = {
             "version": self._BACKTEST_TREND_FILTER_CACHE_VERSION,
             "as_of_date": str(as_of_date).strip(),
             "trend_step": str(trend_step).strip(),
             "board_filters": sorted({str(item).strip().lower() for item in board_filters if str(item).strip()}),
-            "max_symbols": int(max_symbols),
             "tdx_root": str(self._resolve_user_path(self._config.tdx_data_path)),
             "markets": sorted({str(item).strip().lower() for item in screener_params.markets if str(item).strip()}),
             "mode": str(screener_params.mode).strip(),
@@ -6199,6 +6200,9 @@ class InMemoryStore:
                     continue
                 seen.add(symbol)
                 out.append(symbol)
+            # 缓存存储完整列表，按 max_symbols 截断返回
+            if max_symbols > 0 and len(out) > max_symbols:
+                out = out[:max_symbols]
             return out
         except Exception:
             return None
@@ -6716,6 +6720,7 @@ class InMemoryStore:
             if board_filters:
                 source = [row for row in source if self._row_matches_board_filters(row, board_filters)]
 
+            day_symbols_full: list[str] = []
             day_symbols: list[str] = []
             seen_symbols: set[str] = set()
             for row in source:
@@ -6723,19 +6728,19 @@ class InMemoryStore:
                 if not symbol or symbol in seen_symbols:
                     continue
                 seen_symbols.add(symbol)
-                day_symbols.append(symbol)
-                if len(day_symbols) >= payload.max_symbols:
-                    break
+                day_symbols_full.append(symbol)
+                if len(day_symbols) < payload.max_symbols:
+                    day_symbols.append(symbol)
 
             pool_by_refresh_date[as_of_date] = set(day_symbols)
-            if trend_cache_enabled and day_symbols:
+            if trend_cache_enabled and day_symbols_full:
                 if self._save_backtest_trend_filter_cache(
                     as_of_date=as_of_date,
                     trend_step=payload.trend_step,
                     board_filters=board_filters,
                     max_symbols=payload.max_symbols,
                     screener_params=screener_params,
-                    symbols=day_symbols,
+                    symbols=day_symbols_full,
                 ):
                     trend_cache_write_days += 1
             if progress_callback is not None:
