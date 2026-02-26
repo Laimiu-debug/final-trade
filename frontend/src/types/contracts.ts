@@ -276,6 +276,110 @@ export interface SignalsResponse {
   notes?: string[]
 }
 
+export interface SignalEtfBacktestConstituentInput {
+  symbol: string
+  name?: string
+  signal_date: string
+  signal_primary?: string
+  signal_event?: string
+  signal_reason?: string
+}
+
+export interface SignalEtfBacktestCreateRequest {
+  strategy_id: string
+  strategy_name?: string
+  signal_date: string
+  name?: string
+  notes?: string
+  constituents: SignalEtfBacktestConstituentInput[]
+}
+
+export interface SignalEtfBacktestUpdateRequest {
+  name?: string
+  notes?: string
+}
+
+export interface SignalEtfBacktestPerformance {
+  return_pct: number
+  benchmark_return_pct: number
+  excess_return_pct: number
+  stock_win_rate: number
+  daily_win_rate: number
+  tradable_count: number
+  skipped_count: number
+}
+
+export interface SignalEtfBacktestStrategyStats {
+  strategy_id: string
+  total_records: number
+  win_rate_t1: number
+  win_rate_t2: number
+}
+
+export interface SignalEtfBacktestSummary {
+  t1: SignalEtfBacktestPerformance
+  t2: SignalEtfBacktestPerformance
+  strategy_stats: SignalEtfBacktestStrategyStats
+}
+
+export interface SignalEtfBacktestRecord {
+  record_id: string
+  name: string
+  notes: string
+  signal_date: string
+  strategy_id: string
+  strategy_name: string
+  benchmark_symbol: string
+  total_constituents: number
+  created_at: string
+  updated_at: string
+  summary: SignalEtfBacktestSummary
+}
+
+export interface SignalEtfBacktestConstituentDetail {
+  symbol: string
+  name: string
+  signal_date: string
+  signal_primary: string
+  signal_event: string
+  signal_reason: string
+  current_date?: string
+  current_price?: number
+  buy_date_t1?: string
+  buy_price_t1?: number
+  return_pct_t1?: number
+  status_t1: 'bought' | 'skipped'
+  buy_date_t2?: string
+  buy_price_t2?: number
+  return_pct_t2?: number
+  status_t2: 'bought' | 'skipped'
+}
+
+export interface SignalEtfBacktestCurvePoint {
+  date: string
+  etf_return_t1?: number
+  etf_return_t2?: number
+  benchmark_return_t1?: number
+  benchmark_return_t2?: number
+  excess_return_t1?: number
+  excess_return_t2?: number
+}
+
+export interface SignalEtfBacktestDetail extends SignalEtfBacktestRecord {
+  benchmark_available: boolean
+  constituents: SignalEtfBacktestConstituentDetail[]
+  curve: SignalEtfBacktestCurvePoint[]
+}
+
+export interface SignalEtfBacktestListResponse {
+  items: SignalEtfBacktestRecord[]
+}
+
+export interface SignalEtfBacktestDeleteResponse {
+  deleted: boolean
+  record_id: string
+}
+
 export interface SimTradeOrder {
   order_id: string
   symbol: string

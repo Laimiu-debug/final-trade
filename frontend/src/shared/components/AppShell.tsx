@@ -20,13 +20,14 @@ const SCREENER_CACHE_KEY = 'tdx-trend-screener-cache-v4'
 const navItems: ItemType[] = [
   { key: '/screener', icon: <FilterIcon />, label: '选股漏斗' },
   { key: '/signals', icon: <AimOutlined />, label: '待买信号' },
+  { key: '/signals/backtest', icon: <LineChartOutlined />, label: '待买回测' },
   { key: '/strategy', icon: <ControlOutlined />, label: '策略中心' },
   { key: '/strategy/events', icon: <ControlOutlined />, label: '事件判别' },
   { key: '/trade', icon: <SwapOutlined />, label: '模拟交易' },
   { key: '/backtest', icon: <LineChartOutlined />, label: '策略回测' },
   { key: '/portfolio', icon: <LineChartOutlined />, label: '持仓管理' },
   { key: '/review', icon: <BarChartOutlined />, label: '复盘统计' },
-  { key: '/review/share', icon: <AreaChartOutlined />, label: '股票搜索与分享' },
+  { key: '/review/share', icon: <AreaChartOutlined />, label: '复盘分享' },
   { key: '/review/news', icon: <BarChartOutlined />, label: '资讯面板' },
   { key: '/ai', icon: <RadarChartOutlined />, label: 'AI 分析' },
   { key: '/settings', icon: <SettingOutlined />, label: '系统设置' },
@@ -38,6 +39,7 @@ function FilterIcon() {
 
 function resolveSelected(pathname: string) {
   if (pathname.startsWith('/stocks/')) return '/screener'
+  if (pathname.startsWith('/signals/backtest')) return '/signals/backtest'
   if (pathname.startsWith('/strategy/events')) return '/strategy/events'
   if (pathname.startsWith('/review/share')) return '/review/share'
   if (pathname.startsWith('/review/news')) return '/review/news'

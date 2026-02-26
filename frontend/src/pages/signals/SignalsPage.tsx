@@ -26,7 +26,13 @@ import type { ColumnsType } from 'antd/es/table'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import wyckoffCycleDiagram from '@/assets/wyckoff-cycle.svg'
 import { ApiError } from '@/shared/api/client'
-import { getLatestScreenerRun, getScreenerRun, getSignals, getStrategies } from '@/shared/api/endpoints'
+import {
+  createSignalEtfBacktest,
+  getLatestScreenerRun,
+  getScreenerRun,
+  getSignals,
+  getStrategies,
+} from '@/shared/api/endpoints'
 import { DismissibleAlert } from '@/shared/components/DismissibleAlert'
 import { PageHeader } from '@/shared/components/PageHeader'
 import {
@@ -46,6 +52,7 @@ import type {
   Market,
   SignalResult,
   SignalScanMode,
+  SignalEtfBacktestCreateRequest,
   SignalType,
   StrategyId,
   TrendPoolStep,
@@ -288,14 +295,18 @@ function isRunNotFoundError(error: unknown) {
 
 function formatSignalError(error: unknown) {
   if (error instanceof ApiError) {
-    if (error.code === 'RUN_NOT_FOUND') {
+    const errorCode = typeof error.code === 'string' ? error.code : ''
+    if (errorCode === 'RUN_NOT_FOUND') {
       return '筛选任务不存在或已失效，请重新绑定最新筛选任务。'
     }
-    if (error.code === 'REQUEST_TIMEOUT') {
+    if (errorCode === 'REQUEST_TIMEOUT') {
       return '待买信号请求超时，请稍后重试（全市场扫描可能需要更长时间）。'
     }
-    if (error.code.startsWith('HTTP_')) {
-      return `待买信号请求失败（${error.code}）：${error.message}`
+    if (errorCode === 'HTTP_404') {
+      return '接口不存在（404），请确认后端已更新并重启。'
+    }
+    if (errorCode.startsWith('HTTP_')) {
+      return `待买信号请求失败（${errorCode}）：${error.message}`
     }
     return error.message
   }
@@ -913,6 +924,50 @@ export function SignalsPage() {
     }
     setSearchParams(next, { replace: true })
     message.success(`已从选股池缓存绑定任务：${cached.runId}`)
+  }
+
+  const createSignalEtfMutation = useMutation({
+    mutationFn: (payload: SignalEtfBacktestCreateRequest) => createSignalEtfBacktest(payload),
+    onSuccess: (detail) => {
+      message.success(`已生成待买回测：${detail.name}`)
+      navigate(`/signals/backtest?highlight=${encodeURIComponent(detail.record_id)}`)
+    },
+    onError: (error) => {
+      message.error(formatSignalError(error))
+    },
+  })
+
+  const handleCreateSignalEtfBacktest = () => {
+    if (filteredRows.length <= 0) {
+      message.warning('当前筛选结果为空，无法生成待买回测。')
+      return
+    }
+    const normalizedRows = filteredRows
+      .filter((row) => row.symbol.trim().length >= 8 && /^\d{4}-\d{2}-\d{2}$/.test(row.trigger_date))
+      .map((row) => ({
+        symbol: row.symbol.trim().toLowerCase(),
+        name: row.name?.trim() || '',
+        signal_date: row.trigger_date,
+        signal_primary: row.primary_signal,
+        signal_event: row.event_label || row.wyckoff_signal || '',
+        signal_reason: row.trigger_reason || '',
+      }))
+    if (normalizedRows.length <= 0) {
+      message.warning('筛选结果缺少有效信号日期，无法生成待买回测。')
+      return
+    }
+    const uniqueSignalDates = Array.from(new Set(normalizedRows.map((row) => row.signal_date))).sort()
+    const asOfDate = (signalQuery.data?.as_of_date ?? '').trim()
+    const signalDate = /^\d{4}-\d{2}-\d{2}$/.test(asOfDate) ? asOfDate : uniqueSignalDates[0]
+    if (uniqueSignalDates.length > 1) {
+      message.info(`检测到多信号日期，已按 ${signalDate} 作为回测命名日期。`)
+    }
+    createSignalEtfMutation.mutate({
+      strategy_id: strategyId,
+      strategy_name: selectedStrategy?.name || strategyId,
+      signal_date: signalDate,
+      constituents: normalizedRows,
+    })
   }
 
   const effectiveSignalItems = trendPoolReady ? (signalQuery.data?.items ?? []) : []
@@ -1865,6 +1920,15 @@ export function SignalsPage() {
                     }
                   }}
                 />
+                <Button
+                  type="primary"
+                  icon={<LineChartOutlined />}
+                  loading={createSignalEtfMutation.isPending}
+                  disabled={filteredRows.length <= 0 || signalQuery.isLoading}
+                  onClick={handleCreateSignalEtfBacktest}
+                >
+                  一键生成ETF回测
+                </Button>
                 <Button
                   icon={<ReloadOutlined />}
                   loading={manualRefreshing && signalQuery.isFetching}

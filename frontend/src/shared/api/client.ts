@@ -11,8 +11,13 @@ export class ApiError extends Error {
   trace_id?: string
 
   constructor(payload: ApiErrorPayload) {
-    super(payload.message)
-    this.code = payload.code
+    const message = typeof payload?.message === 'string' && payload.message.trim()
+      ? payload.message
+      : DEFAULT_ERROR_MESSAGE
+    super(message)
+    this.code = typeof payload?.code === 'string' && payload.code.trim()
+      ? payload.code
+      : 'HTTP_UNKNOWN'
     this.degraded = payload.degraded
     this.degraded_reason = payload.degraded_reason
     this.trace_id = payload.trace_id
@@ -101,7 +106,30 @@ export async function apiRequest<T>(
       message: DEFAULT_ERROR_MESSAGE,
     }
     try {
-      payload = (await response.json()) as ApiErrorPayload
+      const raw = await response.json() as unknown
+      if (raw && typeof raw === 'object') {
+        const body = raw as Record<string, unknown>
+        const code = typeof body.code === 'string' && body.code.trim()
+          ? body.code
+          : `HTTP_${response.status}`
+        const message = typeof body.message === 'string' && body.message.trim()
+          ? body.message
+          : typeof body.detail === 'string' && body.detail.trim()
+            ? body.detail
+            : response.statusText || DEFAULT_ERROR_MESSAGE
+        payload = {
+          code,
+          message,
+          degraded: typeof body.degraded === 'boolean' ? body.degraded : undefined,
+          degraded_reason: typeof body.degraded_reason === 'string' ? body.degraded_reason : undefined,
+          trace_id: typeof body.trace_id === 'string' ? body.trace_id : undefined,
+        }
+      } else {
+        payload = {
+          code: `HTTP_${response.status}`,
+          message: response.statusText || DEFAULT_ERROR_MESSAGE,
+        }
+      }
     } catch {
       payload = {
         code: `HTTP_${response.status}`,

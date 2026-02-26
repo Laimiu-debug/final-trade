@@ -15,6 +15,10 @@ const SignalsPage = lazy(async () => {
   const module = await import('@/pages/signals/SignalsPage')
   return { default: module.SignalsPage }
 })
+const SignalsBacktestPage = lazy(async () => {
+  const module = await import('@/pages/signals/SignalsBacktestPage')
+  return { default: module.SignalsBacktestPage }
+})
 const TradePage = lazy(async () => {
   const module = await import('@/pages/trade/TradePage')
   return { default: module.TradePage }
@@ -75,6 +79,7 @@ export function AppRoutes() {
           <Route path="/screener" element={<ScreenerPage />} />
           <Route path="/stocks/:symbol/chart" element={<ChartPage />} />
           <Route path="/signals" element={<SignalsPage />} />
+          <Route path="/signals/backtest" element={<SignalsBacktestPage />} />
           <Route path="/strategy" element={<StrategyCenterPage />} />
           <Route path="/strategy/events" element={<EventJudgmentPage />} />
           <Route path="/trade" element={<TradePage />} />

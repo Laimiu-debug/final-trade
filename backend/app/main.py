@@ -59,6 +59,12 @@ from .models import (
     SimTradingConfig,
     SystemStorageStatus,
     SignalScanMode,
+    SignalEtfBacktestCreateRequest,
+    SignalEtfBacktestDeleteResponse,
+    SignalEtfBacktestDetail,
+    SignalEtfBacktestListResponse,
+    SignalEtfBacktestRecord,
+    SignalEtfBacktestUpdateRequest,
     StrategyCatalogResponse,
     StrategyDescriptor,
     EventJudgmentCatalogResponse,
@@ -238,6 +244,76 @@ def get_signals(
         return error_response(400, exc.code, str(exc))
     except ValueError as exc:
         return error_response(400, "SIGNALS_INVALID", str(exc))
+
+
+@app.post("/api/signals/etf-backtests", response_model=SignalEtfBacktestDetail)
+def post_signal_etf_backtest(
+    payload: SignalEtfBacktestCreateRequest,
+) -> SignalEtfBacktestDetail | JSONResponse:
+    try:
+        return store.create_signal_etf_backtest(payload)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "SIGNAL_ETF_INVALID", str(exc))
+
+
+@app.get("/api/signals/etf-backtests", response_model=SignalEtfBacktestListResponse)
+def get_signal_etf_backtests(refresh: bool = Query(default=True)) -> SignalEtfBacktestListResponse | JSONResponse:
+    try:
+        return store.list_signal_etf_backtests(refresh=refresh)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "SIGNAL_ETF_INVALID", str(exc))
+
+
+@app.get("/api/signals/etf-backtests/{record_id}", response_model=SignalEtfBacktestDetail)
+def get_signal_etf_backtest(
+    record_id: str = Path(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9._-]+$"),
+    refresh: bool = Query(default=True),
+) -> SignalEtfBacktestDetail | JSONResponse:
+    try:
+        detail = store.get_signal_etf_backtest(record_id, refresh=refresh)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "SIGNAL_ETF_INVALID", str(exc))
+    if detail is None:
+        return error_response(404, "SIGNAL_ETF_NOT_FOUND", "待买ETF回测记录不存在")
+    return detail
+
+
+@app.patch("/api/signals/etf-backtests/{record_id}", response_model=SignalEtfBacktestRecord)
+def patch_signal_etf_backtest(
+    payload: SignalEtfBacktestUpdateRequest,
+    record_id: str = Path(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9._-]+$"),
+) -> SignalEtfBacktestRecord | JSONResponse:
+    if payload.name is None and payload.notes is None:
+        return error_response(400, "SIGNAL_ETF_UPDATE_EMPTY", "至少提供一个可更新字段：name/notes。")
+    try:
+        row = store.update_signal_etf_backtest(record_id, payload)
+    except BacktestValidationError as exc:
+        status_code = 404 if exc.code == "SIGNAL_ETF_NOT_FOUND" else 400
+        return error_response(status_code, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "SIGNAL_ETF_INVALID", str(exc))
+    return row
+
+
+@app.delete("/api/signals/etf-backtests/{record_id}", response_model=SignalEtfBacktestDeleteResponse)
+def delete_signal_etf_backtest(
+    record_id: str = Path(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9._-]+$"),
+) -> SignalEtfBacktestDeleteResponse | JSONResponse:
+    try:
+        deleted = store.delete_signal_etf_backtest(record_id)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "SIGNAL_ETF_INVALID", str(exc))
+    if not deleted:
+        return error_response(404, "SIGNAL_ETF_NOT_FOUND", "待买ETF回测记录不存在")
+    return SignalEtfBacktestDeleteResponse(deleted=True, record_id=record_id)
 
 
 @app.get("/api/strategies", response_model=StrategyCatalogResponse)

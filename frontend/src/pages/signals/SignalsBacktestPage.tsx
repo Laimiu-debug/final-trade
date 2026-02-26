@@ -1,0 +1,659 @@
+﻿import { useMemo, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import dayjs from 'dayjs'
+import ReactECharts from 'echarts-for-react'
+import {
+  App as AntdApp,
+  Button,
+  Card,
+  Empty,
+  Form,
+  Input,
+  Modal,
+  Popconfirm,
+  Space,
+  Table,
+  Tag,
+  Typography,
+} from 'antd'
+import { DeleteOutlined, EditOutlined, ReloadOutlined } from '@ant-design/icons'
+import type { ColumnsType } from 'antd/es/table'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import {
+  deleteSignalEtfBacktest,
+  getSignalEtfBacktest,
+  listSignalEtfBacktests,
+  updateSignalEtfBacktest,
+} from '@/shared/api/endpoints'
+import { PageHeader } from '@/shared/components/PageHeader'
+import type {
+  SignalEtfBacktestConstituentDetail,
+  SignalEtfBacktestRecord,
+} from '@/types/contracts'
+
+type ConstituentTableRow = SignalEtfBacktestConstituentDetail & {
+  contribution_t1?: number
+  contribution_t2?: number
+  contribution_score: number
+}
+
+function toPercent(value: number | null | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '--'
+  return `${(value * 100).toFixed(2)}%`
+}
+
+function toSignedPercent(value: number | null | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '--'
+  const pct = value * 100
+  if (pct > 0) return `+${pct.toFixed(2)}%`
+  return `${pct.toFixed(2)}%`
+}
+
+function toPrice(value: number | null | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return '--'
+  return value.toFixed(2)
+}
+
+function toDateValue(value: string | null | undefined) {
+  const text = String(value || '').trim()
+  const parsed = dayjs(text)
+  if (!parsed.isValid()) return 0
+  return parsed.valueOf()
+}
+
+function toSignedColor(value: number | null | undefined) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  if (value > 0) return '#cf1322'
+  if (value < 0) return '#389e0d'
+  return '#475467'
+}
+
+function buildFilters(values: string[]) {
+  const unique = Array.from(new Set(values.map((item) => item.trim()).filter((item) => item.length > 0)))
+  return unique
+    .sort((a, b) => a.localeCompare(b, 'zh-CN'))
+    .map((item) => ({ text: item, value: item }))
+}
+
+function toSingleDateLabel(values: Array<string | null | undefined>) {
+  const unique = Array.from(
+    new Set(values.map((item) => String(item || '').trim()).filter((item) => item.length > 0)),
+  )
+  if (unique.length === 1) return unique[0]
+  if (unique.length > 1) return '多日'
+  return '--'
+}
+
+function buildTwoLineTitle(title: string, subtitle: string) {
+  return (
+    <div style={{ lineHeight: 1.15 }}>
+      <div>{title}</div>
+      <div style={{ marginTop: 2, fontSize: 11, color: 'rgba(0, 0, 0, 0.45)' }}>{subtitle}</div>
+    </div>
+  )
+}
+
+export function SignalsBacktestPage() {
+  const { message } = AntdApp.useApp()
+  const [searchParams] = useSearchParams()
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+  const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null)
+  const [editingRecord, setEditingRecord] = useState<SignalEtfBacktestRecord | null>(null)
+  const [editForm] = Form.useForm<{ name: string; notes: string }>()
+  const highlightedRecordId = (searchParams.get('highlight') ?? '').trim()
+
+  const listQuery = useQuery({
+    queryKey: ['signal-etf-backtests'],
+    queryFn: () => listSignalEtfBacktests({ refresh: true }),
+    refetchInterval: 60_000,
+    staleTime: 15_000,
+  })
+
+  const detailQuery = useQuery({
+    queryKey: ['signal-etf-backtest-detail', selectedRecordId],
+    queryFn: () => getSignalEtfBacktest(selectedRecordId as string, { refresh: true }),
+    enabled: Boolean(selectedRecordId),
+    staleTime: 0,
+  })
+
+  const updateMutation = useMutation({
+    mutationFn: ({ recordId, name, notes }: { recordId: string; name: string; notes: string }) =>
+      updateSignalEtfBacktest(recordId, { name, notes }),
+    onSuccess: (row) => {
+      message.success(`已更新：${row.name}`)
+      setEditingRecord(null)
+      void queryClient.invalidateQueries({ queryKey: ['signal-etf-backtests'] })
+      void queryClient.invalidateQueries({ queryKey: ['signal-etf-backtest-detail', row.record_id] })
+    },
+    onError: (error) => {
+      const text = error instanceof Error ? error.message : '更新失败'
+      message.error(text)
+    },
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (recordId: string) => deleteSignalEtfBacktest(recordId),
+    onSuccess: (resp) => {
+      message.success(`已删除：${resp.record_id}`)
+      if (selectedRecordId === resp.record_id) {
+        setSelectedRecordId(null)
+      }
+      void queryClient.invalidateQueries({ queryKey: ['signal-etf-backtests'] })
+      void queryClient.invalidateQueries({ queryKey: ['signal-etf-backtest-detail', resp.record_id] })
+    },
+    onError: (error) => {
+      const text = error instanceof Error ? error.message : '删除失败'
+      message.error(text)
+    },
+  })
+
+  const rows = listQuery.data?.items ?? []
+  const strategyFilters = useMemo(() => buildFilters(rows.map((row) => row.strategy_name || row.strategy_id)), [rows])
+  const signalDateFilters = useMemo(() => buildFilters(rows.map((row) => row.signal_date)), [rows])
+  const detail = detailQuery.data
+  const constituents = detail?.constituents ?? []
+
+  const buyDateT1Label = useMemo(
+    () => toSingleDateLabel(constituents.map((row) => row.buy_date_t1)),
+    [constituents],
+  )
+  const buyDateT2Label = useMemo(
+    () => toSingleDateLabel(constituents.map((row) => row.buy_date_t2)),
+    [constituents],
+  )
+  const currentDateLabel = useMemo(
+    () => toSingleDateLabel(constituents.map((row) => row.current_date)),
+    [constituents],
+  )
+
+  const constituentRows = useMemo<ConstituentTableRow[]>(() => {
+    const tradableCountT1 = detail?.summary.t1.tradable_count ?? 0
+    const tradableCountT2 = detail?.summary.t2.tradable_count ?? 0
+    return constituents.map((row) => {
+      const contributionT1 =
+        row.status_t1 === 'bought' && typeof row.return_pct_t1 === 'number' && tradableCountT1 > 0
+          ? row.return_pct_t1 / tradableCountT1
+          : undefined
+      const contributionT2 =
+        row.status_t2 === 'bought' && typeof row.return_pct_t2 === 'number' && tradableCountT2 > 0
+          ? row.return_pct_t2 / tradableCountT2
+          : undefined
+      const contributionScore =
+        typeof contributionT1 === 'number' && Number.isFinite(contributionT1)
+          ? contributionT1
+          : typeof contributionT2 === 'number' && Number.isFinite(contributionT2)
+            ? contributionT2
+            : Number.NEGATIVE_INFINITY
+      return {
+        ...row,
+        contribution_t1: contributionT1,
+        contribution_t2: contributionT2,
+        contribution_score: contributionScore,
+      }
+    })
+  }, [constituents, detail?.summary.t1.tradable_count, detail?.summary.t2.tradable_count])
+
+  const chartOption = useMemo(() => {
+    const curve = detail?.curve ?? []
+    return {
+      tooltip: {
+        trigger: 'axis',
+        formatter: (params: unknown) => {
+          const rows = Array.isArray(params) ? params : [params]
+          if (rows.length <= 0) return ''
+          const first = rows[0] as { axisValueLabel?: string; axisValue?: string }
+          const title = first?.axisValueLabel || first?.axisValue || ''
+          const body = rows.map((row) => {
+            const item = row as {
+              marker?: string
+              seriesName?: string
+              value?: unknown
+            }
+            const rawValue = Array.isArray(item.value) ? item.value[item.value.length - 1] : item.value
+            const num = Number(rawValue)
+            const valueText = Number.isFinite(num)
+              ? `${num > 0 ? '+' : ''}${(num * 100).toFixed(2)}%`
+              : '--'
+            return `${item.marker ?? ''}${item.seriesName ?? ''} <span style="float:right;margin-left:16px;font-weight:600;">${valueText}</span>`
+          })
+          return [title, ...body].join('<br/>')
+        },
+      },
+      legend: {
+        top: 8,
+        data: ['ETF T+1', 'ETF T+2', '基准 T+1', '基准 T+2'],
+      },
+      grid: {
+        left: 48,
+        right: 20,
+        top: 44,
+        bottom: 34,
+      },
+      xAxis: {
+        type: 'category',
+        data: curve.map((item) => item.date),
+      },
+      yAxis: {
+        type: 'value',
+        axisLabel: {
+          formatter: (value: number) => `${(value * 100).toFixed(1)}%`,
+        },
+      },
+      series: [
+        {
+          name: 'ETF T+1',
+          type: 'line',
+          smooth: true,
+          connectNulls: true,
+          data: curve.map((item) => (typeof item.etf_return_t1 === 'number' ? item.etf_return_t1 : null)),
+        },
+        {
+          name: 'ETF T+2',
+          type: 'line',
+          smooth: true,
+          connectNulls: true,
+          data: curve.map((item) => (typeof item.etf_return_t2 === 'number' ? item.etf_return_t2 : null)),
+        },
+        {
+          name: '基准 T+1',
+          type: 'line',
+          smooth: true,
+          connectNulls: true,
+          lineStyle: { type: 'dashed' },
+          data: curve.map((item) => (typeof item.benchmark_return_t1 === 'number' ? item.benchmark_return_t1 : null)),
+        },
+        {
+          name: '基准 T+2',
+          type: 'line',
+          smooth: true,
+          connectNulls: true,
+          lineStyle: { type: 'dashed' },
+          data: curve.map((item) => (typeof item.benchmark_return_t2 === 'number' ? item.benchmark_return_t2 : null)),
+        },
+      ],
+    }
+  }, [detail?.curve])
+
+  const columns = useMemo<ColumnsType<SignalEtfBacktestRecord>>(
+    () => [
+      {
+        title: '名称',
+        dataIndex: 'name',
+        width: 220,
+        sorter: (a, b) => a.name.localeCompare(b.name, 'zh-CN'),
+        render: (_, row) => {
+          const highlighted = row.record_id === highlightedRecordId
+          return (
+            <Space size={6}>
+              <Typography.Text strong={highlighted}>{row.name}</Typography.Text>
+              {highlighted ? <Tag color="blue">新建</Tag> : null}
+            </Space>
+          )
+        },
+      },
+      {
+        title: '信号日',
+        dataIndex: 'signal_date',
+        width: 120,
+        filters: signalDateFilters,
+        onFilter: (value, row) => row.signal_date === String(value),
+        sorter: (a, b) => toDateValue(a.signal_date) - toDateValue(b.signal_date),
+      },
+      {
+        title: '策略',
+        key: 'strategy',
+        width: 160,
+        filters: strategyFilters,
+        onFilter: (value, row) => (row.strategy_name || row.strategy_id) === String(value),
+        sorter: (a, b) => (a.strategy_name || a.strategy_id).localeCompare((b.strategy_name || b.strategy_id), 'zh-CN'),
+        render: (_, row) => row.strategy_name || row.strategy_id,
+      },
+      {
+        title: '股票数',
+        dataIndex: 'total_constituents',
+        width: 90,
+        sorter: (a, b) => a.total_constituents - b.total_constituents,
+      },
+      {
+        title: 'T+1收益',
+        key: 't1_return',
+        width: 106,
+        sorter: (a, b) => a.summary.t1.return_pct - b.summary.t1.return_pct,
+        render: (_, row) => (
+          <Typography.Text style={{ color: toSignedColor(row.summary.t1.return_pct) }}>
+            {toSignedPercent(row.summary.t1.return_pct)}
+          </Typography.Text>
+        ),
+      },
+      {
+        title: 'T+2收益',
+        key: 't2_return',
+        width: 106,
+        sorter: (a, b) => a.summary.t2.return_pct - b.summary.t2.return_pct,
+        render: (_, row) => (
+          <Typography.Text style={{ color: toSignedColor(row.summary.t2.return_pct) }}>
+            {toSignedPercent(row.summary.t2.return_pct)}
+          </Typography.Text>
+        ),
+      },
+      {
+        title: 'T+1 ETF内胜率',
+        key: 't1_stock_win',
+        width: 136,
+        sorter: (a, b) => a.summary.t1.stock_win_rate - b.summary.t1.stock_win_rate,
+        render: (_, row) => toPercent(row.summary.t1.stock_win_rate),
+      },
+      {
+        title: 'T+2 ETF内胜率',
+        key: 't2_stock_win',
+        width: 136,
+        sorter: (a, b) => a.summary.t2.stock_win_rate - b.summary.t2.stock_win_rate,
+        render: (_, row) => toPercent(row.summary.t2.stock_win_rate),
+      },
+      {
+        title: '基准收益(T+1/T+2)',
+        key: 'benchmark',
+        width: 170,
+        sorter: (a, b) => a.summary.t1.benchmark_return_pct - b.summary.t1.benchmark_return_pct,
+        render: (_, row) => `${toSignedPercent(row.summary.t1.benchmark_return_pct)} / ${toSignedPercent(row.summary.t2.benchmark_return_pct)}`,
+      },
+      {
+        title: '超额(T+1/T+2)',
+        key: 'excess',
+        width: 150,
+        sorter: (a, b) => a.summary.t1.excess_return_pct - b.summary.t1.excess_return_pct,
+        render: (_, row) => `${toSignedPercent(row.summary.t1.excess_return_pct)} / ${toSignedPercent(row.summary.t2.excess_return_pct)}`,
+      },
+      {
+        title: '操作',
+        key: 'actions',
+        width: 140,
+        fixed: 'right',
+        render: (_, row) => (
+          <Space size={4}>
+            <Button
+              type="link"
+              size="small"
+              icon={<EditOutlined />}
+              onClick={(event) => {
+                event.stopPropagation()
+                editForm.setFieldsValue({ name: row.name, notes: row.notes || '' })
+                setEditingRecord(row)
+              }}
+            >
+              编辑
+            </Button>
+            <Popconfirm
+              title="删除该ETF记录？"
+              description="删除后不可恢复。"
+              onConfirm={(event) => {
+                event?.stopPropagation()
+                deleteMutation.mutate(row.record_id)
+              }}
+              onPopupClick={(event) => event.stopPropagation()}
+            >
+              <Button
+                danger
+                type="link"
+                size="small"
+                icon={<DeleteOutlined />}
+                onClick={(event) => event.stopPropagation()}
+                loading={deleteMutation.isPending && deleteMutation.variables === row.record_id}
+              >
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        ),
+      },
+    ],
+    [deleteMutation.isPending, editForm, highlightedRecordId, signalDateFilters, strategyFilters],
+  )
+
+  const constituentColumns = useMemo<ColumnsType<ConstituentTableRow>>(
+    () => [
+      {
+        title: '代码',
+        dataIndex: 'symbol',
+        width: 90,
+        sorter: (a, b) => a.symbol.localeCompare(b.symbol, 'zh-CN'),
+      },
+      {
+        title: '名称',
+        dataIndex: 'name',
+        width: 116,
+        sorter: (a, b) => a.name.localeCompare(b.name, 'zh-CN'),
+        render: (_, row) => (
+          <Button
+            type="link"
+            size="small"
+            onClick={() => {
+              const params = new URLSearchParams({
+                signal_stock_name: row.name || '',
+                signal_as_of_date: row.signal_date,
+                signal_age_min: '0',
+              })
+              navigate(`/stocks/${row.symbol}/chart?${params.toString()}`)
+            }}
+          >
+            {row.name || row.symbol}
+          </Button>
+        ),
+      },
+      {
+        title: '信号事件',
+        dataIndex: 'signal_event',
+        width: 90,
+        sorter: (a, b) => a.signal_event.localeCompare(b.signal_event, 'zh-CN'),
+        render: (value: string) => value || '-',
+      },
+      {
+        title: '信号信息',
+        dataIndex: 'signal_reason',
+        width: 180,
+        ellipsis: true,
+        render: (value: string) => value || '-',
+      },
+      {
+        title: buildTwoLineTitle('T+1买入', buyDateT1Label),
+        key: 'buy_t1',
+        width: 96,
+        sorter: (a, b) => Number(a.buy_price_t1 ?? 0) - Number(b.buy_price_t1 ?? 0),
+        render: (_, row) => (row.status_t1 === 'bought' ? toPrice(row.buy_price_t1) : <Tag>跳过</Tag>),
+      },
+      {
+        title: buildTwoLineTitle('T+2买入', buyDateT2Label),
+        key: 'buy_t2',
+        width: 96,
+        sorter: (a, b) => Number(a.buy_price_t2 ?? 0) - Number(b.buy_price_t2 ?? 0),
+        render: (_, row) => (row.status_t2 === 'bought' ? toPrice(row.buy_price_t2) : <Tag>跳过</Tag>),
+      },
+      {
+        title: buildTwoLineTitle('当前价', currentDateLabel),
+        key: 'current_price',
+        width: 92,
+        sorter: (a, b) => Number(a.current_price ?? 0) - Number(b.current_price ?? 0),
+        render: (_, row) => toPrice(row.current_price),
+      },
+      {
+        title: 'T+1收益',
+        key: 'return_t1',
+        width: 90,
+        sorter: (a, b) => Number(a.return_pct_t1 ?? -99) - Number(b.return_pct_t1 ?? -99),
+        render: (_, row) => (
+          <Typography.Text style={{ color: toSignedColor(row.return_pct_t1) }}>
+            {toSignedPercent(row.return_pct_t1)}
+          </Typography.Text>
+        ),
+      },
+      {
+        title: 'T+2收益',
+        key: 'return_t2',
+        width: 90,
+        sorter: (a, b) => Number(a.return_pct_t2 ?? -99) - Number(b.return_pct_t2 ?? -99),
+        render: (_, row) => (
+          <Typography.Text style={{ color: toSignedColor(row.return_pct_t2) }}>
+            {toSignedPercent(row.return_pct_t2)}
+          </Typography.Text>
+        ),
+      },
+      {
+        title: buildTwoLineTitle('收益率贡献', 'T+1 / T+2'),
+        key: 'contribution',
+        width: 132,
+        sorter: (a, b) => Number(a.contribution_score) - Number(b.contribution_score),
+        render: (_, row) => (
+          <Space size={4}>
+            <Typography.Text style={{ color: toSignedColor(row.contribution_t1) }}>
+              {toSignedPercent(row.contribution_t1)}
+            </Typography.Text>
+            <Typography.Text type="secondary">/</Typography.Text>
+            <Typography.Text style={{ color: toSignedColor(row.contribution_t2) }}>
+              {toSignedPercent(row.contribution_t2)}
+            </Typography.Text>
+          </Space>
+        ),
+      },
+    ],
+    [buyDateT1Label, buyDateT2Label, currentDateLabel, navigate],
+  )
+
+  return (
+    <Space orientation="vertical" size={16} style={{ width: '100%' }}>
+      <PageHeader
+        title="待买回测"
+        subtitle="由当前待买信号一键生成ETF记录，支持 T+1/T+2 买入口径、胜率统计与成分股明细。"
+        badge="ETF"
+      />
+
+      <Card className="glass-card" variant="borderless">
+        <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+          <Typography.Text type="secondary">
+            共 {rows.length} 条记录，自动按最新行情刷新收益与胜率。
+          </Typography.Text>
+          <Button
+            icon={<ReloadOutlined />}
+            loading={listQuery.isFetching}
+            onClick={() => {
+              void queryClient.invalidateQueries({ queryKey: ['signal-etf-backtests'] })
+              if (selectedRecordId) {
+                void queryClient.invalidateQueries({ queryKey: ['signal-etf-backtest-detail', selectedRecordId] })
+              }
+            }}
+          >
+            立即刷新
+          </Button>
+        </Space>
+
+        <Table
+          rowKey="record_id"
+          style={{ marginTop: 12 }}
+          loading={listQuery.isLoading || listQuery.isFetching}
+          dataSource={rows}
+          columns={columns}
+          scroll={{ x: 1960 }}
+          pagination={{
+            pageSize: 20,
+            showSizeChanger: true,
+            pageSizeOptions: ['20', '50', '100'],
+            showTotal: (total) => `共 ${total} 条`,
+          }}
+          onRow={(record) => ({
+            onClick: () => setSelectedRecordId(record.record_id),
+          })}
+          locale={{
+            emptyText: listQuery.isLoading ? '加载中...' : <Empty description="暂无待买回测记录，请去待买信号页一键生成。" />,
+          }}
+        />
+      </Card>
+
+      <Modal
+        open={Boolean(selectedRecordId)}
+        width={1320}
+        title={detail ? `${detail.name}（${detail.signal_date}）` : '待买回测详情'}
+        onCancel={() => setSelectedRecordId(null)}
+        footer={null}
+        destroyOnHidden
+      >
+        <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+          <Typography.Text type="secondary">
+            策略：{detail?.strategy_name || detail?.strategy_id || '--'} |
+            胜率(T+1/T+2)：{toPercent(detail?.summary.strategy_stats.win_rate_t1)} / {toPercent(detail?.summary.strategy_stats.win_rate_t2)}
+          </Typography.Text>
+          <Card size="small" loading={detailQuery.isLoading}>
+            {(detail?.curve?.length ?? 0) > 0 ? (
+              <ReactECharts option={chartOption} style={{ height: 320 }} notMerge />
+            ) : (
+              <Empty description="暂无可展示走势（可能成分股均被跳过）" />
+            )}
+          </Card>
+          <Card
+            size="small"
+            title={`成分股 (${constituentRows.length})`}
+            extra={<Typography.Text type="secondary">点击名称可跳转K线（默认信号日）</Typography.Text>}
+          >
+            <Table
+              size="small"
+              rowKey={(row) => `${row.symbol}-${row.signal_date}`}
+              loading={detailQuery.isLoading}
+              dataSource={constituentRows}
+              columns={constituentColumns}
+              scroll={{ x: 1220, y: 360 }}
+              pagination={{
+                pageSize: 20,
+                showSizeChanger: true,
+                pageSizeOptions: ['20', '50', '100'],
+              }}
+            />
+          </Card>
+        </Space>
+      </Modal>
+
+      <Modal
+        open={Boolean(editingRecord)}
+        title="编辑ETF记录"
+        okText="保存"
+        cancelText="取消"
+        confirmLoading={updateMutation.isPending}
+        onCancel={() => setEditingRecord(null)}
+        onOk={() => {
+          const row = editingRecord
+          if (!row) return
+          editForm
+            .validateFields()
+            .then((values) => {
+              updateMutation.mutate({
+                recordId: row.record_id,
+                name: values.name.trim(),
+                notes: values.notes.trim(),
+              })
+            })
+            .catch(() => undefined)
+        }}
+        destroyOnHidden
+      >
+        <Form form={editForm} layout="vertical">
+          <Form.Item
+            name="name"
+            label="名称"
+            rules={[
+              { required: true, message: '请输入名称' },
+              { max: 128, message: '名称不能超过128个字符' },
+            ]}
+          >
+            <Input placeholder="输入ETF记录名称" />
+          </Form.Item>
+          <Form.Item
+            name="notes"
+            label="备注"
+            rules={[{ max: 1000, message: '备注不能超过1000个字符' }]}
+          >
+            <Input.TextArea rows={4} placeholder="输入备注（可留空）" />
+          </Form.Item>
+        </Form>
+      </Modal>
+    </Space>
+  )
+}
+
