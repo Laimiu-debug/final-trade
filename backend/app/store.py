@@ -8863,6 +8863,8 @@ class InMemoryStore:
         cancelled_exc: BacktestTaskCancelledError | None = None
 
         # --- Pre-build universes by max_symbols to avoid redundant pool construction ---
+        # 优化：只用最大 max_symbols 构建一次完整 universe，较小值从中截断。
+        # TDX 数据加载和 screener 筛选不依赖 max_symbols，max_symbols 只影响每日截断数量。
         board_filters_for_prebuild = [
             item for item in base.board_filters if item in {"main", "gem", "star", "beijing", "st"}
         ]
@@ -8870,27 +8872,60 @@ class InMemoryStore:
         universe_by_max_symbols: dict[int, tuple[list[str], dict[str, set[str]] | None, list[str]]] = {}
         if can_prebuild:
             unique_max_symbols = sorted({int(p.max_symbols) for p in params_to_evaluate})
-            for ms_idx, ms_val in enumerate(unique_max_symbols):
-                if control_callback is not None:
-                    control_callback()
-                try:
-                    prebuild_payload = base.model_copy(update={"max_symbols": ms_val}, deep=True)
-                    universe = self._build_backtest_universe_for_plateau(
-                        prebuild_payload,
-                        board_filters_for_prebuild,
-                        control_callback=control_callback,
-                    )
-                    universe_by_max_symbols[ms_val] = universe
-                except BacktestTaskCancelledError:
-                    raise
-                except Exception:
-                    pass  # will fall back to run_backtest building its own universe
-                if progress_callback is not None:
-                    progress_callback(
-                        0,
-                        int(total_to_evaluate),
-                        f"候选池预构建 {ms_idx + 1}/{len(unique_max_symbols)}（max_symbols={ms_val}）",
-                    )
+            max_ms = unique_max_symbols[-1] if unique_max_symbols else int(base.max_symbols)
+            if control_callback is not None:
+                control_callback()
+            if progress_callback is not None:
+                progress_callback(
+                    0,
+                    int(total_to_evaluate),
+                    f"候选池预构建（max_symbols={max_ms}，共 {len(unique_max_symbols)} 个值）",
+                )
+            try:
+                prebuild_payload = base.model_copy(update={"max_symbols": max_ms}, deep=True)
+                full_universe = self._build_backtest_universe_for_plateau(
+                    prebuild_payload,
+                    board_filters_for_prebuild,
+                    control_callback=control_callback,
+                )
+                full_symbols, full_allowed, full_notes = full_universe
+                universe_by_max_symbols[max_ms] = full_universe
+                # 对较小的 max_symbols 值，从完整结果中截断 allowed_symbols_by_date
+                for ms_val in unique_max_symbols:
+                    if ms_val == max_ms:
+                        continue
+                    if full_allowed is not None:
+                        truncated_allowed: dict[str, set[str]] = {}
+                        truncated_symbols_union: set[str] = set()
+                        for date_key, date_symbols in full_allowed.items():
+                            truncated_day = set(list(date_symbols)[:ms_val])
+                            truncated_allowed[date_key] = truncated_day
+                            truncated_symbols_union.update(truncated_day)
+                        truncated_notes = list(full_notes) + [
+                            f"候选池从 max_symbols={max_ms} 截断到 {ms_val}。"
+                        ]
+                        universe_by_max_symbols[ms_val] = (
+                            sorted(truncated_symbols_union),
+                            truncated_allowed,
+                            truncated_notes,
+                        )
+                    else:
+                        # full_allowed is None means no per-date restriction
+                        truncated_syms = full_symbols[:ms_val]
+                        truncated_notes = list(full_notes) + [
+                            f"候选池从 max_symbols={max_ms} 截断到 {ms_val}。"
+                        ]
+                        universe_by_max_symbols[ms_val] = (truncated_syms, None, truncated_notes)
+            except BacktestTaskCancelledError:
+                raise
+            except Exception:
+                pass  # will fall back to run_backtest building its own universe
+            if progress_callback is not None:
+                progress_callback(
+                    0,
+                    int(total_to_evaluate),
+                    f"候选池预构建完成（{len(universe_by_max_symbols)} 个 max_symbols 值）",
+                )
 
         # Sort params by (window_days, max_symbols) to maximize Wyckoff snapshot cache hits.
         # The first run for each window_days warms the cache; subsequent runs hit it.
