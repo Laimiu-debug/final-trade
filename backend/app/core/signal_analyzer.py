@@ -1321,49 +1321,50 @@ class SignalAnalyzer:
                 and highs[idx] >= prior_high_at(idx, 20) * bc_anchor_high_prior_high_min
             ),
         )
-        if bc_idx is None:
-            bc_idx = look_bc_start + max(
-                range(len(volumes[look_bc_start:])),
-                key=lambda idx: volumes[look_bc_start + idx],
-            )
-        bc_range = max(highs[bc_idx] - lows[bc_idx], 0.01)
-        bc_close_near_high = closes[bc_idx] >= highs[bc_idx] - bc_range * bc_close_near_high_ratio_max
+        # bc_idx 为 None 时不再强制 fallback，避免误判
+        bc_fallback_idx = look_bc_start + max(
+            range(len(volumes[look_bc_start:])),
+            key=lambda idx: volumes[look_bc_start + idx],
+        ) if bc_idx is None else bc_idx
+        bc_range = max(highs[bc_fallback_idx] - lows[bc_fallback_idx], 0.01)
+        bc_close_near_high = closes[bc_fallback_idx] >= highs[bc_fallback_idx] - bc_range * bc_close_near_high_ratio_max
         bc_condition = (
-            bc_close_near_high
-            and tr_pos_at(bc_idx) >= bc_tr_pos_min
-            and vol_ratio_at(bc_idx, 20) >= bc_vol_ratio_min
-            and highs[bc_idx] >= max(highs[max(0, bc_idx - 20):bc_idx + 1]) * bc_high_recent_high_min
+            bc_idx is not None
+            and bc_close_near_high
+            and tr_pos_at(bc_fallback_idx) >= bc_tr_pos_min
+            and vol_ratio_at(bc_fallback_idx, 20) >= bc_vol_ratio_min
+            and highs[bc_fallback_idx] >= max(highs[max(0, bc_fallback_idx - 20):bc_fallback_idx + 1]) * bc_high_recent_high_min
         )
 
         psy_idx = first_index_where(
-            max(0, bc_idx - psy_window_before_bc_days),
-            max(0, bc_idx - 1),
+            max(0, bc_fallback_idx - psy_window_before_bc_days),
+            max(0, bc_fallback_idx - 1),
             lambda idx: (
                 tr_pos_at(idx) >= psy_tr_pos_min
                 and vol_ratio_at(idx, 20) >= psy_vol_ratio_min
                 and closes[idx] >= ma_at(idx) * psy_close_ma20_min
             ),
-        ) if bc_idx > 0 else None
-        push_event("PSY", enable_psy and (psy_idx is not None), psy_idx, category="distributionRisk")
-        push_event("BC", enable_bc and bc_condition, bc_idx, category="distributionRisk")
+        ) if bc_fallback_idx > 0 else None
+        push_event("PSY", enable_psy and (psy_idx is not None) and bc_condition, psy_idx, category="distributionRisk")
+        push_event("BC", enable_bc and bc_condition, bc_fallback_idx, category="distributionRisk")
 
         ar_d_idx: int | None = None
-        if "BC" in event_dates and bc_idx < last_idx - 1:
-            decline_scan_end = min(last_idx, bc_idx + ard_window_after_bc_days)
-            decline_slice = closes[bc_idx + 1:decline_scan_end + 1]
-            decline_min = min(decline_slice) if decline_slice else closes[bc_idx]
-            if decline_min <= closes[bc_idx] * ard_decline_close_bc_max:
-                ar_d_idx = bc_idx + decline_slice.index(decline_min) + 1
+        if "BC" in event_dates and bc_fallback_idx < last_idx - 1:
+            decline_scan_end = min(last_idx, bc_fallback_idx + ard_window_after_bc_days)
+            decline_slice = closes[bc_fallback_idx + 1:decline_scan_end + 1]
+            decline_min = min(decline_slice) if decline_slice else closes[bc_fallback_idx]
+            if decline_min <= closes[bc_fallback_idx] * ard_decline_close_bc_max:
+                ar_d_idx = bc_fallback_idx + decline_slice.index(decline_min) + 1
                 push_event("AR(d)", enable_ar_d, ar_d_idx, category="distributionRisk")
 
         st_d_idx: int | None = None
-        if "BC" in event_dates and bc_idx < last_idx:
-            bc_high = highs[bc_idx]
-            st_d_start = (ar_d_idx + 1) if ar_d_idx is not None else (bc_idx + 2)
-            st_d_end = min(last_idx, bc_idx + std_window_after_bc_days)
+        if "BC" in event_dates and bc_fallback_idx < last_idx:
+            bc_high = highs[bc_fallback_idx]
+            st_d_start = (ar_d_idx + 1) if ar_d_idx is not None else (bc_fallback_idx + 2)
+            st_d_end = min(last_idx, bc_fallback_idx + std_window_after_bc_days)
             for idx in range(st_d_start, st_d_end + 1):
                 near_bc_high = abs(highs[idx] - bc_high) / max(bc_high, 0.01) <= std_high_near_bc_tol
-                lower_volume = volumes[idx] <= volumes[bc_idx] * std_vol_vs_bc_max
+                lower_volume = volumes[idx] <= volumes[bc_fallback_idx] * std_vol_vs_bc_max
                 close_weak = closes[idx] <= highs[idx] * std_close_high_max
                 if near_bc_high and lower_volume and close_weak:
                     st_d_idx = idx
@@ -1373,7 +1374,7 @@ class SignalAnalyzer:
         # Risk-side events (Distribution)
         utad_start = max(
             lookback_start,
-            (st_d_idx + 1) if "ST(d)" in event_dates and st_d_idx is not None else (bc_idx + 1),
+            (st_d_idx + 1) if "ST(d)" in event_dates and st_d_idx is not None else (bc_fallback_idx + 1),
         )
         utad_idx = first_index_where(
             utad_start,
@@ -1390,7 +1391,7 @@ class SignalAnalyzer:
 
         sow_start = max(
             lookback_start,
-            (utad_idx + 1) if utad_idx is not None else ((ar_d_idx + 1) if ar_d_idx is not None else (bc_idx + 1)),
+            (utad_idx + 1) if utad_idx is not None else ((ar_d_idx + 1) if ar_d_idx is not None else (bc_fallback_idx + 1)),
         )
         sow_idx = first_index_where(
             sow_start,
@@ -1457,28 +1458,50 @@ class SignalAnalyzer:
         row: ScreenerResult,
     ) -> str:
         """Determine the current phase based on events."""
-        if risk_events:
-            risk_set = set(risk_events)
+        risk_set = set(risk_events) if risk_events else set()
+        event_set = set(events) if events else set()
+        # 强派发信号：有 SOW/LPSY 等确认性事件，直接判定派发阶段
+        has_strong_dist = risk_set & {"SOW", "LPSY", "UTAD"}
+        if has_strong_dist:
             if "LPSY" in risk_set and ret20 <= -0.12:
-                return "\u6d3e\u53d1D" if ret20 > -0.2 else "\u6d3e\u53d1E"
+                return "派发D" if ret20 > -0.2 else "派发E"
             if "SOW" in risk_set and "UTAD" in risk_set:
-                return "\u6d3e\u53d1C"
+                return "派发C"
             if "SOW" in risk_set:
-                return "\u6d3e\u53d1C"
-            if "UTAD" in risk_set or "AR(d)" in risk_set or "ST(d)" in risk_set:
-                return "\u6d3e\u53d1B"
-            return "\u6d3e\u53d1A"
-        if "LPS" in events:
-            return "\u5438\u7b79E"
-        if "JOC" in events or "SOS" in events:
-            return "\u5438\u7b79D"
-        if "Spring" in events:
-            return "\u5438\u7b79C"
-        if "ST" in events or "TSO" in events:
-            return "\u5438\u7b79B"
-        if {"PS", "SC", "AR"} & set(events):
-            return "\u5438\u7b79A"
-        return "\u9636\u6bb5\u672a\u660e"
+                return "派发C"
+            if "UTAD" in risk_set:
+                return "派发B"
+        # 弱派发信号：仅有 PSY/BC/AR(d)/ST(d)，需要与吸筹事件综合判断
+        has_weak_dist = risk_set & {"PSY", "BC", "AR(d)", "ST(d)"}
+        if has_weak_dist and not has_strong_dist:
+            # 如果同时有吸筹事件，吸筹优先（PSY/BC 只是早期预警）
+            if event_set:
+                if "LPS" in event_set:
+                    return "吸筹E"
+                if "JOC" in event_set or "SOS" in event_set:
+                    return "吸筹D"
+                if "Spring" in event_set:
+                    return "吸筹C"
+                if "ST" in event_set or "TSO" in event_set:
+                    return "吸筹B"
+                if {"PS", "SC", "AR"} & event_set:
+                    return "吸筹A"
+            # 无吸筹事件，仅有弱派发信号
+            if "AR(d)" in risk_set or "ST(d)" in risk_set:
+                return "派发B"
+            return "派发A"
+        # 无派发信号，按吸筹事件判断
+        if "LPS" in event_set:
+            return "吸筹E"
+        if "JOC" in event_set or "SOS" in event_set:
+            return "吸筹D"
+        if "Spring" in event_set:
+            return "吸筹C"
+        if "ST" in event_set or "TSO" in event_set:
+            return "吸筹B"
+        if {"PS", "SC", "AR"} & event_set:
+            return "吸筹A"
+        return "阶段未明"
 
     @classmethod
     def _calculate_health_metrics(
