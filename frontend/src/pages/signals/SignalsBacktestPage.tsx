@@ -1,4 +1,4 @@
-﻿import { useMemo, useState } from 'react'
+﻿import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import dayjs from 'dayjs'
 import ReactECharts from 'echarts-for-react'
@@ -11,6 +11,7 @@ import {
   Input,
   Modal,
   Popconfirm,
+  Slider,
   Space,
   Table,
   Tag,
@@ -100,6 +101,8 @@ export function SignalsBacktestPage() {
   const queryClient = useQueryClient()
   const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null)
   const [editingRecord, setEditingRecord] = useState<SignalEtfBacktestRecord | null>(null)
+  const [valuationDate, setValuationDate] = useState<string | null>(null)
+  const [valuationDateOptions, setValuationDateOptions] = useState<string[]>([])
   const [editForm] = Form.useForm<{ name: string; notes: string }>()
   const highlightedRecordId = (searchParams.get('highlight') ?? '').trim()
 
@@ -111,8 +114,12 @@ export function SignalsBacktestPage() {
   })
 
   const detailQuery = useQuery({
-    queryKey: ['signal-etf-backtest-detail', selectedRecordId],
-    queryFn: () => getSignalEtfBacktest(selectedRecordId as string, { refresh: true }),
+    queryKey: ['signal-etf-backtest-detail', selectedRecordId, valuationDate ?? 'latest'],
+    queryFn: () =>
+      getSignalEtfBacktest(selectedRecordId as string, {
+        refresh: true,
+        asOfDate: valuationDate ?? undefined,
+      }),
     enabled: Boolean(selectedRecordId),
     staleTime: 0,
   })
@@ -153,6 +160,65 @@ export function SignalsBacktestPage() {
   const signalDateFilters = useMemo(() => buildFilters(rows.map((row) => row.signal_date)), [rows])
   const detail = detailQuery.data
   const constituents = detail?.constituents ?? []
+
+  useEffect(() => {
+    setValuationDate(null)
+    setValuationDateOptions([])
+  }, [selectedRecordId])
+
+  useEffect(() => {
+    if (!detail || valuationDate !== null) return
+    const merged = Array.from(
+      new Set(
+        [
+          detail.signal_date,
+          ...detail.curve.map((item) => item.date),
+          ...detail.constituents.map((item) => String(item.current_date || '').trim()),
+        ]
+          .map((item) => String(item || '').trim())
+          .filter((item) => item.length > 0),
+      ),
+    ).sort((a, b) => a.localeCompare(b, 'zh-CN'))
+    setValuationDateOptions(merged.length > 0 ? merged : [detail.signal_date])
+  }, [detail, valuationDate])
+
+  const activeValuationDate = useMemo(() => {
+    if (valuationDate) return valuationDate
+    if (valuationDateOptions.length > 0) return valuationDateOptions[valuationDateOptions.length - 1]
+    return detail?.signal_date ?? ''
+  }, [detail?.signal_date, valuationDate, valuationDateOptions])
+
+  const valuationSliderIndex = useMemo(() => {
+    if (valuationDateOptions.length <= 0) return 0
+    const idx = valuationDateOptions.indexOf(activeValuationDate)
+    return idx >= 0 ? idx : valuationDateOptions.length - 1
+  }, [activeValuationDate, valuationDateOptions])
+
+  const holdingDays = useMemo(() => {
+    if (!detail?.signal_date || !activeValuationDate) return '--'
+    const diff = dayjs(activeValuationDate).diff(dayjs(detail.signal_date), 'day')
+    return String(Math.max(0, diff))
+  }, [activeValuationDate, detail?.signal_date])
+
+  const timelineStartDate = useMemo(() => {
+    if (valuationDateOptions.length > 0) return valuationDateOptions[0]
+    return detail?.signal_date ?? '--'
+  }, [detail?.signal_date, valuationDateOptions])
+
+  const timelineEndDate = useMemo(() => {
+    if (valuationDateOptions.length > 0) return valuationDateOptions[valuationDateOptions.length - 1]
+    return detail?.signal_date ?? '--'
+  }, [detail?.signal_date, valuationDateOptions])
+
+  const handleValuationDateChange = (value: number) => {
+    if (valuationDateOptions.length <= 0) return
+    const rawIndex = Number(value)
+    if (!Number.isFinite(rawIndex)) return
+    const safeIndex = Math.max(0, Math.min(valuationDateOptions.length - 1, Math.round(rawIndex)))
+    const picked = valuationDateOptions[safeIndex]
+    const latest = valuationDateOptions[valuationDateOptions.length - 1]
+    setValuationDate(picked && picked !== latest ? picked : null)
+  }
 
   const buyDateT1Label = useMemo(
     () => toSingleDateLabel(constituents.map((row) => row.buy_date_t1)),
@@ -581,7 +647,7 @@ export function SignalsBacktestPage() {
             策略：{detail?.strategy_name || detail?.strategy_id || '--'} |
             胜率(T+1/T+2)：{toPercent(detail?.summary.strategy_stats.win_rate_t1)} / {toPercent(detail?.summary.strategy_stats.win_rate_t2)}
           </Typography.Text>
-          <Card size="small" loading={detailQuery.isLoading}>
+          <Card size="small" loading={detailQuery.isLoading || detailQuery.isFetching}>
             {(detail?.curve?.length ?? 0) > 0 ? (
               <ReactECharts option={chartOption} style={{ height: 320 }} notMerge />
             ) : (
@@ -591,12 +657,72 @@ export function SignalsBacktestPage() {
           <Card
             size="small"
             title={`成分股 (${constituentRows.length})`}
-            extra={<Typography.Text type="secondary">点击名称可跳转K线（默认信号日）</Typography.Text>}
+            extra={
+              <Space size={8} wrap>
+                <Tag color={valuationDate ? 'orange' : 'green'}>{valuationDate ? '历史回放' : '最新口径'}</Tag>
+                <Tag color="blue">估值日 {activeValuationDate || '--'}</Tag>
+                <Tag>持仓 {holdingDays} 天</Tag>
+                <Button type="link" size="small" disabled={!valuationDate} onClick={() => setValuationDate(null)}>
+                  回到最新
+                </Button>
+                <Typography.Text type="secondary">点击名称可跳转K线（默认信号日）</Typography.Text>
+              </Space>
+            }
           >
+            {valuationDateOptions.length > 1 ? (
+              <div
+                style={{
+                  marginBottom: 8,
+                  padding: '8px 12px 6px',
+                  borderRadius: 10,
+                  border: '1px solid rgba(5, 5, 5, 0.08)',
+                  background: 'rgba(22, 119, 255, 0.04)',
+                }}
+              >
+                <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                  <Typography.Text style={{ fontSize: 12 }} strong>
+                    估值时间轴
+                  </Typography.Text>
+                  <Typography.Text style={{ fontSize: 12 }} type="secondary">
+                    当前：{activeValuationDate || '--'}
+                  </Typography.Text>
+                </Space>
+                <Slider
+                  min={0}
+                  max={valuationDateOptions.length - 1}
+                  value={valuationSliderIndex}
+                  step={1}
+                  style={{ margin: '8px 2px 2px' }}
+                  tooltip={{
+                    formatter: (value) => {
+                      const index = Number(value)
+                      if (!Number.isFinite(index)) return ''
+                      return valuationDateOptions[index] || ''
+                    },
+                  }}
+                  onChange={(value) => {
+                    if (typeof value === 'number') handleValuationDateChange(value)
+                  }}
+                />
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    gap: 8,
+                    marginTop: 4,
+                    fontSize: 12,
+                    color: 'rgba(0, 0, 0, 0.45)',
+                  }}
+                >
+                  <span style={{ whiteSpace: 'nowrap' }}>{timelineStartDate}</span>
+                  <span style={{ whiteSpace: 'nowrap' }}>{timelineEndDate}</span>
+                </div>
+              </div>
+            ) : null}
             <Table
               size="small"
               rowKey={(row) => `${row.symbol}-${row.signal_date}`}
-              loading={detailQuery.isLoading}
+              loading={detailQuery.isLoading || detailQuery.isFetching}
               dataSource={constituentRows}
               columns={constituentColumns}
               scroll={{ x: 1220, y: 360 }}
@@ -656,4 +782,5 @@ export function SignalsBacktestPage() {
     </Space>
   )
 }
+
 

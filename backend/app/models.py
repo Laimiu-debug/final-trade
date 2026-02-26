@@ -334,7 +334,7 @@ class SignalEtfBacktestRecord(BaseModel):
     signal_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     strategy_id: str
     strategy_name: str = ""
-    benchmark_symbol: str = "sh000300"
+    benchmark_symbol: str = "sh000001"
     total_constituents: int = 0
     created_at: str
     updated_at: str

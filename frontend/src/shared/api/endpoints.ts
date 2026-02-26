@@ -203,9 +203,10 @@ export function listSignalEtfBacktests(params?: { refresh?: boolean }) {
   })
 }
 
-export function getSignalEtfBacktest(recordId: string, params?: { refresh?: boolean }) {
+export function getSignalEtfBacktest(recordId: string, params?: { refresh?: boolean; asOfDate?: string }) {
   const query = new URLSearchParams()
   if (typeof params?.refresh === 'boolean') query.set('refresh', String(params.refresh))
+  if (typeof params?.asOfDate === 'string' && params.asOfDate.trim()) query.set('as_of_date', params.asOfDate.trim())
   const suffix = query.toString()
   return apiRequest<SignalEtfBacktestDetail>(
     `/api/signals/etf-backtests/${encodeURIComponent(recordId)}${suffix ? `?${suffix}` : ''}`,

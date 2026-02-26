@@ -66,6 +66,7 @@ def patch_signal_etf_candles(monkeypatch: pytest.MonkeyPatch):
     candles_map = {
         "sz300750": _build(100, 1.5),
         "sh600519": _build(200, 1.2),
+        "sh000001": _build(280, 1.0),
         "sh000300": _build(300, 0.8),
     }
 
@@ -176,3 +177,29 @@ def test_signal_etf_backtest_duplicate_name_suffix_and_strategy_stats(patch_sign
         assert stats["total_records"] == 2
         assert 0.0 <= stats["win_rate_t1"] <= 1.0
         assert 0.0 <= stats["win_rate_t2"] <= 1.0
+
+
+def test_signal_etf_backtest_detail_supports_as_of_date(patch_signal_etf_candles) -> None:
+    _ = patch_signal_etf_candles
+    create_resp = client.post("/api/signals/etf-backtests", json=_build_create_payload())
+    assert create_resp.status_code == 200
+    record_id = create_resp.json()["record_id"]
+
+    latest_resp = client.get(f"/api/signals/etf-backtests/{record_id}", params={"refresh": "true"})
+    cutoff_resp = client.get(
+        f"/api/signals/etf-backtests/{record_id}",
+        params={"refresh": "true", "as_of_date": "2026-02-05"},
+    )
+    assert latest_resp.status_code == 200
+    assert cutoff_resp.status_code == 200
+
+    latest = latest_resp.json()
+    cutoff = cutoff_resp.json()
+    assert len(latest["curve"]) >= len(cutoff["curve"])
+    if cutoff["curve"]:
+        assert cutoff["curve"][-1]["date"] <= "2026-02-05"
+
+    for row in cutoff["constituents"]:
+        current_date = row.get("current_date")
+        if isinstance(current_date, str) and current_date:
+            assert current_date <= "2026-02-05"

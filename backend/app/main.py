@@ -272,9 +272,10 @@ def get_signal_etf_backtests(refresh: bool = Query(default=True)) -> SignalEtfBa
 def get_signal_etf_backtest(
     record_id: str = Path(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9._-]+$"),
     refresh: bool = Query(default=True),
+    as_of_date: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
 ) -> SignalEtfBacktestDetail | JSONResponse:
     try:
-        detail = store.get_signal_etf_backtest(record_id, refresh=refresh)
+        detail = store.get_signal_etf_backtest(record_id, refresh=refresh, as_of_date=as_of_date)
     except BacktestValidationError as exc:
         return error_response(400, exc.code, str(exc))
     except ValueError as exc:
