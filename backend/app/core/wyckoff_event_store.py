@@ -20,6 +20,30 @@ def build_wyckoff_params_hash(window_days: int, *, profile_hash: str = "") -> st
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
 
 
+_EXTRA_SCORE_KEYS: tuple[str, ...] = (
+    "health_score",
+    "event_score",
+    "event_grade",
+    "candle_quality_score",
+    "cost_center_shift_score",
+    "weekly_context_score",
+    "weekly_context_multiplier",
+    "risk_score",
+    "confirmation_status",
+    "phase_context_score",
+    "event_recency_score",
+    "event_background_score",
+    "event_position_score",
+    "event_vol_price_score",
+    "event_confirmation_score",
+    "slope_stability",
+    "volatility_stability",
+    "pullback_quality",
+    "event_confirmation_map",
+    "event_grade_map",
+)
+
+
 class WyckoffEventStore:
     def __init__(
         self,
@@ -112,6 +136,12 @@ class WyckoffEventStore:
                 """
             )
             conn.commit()
+            # 迁移：添加 extra_scores_json 列（存储 health_score / event_score / candle_quality_score 等）
+            try:
+                conn.execute("ALTER TABLE wyckoff_daily_events ADD COLUMN extra_scores_json TEXT NOT NULL DEFAULT '{}'")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # 列已存在
 
     @staticmethod
     def _safe_float(raw: Any, default: float = 0.0) -> float:
@@ -246,7 +276,8 @@ class WyckoffEventStore:
                         volatility_score,
                         event_strength_score,
                         structure_hhh,
-                        trigger_date
+                        trigger_date,
+                        extra_scores_json
                     FROM wyckoff_daily_events
                     WHERE symbol=? AND trade_date=? AND window_days=?
                       AND algo_version=? AND data_source=? AND data_version=? AND params_hash=?
@@ -284,6 +315,12 @@ class WyckoffEventStore:
             "trend_score": self._safe_float(row[9], 0.0),
             "volatility_score": self._safe_float(row[12], 0.0),
         }
+        # 合并 extra_scores_json 中的扩展分数字段
+        extra_raw = row[16] if len(row) > 16 else "{}"
+        extra_scores = self._json_load_dict(extra_raw) if extra_raw else {}
+        for extra_key in _EXTRA_SCORE_KEYS:
+            if extra_key in extra_scores:
+                snapshot[extra_key] = extra_scores[extra_key]
         self._runtime_cache[key] = copy.deepcopy(snapshot)
         return snapshot
 
@@ -367,6 +404,7 @@ class WyckoffEventStore:
             key[4],
             key[5],
             key[6],
+            self._json_dump({k: snapshot[k] for k in _EXTRA_SCORE_KEYS if k in snapshot}),
             now_text,
             now_text,
         )
@@ -403,9 +441,10 @@ class WyckoffEventStore:
                                 data_source,
                                 data_version,
                                 params_hash,
+                                extra_scores_json,
                                 created_at,
                                 updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(
                                 symbol,
                                 trade_date,
@@ -431,6 +470,7 @@ class WyckoffEventStore:
                                 event_strength_score=excluded.event_strength_score,
                                 structure_hhh=excluded.structure_hhh,
                                 trigger_date=excluded.trigger_date,
+                                extra_scores_json=excluded.extra_scores_json,
                                 updated_at=excluded.updated_at
                             """,
                             record_values,
