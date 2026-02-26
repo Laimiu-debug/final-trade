@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gc
 import io
 import math
 import hashlib
@@ -219,6 +220,7 @@ class InMemoryStore:
 
     def __init__(self, app_state_path: str | None = None, sim_state_path: str | None = None) -> None:
         self._lock = RLock()
+        self._candles_lock = RLock()
         self._candles_map: dict[str, list[CandlePoint]] = {}
         self._run_store: dict[str, ScreenerRunDetail] = {}
         self._annotation_store: dict[str, StockAnnotation] = {}
@@ -4114,22 +4116,83 @@ class InMemoryStore:
             )
         return points
 
+    @staticmethod
+    def _candles_runtime_cache_max_symbols() -> int:
+        raw = os.getenv("TDX_TREND_CANDLES_RUNTIME_CACHE_MAX_SYMBOLS", "").strip()
+        if not raw:
+            return 1500
+        try:
+            value = int(raw)
+        except Exception:
+            return 1500
+        if value <= 0:
+            return 0
+        return max(50, int(value))
+
+    @staticmethod
+    def _candles_runtime_idle_keep_symbols() -> int:
+        raw = os.getenv("TDX_TREND_CANDLES_RUNTIME_IDLE_KEEP_SYMBOLS", "").strip()
+        if not raw:
+            return 200
+        try:
+            value = int(raw)
+        except Exception:
+            return 200
+        return max(0, int(value))
+
+    def _trim_candles_runtime_cache(self, *, target_max_symbols: int) -> int:
+        target = max(0, int(target_max_symbols))
+        removed = 0
+        with self._candles_lock:
+            if target <= 0:
+                removed = len(self._candles_map)
+                self._candles_map.clear()
+                return removed
+            while len(self._candles_map) > target:
+                oldest_key = next(iter(self._candles_map))
+                self._candles_map.pop(oldest_key, None)
+                removed += 1
+        return removed
+
     def _ensure_candles(self, symbol: str) -> list[CandlePoint]:
-        if symbol not in self._candles_map:
-            window_bars = max(120, int(self._config.candles_window_bars))
-            real_candles = load_candles_for_symbol(
-                self._config.tdx_data_path,
-                symbol,
-                window=window_bars,
-                market_data_source=self._config.market_data_source,
-                akshare_cache_dir=self._config.akshare_cache_dir,
-            )
-            if real_candles:
-                self._candles_map[symbol] = real_candles
-            else:
-                seed = self._hash_seed(symbol)
-                self._candles_map[symbol] = self._gen_candles(seed, 20.0 + (seed % 70))
-        return self._candles_map[symbol]
+        symbol_key = str(symbol).strip().lower()
+        with self._candles_lock:
+            cached = self._candles_map.get(symbol_key)
+            if cached is not None:
+                # LRU touch: move to tail.
+                self._candles_map.pop(symbol_key, None)
+                self._candles_map[symbol_key] = cached
+                return cached
+
+        window_bars = max(120, int(self._config.candles_window_bars))
+        real_candles = load_candles_for_symbol(
+            self._config.tdx_data_path,
+            symbol_key,
+            window=window_bars,
+            market_data_source=self._config.market_data_source,
+            akshare_cache_dir=self._config.akshare_cache_dir,
+        )
+        if real_candles:
+            resolved = real_candles
+        else:
+            seed = self._hash_seed(symbol_key)
+            resolved = self._gen_candles(seed, 20.0 + (seed % 70))
+
+        with self._candles_lock:
+            existing = self._candles_map.get(symbol_key)
+            if existing is not None:
+                self._candles_map.pop(symbol_key, None)
+                self._candles_map[symbol_key] = existing
+                return existing
+
+            self._candles_map[symbol_key] = resolved
+            max_symbols = self._candles_runtime_cache_max_symbols()
+            if max_symbols > 0 and len(self._candles_map) > max_symbols:
+                trim_to = max(1, int(max_symbols * 0.9))
+                while len(self._candles_map) > trim_to:
+                    oldest_key = next(iter(self._candles_map))
+                    self._candles_map.pop(oldest_key, None)
+            return resolved
 
     @staticmethod
     def _intraday_axis() -> list[str]:
@@ -7998,6 +8061,40 @@ class InMemoryStore:
         with self._backtest_precheck_cache_lock:
             self._backtest_precheck_cache.clear()
 
+    @staticmethod
+    def _is_backtest_runtime_auto_trim_enabled() -> bool:
+        raw = os.getenv("TDX_TREND_BACKTEST_AUTO_TRIM_RUNTIME", "").strip().lower()
+        if not raw:
+            return True
+        if raw in {"1", "true", "yes", "y", "on"}:
+            return True
+        if raw in {"0", "false", "no", "n", "off"}:
+            return False
+        return True
+
+    def _is_backtest_runtime_idle(self) -> bool:
+        with self._backtest_task_lock:
+            backtest_running = bool(self._backtest_running_worker_ids)
+        with self._backtest_plateau_task_lock:
+            plateau_running = bool(self._backtest_plateau_running_worker_ids)
+        return (not backtest_running) and (not plateau_running)
+
+    def maybe_trim_backtest_runtime_memory(self, *, force: bool = False) -> None:
+        if (not force) and (not self._is_backtest_runtime_auto_trim_enabled()):
+            return
+        if (not force) and (not self._is_backtest_runtime_idle()):
+            return
+        try:
+            self._backtest_matrix_engine.clear_runtime_cache()
+            self._clear_backtest_signal_matrix_runtime_cache()
+            self._clear_backtest_input_pool_runtime_cache()
+            self._clear_backtest_precheck_cache()
+            self._signals_cache.clear()
+            self._trim_candles_runtime_cache(target_max_symbols=self._candles_runtime_idle_keep_symbols())
+            gc.collect()
+        except Exception:
+            return
+
     def _run_backtest_precheck_with_cache(self, payload: BacktestRunRequest) -> None:
         cache_key = self._build_backtest_precheck_cache_key(payload)
         cached = self._load_backtest_precheck_cache(cache_key)
@@ -11270,6 +11367,7 @@ class InMemoryStore:
                 self._clear_backtest_runtime_stage_timing_callback()
                 with self._backtest_task_lock:
                     self._backtest_running_worker_ids.discard(task_id)
+                self.maybe_trim_backtest_runtime_memory()
                 self._persist_backtest_task_state(force=True)
 
         Thread(target=_worker, daemon=True).start()
@@ -11767,6 +11865,7 @@ class InMemoryStore:
             finally:
                 with self._backtest_plateau_task_lock:
                     self._backtest_plateau_running_worker_ids.discard(task_id)
+                self.maybe_trim_backtest_runtime_memory()
                 self._persist_backtest_plateau_task_state(force=True)
 
         Thread(target=_worker, daemon=True).start()

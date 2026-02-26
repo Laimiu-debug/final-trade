@@ -923,6 +923,56 @@ def test_backtest_plateau_replay_reuses_candidates(monkeypatch: pytest.MonkeyPat
     assert any("候选重放复用" in note for note in body["notes"])
 
 
+def test_maybe_trim_backtest_runtime_memory_respects_idle_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {
+        "matrix": 0,
+        "signal_runtime": 0,
+        "input_runtime": 0,
+        "precheck": 0,
+        "candles_trim": 0,
+        "gc": 0,
+    }
+
+    monkeypatch.setenv("TDX_TREND_BACKTEST_AUTO_TRIM_RUNTIME", "1")
+
+    def _bump(key: str) -> None:
+        calls[key] += 1
+
+    monkeypatch.setattr(store._backtest_matrix_engine, "clear_runtime_cache", lambda: _bump("matrix"))
+    monkeypatch.setattr(store, "_clear_backtest_signal_matrix_runtime_cache", lambda: _bump("signal_runtime"))
+    monkeypatch.setattr(store, "_clear_backtest_input_pool_runtime_cache", lambda: _bump("input_runtime"))
+    monkeypatch.setattr(store, "_clear_backtest_precheck_cache", lambda: _bump("precheck"))
+    monkeypatch.setattr(
+        store,
+        "_trim_candles_runtime_cache",
+        lambda *, target_max_symbols: (_bump("candles_trim"), target_max_symbols)[1],
+    )
+    monkeypatch.setattr(store_module.gc, "collect", lambda: (_bump("gc"), 0)[1])
+
+    with store._backtest_task_lock:
+        store._backtest_running_worker_ids.clear()
+    with store._backtest_plateau_task_lock:
+        store._backtest_plateau_running_worker_ids.clear()
+
+    store.maybe_trim_backtest_runtime_memory()
+    assert calls["matrix"] == 1
+    assert calls["signal_runtime"] == 1
+    assert calls["input_runtime"] == 1
+    assert calls["precheck"] == 1
+    assert calls["candles_trim"] == 1
+    assert calls["gc"] == 1
+
+    with store._backtest_task_lock:
+        store._backtest_running_worker_ids.add("bt_running_demo")
+    try:
+        store.maybe_trim_backtest_runtime_memory()
+    finally:
+        with store._backtest_task_lock:
+            store._backtest_running_worker_ids.discard("bt_running_demo")
+
+    assert calls["matrix"] == 1
+
+
 def test_backtest_run_requires_existing_run_when_run_missing() -> None:
     dates = _load_symbol_dates("sz300750")
     date_from = dates[-35]
