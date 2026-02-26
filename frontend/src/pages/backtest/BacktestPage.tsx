@@ -99,6 +99,7 @@ const TRADE_BACKTEST_DEFAULTS = {
   maxPositions: 5,
   stopLoss: 0.05,
   takeProfit: 0.15,
+  trailingStopPct: 0,
   maxHoldDays: 60,
   feeBps: 10,
   prioritizeSignals: true,
@@ -177,6 +178,7 @@ type BacktestFormDraft = {
   max_positions: number
   stop_loss: number
   take_profit: number
+  trailing_stop_pct: number
   max_hold_days: number
   fee_bps: number
   prioritize_signals: boolean
@@ -618,6 +620,7 @@ function buildPlateauTradeExportWorkbookBuffer(
     { 参数项: '单笔仓位(%)', 参数值: Number((effectiveRunRequest.position_pct * 100).toFixed(2)) },
     { 参数项: '止损(%)', 参数值: Number((effectiveRunRequest.stop_loss * 100).toFixed(2)) },
     { 参数项: '止盈(%)', 参数值: Number((effectiveRunRequest.take_profit * 100).toFixed(2)) },
+    { 参数项: '高位回撤(%)', 参数值: Number(((effectiveRunRequest.trailing_stop_pct ?? 0) * 100).toFixed(2)) },
     { 参数项: '最大股票数', 参数值: effectiveRunRequest.max_symbols },
     { 参数项: 'TopK/日', 参数值: effectiveRunRequest.priority_topk_per_day },
     { 参数项: '执行路径偏好', 参数值: effectiveRunRequest.execution_path_preference ?? 'legacy' },
@@ -1055,6 +1058,7 @@ function buildDefaultDraft(): BacktestFormDraft {
     max_positions: TRADE_BACKTEST_DEFAULTS.maxPositions,
     stop_loss: TRADE_BACKTEST_DEFAULTS.stopLoss,
     take_profit: TRADE_BACKTEST_DEFAULTS.takeProfit,
+    trailing_stop_pct: TRADE_BACKTEST_DEFAULTS.trailingStopPct,
     max_hold_days: TRADE_BACKTEST_DEFAULTS.maxHoldDays,
     fee_bps: TRADE_BACKTEST_DEFAULTS.feeBps,
     prioritize_signals: TRADE_BACKTEST_DEFAULTS.prioritizeSignals,
@@ -1255,6 +1259,7 @@ function parseExitReason(value: string): ExitReasonView {
   }
   if (text === 'stop_loss') return { label: '止损', color: 'red' }
   if (text === 'take_profit') return { label: '止盈', color: 'green' }
+  if (text === 'trailing_stop') return { label: '回撤', color: 'orange' }
   if (text === 'time_exit') return { label: '超时', color: 'gold' }
   if (text === 'eod_exit') return { label: '收盘', color: 'purple' }
   if (!text) return { label: '未知' }
@@ -1661,6 +1666,7 @@ export function BacktestPage() {
   const [maxPositions, setMaxPositions] = useState(initialDraft.max_positions)
   const [stopLossPercent, setStopLossPercent] = useState(toPercent(initialDraft.stop_loss))
   const [takeProfitPercent, setTakeProfitPercent] = useState(toPercent(initialDraft.take_profit))
+  const [trailingStopPercent, setTrailingStopPercent] = useState(toPercent(initialDraft.trailing_stop_pct))
   const [maxHoldDays, setMaxHoldDays] = useState(initialDraft.max_hold_days)
   const [feeBps, setFeeBps] = useState(initialDraft.fee_bps)
   const [windowDays, setWindowDays] = useState(initialDraft.window_days)
@@ -1899,6 +1905,7 @@ export function BacktestPage() {
       max_positions: maxPositions,
       stop_loss: toRatio(stopLossPercent, TRADE_BACKTEST_DEFAULTS.stopLoss, 0, 0.5),
       take_profit: toRatio(takeProfitPercent, TRADE_BACKTEST_DEFAULTS.takeProfit, 0, 1.5),
+      trailing_stop_pct: toRatio(trailingStopPercent, TRADE_BACKTEST_DEFAULTS.trailingStopPct, 0, 0.5),
       max_hold_days: maxHoldDays,
       fee_bps: feeBps,
       prioritize_signals: prioritizeSignals,
@@ -1932,6 +1939,7 @@ export function BacktestPage() {
     maxPositions,
     stopLossPercent,
     takeProfitPercent,
+    trailingStopPercent,
     maxHoldDays,
     feeBps,
     prioritizeSignals,
@@ -2465,6 +2473,7 @@ export function BacktestPage() {
       max_positions: maxPositions,
       stop_loss: toRatio(stopLossPercent, TRADE_BACKTEST_DEFAULTS.stopLoss, 0, 0.5),
       take_profit: toRatio(takeProfitPercent, TRADE_BACKTEST_DEFAULTS.takeProfit, 0, 1.5),
+      trailing_stop_pct: toRatio(trailingStopPercent, TRADE_BACKTEST_DEFAULTS.trailingStopPct, 0, 0.5),
       max_hold_days: maxHoldDays,
       fee_bps: feeBps,
       prioritize_signals: prioritizeSignals,
@@ -3990,6 +3999,20 @@ export function BacktestPage() {
                 suffix="%"
                 value={takeProfitPercent}
                 onChange={(value) => setTakeProfitPercent(Number(value || toPercent(TRADE_BACKTEST_DEFAULTS.takeProfit)))}
+                style={{ width: '100%' }}
+              />
+            </Space>
+          </Col>
+          <Col xs={24} md={6}>
+            <Space orientation="vertical" style={{ width: '100%' }}>
+              <span>高位回撤(%)</span>
+              <InputNumber
+                min={0}
+                max={50}
+                step={0.5}
+                suffix="%"
+                value={trailingStopPercent}
+                onChange={(value) => setTrailingStopPercent(Number(value ?? 0))}
                 style={{ width: '100%' }}
               />
             </Space>

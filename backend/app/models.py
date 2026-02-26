@@ -545,6 +545,7 @@ class BacktestRunRequest(BaseModel):
     max_positions: int = Field(default=5, ge=1, le=100)
     stop_loss: float = Field(default=0.05, ge=0, le=0.5)
     take_profit: float = Field(default=0.15, ge=0, le=1.5)
+    trailing_stop_pct: float = Field(default=0.0, ge=0.0, le=0.5)
     max_hold_days: int = Field(default=60, ge=1, le=365)
     fee_bps: float = Field(default=10.0, ge=0.0, le=500.0)
     prioritize_signals: bool = True

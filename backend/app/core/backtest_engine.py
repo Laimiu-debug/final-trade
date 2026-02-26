@@ -488,6 +488,8 @@ class BacktestEngine:
 
         stop_price = entry_price * (1 - payload.stop_loss) if payload.stop_loss > 0 else None
         take_price = entry_price * (1 + payload.take_profit) if payload.take_profit > 0 else None
+        trailing_pct = float(getattr(payload, "trailing_stop_pct", 0.0) or 0.0)
+        max_price_since_entry = entry_price
         entry_date = candles[entry_index].time
         last_sellable_index: int | None = None
 
@@ -497,14 +499,21 @@ class BacktestEngine:
             if payload.enforce_t1:
                 sellable_today = bar.time > entry_date
             if not sellable_today:
+                max_price_since_entry = max(max_price_since_entry, float(bar.high))
                 continue
 
             last_sellable_index = bar_index
+            max_price_since_entry = max(max_price_since_entry, float(bar.high))
 
             if stop_price is not None and float(bar.low) <= stop_price:
                 return bar_index, float(stop_price), "stop_loss"
             if take_price is not None and float(bar.high) >= take_price:
                 return bar_index, float(take_price), "take_profit"
+            if trailing_pct > 0 and max_price_since_entry > entry_price:
+                trailing_trigger = max_price_since_entry * (1 - trailing_pct)
+                if float(bar.low) <= trailing_trigger and trailing_trigger > entry_price:
+                    exit_price = max(float(bar.open), trailing_trigger) if float(bar.open) >= trailing_trigger else trailing_trigger
+                    return bar_index, float(exit_price), "trailing_stop"
             if bar_index in exit_signal_events_by_index:
                 event_names = [item for item in exit_signal_events_by_index.get(bar_index, []) if item]
                 if event_names:
@@ -538,6 +547,8 @@ class BacktestEngine:
 
         stop_price = entry_price * (1 - payload.stop_loss) if payload.stop_loss > 0 else None
         take_price = entry_price * (1 + payload.take_profit) if payload.take_profit > 0 else None
+        trailing_pct = float(getattr(payload, "trailing_stop_pct", 0.0) or 0.0)
+        max_price_since_entry = entry_price
         last_sellable_index: int | None = None
 
         start_index = entry_index + 1 if payload.enforce_t1 else entry_index
@@ -554,10 +565,18 @@ class BacktestEngine:
             if low_price <= 0 or high_price <= 0 or close_price <= 0:
                 continue
 
+            max_price_since_entry = max(max_price_since_entry, high_price)
+
             if stop_price is not None and low_price <= stop_price:
                 return bar_index, float(stop_price), "stop_loss"
             if take_price is not None and high_price >= take_price:
                 return bar_index, float(take_price), "take_profit"
+            if trailing_pct > 0 and max_price_since_entry > entry_price:
+                trailing_trigger = max_price_since_entry * (1 - trailing_pct)
+                if low_price <= trailing_trigger and trailing_trigger > entry_price:
+                    open_price = float(close_col[bar_index])  # use close as proxy
+                    exit_price = max(open_price, trailing_trigger) if open_price >= trailing_trigger else trailing_trigger
+                    return bar_index, float(exit_price), "trailing_stop"
             if bool(sell_col[bar_index]):
                 return bar_index, float(close_price), f"event_exit:{BacktestEngine._build_matrix_exit_signal_label(payload)}"
             if (bar_index - entry_index + 1) >= payload.max_hold_days:

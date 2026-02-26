@@ -449,6 +449,7 @@ export interface BacktestRunRequest {
   max_positions: number
   stop_loss: number
   take_profit: number
+  trailing_stop_pct?: number
   max_hold_days: number
   fee_bps: number
   prioritize_signals: boolean
