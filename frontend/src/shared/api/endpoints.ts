@@ -42,6 +42,12 @@ import type {
   ScreenerRunDetail,
   ScreenerRunResponse,
   SignalScanMode,
+  SignalEtfBacktestCreateRequest,
+  SignalEtfBacktestDeleteResponse,
+  SignalEtfBacktestDetail,
+  SignalEtfBacktestListResponse,
+  SignalEtfBacktestRecord,
+  SignalEtfBacktestUpdateRequest,
   SignalsResponse,
   TrendPoolStep,
   SimFillsResponse,
@@ -176,6 +182,53 @@ export function getSignals(params?: {
   const timeoutMs = params?.mode === 'full_market' ? 240_000 : 45_000
   return apiRequest<SignalsResponse>(`/api/signals${suffix ? `?${suffix}` : ''}`, {
     timeoutMs,
+  })
+}
+
+export function createSignalEtfBacktest(payload: SignalEtfBacktestCreateRequest) {
+  return apiRequest<SignalEtfBacktestDetail>('/api/signals/etf-backtests', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 90_000,
+  })
+}
+
+export function listSignalEtfBacktests(params?: { refresh?: boolean }) {
+  const query = new URLSearchParams()
+  if (typeof params?.refresh === 'boolean') query.set('refresh', String(params.refresh))
+  const suffix = query.toString()
+  return apiRequest<SignalEtfBacktestListResponse>(`/api/signals/etf-backtests${suffix ? `?${suffix}` : ''}`, {
+    timeoutMs: 90_000,
+  })
+}
+
+export function getSignalEtfBacktest(recordId: string, params?: { refresh?: boolean; asOfDate?: string }) {
+  const query = new URLSearchParams()
+  if (typeof params?.refresh === 'boolean') query.set('refresh', String(params.refresh))
+  if (typeof params?.asOfDate === 'string' && params.asOfDate.trim()) query.set('as_of_date', params.asOfDate.trim())
+  const suffix = query.toString()
+  return apiRequest<SignalEtfBacktestDetail>(
+    `/api/signals/etf-backtests/${encodeURIComponent(recordId)}${suffix ? `?${suffix}` : ''}`,
+    {
+      timeoutMs: 90_000,
+    },
+  )
+}
+
+export function updateSignalEtfBacktest(recordId: string, payload: SignalEtfBacktestUpdateRequest) {
+  return apiRequest<SignalEtfBacktestRecord>(`/api/signals/etf-backtests/${encodeURIComponent(recordId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 45_000,
+  })
+}
+
+export function deleteSignalEtfBacktest(recordId: string) {
+  return apiRequest<SignalEtfBacktestDeleteResponse>(`/api/signals/etf-backtests/${encodeURIComponent(recordId)}`, {
+    method: 'DELETE',
+    timeoutMs: 30_000,
   })
 }
 

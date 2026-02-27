@@ -209,7 +209,7 @@ if (-not $npmCmd) {
 }
 
 $env:TDX_TREND_BACKTEST_MATRIX_ENGINE = '1'
-$backendProc = Start-Process -FilePath $backendPython -ArgumentList @('-m', 'uvicorn', 'app.main:app', '--reload', '--host', '127.0.0.1', '--port', "$backendPort") -WorkingDirectory $backendDir -RedirectStandardOutput $backendOut -RedirectStandardError $backendErr -PassThru
+$backendProc = Start-Process -FilePath $backendPython -ArgumentList @('-m', 'uvicorn', 'app.main:app', '--app-dir', '.', '--reload', '--host', '127.0.0.1', '--port', "$backendPort") -WorkingDirectory $backendDir -RedirectStandardOutput $backendOut -RedirectStandardError $backendErr -PassThru
 $frontendProc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', "set VITE_API_PROXY_TARGET=$BackendUrl && npm run dev:host") -WorkingDirectory $frontendDir -RedirectStandardOutput $frontendOut -RedirectStandardError $frontendErr -PassThru
 
 Write-Host "Backend PID: $($backendProc.Id)"

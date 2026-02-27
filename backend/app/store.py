@@ -102,6 +102,17 @@ from .models import (
     ScreenerStepPools,
     ScreenerStepSummary,
     SignalScanMode,
+    SignalEtfBacktestConstituentDetail,
+    SignalEtfBacktestConstituentInput,
+    SignalEtfBacktestCreateRequest,
+    SignalEtfBacktestCurvePoint,
+    SignalEtfBacktestDetail,
+    SignalEtfBacktestListResponse,
+    SignalEtfBacktestPerformance,
+    SignalEtfBacktestRecord,
+    SignalEtfBacktestStrategyStats,
+    SignalEtfBacktestSummary,
+    SignalEtfBacktestUpdateRequest,
     SignalResult,
     SignalsResponse,
     StrategyCatalogResponse,
@@ -190,7 +201,7 @@ class BacktestTaskCancelledError(RuntimeError):
 
 
 class InMemoryStore:
-    _APP_STATE_SCHEMA_VERSION = 2
+    _APP_STATE_SCHEMA_VERSION = 3
     _FULL_MARKET_SYSTEM_PROTECT_LIMIT = 6000
     _BACKTEST_INPUT_POOL_CACHE_VERSION = "input-pool-v1"
     _SCREENER_RESULT_CACHE_VERSION = "screener-run-v1"
@@ -229,6 +240,7 @@ class InMemoryStore:
         self._ai_record_store: list[AIAnalysisRecord] = self._default_ai_records()
         self._daily_review_store: dict[str, DailyReviewRecord] = {}
         self._weekly_review_store: dict[str, WeeklyReviewRecord] = {}
+        self._signal_etf_backtest_store: dict[str, dict[str, Any]] = {}
         self._review_tags: dict[ReviewTagType, list[ReviewTag]] = self._default_review_tags()
         self._fill_tag_store: dict[str, TradeFillTagAssignment] = {}
         self._web_evidence_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
@@ -1388,6 +1400,7 @@ class InMemoryStore:
             "annotations": {symbol: item.model_dump() for symbol, item in self._annotation_store.items()},
             "daily_reviews": {day: item.model_dump() for day, item in self._daily_review_store.items()},
             "weekly_reviews": {week: item.model_dump() for week, item in self._weekly_review_store.items()},
+            "signal_etf_backtests": self._signal_etf_backtest_store,
             "review_tags": {
                 "emotion": [item.model_dump() for item in self._review_tags.get("emotion", [])],
                 "reason": [item.model_dump() for item in self._review_tags.get("reason", [])],
@@ -1477,6 +1490,19 @@ class InMemoryStore:
                     except Exception:
                         continue
                 self._weekly_review_store = restored_weekly
+            signal_etf_raw = raw.get("signal_etf_backtests")
+            if isinstance(signal_etf_raw, dict):
+                restored_signal_etf: dict[str, dict[str, Any]] = {}
+                for record_id, item in signal_etf_raw.items():
+                    if not isinstance(item, dict):
+                        continue
+                    normalized_record_id = str(record_id).strip()
+                    if not normalized_record_id:
+                        continue
+                    payload = dict(item)
+                    payload["record_id"] = normalized_record_id
+                    restored_signal_etf[normalized_record_id] = payload
+                self._signal_etf_backtest_store = restored_signal_etf
             review_tags_raw = raw.get("review_tags")
             if isinstance(review_tags_raw, dict):
                 merged_tags = self._default_review_tags()
@@ -11909,6 +11935,725 @@ class InMemoryStore:
             resumed=False,
         )
         return task_id
+
+    @staticmethod
+    def _normalize_signal_etf_symbol(raw: object) -> str:
+        text = str(raw or "").strip().lower()
+        if re.fullmatch(r"(sh|sz|bj)\d{6}", text):
+            return text
+        return ""
+
+    @staticmethod
+    def _safe_signal_etf_date(raw: object, fallback: str) -> str:
+        text = str(raw or "").strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            return text
+        return fallback
+
+    @staticmethod
+    def _signal_etf_limit_up_ratio(symbol: str) -> float:
+        code = str(symbol or "")[2:]
+        market = str(symbol or "")[:2]
+        if market == "bj":
+            return 0.30
+        if code.startswith(("300", "301", "688", "689")):
+            return 0.20
+        return 0.10
+
+    @staticmethod
+    def _to_signal_etf_ratio(numerator: float, denominator: float) -> float:
+        if not (math.isfinite(numerator) and math.isfinite(denominator) and denominator > 0):
+            return 0.0
+        return float(numerator / denominator)
+
+    @staticmethod
+    def _round_signal_etf_ratio(value: float) -> float:
+        if not math.isfinite(value):
+            return 0.0
+        return round(float(value), 6)
+
+    def _build_signal_etf_unique_name(self, base_name: str, *, exclude_record_id: str | None = None) -> str:
+        normalized_base = str(base_name or "").strip() or "待买ETF"
+        used_names = {
+            str(row.get("name", "")).strip().lower()
+            for rid, row in self._signal_etf_backtest_store.items()
+            if rid != exclude_record_id
+        }
+        if normalized_base.lower() not in used_names:
+            return normalized_base
+        index = 2
+        while True:
+            candidate = f"{normalized_base}-{index}"
+            if candidate.lower() not in used_names:
+                return candidate
+            index += 1
+
+    def _normalize_signal_etf_constituents(
+        self,
+        raw_items: object,
+        *,
+        fallback_signal_date: str,
+    ) -> list[SignalEtfBacktestConstituentInput]:
+        if not isinstance(raw_items, list):
+            return []
+        out: list[SignalEtfBacktestConstituentInput] = []
+        seen: set[str] = set()
+        for row in raw_items:
+            candidate: SignalEtfBacktestConstituentInput | None = None
+            if isinstance(row, SignalEtfBacktestConstituentInput):
+                candidate = row
+            elif isinstance(row, dict):
+                try:
+                    candidate = SignalEtfBacktestConstituentInput(**row)
+                except Exception:
+                    candidate = None
+            if candidate is None:
+                continue
+            symbol = self._normalize_signal_etf_symbol(candidate.symbol)
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            normalized_signal_date = self._safe_signal_etf_date(candidate.signal_date, fallback_signal_date)
+            out.append(
+                SignalEtfBacktestConstituentInput(
+                    symbol=symbol,
+                    name=str(candidate.name or "").strip()[:64],
+                    signal_date=normalized_signal_date,
+                    signal_primary=str(candidate.signal_primary or "").strip()[:16],
+                    signal_event=str(candidate.signal_event or "").strip()[:64],
+                    signal_reason=str(candidate.signal_reason or "").strip()[:400],
+                )
+            )
+        return out
+
+    def _signal_etf_window_bars(self, signal_dates: list[str]) -> int:
+        today_text = self._now_date()
+        fallback = max(400, int(self._config.candles_window_bars))
+        date_points: list[datetime] = []
+        for item in signal_dates:
+            text = str(item or "").strip()
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+                continue
+            try:
+                date_points.append(datetime.strptime(text, "%Y-%m-%d"))
+            except Exception:
+                continue
+        if not date_points:
+            return fallback
+        try:
+            today_dt = datetime.strptime(today_text, "%Y-%m-%d")
+        except Exception:
+            return fallback
+        oldest = min(date_points)
+        days = max(60, (today_dt - oldest).days + 30)
+        dynamic = max(fallback, days * 2)
+        return max(400, min(5000, int(dynamic)))
+
+    def _load_signal_etf_candles(
+        self,
+        symbol: str,
+        *,
+        window_bars: int,
+        candle_cache: dict[str, list[CandlePoint]],
+    ) -> list[CandlePoint]:
+        key = str(symbol or "").strip().lower()
+        cached = candle_cache.get(key)
+        if cached is not None:
+            return cached
+        candles = load_candles_for_symbol(
+            self._config.tdx_data_path,
+            key,
+            window=max(120, int(window_bars)),
+            market_data_source=self._config.market_data_source,
+            akshare_cache_dir=self._config.akshare_cache_dir,
+        )
+        resolved = list(candles or [])
+        resolved.sort(key=lambda item: item.time)
+        candle_cache[key] = resolved
+        return resolved
+
+    def _resolve_signal_etf_buy_price(
+        self,
+        *,
+        symbol: str,
+        candles: list[CandlePoint],
+        buy_index: int,
+    ) -> float:
+        if buy_index < 0 or buy_index >= len(candles):
+            return 0.0
+        candle = candles[buy_index]
+        open_price = float(candle.open)
+        if buy_index <= 0:
+            return round(open_price, 2)
+        prev_close = float(candles[buy_index - 1].close)
+        if prev_close <= 0:
+            return round(open_price, 2)
+        ratio = self._signal_etf_limit_up_ratio(symbol)
+        limit_up_price = round(prev_close * (1.0 + ratio), 2)
+        if open_price >= limit_up_price * 0.999:
+            return limit_up_price
+        return round(open_price, 2)
+
+    @staticmethod
+    def _resolve_close_on_or_before(
+        *,
+        dates: list[str],
+        closes: list[float],
+        target_date: str,
+        min_date: str,
+    ) -> float | None:
+        if not dates or len(dates) != len(closes):
+            return None
+        index = bisect_right(dates, target_date) - 1
+        if index < 0:
+            return None
+        if dates[index] < min_date:
+            return None
+        close = closes[index]
+        if not (math.isfinite(close) and close > 0):
+            return None
+        return float(close)
+
+    def _build_signal_etf_runtime(
+        self,
+        raw: dict[str, Any],
+        *,
+        candle_cache: dict[str, list[CandlePoint]],
+        as_of_date: str | None = None,
+    ) -> dict[str, object]:
+        now_date = self._now_date()
+        now_datetime = self._now_datetime()
+        valuation_cutoff = self._safe_signal_etf_date(as_of_date, now_date) if as_of_date else None
+        record_id = str(raw.get("record_id") or "").strip() or f"setf_{uuid4().hex[:12]}"
+        signal_date = self._safe_signal_etf_date(raw.get("signal_date"), now_date)
+        strategy_id = str(raw.get("strategy_id") or "").strip() or "unknown_strategy"
+        strategy_name = str(raw.get("strategy_name") or "").strip() or strategy_id
+        base_name = str(raw.get("name") or "").strip() or f"{strategy_name}_{signal_date}"
+        notes = str(raw.get("notes") or "").strip()
+        benchmark_symbol_raw = self._normalize_signal_etf_symbol(raw.get("benchmark_symbol")) or ""
+        if not benchmark_symbol_raw or benchmark_symbol_raw == "sh000300":
+            benchmark_symbol = "sh000001"
+        else:
+            benchmark_symbol = benchmark_symbol_raw
+        created_at = str(raw.get("created_at") or "").strip() or now_datetime
+        updated_at = str(raw.get("updated_at") or "").strip() or created_at
+
+        constituents = self._normalize_signal_etf_constituents(
+            raw.get("constituents"),
+            fallback_signal_date=signal_date,
+        )
+        window_bars = self._signal_etf_window_bars(
+            [signal_date, *[item.signal_date for item in constituents]],
+        )
+
+        stock_frames: dict[str, dict[str, object]] = {}
+        all_symbol_dates: set[str] = set()
+        for item in constituents:
+            symbol = item.symbol
+            candles = self._load_signal_etf_candles(
+                symbol,
+                window_bars=window_bars,
+                candle_cache=candle_cache,
+            )
+            dates = [row.time for row in candles]
+            closes = [float(row.close) for row in candles]
+            date_to_index = {day: idx for idx, day in enumerate(dates)}
+            if valuation_cutoff and dates:
+                latest_index = bisect_right(dates, valuation_cutoff) - 1
+                if latest_index >= 0:
+                    latest_date = dates[latest_index]
+                    latest_close = closes[latest_index] if latest_index < len(closes) else None
+                else:
+                    latest_date = None
+                    latest_close = None
+            else:
+                latest_date = dates[-1] if dates else None
+                latest_close = closes[-1] if closes else None
+            stock_frames[symbol] = {
+                "candles": candles,
+                "dates": dates,
+                "closes": closes,
+                "date_to_index": date_to_index,
+                "latest_date": latest_date,
+                "latest_close": latest_close,
+            }
+            all_symbol_dates.update(dates)
+
+        benchmark_candles = self._load_signal_etf_candles(
+            benchmark_symbol,
+            window_bars=window_bars,
+            candle_cache=candle_cache,
+        )
+        benchmark_dates = [row.time for row in benchmark_candles]
+        benchmark_closes = [float(row.close) for row in benchmark_candles]
+        benchmark_available = len(benchmark_dates) > 0 and len(benchmark_dates) == len(benchmark_closes)
+        calendar_dates = benchmark_dates if benchmark_available else sorted(all_symbol_dates)
+
+        def _resolve_buy_date(reference_date: str, offset: int) -> str | None:
+            if not calendar_dates:
+                return None
+            base_idx = bisect_right(calendar_dates, reference_date)
+            target = base_idx + max(0, int(offset) - 1)
+            if target < 0 or target >= len(calendar_dates):
+                return None
+            return calendar_dates[target]
+
+        t1_positions: dict[str, tuple[str, float]] = {}
+        t2_positions: dict[str, tuple[str, float]] = {}
+        constituent_details: list[SignalEtfBacktestConstituentDetail] = []
+
+        for item in constituents:
+            frame = stock_frames.get(item.symbol) or {}
+            dates = frame.get("dates") if isinstance(frame, dict) else None
+            candles = frame.get("candles") if isinstance(frame, dict) else None
+            date_to_index = frame.get("date_to_index") if isinstance(frame, dict) else None
+            latest_date = frame.get("latest_date") if isinstance(frame, dict) else None
+            latest_close = frame.get("latest_close") if isinstance(frame, dict) else None
+            dates = dates if isinstance(dates, list) else []
+            candles = candles if isinstance(candles, list) else []
+            date_to_index = date_to_index if isinstance(date_to_index, dict) else {}
+            current_date = str(latest_date).strip() if isinstance(latest_date, str) and latest_date else None
+            current_price = (
+                round(float(latest_close), 2)
+                if isinstance(latest_close, (int, float)) and math.isfinite(float(latest_close)) and float(latest_close) > 0
+                else None
+            )
+
+            buy_date_t1 = _resolve_buy_date(item.signal_date, 1)
+            buy_idx_t1 = date_to_index.get(buy_date_t1) if buy_date_t1 else None
+            buy_price_t1: float | None = None
+            status_t1: Literal["bought", "skipped"] = "skipped"
+            if isinstance(buy_idx_t1, int) and buy_idx_t1 >= 0:
+                resolved_price = self._resolve_signal_etf_buy_price(
+                    symbol=item.symbol,
+                    candles=candles,
+                    buy_index=buy_idx_t1,
+                )
+                if resolved_price > 0:
+                    buy_price_t1 = resolved_price
+                    t1_positions[item.symbol] = (buy_date_t1 or "", buy_price_t1)
+                    status_t1 = "bought"
+
+            buy_date_t2 = _resolve_buy_date(item.signal_date, 2)
+            buy_idx_t2 = date_to_index.get(buy_date_t2) if buy_date_t2 else None
+            buy_price_t2: float | None = None
+            status_t2: Literal["bought", "skipped"] = "skipped"
+            if isinstance(buy_idx_t2, int) and buy_idx_t2 >= 0:
+                resolved_price = self._resolve_signal_etf_buy_price(
+                    symbol=item.symbol,
+                    candles=candles,
+                    buy_index=buy_idx_t2,
+                )
+                if resolved_price > 0:
+                    buy_price_t2 = resolved_price
+                    t2_positions[item.symbol] = (buy_date_t2 or "", buy_price_t2)
+                    status_t2 = "bought"
+
+            return_pct_t1 = (
+                self._round_signal_etf_ratio((float(current_price) / buy_price_t1) - 1.0)
+                if (
+                    current_price is not None
+                    and buy_price_t1 is not None
+                    and buy_price_t1 > 0
+                    and isinstance(current_date, str)
+                    and isinstance(buy_date_t1, str)
+                    and current_date >= buy_date_t1
+                )
+                else None
+            )
+            return_pct_t2 = (
+                self._round_signal_etf_ratio((float(current_price) / buy_price_t2) - 1.0)
+                if (
+                    current_price is not None
+                    and buy_price_t2 is not None
+                    and buy_price_t2 > 0
+                    and isinstance(current_date, str)
+                    and isinstance(buy_date_t2, str)
+                    and current_date >= buy_date_t2
+                )
+                else None
+            )
+            constituent_details.append(
+                SignalEtfBacktestConstituentDetail(
+                    symbol=item.symbol,
+                    name=item.name,
+                    signal_date=item.signal_date,
+                    signal_primary=item.signal_primary,
+                    signal_event=item.signal_event,
+                    signal_reason=item.signal_reason,
+                    current_date=current_date,
+                    current_price=current_price,
+                    buy_date_t1=buy_date_t1 if status_t1 == "bought" else None,
+                    buy_price_t1=buy_price_t1,
+                    return_pct_t1=return_pct_t1,
+                    status_t1=status_t1,
+                    buy_date_t2=buy_date_t2 if status_t2 == "bought" else None,
+                    buy_price_t2=buy_price_t2,
+                    return_pct_t2=return_pct_t2,
+                    status_t2=status_t2,
+                )
+            )
+
+        def _build_etf_series(
+            positions: dict[str, tuple[str, float]],
+        ) -> tuple[dict[str, float], dict[str, float]]:
+            if not positions or not calendar_dates:
+                return {}, {}
+            series: dict[str, float] = {}
+            per_stock_final: dict[str, float] = {}
+            for day in calendar_dates:
+                if valuation_cutoff and day > valuation_cutoff:
+                    break
+                returns: list[float] = []
+                for symbol, (buy_day, buy_price) in positions.items():
+                    if not buy_day or buy_day > day or buy_price <= 0:
+                        continue
+                    frame = stock_frames.get(symbol) or {}
+                    dates = frame.get("dates") if isinstance(frame, dict) else None
+                    closes = frame.get("closes") if isinstance(frame, dict) else None
+                    dates = dates if isinstance(dates, list) else []
+                    closes = closes if isinstance(closes, list) else []
+                    close = self._resolve_close_on_or_before(
+                        dates=dates,
+                        closes=closes,
+                        target_date=day,
+                        min_date=buy_day,
+                    )
+                    if close is None or close <= 0:
+                        continue
+                    returns.append((close / buy_price) - 1.0)
+                if returns:
+                    series[day] = self._round_signal_etf_ratio(sum(returns) / len(returns))
+            if series:
+                last_day = next(reversed(series))
+                for symbol, (buy_day, buy_price) in positions.items():
+                    if not buy_day or buy_price <= 0:
+                        continue
+                    frame = stock_frames.get(symbol) or {}
+                    dates = frame.get("dates") if isinstance(frame, dict) else None
+                    closes = frame.get("closes") if isinstance(frame, dict) else None
+                    dates = dates if isinstance(dates, list) else []
+                    closes = closes if isinstance(closes, list) else []
+                    close = self._resolve_close_on_or_before(
+                        dates=dates,
+                        closes=closes,
+                        target_date=last_day,
+                        min_date=buy_day,
+                    )
+                    if close is None or close <= 0:
+                        continue
+                    per_stock_final[symbol] = self._round_signal_etf_ratio((close / buy_price) - 1.0)
+            return series, per_stock_final
+
+        def _build_benchmark_series(start_date: str | None) -> dict[str, float]:
+            if not start_date or not benchmark_available:
+                return {}
+            if not benchmark_dates or len(benchmark_dates) != len(benchmark_closes):
+                return {}
+            start_close = self._resolve_close_on_or_before(
+                dates=benchmark_dates,
+                closes=benchmark_closes,
+                target_date=start_date,
+                min_date=benchmark_dates[0],
+            )
+            if start_close is None or start_close <= 0:
+                return {}
+            out: dict[str, float] = {}
+            for day in calendar_dates:
+                if valuation_cutoff and day > valuation_cutoff:
+                    break
+                if day < start_date:
+                    continue
+                close = self._resolve_close_on_or_before(
+                    dates=benchmark_dates,
+                    closes=benchmark_closes,
+                    target_date=day,
+                    min_date=benchmark_dates[0],
+                )
+                if close is None or close <= 0:
+                    continue
+                out[day] = self._round_signal_etf_ratio((close / start_close) - 1.0)
+            return out
+
+        t1_series, t1_stock_final = _build_etf_series(t1_positions)
+        t2_series, t2_stock_final = _build_etf_series(t2_positions)
+        t1_start = next(iter(t1_series.keys()), None) if t1_series else None
+        t2_start = next(iter(t2_series.keys()), None) if t2_series else None
+        t1_benchmark_series = _build_benchmark_series(t1_start)
+        t2_benchmark_series = _build_benchmark_series(t2_start)
+
+        def _build_performance(
+            series: dict[str, float],
+            stock_final: dict[str, float],
+            benchmark_series: dict[str, float],
+            *,
+            total_count: int,
+        ) -> SignalEtfBacktestPerformance:
+            if not series:
+                return SignalEtfBacktestPerformance(
+                    return_pct=0.0,
+                    benchmark_return_pct=0.0,
+                    excess_return_pct=0.0,
+                    stock_win_rate=0.0,
+                    daily_win_rate=0.0,
+                    tradable_count=0,
+                    skipped_count=total_count,
+                )
+            series_values = list(series.values())
+            final_return = series_values[-1] if series_values else 0.0
+            daily_win_days = len([value for value in series_values if value > 0])
+            daily_win_rate = self._to_signal_etf_ratio(daily_win_days, len(series_values))
+            tradable_count = len(stock_final)
+            stock_win_count = len([value for value in stock_final.values() if value > 0])
+            stock_win_rate = self._to_signal_etf_ratio(stock_win_count, tradable_count)
+            benchmark_values = list(benchmark_series.values())
+            benchmark_final = benchmark_values[-1] if benchmark_values else 0.0
+            return SignalEtfBacktestPerformance(
+                return_pct=self._round_signal_etf_ratio(final_return),
+                benchmark_return_pct=self._round_signal_etf_ratio(benchmark_final),
+                excess_return_pct=self._round_signal_etf_ratio(final_return - benchmark_final),
+                stock_win_rate=self._round_signal_etf_ratio(stock_win_rate),
+                daily_win_rate=self._round_signal_etf_ratio(daily_win_rate),
+                tradable_count=tradable_count,
+                skipped_count=max(0, total_count - tradable_count),
+            )
+
+        summary = SignalEtfBacktestSummary(
+            t1=_build_performance(
+                t1_series,
+                t1_stock_final,
+                t1_benchmark_series,
+                total_count=len(constituents),
+            ),
+            t2=_build_performance(
+                t2_series,
+                t2_stock_final,
+                t2_benchmark_series,
+                total_count=len(constituents),
+            ),
+            strategy_stats=SignalEtfBacktestStrategyStats(strategy_id=strategy_id),
+        )
+
+        merged_curve_dates = sorted(
+            set(t1_series.keys()) | set(t2_series.keys()) | set(t1_benchmark_series.keys()) | set(t2_benchmark_series.keys())
+        )
+        curve: list[SignalEtfBacktestCurvePoint] = []
+        for day in merged_curve_dates:
+            etf_t1 = t1_series.get(day)
+            etf_t2 = t2_series.get(day)
+            benchmark_t1 = t1_benchmark_series.get(day)
+            benchmark_t2 = t2_benchmark_series.get(day)
+            curve.append(
+                SignalEtfBacktestCurvePoint(
+                    date=day,
+                    etf_return_t1=etf_t1,
+                    etf_return_t2=etf_t2,
+                    benchmark_return_t1=benchmark_t1,
+                    benchmark_return_t2=benchmark_t2,
+                    excess_return_t1=(
+                        self._round_signal_etf_ratio(etf_t1 - benchmark_t1)
+                        if etf_t1 is not None and benchmark_t1 is not None
+                        else None
+                    ),
+                    excess_return_t2=(
+                        self._round_signal_etf_ratio(etf_t2 - benchmark_t2)
+                        if etf_t2 is not None and benchmark_t2 is not None
+                        else None
+                    ),
+                )
+            )
+
+        detail = SignalEtfBacktestDetail(
+            record_id=record_id,
+            name=base_name,
+            notes=notes,
+            signal_date=signal_date,
+            strategy_id=strategy_id,
+            strategy_name=strategy_name,
+            benchmark_symbol=benchmark_symbol,
+            total_constituents=len(constituents),
+            created_at=created_at,
+            updated_at=updated_at,
+            summary=summary,
+            benchmark_available=benchmark_available,
+            constituents=constituent_details,
+            curve=curve,
+        )
+        record = SignalEtfBacktestRecord(
+            record_id=detail.record_id,
+            name=detail.name,
+            notes=detail.notes,
+            signal_date=detail.signal_date,
+            strategy_id=detail.strategy_id,
+            strategy_name=detail.strategy_name,
+            benchmark_symbol=detail.benchmark_symbol,
+            total_constituents=detail.total_constituents,
+            created_at=detail.created_at,
+            updated_at=detail.updated_at,
+            summary=detail.summary,
+        )
+        return {
+            "record_id": record_id,
+            "strategy_id": strategy_id,
+            "t1_positive": bool(record.summary.t1.return_pct > 0),
+            "t2_positive": bool(record.summary.t2.return_pct > 0),
+            "record": record,
+            "detail": detail,
+        }
+
+    @staticmethod
+    def _build_signal_etf_strategy_stats_map(
+        runtimes: list[dict[str, object]],
+    ) -> dict[str, SignalEtfBacktestStrategyStats]:
+        counters: dict[str, dict[str, int]] = {}
+        for runtime in runtimes:
+            strategy_id = str(runtime.get("strategy_id") or "").strip() or "unknown_strategy"
+            bucket = counters.setdefault(strategy_id, {"total": 0, "wins_t1": 0, "wins_t2": 0})
+            bucket["total"] += 1
+            if bool(runtime.get("t1_positive")):
+                bucket["wins_t1"] += 1
+            if bool(runtime.get("t2_positive")):
+                bucket["wins_t2"] += 1
+        out: dict[str, SignalEtfBacktestStrategyStats] = {}
+        for strategy_id, bucket in counters.items():
+            total = max(0, int(bucket.get("total", 0)))
+            wins_t1 = max(0, int(bucket.get("wins_t1", 0)))
+            wins_t2 = max(0, int(bucket.get("wins_t2", 0)))
+            out[strategy_id] = SignalEtfBacktestStrategyStats(
+                strategy_id=strategy_id,
+                total_records=total,
+                win_rate_t1=round((wins_t1 / total), 6) if total > 0 else 0.0,
+                win_rate_t2=round((wins_t2 / total), 6) if total > 0 else 0.0,
+            )
+        return out
+
+    def _build_signal_etf_runtime_bundle(
+        self,
+        *,
+        as_of_date: str | None = None,
+    ) -> tuple[list[SignalEtfBacktestRecord], dict[str, SignalEtfBacktestDetail]]:
+        with self._lock:
+            raw_rows = [dict(value) for value in self._signal_etf_backtest_store.values() if isinstance(value, dict)]
+        candle_cache: dict[str, list[CandlePoint]] = {}
+        runtimes = [self._build_signal_etf_runtime(row, candle_cache=candle_cache, as_of_date=as_of_date) for row in raw_rows]
+        stats_map = self._build_signal_etf_strategy_stats_map(runtimes)
+
+        records: list[SignalEtfBacktestRecord] = []
+        detail_map: dict[str, SignalEtfBacktestDetail] = {}
+        for runtime in runtimes:
+            record = runtime.get("record")
+            detail = runtime.get("detail")
+            strategy_id = str(runtime.get("strategy_id") or "").strip() or "unknown_strategy"
+            if not isinstance(record, SignalEtfBacktestRecord) or not isinstance(detail, SignalEtfBacktestDetail):
+                continue
+            strategy_stats = stats_map.get(strategy_id, SignalEtfBacktestStrategyStats(strategy_id=strategy_id))
+            patched_summary = record.summary.model_copy(update={"strategy_stats": strategy_stats})
+            patched_record = record.model_copy(update={"summary": patched_summary})
+            patched_detail = detail.model_copy(update={"summary": patched_summary})
+            records.append(patched_record)
+            detail_map[patched_record.record_id] = patched_detail
+
+        records.sort(key=lambda item: item.created_at, reverse=True)
+        return records, detail_map
+
+    def create_signal_etf_backtest(self, payload: SignalEtfBacktestCreateRequest) -> SignalEtfBacktestDetail:
+        strategy_id = str(payload.strategy_id or "").strip()
+        if not strategy_id:
+            raise BacktestValidationError("SIGNAL_ETF_STRATEGY_REQUIRED", "strategy_id 不能为空。")
+        signal_date = self._safe_signal_etf_date(payload.signal_date, self._now_date())
+        strategy_name = str(payload.strategy_name or "").strip() or strategy_id
+        normalized_constituents = self._normalize_signal_etf_constituents(
+            [item.model_dump(exclude_none=True) for item in payload.constituents],
+            fallback_signal_date=signal_date,
+        )
+        if len(normalized_constituents) <= 0:
+            raise BacktestValidationError("SIGNAL_ETF_EMPTY", "没有可用成分股，无法生成待买ETF回测。")
+
+        custom_name = str(payload.name or "").strip()
+        base_name = custom_name or f"{strategy_name}_{signal_date}"
+        now_text = self._now_datetime()
+        record_id = f"setf_{uuid4().hex[:16]}"
+
+        with self._lock:
+            unique_name = self._build_signal_etf_unique_name(base_name)
+            self._signal_etf_backtest_store[record_id] = {
+                "record_id": record_id,
+                "name": unique_name,
+                "notes": str(payload.notes or "").strip(),
+                "signal_date": signal_date,
+                "strategy_id": strategy_id,
+                "strategy_name": strategy_name,
+                "benchmark_symbol": "sh000001",
+                "created_at": now_text,
+                "updated_at": now_text,
+                "constituents": [item.model_dump(exclude_none=True) for item in normalized_constituents],
+            }
+        self._persist_app_state()
+        detail = self.get_signal_etf_backtest(record_id, refresh=True)
+        if detail is None:
+            raise BacktestValidationError("SIGNAL_ETF_NOT_FOUND", "待买ETF回测记录创建失败。")
+        return detail
+
+    def list_signal_etf_backtests(self, *, refresh: bool = True) -> SignalEtfBacktestListResponse:
+        _ = refresh
+        records, _detail_map = self._build_signal_etf_runtime_bundle()
+        return SignalEtfBacktestListResponse(items=records)
+
+    def get_signal_etf_backtest(
+        self,
+        record_id: str,
+        *,
+        refresh: bool = True,
+        as_of_date: str | None = None,
+    ) -> SignalEtfBacktestDetail | None:
+        _ = refresh
+        normalized = str(record_id or "").strip()
+        if not normalized:
+            return None
+        valuation_date = self._safe_signal_etf_date(as_of_date, self._now_date()) if as_of_date else None
+        _records, detail_map = self._build_signal_etf_runtime_bundle(as_of_date=valuation_date)
+        return detail_map.get(normalized)
+
+    def update_signal_etf_backtest(
+        self,
+        record_id: str,
+        payload: SignalEtfBacktestUpdateRequest,
+    ) -> SignalEtfBacktestRecord:
+        normalized = str(record_id or "").strip()
+        if not normalized:
+            raise BacktestValidationError("SIGNAL_ETF_NOT_FOUND", "待买ETF回测记录不存在。")
+        with self._lock:
+            target = self._signal_etf_backtest_store.get(normalized)
+            if not isinstance(target, dict):
+                raise BacktestValidationError("SIGNAL_ETF_NOT_FOUND", "待买ETF回测记录不存在。")
+            updated = dict(target)
+            if payload.name is not None:
+                name_text = str(payload.name or "").strip()
+                if not name_text:
+                    raise BacktestValidationError("SIGNAL_ETF_NAME_EMPTY", "名称不能为空。")
+                updated["name"] = self._build_signal_etf_unique_name(name_text, exclude_record_id=normalized)
+            if payload.notes is not None:
+                updated["notes"] = str(payload.notes or "").strip()
+            updated["updated_at"] = self._now_datetime()
+            self._signal_etf_backtest_store[normalized] = updated
+        self._persist_app_state()
+        records, _detail_map = self._build_signal_etf_runtime_bundle()
+        for row in records:
+            if row.record_id == normalized:
+                return row
+        raise BacktestValidationError("SIGNAL_ETF_NOT_FOUND", "待买ETF回测记录不存在。")
+
+    def delete_signal_etf_backtest(self, record_id: str) -> bool:
+        normalized = str(record_id or "").strip()
+        if not normalized:
+            return False
+        with self._lock:
+            existed = normalized in self._signal_etf_backtest_store
+            if existed:
+                self._signal_etf_backtest_store.pop(normalized, None)
+        if existed:
+            self._persist_app_state()
+        return existed
 
     def create_order(self, payload: CreateOrderRequest) -> CreateOrderResponse:
         return self._sim_engine.create_order(payload)

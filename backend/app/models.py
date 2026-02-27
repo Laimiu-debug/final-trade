@@ -281,6 +281,110 @@ class SignalsResponse(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class SignalEtfBacktestConstituentInput(BaseModel):
+    symbol: str = Field(min_length=4, max_length=16)
+    name: str = Field(default="", max_length=64)
+    signal_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    signal_primary: str = Field(default="", max_length=16)
+    signal_event: str = Field(default="", max_length=64)
+    signal_reason: str = Field(default="", max_length=400)
+
+
+class SignalEtfBacktestCreateRequest(BaseModel):
+    strategy_id: str = Field(min_length=1, max_length=128)
+    strategy_name: str = Field(default="", max_length=128)
+    signal_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    name: str | None = Field(default=None, max_length=128)
+    notes: str | None = Field(default=None, max_length=1000)
+    constituents: list[SignalEtfBacktestConstituentInput] = Field(min_length=1, max_length=2000)
+
+
+class SignalEtfBacktestUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+    notes: str | None = Field(default=None, max_length=1000)
+
+
+class SignalEtfBacktestPerformance(BaseModel):
+    return_pct: float = 0.0
+    benchmark_return_pct: float = 0.0
+    excess_return_pct: float = 0.0
+    stock_win_rate: float = 0.0
+    daily_win_rate: float = 0.0
+    tradable_count: int = 0
+    skipped_count: int = 0
+
+
+class SignalEtfBacktestStrategyStats(BaseModel):
+    strategy_id: str = ""
+    total_records: int = 0
+    win_rate_t1: float = 0.0
+    win_rate_t2: float = 0.0
+
+
+class SignalEtfBacktestSummary(BaseModel):
+    t1: SignalEtfBacktestPerformance = Field(default_factory=SignalEtfBacktestPerformance)
+    t2: SignalEtfBacktestPerformance = Field(default_factory=SignalEtfBacktestPerformance)
+    strategy_stats: SignalEtfBacktestStrategyStats = Field(default_factory=SignalEtfBacktestStrategyStats)
+
+
+class SignalEtfBacktestRecord(BaseModel):
+    record_id: str
+    name: str
+    notes: str = ""
+    signal_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    strategy_id: str
+    strategy_name: str = ""
+    benchmark_symbol: str = "sh000001"
+    total_constituents: int = 0
+    created_at: str
+    updated_at: str
+    summary: SignalEtfBacktestSummary = Field(default_factory=SignalEtfBacktestSummary)
+
+
+class SignalEtfBacktestConstituentDetail(BaseModel):
+    symbol: str
+    name: str = ""
+    signal_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    signal_primary: str = ""
+    signal_event: str = ""
+    signal_reason: str = ""
+    current_date: str | None = None
+    current_price: float | None = None
+    buy_date_t1: str | None = None
+    buy_price_t1: float | None = None
+    return_pct_t1: float | None = None
+    status_t1: Literal["bought", "skipped"] = "skipped"
+    buy_date_t2: str | None = None
+    buy_price_t2: float | None = None
+    return_pct_t2: float | None = None
+    status_t2: Literal["bought", "skipped"] = "skipped"
+
+
+class SignalEtfBacktestCurvePoint(BaseModel):
+    date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    etf_return_t1: float | None = None
+    etf_return_t2: float | None = None
+    benchmark_return_t1: float | None = None
+    benchmark_return_t2: float | None = None
+    excess_return_t1: float | None = None
+    excess_return_t2: float | None = None
+
+
+class SignalEtfBacktestDetail(SignalEtfBacktestRecord):
+    benchmark_available: bool = False
+    constituents: list[SignalEtfBacktestConstituentDetail] = Field(default_factory=list)
+    curve: list[SignalEtfBacktestCurvePoint] = Field(default_factory=list)
+
+
+class SignalEtfBacktestListResponse(BaseModel):
+    items: list[SignalEtfBacktestRecord] = Field(default_factory=list)
+
+
+class SignalEtfBacktestDeleteResponse(BaseModel):
+    deleted: bool
+    record_id: str
+
+
 class StrategyCapabilities(BaseModel):
     supports_matrix: bool = False
     supports_signal_age_filter: bool = True
