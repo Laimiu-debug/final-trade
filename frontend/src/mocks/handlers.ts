@@ -55,6 +55,7 @@ import type {
   AppConfig,
   BacktestReportDetail,
   BacktestReportSummary,
+  BacktestPlateauResponse,
   BacktestPlateauRunRequest,
   BacktestRunRequest,
   BacktestResponse,
@@ -77,6 +78,13 @@ type MockBacktestTask = {
   poll_count: number
   result: BacktestResponse
 }
+type MockBacktestPlateauTask = {
+  status: 'pending' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled'
+  poll_count: number
+  result: BacktestPlateauResponse
+  sampling_mode: 'grid' | 'lhs'
+  updated_at: string
+}
 
 type MockBacktestReport = {
   summary: BacktestReportSummary
@@ -84,6 +92,7 @@ type MockBacktestReport = {
 }
 
 const mockBacktestTaskStore = new Map<string, MockBacktestTask>()
+const mockBacktestPlateauTaskStore = new Map<string, MockBacktestPlateauTask>()
 const mockBacktestReportStore = new Map<string, MockBacktestReport>()
 
 export const handlers = [
@@ -248,6 +257,186 @@ export const handlers = [
     await delay(280)
     const payload = (await request.json()) as BacktestPlateauRunRequest
     return HttpResponse.json(runBacktestPlateauStore(payload))
+  }),
+
+  http.get('/api/backtest/plateau/tasks', async () => {
+    await delay(80)
+    const items = Array.from(mockBacktestPlateauTaskStore.entries())
+      .sort((left, right) => right[1].updated_at.localeCompare(left[1].updated_at))
+      .map(([taskId, task]) => {
+        const total = Number(task.result.total_combinations || 0)
+        const processed = task.status === 'succeeded' ? total : Math.max(0, Math.floor(total * 0.5))
+        const percent = total > 0 ? (processed / total) * 100 : 0
+        return {
+          task_id: taskId,
+          status: task.status,
+          progress: {
+            sampling_mode: task.sampling_mode,
+            processed_points: processed,
+            total_points: total,
+            percent,
+            message: task.status === 'succeeded' ? '收益平原评估完成。' : '收益平原任务执行中...',
+            started_at: task.updated_at,
+            updated_at: task.updated_at,
+          },
+          result: task.status === 'succeeded' ? task.result : null,
+          error: null,
+          error_code: null,
+        }
+      })
+    return HttpResponse.json({ items })
+  }),
+
+  http.post('/api/backtest/plateau/tasks', async ({ request }) => {
+    await delay(120)
+    const payload = (await request.json()) as BacktestPlateauRunRequest
+    const taskId = `bp_mock_${Date.now()}_${Math.floor(Math.random() * 10000)}`
+    mockBacktestPlateauTaskStore.set(taskId, {
+      status: 'running',
+      poll_count: 0,
+      result: runBacktestPlateauStore(payload),
+      sampling_mode: payload.sampling_mode ?? 'lhs',
+      updated_at: new Date().toISOString(),
+    })
+    return HttpResponse.json({ task_id: taskId })
+  }),
+
+  http.get('/api/backtest/plateau/tasks/:taskId', async ({ params }) => {
+    await delay(120)
+    const taskId = String(params.taskId)
+    const task = mockBacktestPlateauTaskStore.get(taskId)
+    if (!task) {
+      return HttpResponse.json(
+        {
+          code: 'BACKTEST_PLATEAU_TASK_NOT_FOUND',
+          message: '收益平原任务不存在',
+          trace_id: `${Date.now()}`,
+        },
+        { status: 404 },
+      )
+    }
+    task.poll_count += 1
+    if (task.status === 'running' && task.poll_count >= 2) {
+      task.status = 'succeeded'
+      task.updated_at = new Date().toISOString()
+    }
+    const total = Number(task.result.total_combinations || 0)
+    const processed = task.status === 'succeeded' ? total : Math.max(0, Math.floor(total * 0.5))
+    const percent = total > 0 ? (processed / total) * 100 : 0
+    return HttpResponse.json({
+      task_id: taskId,
+      status: task.status,
+      progress: {
+        sampling_mode: task.sampling_mode,
+        processed_points: processed,
+        total_points: total,
+        percent,
+        message: task.status === 'succeeded' ? '收益平原评估完成。' : '收益平原任务执行中...',
+        started_at: task.updated_at,
+        updated_at: task.updated_at,
+      },
+      result: task.status === 'succeeded' ? task.result : null,
+      error: null,
+      error_code: null,
+    })
+  }),
+
+  http.post('/api/backtest/plateau/tasks/:taskId/pause', async ({ params }) => {
+    await delay(80)
+    const taskId = String(params.taskId)
+    const task = mockBacktestPlateauTaskStore.get(taskId)
+    if (!task) {
+      return HttpResponse.json({ code: 'BACKTEST_PLATEAU_TASK_NOT_FOUND', message: '收益平原任务不存在' }, { status: 404 })
+    }
+    task.status = 'paused'
+    task.updated_at = new Date().toISOString()
+    return HttpResponse.json({
+      task_id: taskId,
+      status: 'paused',
+      progress: {
+        sampling_mode: task.sampling_mode,
+        processed_points: Math.max(0, Math.floor(task.result.total_combinations * 0.5)),
+        total_points: task.result.total_combinations,
+        percent: 50,
+        message: '任务已暂停。',
+        started_at: task.updated_at,
+        updated_at: task.updated_at,
+      },
+      result: null,
+      error: null,
+      error_code: null,
+    })
+  }),
+
+  http.post('/api/backtest/plateau/tasks/:taskId/resume', async ({ params }) => {
+    await delay(80)
+    const taskId = String(params.taskId)
+    const task = mockBacktestPlateauTaskStore.get(taskId)
+    if (!task) {
+      return HttpResponse.json({ code: 'BACKTEST_PLATEAU_TASK_NOT_FOUND', message: '收益平原任务不存在' }, { status: 404 })
+    }
+    task.status = 'running'
+    task.updated_at = new Date().toISOString()
+    return HttpResponse.json({
+      task_id: taskId,
+      status: 'running',
+      progress: {
+        sampling_mode: task.sampling_mode,
+        processed_points: Math.max(0, Math.floor(task.result.total_combinations * 0.5)),
+        total_points: task.result.total_combinations,
+        percent: 50,
+        message: '任务已继续。',
+        started_at: task.updated_at,
+        updated_at: task.updated_at,
+      },
+      result: null,
+      error: null,
+      error_code: null,
+    })
+  }),
+
+  http.post('/api/backtest/plateau/tasks/:taskId/cancel', async ({ params }) => {
+    await delay(80)
+    const taskId = String(params.taskId)
+    const task = mockBacktestPlateauTaskStore.get(taskId)
+    if (!task) {
+      return HttpResponse.json({ code: 'BACKTEST_PLATEAU_TASK_NOT_FOUND', message: '收益平原任务不存在' }, { status: 404 })
+    }
+    task.status = 'cancelled'
+    task.updated_at = new Date().toISOString()
+    return HttpResponse.json({
+      task_id: taskId,
+      status: 'cancelled',
+      progress: {
+        sampling_mode: task.sampling_mode,
+        processed_points: Math.max(0, Math.floor(task.result.total_combinations * 0.5)),
+        total_points: task.result.total_combinations,
+        percent: 50,
+        message: '任务已停止。',
+        started_at: task.updated_at,
+        updated_at: task.updated_at,
+      },
+      result: null,
+      error: null,
+      error_code: null,
+    })
+  }),
+
+  http.delete('/api/backtest/plateau/tasks/:taskId', async ({ params }) => {
+    await delay(80)
+    const taskId = String(params.taskId)
+    const task = mockBacktestPlateauTaskStore.get(taskId)
+    if (!task) {
+      return HttpResponse.json({ code: 'BACKTEST_PLATEAU_TASK_NOT_FOUND', message: '收益平原任务不存在' }, { status: 404 })
+    }
+    if (task.status === 'pending' || task.status === 'running') {
+      return HttpResponse.json(
+        { code: 'BACKTEST_PLATEAU_TASK_CONTROL_INVALID', message: `任务当前状态为 ${task.status}，请先暂停或停止后再删除。` },
+        { status: 400 },
+      )
+    }
+    mockBacktestPlateauTaskStore.delete(taskId)
+    return HttpResponse.json({ deleted: true, task_id: taskId })
   }),
 
   http.post('/api/backtest/tasks', async ({ request }) => {

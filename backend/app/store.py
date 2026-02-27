@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import gc
@@ -43,13 +43,9 @@ from .models import (
     BacktestPlateauCorrelationRow,
     BacktestPlateauTaskProgress,
     BacktestPlateauTaskStatusResponse,
+    BacktestPlateauTaskListResponse,
+    BacktestPlateauTaskDeleteResponse,
     BacktestPoolRollMode,
-    BacktestABExperimentRequest,
-    BacktestABExperimentResponse,
-    BacktestABVariantConfig,
-    BacktestABVariantResult,
-    BacktestABComparisonRow,
-    BacktestABSignalBucket,
     BacktestResponse,
     BacktestTrade,
     BacktestRiskMetrics,
@@ -8366,6 +8362,7 @@ class InMemoryStore:
             float(point.params.min_score),
             float(point.params.stop_loss),
             float(point.params.take_profit),
+            float(point.params.trailing_stop_pct),
             float(point.params.max_positions),
             float(point.params.position_pct),
             float(point.params.max_symbols),
@@ -8445,6 +8442,7 @@ class InMemoryStore:
             ("min_score", "最低评分", lambda row: float(row.params.min_score)),
             ("stop_loss", "止损比例", lambda row: float(row.params.stop_loss)),
             ("take_profit", "止盈比例", lambda row: float(row.params.take_profit)),
+            ("trailing_stop_pct", "高位回撤比例", lambda row: float(row.params.trailing_stop_pct)),
             ("max_positions", "最大并发持仓", lambda row: float(row.params.max_positions)),
             ("position_pct", "单笔仓位占比", lambda row: float(row.params.position_pct)),
             ("max_symbols", "最大股票数", lambda row: float(row.params.max_symbols)),
@@ -8563,6 +8561,7 @@ class InMemoryStore:
         min_score_axis: list[float],
         stop_loss_axis: list[float],
         take_profit_axis: list[float],
+        trailing_stop_axis: list[float],
         max_positions_axis: list[int],
         position_pct_axis: list[float],
         max_symbols_axis: list[int],
@@ -8576,6 +8575,7 @@ class InMemoryStore:
         min_score_bounds = (min(min_score_axis), max(min_score_axis))
         stop_loss_bounds = (min(stop_loss_axis), max(stop_loss_axis))
         take_profit_bounds = (min(take_profit_axis), max(take_profit_axis))
+        trailing_stop_bounds = (min(trailing_stop_axis), max(trailing_stop_axis))
         max_positions_bounds = (min(max_positions_axis), max(max_positions_axis))
         position_pct_bounds = (min(position_pct_axis), max(position_pct_axis))
         max_symbols_bounds = (min(max_symbols_axis), max(max_symbols_axis))
@@ -8609,24 +8609,30 @@ class InMemoryStore:
                     upper=float(take_profit_bounds[1]),
                     precision=6,
                 ),
-                max_positions=self._map_plateau_int_from_unit(
+                trailing_stop_pct=self._map_plateau_float_from_unit(
                     unit_values[4],
+                    lower=float(trailing_stop_bounds[0]),
+                    upper=float(trailing_stop_bounds[1]),
+                    precision=6,
+                ),
+                max_positions=self._map_plateau_int_from_unit(
+                    unit_values[5],
                     lower=int(max_positions_bounds[0]),
                     upper=int(max_positions_bounds[1]),
                 ),
                 position_pct=self._map_plateau_float_from_unit(
-                    unit_values[5],
+                    unit_values[6],
                     lower=float(position_pct_bounds[0]),
                     upper=float(position_pct_bounds[1]),
                     precision=6,
                 ),
                 max_symbols=self._map_plateau_int_from_unit(
-                    unit_values[6],
+                    unit_values[7],
                     lower=int(max_symbols_bounds[0]),
                     upper=int(max_symbols_bounds[1]),
                 ),
                 priority_topk_per_day=self._map_plateau_int_from_unit(
-                    unit_values[7],
+                    unit_values[8],
                     lower=int(priority_topk_bounds[0]),
                     upper=int(priority_topk_bounds[1]),
                 ),
@@ -8636,6 +8642,7 @@ class InMemoryStore:
                 float(candidate.min_score),
                 float(candidate.stop_loss),
                 float(candidate.take_profit),
+                float(candidate.trailing_stop_pct),
                 int(candidate.max_positions),
                 float(candidate.position_pct),
                 int(candidate.max_symbols),
@@ -8646,7 +8653,7 @@ class InMemoryStore:
             seen.add(key)
             params.append(candidate)
 
-        lhs_units = self._lhs_unit_matrix(point_count, 8, rng)
+        lhs_units = self._lhs_unit_matrix(point_count, 9, rng)
         for row in lhs_units:
             _try_append(row)
             if len(params) >= point_count:
@@ -8656,7 +8663,7 @@ class InMemoryStore:
         attempts = 0
         while len(params) < point_count and attempts < max_attempts:
             attempts += 1
-            _try_append([rng.random() for _ in range(8)])
+            _try_append([rng.random() for _ in range(9)])
 
         return params[:point_count]
 
@@ -8801,6 +8808,13 @@ class InMemoryStore:
             upper=1.5,
             precision=6,
         )
+        trailing_stop_axis = self._normalize_plateau_axis_float(
+            payload.trailing_stop_pct_list,
+            base=float(base.trailing_stop_pct),
+            lower=0.0,
+            upper=0.5,
+            precision=6,
+        )
         max_positions_axis = self._normalize_plateau_axis_int(
             payload.max_positions_list,
             base=int(base.max_positions),
@@ -8832,6 +8846,7 @@ class InMemoryStore:
             len(min_score_axis),
             len(stop_loss_axis),
             len(take_profit_axis),
+            len(trailing_stop_axis),
             len(max_positions_axis),
             len(position_pct_axis),
             len(max_symbols_axis),
@@ -8855,6 +8870,7 @@ class InMemoryStore:
                 min_score_axis=min_score_axis,
                 stop_loss_axis=stop_loss_axis,
                 take_profit_axis=take_profit_axis,
+                trailing_stop_axis=trailing_stop_axis,
                 max_positions_axis=max_positions_axis,
                 position_pct_axis=position_pct_axis,
                 max_symbols_axis=max_symbols_axis,
@@ -8866,6 +8882,7 @@ class InMemoryStore:
                 min_score_axis,
                 stop_loss_axis,
                 take_profit_axis,
+                trailing_stop_axis,
                 max_positions_axis,
                 position_pct_axis,
                 max_symbols_axis,
@@ -8878,6 +8895,7 @@ class InMemoryStore:
                     min_score,
                     stop_loss,
                     take_profit,
+                    trailing_stop_pct,
                     max_positions,
                     position_pct,
                     max_symbols,
@@ -8889,6 +8907,7 @@ class InMemoryStore:
                         min_score=float(min_score),
                         stop_loss=float(stop_loss),
                         take_profit=float(take_profit),
+                        trailing_stop_pct=float(trailing_stop_pct),
                         max_positions=int(max_positions),
                         position_pct=float(position_pct),
                         max_symbols=int(max_symbols),
@@ -8939,6 +8958,7 @@ class InMemoryStore:
                     "min_score": params.min_score,
                     "stop_loss": params.stop_loss,
                     "take_profit": params.take_profit,
+                    "trailing_stop_pct": params.trailing_stop_pct,
                     "max_positions": params.max_positions,
                     "position_pct": params.position_pct,
                     "max_symbols": params.max_symbols,
@@ -9091,7 +9111,14 @@ class InMemoryStore:
         )
 
         def _candidate_cache_key(p: BacktestPlateauParams) -> tuple:
-            return (int(p.window_days), float(p.min_score), float(p.stop_loss), float(p.take_profit), int(p.max_symbols))
+            return (
+                int(p.window_days),
+                float(p.min_score),
+                float(p.stop_loss),
+                float(p.take_profit),
+                float(p.trailing_stop_pct),
+                int(p.max_symbols),
+            )
 
         from collections import defaultdict as _ddict
 
@@ -9131,6 +9158,7 @@ class InMemoryStore:
                     "min_score": params.min_score,
                     "stop_loss": params.stop_loss,
                     "take_profit": params.take_profit,
+                    "trailing_stop_pct": params.trailing_stop_pct,
                     "max_positions": params.max_positions,
                     "position_pct": params.position_pct,
                     "max_symbols": params.max_symbols,
@@ -9356,291 +9384,6 @@ class InMemoryStore:
         )
 
     @staticmethod
-    def _build_backtest_ab_default_variants() -> list[BacktestABVariantConfig]:
-        return [
-            BacktestABVariantConfig(label="delay_2", entry_delay_days=2),
-            BacktestABVariantConfig(label="delay_3", entry_delay_days=3),
-            BacktestABVariantConfig(label="delay_2_health_60", entry_delay_days=2, health_score_min=60.0),
-            BacktestABVariantConfig(label="delay_2_event_60", entry_delay_days=2, event_score_min=60.0),
-            BacktestABVariantConfig(
-                label="delay_2_health_60_event_60",
-                entry_delay_days=2,
-                health_score_min=60.0,
-                event_score_min=60.0,
-            ),
-            BacktestABVariantConfig(
-                label="delay_2_aligned_semantic",
-                entry_delay_days=2,
-                matrix_event_semantic_version="aligned_wyckoff_v2",
-            ),
-            BacktestABVariantConfig(
-                label="delay_2_matrix_path",
-                entry_delay_days=2,
-                matrix_event_semantic_version="aligned_wyckoff_v2",
-                execution_path_preference="matrix",
-            ),
-            BacktestABVariantConfig(
-                label="delay_2_legacy_path",
-                entry_delay_days=2,
-                matrix_event_semantic_version="aligned_wyckoff_v2",
-                execution_path_preference="legacy",
-            ),
-        ]
-
-    @staticmethod
-    def _normalize_backtest_ab_entry_signal(raw: str | None) -> str:
-        text = str(raw or "").strip().upper()
-        if not text:
-            return "UNKNOWN"
-        if ":" in text:
-            text = text.split(":", 1)[-1].strip()
-        for sep in ("/", ",", "|", " "):
-            if sep in text:
-                first = text.split(sep, 1)[0].strip()
-                if first:
-                    text = first
-                    break
-        return text or "UNKNOWN"
-
-    @classmethod
-    def _build_backtest_ab_signal_breakdown(
-        cls,
-        trades: list[BacktestTrade],
-    ) -> list[BacktestABSignalBucket]:
-        if not trades:
-            return []
-        grouped: dict[str, list[BacktestTrade]] = {}
-        for row in trades:
-            signal = cls._normalize_backtest_ab_entry_signal(row.entry_signal)
-            grouped.setdefault(signal, []).append(row)
-        buckets: list[BacktestABSignalBucket] = []
-        for signal, rows in grouped.items():
-            trade_count = len(rows)
-            if trade_count <= 0:
-                continue
-            win_count = sum(1 for item in rows if float(item.pnl_ratio) > 0.0)
-            total_pnl_ratio = sum(float(item.pnl_ratio) for item in rows)
-            avg_pnl_ratio = total_pnl_ratio / float(trade_count)
-            utad_count = sum(1 for item in rows if str(item.exit_reason).strip().upper() == "UTAD")
-            buckets.append(
-                BacktestABSignalBucket(
-                    signal=signal,
-                    trade_count=int(trade_count),
-                    win_rate=round(float(win_count) / float(trade_count), 6),
-                    avg_pnl_ratio=round(float(avg_pnl_ratio), 6),
-                    total_pnl_ratio=round(float(total_pnl_ratio), 6),
-                    utad_exit_ratio=round(float(utad_count) / float(trade_count), 6),
-                )
-            )
-        buckets.sort(key=lambda row: (-int(row.trade_count), str(row.signal)))
-        return buckets
-
-    @staticmethod
-    def _build_backtest_ab_variant_label(
-        *,
-        base_payload: BacktestRunRequest,
-        variant_payload: BacktestRunRequest,
-        fallback_label: str | None,
-    ) -> str:
-        text = str(fallback_label or "").strip()
-        if text:
-            return text
-        parts: list[str] = []
-        if int(variant_payload.entry_delay_days) != int(base_payload.entry_delay_days):
-            parts.append(f"delay={int(variant_payload.entry_delay_days)}")
-        if float(variant_payload.health_score_min) != float(base_payload.health_score_min):
-            parts.append(f"health>={float(variant_payload.health_score_min):.1f}")
-        if float(variant_payload.event_score_min) != float(base_payload.event_score_min):
-            parts.append(f"event>={float(variant_payload.event_score_min):.1f}")
-        if str(variant_payload.event_grade_min) != str(base_payload.event_grade_min):
-            parts.append(f"grade>={str(variant_payload.event_grade_min)}")
-        if str(variant_payload.execution_path_preference) != str(base_payload.execution_path_preference):
-            parts.append(f"path={str(variant_payload.execution_path_preference)}")
-        if str(variant_payload.matrix_event_semantic_version) != str(base_payload.matrix_event_semantic_version):
-            parts.append(f"semantic={str(variant_payload.matrix_event_semantic_version)}")
-        if str(variant_payload.strategy_id) != str(base_payload.strategy_id):
-            parts.append(f"strategy={str(variant_payload.strategy_id)}")
-        if not parts:
-            return "baseline"
-        return ",".join(parts)
-
-    def run_backtest_ab_experiment(
-        self,
-        payload: BacktestABExperimentRequest,
-    ) -> BacktestABExperimentResponse:
-        base_payload = payload.base_payload.model_copy(deep=True)
-        variant_configs: list[BacktestABVariantConfig] = [BacktestABVariantConfig(label="baseline")]
-        if bool(payload.auto_generate_default_matrix):
-            variant_configs.extend(self._build_backtest_ab_default_variants())
-        variant_configs.extend(list(payload.variants))
-
-        dedup_keys: set[str] = set()
-        prepared_variants: list[tuple[str, BacktestRunRequest]] = []
-        for config in variant_configs:
-            updates: dict[str, Any] = {}
-            if config.entry_delay_days is not None:
-                updates["entry_delay_days"] = int(config.entry_delay_days)
-            if config.health_score_min is not None:
-                updates["health_score_min"] = float(config.health_score_min)
-            if config.event_score_min is not None:
-                updates["event_score_min"] = float(config.event_score_min)
-            if config.event_grade_min is not None:
-                updates["event_grade_min"] = str(config.event_grade_min)
-            if config.execution_path_preference is not None:
-                updates["execution_path_preference"] = str(config.execution_path_preference)
-            if config.matrix_event_semantic_version is not None:
-                updates["matrix_event_semantic_version"] = str(config.matrix_event_semantic_version)
-            if config.rank_weight_health is not None:
-                updates["rank_weight_health"] = float(config.rank_weight_health)
-            if config.rank_weight_event is not None:
-                updates["rank_weight_event"] = float(config.rank_weight_event)
-            if config.strategy_id is not None:
-                updates["strategy_id"] = str(config.strategy_id)
-            if config.strategy_params is not None:
-                merged_params = dict(base_payload.strategy_params)
-                merged_params.update(dict(config.strategy_params))
-                updates["strategy_params"] = merged_params
-            if config.enable_advanced_analysis is not None:
-                updates["enable_advanced_analysis"] = bool(config.enable_advanced_analysis)
-            else:
-                updates["enable_advanced_analysis"] = False
-            variant_payload = base_payload.model_copy(update=updates, deep=True)
-            dedup_key = json.dumps(
-                variant_payload.model_dump(exclude_none=True),
-                sort_keys=True,
-                ensure_ascii=True,
-                separators=(",", ":"),
-            )
-            if dedup_key in dedup_keys:
-                continue
-            dedup_keys.add(dedup_key)
-            label = self._build_backtest_ab_variant_label(
-                base_payload=base_payload,
-                variant_payload=variant_payload,
-                fallback_label=config.label,
-            )
-            prepared_variants.append((label, variant_payload))
-            if len(prepared_variants) >= int(payload.max_variants):
-                break
-
-        if not prepared_variants:
-            raise BacktestValidationError("BACKTEST_AB_EMPTY", "A/B 实验无可执行参数组合。")
-
-        variant_results: list[BacktestABVariantResult] = []
-        for idx, (label, run_payload) in enumerate(prepared_variants, start=1):
-            variant_id = f"v{idx:02d}"
-            try:
-                result = self.run_backtest(run_payload)
-                trades = list(result.trades)
-                trade_count = len(trades)
-                utad_count = sum(1 for row in trades if str(row.exit_reason).strip().upper() == "UTAD")
-                utad_exit_ratio = (float(utad_count) / float(trade_count)) if trade_count > 0 else 0.0
-                signal_breakdown = self._build_backtest_ab_signal_breakdown(trades)
-                max_consecutive_losses = int(
-                    result.risk_metrics.max_consecutive_losses
-                    if result.risk_metrics is not None
-                    else 0
-                )
-                variant_results.append(
-                    BacktestABVariantResult(
-                        variant_id=variant_id,
-                        label=label,
-                        run_request=run_payload,
-                        status="succeeded",
-                        error=None,
-                        stats=result.stats,
-                        risk_metrics=result.risk_metrics,
-                        execution_path=result.execution_path,
-                        candidate_count=int(result.candidate_count),
-                        trade_count=trade_count,
-                        utad_exit_ratio=round(float(utad_exit_ratio), 6),
-                        max_consecutive_losses=max_consecutive_losses,
-                        signal_breakdown=signal_breakdown,
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001
-                variant_results.append(
-                    BacktestABVariantResult(
-                        variant_id=variant_id,
-                        label=label,
-                        run_request=run_payload,
-                        status="failed",
-                        error=str(exc),
-                    )
-                )
-
-        succeeded = [
-            row
-            for row in variant_results
-            if row.status == "succeeded" and row.stats is not None
-        ]
-        baseline = succeeded[0] if succeeded else (variant_results[0] if variant_results else None)
-        comparisons: list[BacktestABComparisonRow] = []
-        if baseline is not None and baseline.stats is not None:
-            for row in succeeded:
-                if row.variant_id == baseline.variant_id or row.stats is None:
-                    continue
-                baseline_expectancy = (
-                    float(baseline.risk_metrics.expectancy)
-                    if baseline.risk_metrics is not None
-                    else 0.0
-                )
-                row_expectancy = (
-                    float(row.risk_metrics.expectancy)
-                    if row.risk_metrics is not None
-                    else 0.0
-                )
-                comparisons.append(
-                    BacktestABComparisonRow(
-                        baseline_variant_id=str(baseline.variant_id),
-                        variant_id=str(row.variant_id),
-                        label=str(row.label),
-                        total_return_delta=round(float(row.stats.total_return) - float(baseline.stats.total_return), 6),
-                        win_rate_delta=round(float(row.stats.win_rate) - float(baseline.stats.win_rate), 6),
-                        max_drawdown_delta=round(float(row.stats.max_drawdown) - float(baseline.stats.max_drawdown), 6),
-                        trade_count_delta=int(row.trade_count) - int(baseline.trade_count),
-                        utad_exit_ratio_delta=round(float(row.utad_exit_ratio) - float(baseline.utad_exit_ratio), 6),
-                        expectancy_delta=round(float(row_expectancy) - float(baseline_expectancy), 6),
-                        max_consecutive_losses_delta=int(row.max_consecutive_losses) - int(baseline.max_consecutive_losses),
-                    )
-                )
-
-        best_variant_id: str | None = None
-        if succeeded:
-            best = max(
-                succeeded,
-                key=lambda row: (
-                    float(row.stats.total_return) if row.stats is not None else -999.0,
-                    float(row.stats.win_rate) if row.stats is not None else -999.0,
-                    -(abs(float(row.stats.max_drawdown)) if row.stats is not None else 999.0),
-                    -float(row.utad_exit_ratio),
-                    -int(row.max_consecutive_losses),
-                ),
-            )
-            best_variant_id = str(best.variant_id)
-
-        failed_count = sum(1 for row in variant_results if row.status == "failed")
-        notes: list[str] = [
-            f"A/B 变体总数: {len(variant_results)}。",
-            f"成功 {len(succeeded)} 组，失败 {failed_count} 组。",
-            "建议重点观察指标: total_return, win_rate, max_drawdown, utad_exit_ratio, max_consecutive_losses。",
-        ]
-        if failed_count > 0:
-            notes.append("部分变体执行失败，详情见 variants[].error。")
-        if baseline is not None:
-            notes.append(f"基线变体: {baseline.variant_id} ({baseline.label})。")
-        if best_variant_id:
-            notes.append(f"综合最优变体: {best_variant_id}。")
-
-        return BacktestABExperimentResponse(
-            baseline_variant_id=(str(baseline.variant_id) if baseline is not None else None),
-            best_variant_id=best_variant_id,
-            variants=variant_results,
-            comparisons=comparisons,
-            notes=notes,
-        )
-
-    @staticmethod
     def _quantile(values: list[float], ratio: float) -> float:
         if not values:
             return 0.0
@@ -9663,6 +9406,7 @@ class InMemoryStore:
             min_score=float(payload.min_score),
             stop_loss=float(payload.stop_loss),
             take_profit=float(payload.take_profit),
+            trailing_stop_pct=float(payload.trailing_stop_pct),
             max_positions=int(payload.max_positions),
             position_pct=float(payload.position_pct),
             max_symbols=int(payload.max_symbols),
@@ -11460,6 +11204,7 @@ class InMemoryStore:
             len(self._normalize_plateau_axis_float(payload.min_score_list, base=float(base.min_score), lower=0.0, upper=100.0, precision=4)),
             len(self._normalize_plateau_axis_float(payload.stop_loss_list, base=float(base.stop_loss), lower=0.0, upper=0.5, precision=6)),
             len(self._normalize_plateau_axis_float(payload.take_profit_list, base=float(base.take_profit), lower=0.0, upper=1.5, precision=6)),
+            len(self._normalize_plateau_axis_float(payload.trailing_stop_pct_list, base=float(base.trailing_stop_pct), lower=0.0, upper=0.5, precision=6)),
             len(self._normalize_plateau_axis_int(payload.max_positions_list, base=int(base.max_positions), lower=1, upper=100)),
             len(self._normalize_plateau_axis_float(payload.position_pct_list, base=float(base.position_pct), lower=0.0001, upper=1.0, precision=6)),
             len(self._normalize_plateau_axis_int(payload.max_symbols_list, base=int(base.max_symbols), lower=20, upper=2000)),
@@ -11475,7 +11220,7 @@ class InMemoryStore:
             tasks = []
             for task_id, task in self._backtest_plateau_tasks.items():
                 payload = self._backtest_plateau_task_payloads.get(task_id)
-                task_payload = task.model_dump(exclude_none=True, exclude={"result"})
+                task_payload = task.model_dump(exclude_none=True)
                 tasks.append(
                     {
                         "task": task_payload,
@@ -11642,6 +11387,37 @@ class InMemoryStore:
             if task is None:
                 return None
             return task.model_copy(deep=True)
+
+    def list_backtest_plateau_tasks(self, *, include_result: bool = False) -> BacktestPlateauTaskListResponse:
+        with self._backtest_plateau_task_lock:
+            tasks = sorted(
+                self._backtest_plateau_tasks.values(),
+                key=lambda row: row.progress.updated_at,
+                reverse=True,
+            )
+            items: list[BacktestPlateauTaskStatusResponse] = []
+            for row in tasks:
+                copied = row.model_copy(deep=True)
+                if not include_result:
+                    copied = copied.model_copy(update={"result": None})
+                items.append(copied)
+        return BacktestPlateauTaskListResponse(items=items)
+
+    def delete_backtest_plateau_task(self, task_id: str) -> BacktestPlateauTaskDeleteResponse:
+        with self._backtest_plateau_task_lock:
+            task = self._backtest_plateau_tasks.get(task_id)
+            if task is None:
+                raise BacktestValidationError("BACKTEST_PLATEAU_TASK_NOT_FOUND", "收益平原任务不存在")
+            if task.status in {"pending", "running"}:
+                raise BacktestValidationError(
+                    "BACKTEST_PLATEAU_TASK_CONTROL_INVALID",
+                    f"任务当前状态为 {task.status}，请先暂停或停止后再删除。",
+                )
+            self._backtest_plateau_tasks.pop(task_id, None)
+            self._backtest_plateau_task_payloads.pop(task_id, None)
+            self._backtest_plateau_running_worker_ids.discard(task_id)
+        self._persist_backtest_plateau_task_state(force=True)
+        return BacktestPlateauTaskDeleteResponse(deleted=True, task_id=task_id)
 
     def _await_backtest_plateau_task_runnable(self, task_id: str) -> None:
         while True:

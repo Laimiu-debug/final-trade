@@ -15,9 +15,9 @@ import type {
   BacktestResponse,
   BacktestPlateauResponse,
   BacktestPlateauTaskStatusResponse,
+  BacktestPlateauTaskListResponse,
+  BacktestPlateauTaskDeleteResponse,
   BacktestPlateauRunRequest,
-  BacktestABExperimentRequest,
-  BacktestABExperimentResponse,
   BacktestPoolRollMode,
   BacktestRunRequest,
   BoardFilter,
@@ -355,15 +355,6 @@ export function runBacktest(payload: BacktestRunRequest) {
   })
 }
 
-export function runBacktestABExperiment(payload: BacktestABExperimentRequest) {
-  return apiRequest<BacktestABExperimentResponse>('/api/backtest/experiments/ab', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-    timeoutMs: 300_000,
-  })
-}
-
 export function getStrategies() {
   return apiRequest<StrategyCatalogResponse>('/api/strategies', {
     timeoutMs: 45_000,
@@ -457,6 +448,15 @@ export function startBacktestPlateauTask(payload: BacktestPlateauRunRequest) {
   })
 }
 
+export function listBacktestPlateauTasks(params?: { includeResult?: boolean }) {
+  const query = new URLSearchParams()
+  if (typeof params?.includeResult === 'boolean') query.set('include_result', String(params.includeResult))
+  const suffix = query.toString()
+  return apiRequest<BacktestPlateauTaskListResponse>(`/api/backtest/plateau/tasks${suffix ? `?${suffix}` : ''}`, {
+    timeoutMs: 60_000,
+  })
+}
+
 export function getBacktestPlateauTask(taskId: string) {
   return apiRequest<BacktestPlateauTaskStatusResponse>(`/api/backtest/plateau/tasks/${taskId}`, {
     timeoutMs: 60_000,
@@ -480,6 +480,13 @@ export function resumeBacktestPlateauTask(taskId: string) {
 export function cancelBacktestPlateauTask(taskId: string) {
   return apiRequest<BacktestPlateauTaskStatusResponse>(`/api/backtest/plateau/tasks/${taskId}/cancel`, {
     method: 'POST',
+    timeoutMs: 30_000,
+  })
+}
+
+export function deleteBacktestPlateauTask(taskId: string) {
+  return apiRequest<BacktestPlateauTaskDeleteResponse>(`/api/backtest/plateau/tasks/${taskId}`, {
+    method: 'DELETE',
     timeoutMs: 30_000,
   })
 }

@@ -30,17 +30,19 @@ import {
   cancelBacktestPlateauTask,
   cancelBacktestTask,
   deleteBacktestReport,
+  deleteBacktestPlateauTask,
   getBacktestReport,
   getLatestScreenerRun,
   getStrategies,
   importBacktestReportPackage,
   listBacktestReports,
+  listBacktestPlateauTasks,
   pauseBacktestPlateauTask,
   pauseBacktestTask,
   resumeBacktestPlateauTask,
   resumeBacktestTask,
   runBacktest,
-  runBacktestABExperiment,
+  getBacktestPlateauTask,
   startBacktestPlateauTask,
   startBacktestTask,
 } from '@/shared/api/endpoints'
@@ -58,10 +60,6 @@ import {
   setSharedStrategyParams,
 } from '@/shared/utils/strategyParams'
 import type {
-  BacktestABComparisonRow,
-  BacktestABExperimentResponse,
-  BacktestABVariantConfig,
-  BacktestABVariantResult,
   BacktestPlateauCorrelationRow,
   BacktestPlateauPoint,
   BacktestPlateauResponse,
@@ -127,6 +125,7 @@ type PlateauAxisKey =
   | 'min_score'
   | 'stop_loss'
   | 'take_profit'
+  | 'trailing_stop_pct'
   | 'max_positions'
   | 'position_pct'
   | 'max_symbols'
@@ -138,6 +137,7 @@ const PLATEAU_AXIS_OPTIONS: Array<{ value: PlateauAxisKey; label: string }> = [
   { value: 'min_score', label: '最低评分' },
   { value: 'stop_loss', label: '止损比例(%)' },
   { value: 'take_profit', label: '止盈比例(%)' },
+  { value: 'trailing_stop_pct', label: '高位回撤(%)' },
   { value: 'max_positions', label: '最大并发持仓' },
   { value: 'position_pct', label: '单笔仓位占比(%)' },
   { value: 'max_symbols', label: '最大股票数' },
@@ -200,6 +200,7 @@ type BacktestPlateauFormDraft = {
   min_score_list_raw: string
   stop_loss_pct_list_raw: string
   take_profit_pct_list_raw: string
+  trailing_stop_pct_list_raw: string
   max_positions_list_raw: string
   position_pct_list_raw: string
   max_symbols_list_raw: string
@@ -357,6 +358,7 @@ function buildPlateauCorrelationsFromPoints(points: BacktestPlateauPoint[]): Bac
     { key: 'min_score', label: '最低评分', pick: (row) => Number(row.params.min_score) },
     { key: 'stop_loss', label: '止损比例', pick: (row) => Number(row.params.stop_loss) },
     { key: 'take_profit', label: '止盈比例', pick: (row) => Number(row.params.take_profit) },
+    { key: 'trailing_stop_pct', label: '高位回撤比例', pick: (row) => Number(row.params.trailing_stop_pct) },
     { key: 'max_positions', label: '最大并发持仓', pick: (row) => Number(row.params.max_positions) },
     { key: 'position_pct', label: '单笔仓位占比', pick: (row) => Number(row.params.position_pct) },
     { key: 'max_symbols', label: '最大股票数', pick: (row) => Number(row.params.max_symbols) },
@@ -522,6 +524,7 @@ function buildBacktestReportWorkbookBuffer(
         min_score: fold.selected_params.min_score,
         stop_loss: fold.selected_params.stop_loss,
         take_profit: fold.selected_params.take_profit,
+        trailing_stop_pct: fold.selected_params.trailing_stop_pct,
         max_positions: fold.selected_params.max_positions,
         position_pct: fold.selected_params.position_pct,
         max_symbols: fold.selected_params.max_symbols,
@@ -559,6 +562,7 @@ function buildBacktestReportWorkbookBuffer(
       min_score: row.params.min_score,
       stop_loss: row.params.stop_loss,
       take_profit: row.params.take_profit,
+      trailing_stop_pct: row.params.trailing_stop_pct,
       max_positions: row.params.max_positions,
       position_pct: row.params.position_pct,
       max_symbols: row.params.max_symbols,
@@ -756,6 +760,7 @@ function buildBacktestReportHtml(
         <td>${Number(row.params.min_score).toFixed(2)}</td>
         <td>${(Number(row.params.stop_loss) * 100).toFixed(2)}%</td>
         <td>${(Number(row.params.take_profit) * 100).toFixed(2)}%</td>
+        <td>${(Number(row.params.trailing_stop_pct) * 100).toFixed(2)}%</td>
       </tr>`
     ))
     .join('\n')
@@ -903,10 +908,10 @@ function buildBacktestReportHtml(
     <thead>
       <tr>
         <th>rank</th><th>score</th><th>total_return</th><th>win_rate</th><th>window_days</th>
-        <th>min_score</th><th>stop_loss</th><th>take_profit</th>
+        <th>min_score</th><th>stop_loss</th><th>take_profit</th><th>trailing_stop_pct</th>
       </tr>
     </thead>
-    <tbody>${plateauPointRows || '<tr><td colspan="8">无</td></tr>'}</tbody>
+    <tbody>${plateauPointRows || '<tr><td colspan="9">无</td></tr>'}</tbody>
   </table>
   <div class="block">注：仅展示成功参数的前100名，完整数据见 report.xlsx 的 PlateauPoints 工作表。</div>`
     : ''
@@ -971,6 +976,7 @@ function buildPlateauRowKey(row: BacktestPlateauPoint, index: number) {
     Number(params.min_score).toFixed(4),
     Number(params.stop_loss).toFixed(6),
     Number(params.take_profit).toFixed(6),
+    Number(params.trailing_stop_pct).toFixed(6),
     params.max_positions,
     Number(params.position_pct).toFixed(6),
     params.max_symbols,
@@ -986,6 +992,7 @@ function buildPlateauParamsKey(point: BacktestPlateauPoint): string {
     Number(params.min_score).toFixed(4),
     Number(params.stop_loss).toFixed(6),
     Number(params.take_profit).toFixed(6),
+    Number(params.trailing_stop_pct).toFixed(6),
     params.max_positions,
     Number(params.position_pct).toFixed(6),
     params.max_symbols,
@@ -998,6 +1005,7 @@ function getPlateauAxisRawValue(point: BacktestPlateauPoint, axis: PlateauAxisKe
   if (axis === 'min_score') return Number(point.params.min_score)
   if (axis === 'stop_loss') return Number(point.params.stop_loss) * 100
   if (axis === 'take_profit') return Number(point.params.take_profit) * 100
+  if (axis === 'trailing_stop_pct') return Number(point.params.trailing_stop_pct) * 100
   if (axis === 'max_positions') return Number(point.params.max_positions)
   if (axis === 'position_pct') return Number(point.params.position_pct) * 100
   if (axis === 'max_symbols') return Number(point.params.max_symbols)
@@ -1131,6 +1139,7 @@ function buildDefaultPlateauDraft(): BacktestPlateauFormDraft {
     min_score_list_raw: '',
     stop_loss_pct_list_raw: '',
     take_profit_pct_list_raw: '',
+    trailing_stop_pct_list_raw: '',
     max_positions_list_raw: '',
     position_pct_list_raw: '',
     max_symbols_list_raw: '',
@@ -1226,6 +1235,11 @@ type AnalysisAdvice = {
   title: string
   tips: string[]
 }
+
+type BacktestModuleKey =
+  | 'report_share'
+  | 'plateau_params'
+  | 'run_notes'
 
 function normalizeEventToken(raw: string): string {
   const token = String(raw || '').trim()
@@ -1617,6 +1631,12 @@ const plateauColumns: ColumnsType<BacktestPlateauTableRow> = [
     width: 80,
     render: (value: number) => `${(Number(value) * 100).toFixed(2)}%`,
   },
+  {
+    title: '高位回撤%',
+    dataIndex: ['params', 'trailing_stop_pct'],
+    width: 92,
+    render: (value: number) => `${(Number(value) * 100).toFixed(2)}%`,
+  },
   { title: '仓位上限', dataIndex: ['params', 'max_positions'], width: 86 },
   {
     title: '单笔%',
@@ -1688,6 +1708,7 @@ export function BacktestPage() {
   const [plateauMinScoreListRaw, setPlateauMinScoreListRaw] = useState(initialPlateauDraft.min_score_list_raw)
   const [plateauStopLossPctListRaw, setPlateauStopLossPctListRaw] = useState(initialPlateauDraft.stop_loss_pct_list_raw)
   const [plateauTakeProfitPctListRaw, setPlateauTakeProfitPctListRaw] = useState(initialPlateauDraft.take_profit_pct_list_raw)
+  const [plateauTrailingStopPctListRaw, setPlateauTrailingStopPctListRaw] = useState(initialPlateauDraft.trailing_stop_pct_list_raw)
   const [plateauMaxPositionsListRaw, setPlateauMaxPositionsListRaw] = useState(initialPlateauDraft.max_positions_list_raw)
   const [plateauPositionPctListRaw, setPlateauPositionPctListRaw] = useState(initialPlateauDraft.position_pct_list_raw)
   const [plateauMaxSymbolsListRaw, setPlateauMaxSymbolsListRaw] = useState(initialPlateauDraft.max_symbols_list_raw)
@@ -1712,11 +1733,12 @@ export function BacktestPage() {
   const [reportLibrary, setReportLibrary] = useState<BacktestReportSummary[]>([])
   const [reportLibraryLoading, setReportLibraryLoading] = useState(false)
   const [selectedReportId, setSelectedReportId] = useState<string | null>(null)
-  const [abAutoGenerateDefaults, setAbAutoGenerateDefaults] = useState(true)
-  const [abMaxVariants, setAbMaxVariants] = useState(16)
-  const [abCustomVariantsText, setAbCustomVariantsText] = useState('')
-  const [abResult, setAbResult] = useState<BacktestABExperimentResponse | null>(null)
-  const [abError, setAbError] = useState<string | null>(null)
+  const [plateauHistoryLoading, setPlateauHistoryLoading] = useState(false)
+  const [collapsedModules, setCollapsedModules] = useState<Record<BacktestModuleKey, boolean>>({
+    report_share: true,
+    plateau_params: true,
+    run_notes: true,
+  })
   const importReportFileRef = useRef<HTMLInputElement | null>(null)
   const tasksById = useBacktestTaskStore((state) => state.tasksById)
   const payloadById = useBacktestTaskStore((state) => state.payloadById)
@@ -1732,6 +1754,7 @@ export function BacktestPage() {
   const enqueuePlateauTask = useBacktestPlateauTaskStore((state) => state.enqueueTask)
   const upsertPlateauTaskStatus = useBacktestPlateauTaskStore((state) => state.upsertTaskStatus)
   const setSelectedPlateauTask = useBacktestPlateauTaskStore((state) => state.setSelectedTask)
+  const removePlateauTask = useBacktestPlateauTaskStore((state) => state.removeTask)
 
   const taskOptions = useMemo(
     () =>
@@ -1759,6 +1782,15 @@ export function BacktestPage() {
   const regimeAdvice = useMemo(() => buildRegimeAdvice(regimeBreakdown), [regimeBreakdown])
   const monteCarloAdvice = useMemo(() => buildMonteCarloAdvice(monteCarlo), [monteCarlo])
   const walkForwardAdvice = useMemo(() => buildWalkForwardAdvice(walkForward), [walkForward])
+  const renderModuleToggle = (key: BacktestModuleKey) => (
+    <Button
+      type="text"
+      size="small"
+      onClick={() => setCollapsedModules((prev) => ({ ...prev, [key]: !prev[key] }))}
+    >
+      {collapsedModules[key] ? '▶' : '▼'}
+    </Button>
+  )
   const selectedTaskPayload = selectedTaskId ? payloadById[selectedTaskId] ?? null : null
   const runningTaskCount = activeTaskIds.length
   const plateauTaskOptions = useMemo(
@@ -1983,20 +2015,6 @@ export function BacktestPage() {
     },
   })
 
-  const runABExperimentMutation = useMutation({
-    mutationFn: runBacktestABExperiment,
-    onSuccess: (payload) => {
-      setAbResult(payload)
-      setAbError(null)
-      message.success(`A/B 实验完成：共 ${payload.variants.length} 个变体。`)
-    },
-    onError: (error) => {
-      const text = formatApiError(error)
-      setAbError(text)
-      message.error(text)
-    },
-  })
-
   const bindLatestRunMutation = useMutation({
     mutationFn: getLatestScreenerRun,
     onSuccess: (detail) => {
@@ -2042,6 +2060,25 @@ export function BacktestPage() {
     },
   })
 
+  const deletePlateauTaskMutation = useMutation({
+    mutationFn: deleteBacktestPlateauTask,
+    onSuccess: (payload) => {
+      removePlateauTask(payload.task_id)
+      message.success(`收益平原任务已删除：${payload.task_id}`)
+    },
+    onError: (error, taskId) => {
+      if (error instanceof ApiError && error.code === 'BACKTEST_PLATEAU_TASK_NOT_FOUND') {
+        const normalizedTaskId = String(taskId || '').trim()
+        if (normalizedTaskId) {
+          removePlateauTask(normalizedTaskId)
+          message.warning(`任务 ${normalizedTaskId} 在后端不存在，已清理本地历史记录`)
+          return
+        }
+      }
+      message.error(formatApiError(error))
+    },
+  })
+
   const controlTaskMutation = useMutation({
     mutationFn: async (payload: { action: 'pause' | 'resume' | 'cancel'; taskId: string }) => {
       if (payload.action === 'pause') return pauseBacktestTask(payload.taskId)
@@ -2078,6 +2115,20 @@ export function BacktestPage() {
       message.error(formatApiError(error))
     } finally {
       setReportLibraryLoading(false)
+    }
+  }
+
+  async function refreshPlateauTaskHistory() {
+    setPlateauHistoryLoading(true)
+    try {
+      const response = await listBacktestPlateauTasks({ includeResult: true })
+      for (const row of response.items) {
+        upsertPlateauTaskStatus(row)
+      }
+    } catch (error) {
+      message.warning(`收益平原历史加载失败：${formatApiError(error)}`)
+    } finally {
+      setPlateauHistoryLoading(false)
     }
   }
 
@@ -2319,6 +2370,26 @@ export function BacktestPage() {
   }, [])
 
   useEffect(() => {
+    void refreshPlateauTaskHistory()
+  }, [])
+
+  useEffect(() => {
+    if (!plateauSelectedTaskId) return
+    const current = plateauTasksById[plateauSelectedTaskId]
+    if (!current || current.result) return
+    let active = true
+    void getBacktestPlateauTask(plateauSelectedTaskId)
+      .then((status) => {
+        if (!active) return
+        upsertPlateauTaskStatus(status)
+      })
+      .catch(() => {})
+    return () => {
+      active = false
+    }
+  }, [plateauSelectedTaskId, plateauTasksById, upsertPlateauTaskStatus])
+
+  useEffect(() => {
     setTradePage(1)
   }, [result?.trades])
 
@@ -2331,6 +2402,7 @@ export function BacktestPage() {
       min_score_list_raw: plateauMinScoreListRaw,
       stop_loss_pct_list_raw: plateauStopLossPctListRaw,
       take_profit_pct_list_raw: plateauTakeProfitPctListRaw,
+      trailing_stop_pct_list_raw: plateauTrailingStopPctListRaw,
       max_positions_list_raw: plateauMaxPositionsListRaw,
       position_pct_list_raw: plateauPositionPctListRaw,
       max_symbols_list_raw: plateauMaxSymbolsListRaw,
@@ -2350,6 +2422,7 @@ export function BacktestPage() {
     plateauMinScoreListRaw,
     plateauStopLossPctListRaw,
     plateauTakeProfitPctListRaw,
+    plateauTrailingStopPctListRaw,
     plateauMaxPositionsListRaw,
     plateauPositionPctListRaw,
     plateauMaxSymbolsListRaw,
@@ -2510,51 +2583,6 @@ export function BacktestPage() {
     startTaskMutation.mutate(payload)
   }
 
-  function parseABCustomVariants(text: string): BacktestABVariantConfig[] | null {
-    const raw = String(text || '').trim()
-    if (!raw) return []
-    try {
-      const parsed = JSON.parse(raw) as unknown
-      if (!Array.isArray(parsed)) {
-        message.warning('自定义 A/B 变体格式错误：请提供 JSON 数组。')
-        return null
-      }
-      return parsed as BacktestABVariantConfig[]
-    } catch {
-      message.warning('自定义 A/B 变体 JSON 解析失败，请检查格式。')
-      return null
-    }
-  }
-
-  function handleRunABExperiment() {
-    if (runABExperimentMutation.isPending) return
-    if (entryEvents.length === 0 || exitEvents.length === 0) {
-      message.warning('请至少选择一个入场事件和离场事件')
-      return
-    }
-    const cached = readScreenerRunMetaFromStorage()
-    const effectiveBoardFilters = cached?.boardFilters?.length ? cached.boardFilters : boardFilters
-    const shouldApplyBoardFilters = mode === 'trend_pool'
-    if (shouldApplyBoardFilters && effectiveBoardFilters.length === 0) {
-      message.warning('请至少选择一个板块后再运行 A/B')
-      return
-    }
-    if (cached?.boardFilters?.length) {
-      setBoardFilters(cached.boardFilters)
-    }
-
-    const customVariants = parseABCustomVariants(abCustomVariantsText)
-    if (customVariants === null) return
-    const payload = {
-      base_payload: buildBacktestPayload(shouldApplyBoardFilters ? effectiveBoardFilters : undefined),
-      variants: customVariants,
-      auto_generate_default_matrix: abAutoGenerateDefaults,
-      max_variants: Math.max(1, Math.min(64, Math.round(Number(abMaxVariants) || 16))),
-    }
-    setAbError(null)
-    runABExperimentMutation.mutate(payload)
-  }
-
   function handleBindLatestRunId() {
     if (bindLatestRunMutation.isPending) return
     bindLatestRunMutation.mutate()
@@ -2587,6 +2615,12 @@ export function BacktestPage() {
       max: 150,
       precision: 4,
     })
+    const trailingStopPctList = parseNumericList(plateauTrailingStopPctListRaw, {
+      integer: false,
+      min: 0,
+      max: 50,
+      precision: 4,
+    })
     const positionPctList = parseNumericList(plateauPositionPctListRaw, {
       integer: false,
       min: 1,
@@ -2610,6 +2644,7 @@ export function BacktestPage() {
       }),
       stop_loss_list: stopLossPctList.map((item) => Number((item / 100).toFixed(6))),
       take_profit_list: takeProfitPctList.map((item) => Number((item / 100).toFixed(6))),
+      trailing_stop_pct_list: trailingStopPctList.map((item) => Number((item / 100).toFixed(6))),
       max_positions_list: parseNumericList(plateauMaxPositionsListRaw, {
         integer: true,
         min: 1,
@@ -2660,6 +2695,7 @@ export function BacktestPage() {
       min_score: Number(row.params.min_score),
       stop_loss: Number(row.params.stop_loss),
       take_profit: Number(row.params.take_profit),
+      trailing_stop_pct: Number(row.params.trailing_stop_pct),
       max_positions: Number(row.params.max_positions),
       position_pct: Number(row.params.position_pct),
       max_symbols: Number(row.params.max_symbols),
@@ -2693,6 +2729,7 @@ export function BacktestPage() {
     setMinScore(Number(point.params.min_score))
     setStopLossPercent(toPercent(Number(point.params.stop_loss)))
     setTakeProfitPercent(toPercent(Number(point.params.take_profit)))
+    setTrailingStopPercent(toPercent(Number(point.params.trailing_stop_pct)))
     setMaxPositions(Number(point.params.max_positions))
     setPositionPctPercent(toPercent(Number(point.params.position_pct)))
     setMaxSymbols(Number(point.params.max_symbols))
@@ -2718,6 +2755,7 @@ export function BacktestPage() {
       min_score: Number(point.params.min_score),
       stop_loss: Number(point.params.stop_loss),
       take_profit: Number(point.params.take_profit),
+      trailing_stop_pct: Number(point.params.trailing_stop_pct),
       max_positions: Number(point.params.max_positions),
       position_pct: Number(point.params.position_pct),
       max_symbols: Number(point.params.max_symbols),
@@ -2885,7 +2923,7 @@ export function BacktestPage() {
         width: 320,
         render: (_value, row) => {
           const p = row.selected_params
-          return `window=${p.window_days}, min=${Number(p.min_score).toFixed(2)}, sl=${(Number(p.stop_loss) * 100).toFixed(2)}%, tp=${(Number(p.take_profit) * 100).toFixed(2)}%`
+          return `window=${p.window_days}, min=${Number(p.min_score).toFixed(2)}, sl=${(Number(p.stop_loss) * 100).toFixed(2)}%, tp=${(Number(p.take_profit) * 100).toFixed(2)}%, ts=${(Number(p.trailing_stop_pct) * 100).toFixed(2)}%`
         },
       },
     ],
@@ -2960,6 +2998,133 @@ export function BacktestPage() {
       },
     },
   ]
+  const plateauHistoryRows = useMemo(
+    () =>
+      Object.values(plateauTasksById).sort((left, right) => {
+        const leftTs = Date.parse(left.progress.updated_at || left.progress.started_at || '')
+        const rightTs = Date.parse(right.progress.updated_at || right.progress.started_at || '')
+        return rightTs - leftTs
+      }),
+    [plateauTasksById],
+  )
+  const plateauHistoryColumns = useMemo<ColumnsType<BacktestPlateauTaskStatusResponse>>(
+    () => [
+      {
+        title: '完成时间',
+        width: 180,
+        render: (_value, row) => row.progress.updated_at || row.progress.started_at || '--',
+      },
+      {
+        title: '核心参数摘要',
+        width: 460,
+        render: (_value, row) => {
+          const best = row.result?.best_point?.params
+          if (!best) return '--'
+          return `window=${best.window_days}, min=${Number(best.min_score).toFixed(2)}, sl=${(Number(best.stop_loss) * 100).toFixed(2)}%, tp=${(Number(best.take_profit) * 100).toFixed(2)}%, ts=${(Number(best.trailing_stop_pct) * 100).toFixed(2)}%`
+        },
+      },
+      {
+        title: '收益率',
+        width: 110,
+        render: (_value, row) => {
+          const best = row.result?.best_point
+          return best ? formatPct(Number(best.stats.total_return)) : '--'
+        },
+      },
+      {
+        title: '回撤',
+        width: 110,
+        render: (_value, row) => {
+          const best = row.result?.best_point
+          return best ? formatPct(Number(best.stats.max_drawdown)) : '--'
+        },
+      },
+      {
+        title: '状态',
+        width: 100,
+        render: (_value, row) => <Tag color={plateauTaskStatusColor(row.status)}>{plateauTaskStatusLabel(row.status)}</Tag>,
+      },
+      {
+        title: '操作',
+        width: 340,
+        render: (_value, row) => {
+          const controlTaskId = controlPlateauTaskMutation.variables?.taskId
+          const controlAction = controlPlateauTaskMutation.variables?.action
+          const controlLoadingThisRow = controlPlateauTaskMutation.isPending && controlTaskId === row.task_id
+          const controlLoadingOtherRow = controlPlateauTaskMutation.isPending && controlTaskId !== row.task_id
+          const deleteTaskId = deletePlateauTaskMutation.variables
+          const deleteLoadingThisRow = deletePlateauTaskMutation.isPending && deleteTaskId === row.task_id
+          const deleteLoadingOtherRow = deletePlateauTaskMutation.isPending && deleteTaskId !== row.task_id
+          const disableActions = controlLoadingOtherRow || deleteLoadingOtherRow
+          const canPause = row.status === 'pending' || row.status === 'running'
+          const canResume = row.status === 'paused'
+          const canCancel = row.status === 'pending' || row.status === 'running' || row.status === 'paused'
+          const canDelete = row.status !== 'pending' && row.status !== 'running'
+          return (
+            <Space size={6} wrap>
+              <Button
+                size="small"
+                disabled={disableActions}
+                onClick={() => setSelectedPlateauTask(row.task_id)}
+              >
+                查看
+              </Button>
+              {canPause ? (
+                <Button
+                  size="small"
+                  loading={controlLoadingThisRow && controlAction === 'pause'}
+                  disabled={disableActions || deleteLoadingThisRow}
+                  onClick={() => controlPlateauTaskMutation.mutate({ action: 'pause', taskId: row.task_id })}
+                >
+                  暂停
+                </Button>
+              ) : null}
+              {canResume ? (
+                <Button
+                  size="small"
+                  type="primary"
+                  ghost
+                  loading={controlLoadingThisRow && controlAction === 'resume'}
+                  disabled={disableActions || deleteLoadingThisRow}
+                  onClick={() => controlPlateauTaskMutation.mutate({ action: 'resume', taskId: row.task_id })}
+                >
+                  继续
+                </Button>
+              ) : null}
+              {canCancel ? (
+                <Button
+                  size="small"
+                  danger
+                  loading={controlLoadingThisRow && controlAction === 'cancel'}
+                  disabled={disableActions || deleteLoadingThisRow}
+                  onClick={() => controlPlateauTaskMutation.mutate({ action: 'cancel', taskId: row.task_id })}
+                >
+                  停止
+                </Button>
+              ) : null}
+              <Button
+                size="small"
+                danger
+                loading={deleteLoadingThisRow}
+                disabled={!canDelete || disableActions || controlLoadingThisRow}
+                onClick={() => handleDeletePlateauHistoryTask(row.task_id)}
+              >
+                删除
+              </Button>
+            </Space>
+          )
+        },
+      },
+    ],
+    [
+      controlPlateauTaskMutation.isPending,
+      controlPlateauTaskMutation.variables,
+      deletePlateauTaskMutation.isPending,
+      deletePlateauTaskMutation.variables,
+      handleDeletePlateauHistoryTask,
+      setSelectedPlateauTask,
+    ],
+  )
   const plateauScoreBarOption = useMemo(() => {
     const rows = plateauValidPoints.slice(0, 30)
     if (rows.length === 0) return null
@@ -3377,7 +3542,7 @@ export function BacktestPage() {
         width: 360,
         render: (_value, row) => {
           const p = row.point.params
-          return `window=${p.window_days}, min_score=${Number(p.min_score).toFixed(2)}, stop_loss=${(Number(p.stop_loss) * 100).toFixed(2)}%, take_profit=${(Number(p.take_profit) * 100).toFixed(2)}%, pos=${p.max_positions}`
+          return `window=${p.window_days}, min_score=${Number(p.min_score).toFixed(2)}, stop_loss=${(Number(p.stop_loss) * 100).toFixed(2)}%, take_profit=${(Number(p.take_profit) * 100).toFixed(2)}%, trailing_stop=${(Number(p.trailing_stop_pct) * 100).toFixed(2)}%, pos=${p.max_positions}`
         },
       },
       {
@@ -3463,6 +3628,17 @@ export function BacktestPage() {
       setPlateauSavedPresetId(null)
     }
     message.success('已删除收藏参数。')
+  }
+
+  function handleDeletePlateauHistoryTask(taskId: string) {
+    const normalizedTaskId = String(taskId || '').trim()
+    if (!normalizedTaskId) return
+    if (normalizedTaskId.startsWith('imp_plateau_')) {
+      removePlateauTask(normalizedTaskId)
+      message.success(`已删除本地导入任务：${normalizedTaskId}`)
+      return
+    }
+    deletePlateauTaskMutation.mutate(normalizedTaskId)
   }
 
   function appendPointsToCandidateSet(points: BacktestPlateauPoint[], sourceLabel: string) {
@@ -3581,114 +3757,6 @@ export function BacktestPage() {
       })),
     }
   }, [taskProgress?.stage_timings])
-  const abVariantRows = abResult?.variants ?? []
-  const abComparisonRows = abResult?.comparisons ?? []
-  const abVariantColumns = useMemo<ColumnsType<BacktestABVariantResult>>(
-    () => [
-      { title: '变体ID', dataIndex: 'variant_id', width: 92 },
-      { title: '标签', dataIndex: 'label', width: 220 },
-      {
-        title: '状态',
-        dataIndex: 'status',
-        width: 96,
-        render: (value: BacktestABVariantResult['status']) =>
-          value === 'succeeded' ? <Tag color="success">成功</Tag> : <Tag color="error">失败</Tag>,
-      },
-      {
-        title: '执行路径',
-        width: 106,
-        render: (_value, row) =>
-          row.execution_path ? (
-            <Tag color={row.execution_path === 'matrix' ? 'processing' : 'default'}>{row.execution_path}</Tag>
-          ) : (
-            '--'
-          ),
-      },
-      {
-        title: '总收益',
-        width: 110,
-        render: (_value, row) => (row.stats ? formatPct(row.stats.total_return) : '--'),
-      },
-      {
-        title: '胜率',
-        width: 100,
-        render: (_value, row) => (row.stats ? formatPct(row.stats.win_rate) : '--'),
-      },
-      {
-        title: '最大回撤',
-        width: 110,
-        render: (_value, row) => (row.stats ? formatPct(row.stats.max_drawdown) : '--'),
-      },
-      { title: '交易数', dataIndex: 'trade_count', width: 90 },
-      {
-        title: 'UTAD占比',
-        width: 108,
-        render: (_value, row) => formatPct(row.utad_exit_ratio),
-      },
-      { title: '最大连亏', dataIndex: 'max_consecutive_losses', width: 100 },
-      {
-        title: '按入场信号分组',
-        width: 260,
-        render: (_value, row) => {
-          const buckets = Array.isArray(row.signal_breakdown) ? row.signal_breakdown : []
-          if (buckets.length <= 0) return '--'
-          return buckets
-            .map((item) => `${item.signal}:${item.trade_count}笔/${formatPct(item.win_rate)}`)
-            .join(' | ')
-        },
-      },
-      {
-        title: '错误',
-        dataIndex: 'error',
-        width: 260,
-        ellipsis: true,
-      },
-    ],
-    [],
-  )
-  const abComparisonColumns = useMemo<ColumnsType<BacktestABComparisonRow>>(
-    () => [
-      { title: '变体ID', dataIndex: 'variant_id', width: 92 },
-      { title: '标签', dataIndex: 'label', width: 220 },
-      {
-        title: '收益Δ',
-        width: 100,
-        render: (_value, row) => formatPct(row.total_return_delta),
-      },
-      {
-        title: '胜率Δ',
-        width: 100,
-        render: (_value, row) => formatPct(row.win_rate_delta),
-      },
-      {
-        title: '回撤Δ',
-        width: 100,
-        render: (_value, row) => formatPct(row.max_drawdown_delta),
-      },
-      {
-        title: '交易数Δ',
-        dataIndex: 'trade_count_delta',
-        width: 96,
-      },
-      {
-        title: 'UTAD占比Δ',
-        width: 120,
-        render: (_value, row) => formatPct(row.utad_exit_ratio_delta),
-      },
-      {
-        title: 'ExpectancyΔ',
-        width: 116,
-        render: (_value, row) => formatPct(row.expectancy_delta),
-      },
-      {
-        title: '最大连亏Δ',
-        dataIndex: 'max_consecutive_losses_delta',
-        width: 110,
-      },
-    ],
-    [],
-  )
-
   return (
     <Space orientation="vertical" size={16} style={{ width: '100%' }}>
       <PageHeader title="策略回测" subtitle="回放历史信号，评估策略收益、回撤与执行质量。" />
@@ -4204,91 +4272,46 @@ export function BacktestPage() {
           ) : null}
           {result ? <Tag color="green">{`${result.range.date_from} ~ ${result.range.date_to}`}</Tag> : null}
         </Space>
-      </Card>
-
-      <Card title="A/B 实验（延迟/门控/语义）">
-        <Space orientation="vertical" size={12} style={{ width: '100%' }}>
-          <Row gutter={[12, 12]}>
-            <Col xs={24} md={8}>
-              <Space orientation="vertical">
-                <span>自动生成默认变体</span>
-                <Switch checked={abAutoGenerateDefaults} onChange={setAbAutoGenerateDefaults} />
-              </Space>
-            </Col>
-            <Col xs={24} md={8}>
-              <Space orientation="vertical" style={{ width: '100%' }}>
-                <span>最大变体数</span>
-                <InputNumber
-                  min={1}
-                  max={64}
-                  value={abMaxVariants}
-                  style={{ width: '100%' }}
-                  onChange={(value) => setAbMaxVariants(Math.max(1, Math.min(64, Math.round(Number(value) || 16))))}
-                />
-              </Space>
-            </Col>
-            <Col xs={24} md={8}>
-              <Space orientation="vertical" style={{ width: '100%' }}>
-                <span>动作</span>
-                <Button type="primary" ghost loading={runABExperimentMutation.isPending} onClick={handleRunABExperiment}>
-                  运行 A/B 实验
-                </Button>
-              </Space>
-            </Col>
-            <Col xs={24}>
-              <Space orientation="vertical" style={{ width: '100%' }}>
-                <span>自定义变体（可选 JSON 数组）</span>
-                <Input.TextArea
-                  rows={3}
-                  value={abCustomVariantsText}
-                  onChange={(event) => setAbCustomVariantsText(event.target.value)}
-                  placeholder='例如：[{"label":"delay_2","entry_delay_days":2},{"label":"v2_gate","strategy_id":"wyckoff_trend_v2"}]'
-                />
-              </Space>
-            </Col>
-          </Row>
-
-          {abError ? <Alert type="error" showIcon title={abError} /> : null}
-          {abResult ? (
-            <Space wrap>
-              <Tag color="geekblue">{`baseline=${abResult.baseline_variant_id || '-'}`}</Tag>
-              <Tag color="success">{`best=${abResult.best_variant_id || '-'}`}</Tag>
-              <Tag>{`variants=${abVariantRows.length}`}</Tag>
+        {taskStatus ? (
+          <Card size="small" title="最近任务进度" style={{ marginTop: 12 }}>
+            <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+              <Progress
+                percent={Math.max(0, Math.min(100, Number(taskProgress?.percent ?? 0)))}
+                status={taskRunning ? 'active' : (taskStatus.status === 'succeeded' ? 'success' : 'normal')}
+              />
+              <div>{taskProgress?.message || '任务执行中...'}</div>
+              {taskProgress?.current_date ? (
+                <div>当前日期：{taskProgress.current_date}</div>
+              ) : (
+                <div>当前日期：准备中...</div>
+              )}
+              <div>
+                进度：{taskProgress?.processed_dates ?? 0} / {taskProgress?.total_dates ?? 0}
+              </div>
+              {taskProgress?.warning ? <Alert type="warning" showIcon title={taskProgress.warning} /> : null}
+              {taskStageRows.rows.length > 0 ? (
+                <Card size="small" title={`阶段耗时（累计 ${(taskStageRows.totalMs / 1000).toFixed(2)}s）`}>
+                  <Space orientation="vertical" size={6} style={{ width: '100%' }}>
+                    {taskStageRows.rows.map((row) => (
+                      <Space key={row.stageKey} wrap style={{ justifyContent: 'space-between', width: '100%' }}>
+                        <span>{row.label}</span>
+                        <Space wrap size={6}>
+                          <Tag color="geekblue">{row.elapsedSecText}</Tag>
+                          <Tag>{row.shareText}</Tag>
+                        </Space>
+                      </Space>
+                    ))}
+                  </Space>
+                </Card>
+              ) : null}
             </Space>
-          ) : null}
-          {abResult?.notes?.length ? (
-            <Alert
-              type="info"
-              showIcon
-              title="实验说明"
-              description={abResult.notes.join(' ')}
-            />
-          ) : null}
-          {abVariantRows.length > 0 ? (
-            <Table
-              size="small"
-              rowKey={(row) => row.variant_id}
-              columns={abVariantColumns}
-              dataSource={abVariantRows}
-              pagination={{ pageSize: 8, showSizeChanger: false }}
-              scroll={{ x: 1200 }}
-            />
-          ) : null}
-          {abComparisonRows.length > 0 ? (
-            <Table
-              size="small"
-              rowKey={(row) => `${row.baseline_variant_id}-${row.variant_id}`}
-              columns={abComparisonColumns}
-              dataSource={abComparisonRows}
-              pagination={{ pageSize: 8, showSizeChanger: false }}
-              scroll={{ x: 920 }}
-            />
-          ) : null}
-        </Space>
+          </Card>
+        ) : null}
       </Card>
 
-      <Card title="回测报告导出与共享">
-        <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+      <Card title="回测报告导出与共享" extra={renderModuleToggle('report_share')}>
+        {!collapsedModules.report_share ? (
+          <Space orientation="vertical" size={12} style={{ width: '100%' }}>
           <Space wrap>
             <Button
               type="primary"
@@ -4359,11 +4382,13 @@ export function BacktestPage() {
             title="导入说明"
             description="可直接导出 Excel/HTML；.ftbt 用于跨设备共享（内含报告HTML、Excel与回测数据）。重复导入同一 report_id 将覆盖旧报告并保留导入时间。"
           />
-        </Space>
+          </Space>
+        ) : null}
       </Card>
 
-      <Card title="收益平原（参数扫描）">
-        <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+      <Card title="收益平原参数与进度" extra={renderModuleToggle('plateau_params')}>
+        {!collapsedModules.plateau_params ? (
+          <Space orientation="vertical" size={12} style={{ width: '100%' }}>
           <Row gutter={[12, 12]}>
             <Col xs={24} md={8}>
               <Space orientation="vertical" style={{ width: '100%' }}>
@@ -4446,6 +4471,16 @@ export function BacktestPage() {
                   value={plateauTakeProfitPctListRaw}
                   placeholder="如: 10,15,20"
                   onChange={(event) => setPlateauTakeProfitPctListRaw(event.target.value)}
+                />
+              </Space>
+            </Col>
+            <Col xs={24} md={6}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
+                <span>高位回撤列表（trailing_stop_pct，%）</span>
+                <Input
+                  value={plateauTrailingStopPctListRaw}
+                  placeholder="如: 0,3,5"
+                  onChange={(event) => setPlateauTrailingStopPctListRaw(event.target.value)}
                 />
               </Space>
             </Col>
@@ -4586,25 +4621,41 @@ export function BacktestPage() {
               </Button>
             ) : null}
           </Space>
-        </Space>
+          {plateauTaskStatus ? (
+            <Card size="small" title="收益平原进度">
+              <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+                <Progress
+                  percent={Math.max(0, Math.min(100, Number(plateauTaskProgress?.percent ?? 0)))}
+                  status={plateauTaskRunning ? 'active' : (plateauTaskStatus.status === 'succeeded' ? 'success' : 'normal')}
+                />
+                <div>{plateauTaskProgress?.message || '任务执行中...'}</div>
+                <div>
+                  进度：{plateauTaskProgress?.processed_points ?? 0} / {plateauTaskProgress?.total_points ?? 0}
+                </div>
+              </Space>
+            </Card>
+          ) : null}
+          <Card size="small" title="收益平原历史回测列表">
+            <Table
+              size="small"
+              columns={plateauHistoryColumns}
+              dataSource={plateauHistoryRows}
+              rowKey={(row) => row.task_id}
+              loading={plateauHistoryLoading}
+              scroll={{ x: 1320 }}
+              pagination={{
+                defaultPageSize: 8,
+                pageSizeOptions: [8, 20, 50, 100],
+                showSizeChanger: true,
+                showTotal: (total) => `共 ${total} 条`,
+              }}
+            />
+          </Card>
+          </Space>
+        ) : null}
       </Card>
 
       {effectivePlateauError ? <Alert type="error" title={effectivePlateauError} showIcon /> : null}
-
-      {plateauTaskStatus ? (
-        <Card title={plateauTaskRunning ? '收益平原进度' : '最近收益平原进度'}>
-          <Space orientation="vertical" size={8} style={{ width: '100%' }}>
-            <Progress
-              percent={Math.max(0, Math.min(100, Number(plateauTaskProgress?.percent ?? 0)))}
-              status={plateauTaskRunning ? 'active' : (plateauTaskStatus.status === 'succeeded' ? 'success' : 'normal')}
-            />
-            <div>{plateauTaskProgress?.message || '任务执行中...'}</div>
-            <div>
-              进度：{plateauTaskProgress?.processed_points ?? 0} / {plateauTaskProgress?.total_points ?? 0}
-            </div>
-          </Space>
-        </Card>
-      ) : null}
 
       {plateauResult ? (
         <>
@@ -4826,42 +4877,6 @@ export function BacktestPage() {
       ) : null}
 
       {effectiveRunError ? <Alert type="error" title={effectiveRunError} showIcon /> : null}
-
-      {taskStatus ? (
-        <Card title={taskRunning ? '回测进度' : '最近任务进度'}>
-          <Space orientation="vertical" size={8} style={{ width: '100%' }}>
-            <Progress
-              percent={Math.max(0, Math.min(100, Number(taskProgress?.percent ?? 0)))}
-              status={taskRunning ? 'active' : (taskStatus.status === 'succeeded' ? 'success' : 'normal')}
-            />
-            <div>{taskProgress?.message || '任务执行中...'}</div>
-            {taskProgress?.current_date ? (
-              <div>当前日期：{taskProgress.current_date}</div>
-            ) : (
-              <div>当前日期：准备中...</div>
-            )}
-            <div>
-              进度：{taskProgress?.processed_dates ?? 0} / {taskProgress?.total_dates ?? 0}
-            </div>
-            {taskProgress?.warning ? <Alert type="warning" showIcon title={taskProgress.warning} /> : null}
-            {taskStageRows.rows.length > 0 ? (
-              <Card size="small" title={`阶段耗时（累计 ${(taskStageRows.totalMs / 1000).toFixed(2)}s）`}>
-                <Space orientation="vertical" size={6} style={{ width: '100%' }}>
-                  {taskStageRows.rows.map((row) => (
-                    <Space key={row.stageKey} wrap style={{ justifyContent: 'space-between', width: '100%' }}>
-                      <span>{row.label}</span>
-                      <Space wrap size={6}>
-                        <Tag color="geekblue">{row.elapsedSecText}</Tag>
-                        <Tag>{row.shareText}</Tag>
-                      </Space>
-                    </Space>
-                  ))}
-                </Space>
-              </Card>
-            ) : null}
-          </Space>
-        </Card>
-      ) : null}
 
       {result ? (
         <>
@@ -5106,16 +5121,18 @@ export function BacktestPage() {
             </Col>
           </Row>
 
-          <Card title="运行说明">
-            {result.notes.length === 0 ? (
-              <span>无说明。</span>
-            ) : (
-              <ul style={{ margin: 0, paddingInlineStart: 18 }}>
-                {result.notes.map((note, idx) => (
-                  <li key={`${idx}-${note}`}>{note}</li>
-                ))}
-              </ul>
-            )}
+          <Card title="运行说明" extra={renderModuleToggle('run_notes')}>
+            {!collapsedModules.run_notes ? (
+              result.notes.length === 0 ? (
+                <span>无说明。</span>
+              ) : (
+                <ul style={{ margin: 0, paddingInlineStart: 18 }}>
+                  {result.notes.map((note, idx) => (
+                    <li key={`${idx}-${note}`}>{note}</li>
+                  ))}
+                </ul>
+              )
+            ) : null}
           </Card>
 
           <Card title="交易明细">

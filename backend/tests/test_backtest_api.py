@@ -199,116 +199,6 @@ def test_backtest_run_trend_pool_smoke() -> None:
         assert "weekly_context_multiplier" in first
 
 
-def test_backtest_experiment_ab_endpoint_reports_baseline_and_deltas(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stats_by_delay = {
-        1: (0.08, 0.45, -0.14, 3, 1, 3),
-        2: (0.13, 0.58, -0.09, 2, 0, 3),
-        3: (0.07, 0.42, -0.16, 4, 1, 2),
-    }
-
-    def _fake_run_backtest(payload: BacktestRunRequest) -> BacktestResponse:
-        total_return, win_rate, max_drawdown, max_losses, utad_count, trade_count = stats_by_delay[
-            int(payload.entry_delay_days)
-        ]
-        trades: list[BacktestTrade] = []
-        for idx in range(trade_count):
-            is_utad = idx < int(utad_count)
-            entry_signal = "SOS" if idx % 2 == 0 else "JOC"
-            trades.append(
-                BacktestTrade(
-                    symbol=f"sz30075{idx}",
-                    name=f"mock-{idx}",
-                    signal_date=payload.date_from,
-                    entry_date=payload.date_from,
-                    exit_date=payload.date_to,
-                    entry_signal=entry_signal,
-                    entry_phase="吸筹D",
-                    exit_reason=("UTAD" if is_utad else "TAKE_PROFIT"),
-                    quantity=100,
-                    entry_price=100.0,
-                    exit_price=(98.0 if is_utad else 103.0),
-                    holding_days=3,
-                    pnl_amount=(-200.0 if is_utad else 300.0),
-                    pnl_ratio=(-0.02 if is_utad else 0.03),
-                )
-            )
-
-        return BacktestResponse(
-            stats=ReviewStats(
-                win_rate=win_rate,
-                total_return=total_return,
-                max_drawdown=max_drawdown,
-                avg_pnl_ratio=0.02,
-                trade_count=trade_count,
-                win_count=max(0, trade_count - int(utad_count)),
-                loss_count=int(utad_count),
-                profit_factor=1.3,
-            ),
-            trades=trades,
-            range=ReviewRange(
-                date_from=payload.date_from,
-                date_to=payload.date_to,
-                date_axis="sell",
-            ),
-            notes=[],
-            candidate_count=20,
-            skipped_count=4,
-            fill_rate=0.8,
-            max_concurrent_positions=3,
-            risk_metrics=BacktestRiskMetrics(max_consecutive_losses=max_losses),
-        )
-
-    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
-
-    payload = {
-        "base_payload": {
-            "mode": "full_market",
-            "pool_roll_mode": "daily",
-            "date_from": "2025-01-02",
-            "date_to": "2025-01-31",
-            "entry_delay_days": 1,
-        },
-        "auto_generate_default_matrix": False,
-        "max_variants": 8,
-        "variants": [
-            {"label": "delay_2", "entry_delay_days": 2},
-            {"label": "delay_3", "entry_delay_days": 3},
-        ],
-    }
-    resp = client.post("/api/backtest/experiments/ab", json=payload)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["baseline_variant_id"] == "v01"
-    assert body["best_variant_id"] == "v02"
-    assert isinstance(body["notes"], list)
-
-    variants_by_label = {str(item["label"]): item for item in body["variants"]}
-    assert {"baseline", "delay_2", "delay_3"} <= set(variants_by_label)
-    assert variants_by_label["baseline"]["run_request"]["entry_delay_days"] == 1
-    assert variants_by_label["delay_2"]["status"] == "succeeded"
-    assert variants_by_label["delay_2"]["trade_count"] == 3
-    assert variants_by_label["delay_2"]["utad_exit_ratio"] == 0.0
-    assert variants_by_label["delay_3"]["trade_count"] == 2
-    assert variants_by_label["delay_3"]["utad_exit_ratio"] == 0.5
-    breakdown_delay2 = {row["signal"]: row for row in variants_by_label["delay_2"]["signal_breakdown"]}
-    assert {"SOS", "JOC"} <= set(breakdown_delay2)
-    assert breakdown_delay2["SOS"]["trade_count"] == 2
-    assert breakdown_delay2["JOC"]["trade_count"] == 1
-    assert breakdown_delay2["SOS"]["utad_exit_ratio"] == 0.0
-
-    comparisons_by_label = {str(item["label"]): item for item in body["comparisons"]}
-    assert set(comparisons_by_label) == {"delay_2", "delay_3"}
-    assert comparisons_by_label["delay_2"]["total_return_delta"] == pytest.approx(0.05, abs=1e-6)
-    assert comparisons_by_label["delay_2"]["win_rate_delta"] == pytest.approx(0.13, abs=1e-6)
-    assert comparisons_by_label["delay_2"]["max_drawdown_delta"] == pytest.approx(0.05, abs=1e-6)
-    assert comparisons_by_label["delay_2"]["trade_count_delta"] == 0
-    assert comparisons_by_label["delay_2"]["utad_exit_ratio_delta"] == pytest.approx(-0.333333, abs=1e-6)
-    assert comparisons_by_label["delay_2"]["expectancy_delta"] == pytest.approx(0.0, abs=1e-9)
-    assert comparisons_by_label["delay_2"]["max_consecutive_losses_delta"] == -1
-
-
 def test_backtest_plateau_endpoint_handles_truncation_and_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
         _ = (progress_callback, control_callback)
@@ -380,95 +270,11 @@ def test_backtest_plateau_endpoint_handles_truncation_and_failures(monkeypatch: 
     assert len(body["points"]) == 3
     assert body["best_point"] is not None
     assert body["best_point"]["params"]["window_days"] == 60
-    assert len(body["correlations"]) == 8
+    assert len(body["correlations"]) == 9
     assert any("参数组合总数" in note for note in body["notes"])
     assert any("参数评估失败" in note for note in body["notes"])
     assert any("低胜率惩罚" in note for note in body["notes"])
     assert sum(1 for point in body["points"] if point.get("error")) >= 1
-
-
-def test_backtest_experiment_ab_supports_execution_path_preference(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def _fake_run_backtest(payload: BacktestRunRequest) -> BacktestResponse:
-        pref = str(payload.execution_path_preference)
-        if pref == "legacy":
-            execution_path = "legacy"
-            total_return = 0.06
-            win_rate = 0.48
-            expectancy = 0.012
-        else:
-            execution_path = "matrix"
-            total_return = 0.10
-            win_rate = 0.56
-            expectancy = 0.018
-
-        trade = BacktestTrade(
-            symbol="sz300750",
-            name="mock",
-            signal_date=payload.date_from,
-            entry_date=payload.date_from,
-            exit_date=payload.date_to,
-            entry_signal="SOS",
-            entry_phase="吸筹D",
-            exit_reason="TAKE_PROFIT",
-            quantity=100,
-            entry_price=100.0,
-            exit_price=103.0,
-            holding_days=5,
-            pnl_amount=300.0,
-            pnl_ratio=0.03,
-        )
-        return BacktestResponse(
-            stats=ReviewStats(
-                win_rate=win_rate,
-                total_return=total_return,
-                max_drawdown=-0.09,
-                avg_pnl_ratio=0.03,
-                trade_count=1,
-                win_count=1,
-                loss_count=0,
-                profit_factor=2.0,
-            ),
-            trades=[trade],
-            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
-            notes=[],
-            candidate_count=8,
-            skipped_count=1,
-            fill_rate=0.875,
-            max_concurrent_positions=1,
-            risk_metrics=BacktestRiskMetrics(expectancy=expectancy, max_consecutive_losses=0),
-            execution_path=execution_path,  # type: ignore[arg-type]
-        )
-
-    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
-
-    payload = {
-        "base_payload": {
-            "mode": "full_market",
-            "pool_roll_mode": "daily",
-            "date_from": "2025-01-02",
-            "date_to": "2025-01-31",
-            "execution_path_preference": "auto",
-        },
-        "auto_generate_default_matrix": False,
-        "variants": [
-            {"label": "legacy_path", "execution_path_preference": "legacy"},
-        ],
-    }
-    resp = client.post("/api/backtest/experiments/ab", json=payload)
-    assert resp.status_code == 200
-    body = resp.json()
-
-    variants_by_label = {str(item["label"]): item for item in body["variants"]}
-    assert variants_by_label["baseline"]["run_request"]["execution_path_preference"] == "auto"
-    assert variants_by_label["baseline"]["execution_path"] == "matrix"
-    assert variants_by_label["legacy_path"]["run_request"]["execution_path_preference"] == "legacy"
-    assert variants_by_label["legacy_path"]["execution_path"] == "legacy"
-
-    comparisons_by_label = {str(item["label"]): item for item in body["comparisons"]}
-    assert comparisons_by_label["legacy_path"]["total_return_delta"] == pytest.approx(-0.04, abs=1e-6)
-    assert comparisons_by_label["legacy_path"]["expectancy_delta"] == pytest.approx(-0.006, abs=1e-6)
 
 
 def test_backtest_plateau_endpoint_lhs_sampling_is_repeatable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -555,7 +361,7 @@ def test_backtest_plateau_endpoint_lhs_sampling_is_repeatable(monkeypatch: pytes
     assert body1["total_combinations"] == 12
     assert body1["evaluated_combinations"] == 12
     assert len(body1["points"]) == 12
-    assert len(body1["correlations"]) == 8
+    assert len(body1["correlations"]) == 9
     assert any(row["parameter"] == "min_score" for row in body1["correlations"])
     assert body1["points"] == body2["points"]
     assert body1["correlations"] == body2["correlations"]
@@ -750,6 +556,190 @@ def test_backtest_plateau_task_supports_pause_resume_cancel(monkeypatch: pytest.
 
     final_task = _wait_backtest_plateau_task(task_id)
     assert final_task["status"] == "cancelled"
+
+
+def test_backtest_plateau_task_delete_succeeded_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
+        _ = (progress_callback, prebuilt_universe)
+        if control_callback is not None:
+            control_callback()
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.5,
+                total_return=0.1,
+                max_drawdown=-0.08,
+                avg_pnl_ratio=0.02,
+                trade_count=5,
+                win_count=3,
+                loss_count=2,
+                profit_factor=1.2,
+            ),
+            trades=[],
+            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+            notes=[],
+            candidate_count=12,
+            skipped_count=2,
+            fill_rate=0.8,
+            max_concurrent_positions=int(payload.max_positions),
+        )
+
+    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
+
+    base_payload = {
+        "mode": "full_market",
+        "run_id": "",
+        "trend_step": "auto",
+        "pool_roll_mode": "daily",
+        "board_filters": [],
+        "date_from": "2025-01-02",
+        "date_to": "2025-02-28",
+        "window_days": 60,
+        "min_score": 55,
+        "require_sequence": False,
+        "min_event_count": 1,
+        "entry_events": ["Spring", "SOS", "JOC", "LPS"],
+        "exit_events": ["UTAD", "SOW", "LPSY"],
+        "initial_capital": 1_000_000,
+        "position_pct": 0.2,
+        "max_positions": 5,
+        "stop_loss": 0.05,
+        "take_profit": 0.2,
+        "max_hold_days": 30,
+        "fee_bps": 8.0,
+        "prioritize_signals": True,
+        "priority_mode": "balanced",
+        "priority_topk_per_day": 10,
+        "enforce_t1": True,
+        "max_symbols": 100,
+    }
+    payload = {
+        "base_payload": base_payload,
+        "sampling_mode": "lhs",
+        "sample_points": 4,
+        "random_seed": 20260227,
+        "window_days_list": [40, 80],
+        "min_score_list": [50, 70],
+        "stop_loss_list": [0.03, 0.08],
+        "take_profit_list": [0.1, 0.4],
+        "trailing_stop_pct_list": [0.0, 0.08],
+        "max_positions_list": [3, 10],
+        "position_pct_list": [0.1, 0.4],
+        "max_symbols_list": [80, 300],
+        "priority_topk_per_day_list": [0, 20],
+    }
+
+    start_resp = client.post("/api/backtest/plateau/tasks", json=payload)
+    assert start_resp.status_code == 200
+    task_id = str(start_resp.json()["task_id"])
+
+    finished = _wait_backtest_plateau_task(task_id)
+    assert finished["status"] == "succeeded"
+
+    delete_resp = client.delete(f"/api/backtest/plateau/tasks/{task_id}")
+    assert delete_resp.status_code == 200
+    delete_body = delete_resp.json()
+    assert delete_body["deleted"] is True
+    assert delete_body["task_id"] == task_id
+
+    get_resp = client.get(f"/api/backtest/plateau/tasks/{task_id}")
+    assert get_resp.status_code == 404
+    assert get_resp.json()["code"] == "BACKTEST_PLATEAU_TASK_NOT_FOUND"
+
+
+def test_backtest_plateau_task_delete_running_task_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
+        _ = (progress_callback, prebuilt_universe)
+        if control_callback is not None:
+            control_callback()
+        time.sleep(0.05)
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.5,
+                total_return=0.1,
+                max_drawdown=-0.08,
+                avg_pnl_ratio=0.02,
+                trade_count=5,
+                win_count=3,
+                loss_count=2,
+                profit_factor=1.2,
+            ),
+            trades=[],
+            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+            notes=[],
+            candidate_count=12,
+            skipped_count=2,
+            fill_rate=0.8,
+            max_concurrent_positions=int(payload.max_positions),
+        )
+
+    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
+
+    base_payload = {
+        "mode": "full_market",
+        "run_id": "",
+        "trend_step": "auto",
+        "pool_roll_mode": "daily",
+        "board_filters": [],
+        "date_from": "2025-01-02",
+        "date_to": "2025-02-28",
+        "window_days": 60,
+        "min_score": 55,
+        "require_sequence": False,
+        "min_event_count": 1,
+        "entry_events": ["Spring", "SOS", "JOC", "LPS"],
+        "exit_events": ["UTAD", "SOW", "LPSY"],
+        "initial_capital": 1_000_000,
+        "position_pct": 0.2,
+        "max_positions": 5,
+        "stop_loss": 0.05,
+        "take_profit": 0.2,
+        "max_hold_days": 30,
+        "fee_bps": 8.0,
+        "prioritize_signals": True,
+        "priority_mode": "balanced",
+        "priority_topk_per_day": 10,
+        "enforce_t1": True,
+        "max_symbols": 100,
+    }
+    payload = {
+        "base_payload": base_payload,
+        "sampling_mode": "lhs",
+        "sample_points": 80,
+        "random_seed": 20260227,
+        "window_days_list": [40, 80],
+        "min_score_list": [50, 70],
+        "stop_loss_list": [0.03, 0.08],
+        "take_profit_list": [0.1, 0.4],
+        "trailing_stop_pct_list": [0.0, 0.08],
+        "max_positions_list": [3, 10],
+        "position_pct_list": [0.1, 0.4],
+        "max_symbols_list": [80, 300],
+        "priority_topk_per_day_list": [0, 20],
+    }
+
+    start_resp = client.post("/api/backtest/plateau/tasks", json=payload)
+    assert start_resp.status_code == 200
+    task_id = str(start_resp.json()["task_id"])
+
+    running = _wait_backtest_plateau_task_status(task_id, {"running"})
+    assert running["status"] == "running"
+
+    delete_resp = client.delete(f"/api/backtest/plateau/tasks/{task_id}")
+    assert delete_resp.status_code == 400
+    delete_body = delete_resp.json()
+    assert delete_body["code"] == "BACKTEST_PLATEAU_TASK_CONTROL_INVALID"
+
+    cancel_resp = client.post(f"/api/backtest/plateau/tasks/{task_id}/cancel")
+    assert cancel_resp.status_code == 200
+    assert cancel_resp.json()["status"] == "cancelled"
+
+
+def test_backtest_plateau_task_delete_returns_404_for_missing_task() -> None:
+    missing_id = "bp_missing_20260227"
+    delete_resp = client.delete(f"/api/backtest/plateau/tasks/{missing_id}")
+    assert delete_resp.status_code == 404
+    body = delete_resp.json()
+    assert body["code"] == "BACKTEST_PLATEAU_TASK_NOT_FOUND"
 
 
 def test_backtest_plateau_replay_reuses_candidates(monkeypatch: pytest.MonkeyPatch) -> None:

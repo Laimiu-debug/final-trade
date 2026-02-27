@@ -738,6 +738,7 @@ export interface BacktestPlateauRunRequest {
   min_score_list: number[]
   stop_loss_list: number[]
   take_profit_list: number[]
+  trailing_stop_pct_list: number[]
   max_positions_list: number[]
   position_pct_list: number[]
   max_symbols_list: number[]
@@ -752,6 +753,7 @@ export interface BacktestPlateauParams {
   min_score: number
   stop_loss: number
   take_profit: number
+  trailing_stop_pct: number
   max_positions: number
   position_pct: number
   max_symbols: number
@@ -806,6 +808,15 @@ export interface BacktestPlateauTaskStatusResponse {
   result?: BacktestPlateauResponse | null
   error?: string | null
   error_code?: string | null
+}
+
+export interface BacktestPlateauTaskListResponse {
+  items: BacktestPlateauTaskStatusResponse[]
+}
+
+export interface BacktestPlateauTaskDeleteResponse {
+  deleted: boolean
+  task_id: string
 }
 
 export interface StrategyCapabilities {
@@ -899,75 +910,6 @@ export interface EventJudgmentProfileApplyRequest {
 export interface EventJudgmentProfileDeleteResponse {
   success: true
   profile_id: string
-}
-
-export interface BacktestABVariantConfig {
-  label?: string
-  entry_delay_days?: number
-  health_score_min?: number
-  event_score_min?: number
-  event_grade_min?: 'A' | 'B' | 'C'
-  require_key_event_confirmation?: boolean
-  execution_path_preference?: 'auto' | 'matrix' | 'legacy'
-  matrix_event_semantic_version?: 'matrix_v1' | 'aligned_wyckoff_v2'
-  rank_weight_health?: number
-  rank_weight_event?: number
-  strategy_id?: StrategyId
-  strategy_params?: Record<string, unknown>
-  enable_advanced_analysis?: boolean
-}
-
-export interface BacktestABExperimentRequest {
-  base_payload: BacktestRunRequest
-  variants?: BacktestABVariantConfig[]
-  auto_generate_default_matrix?: boolean
-  max_variants?: number
-}
-
-export interface BacktestABSignalBucket {
-  signal: string
-  trade_count: number
-  win_rate: number
-  avg_pnl_ratio: number
-  total_pnl_ratio: number
-  utad_exit_ratio: number
-}
-
-export interface BacktestABVariantResult {
-  variant_id: string
-  label: string
-  run_request: BacktestRunRequest
-  status: 'succeeded' | 'failed'
-  error?: string | null
-  stats?: ReviewStats | null
-  risk_metrics?: BacktestRiskMetrics | null
-  execution_path?: 'matrix' | 'legacy' | null
-  candidate_count: number
-  trade_count: number
-  utad_exit_ratio: number
-  max_consecutive_losses: number
-  signal_breakdown?: BacktestABSignalBucket[]
-}
-
-export interface BacktestABComparisonRow {
-  baseline_variant_id: string
-  variant_id: string
-  label: string
-  total_return_delta: number
-  win_rate_delta: number
-  max_drawdown_delta: number
-  trade_count_delta: number
-  utad_exit_ratio_delta: number
-  expectancy_delta: number
-  max_consecutive_losses_delta: number
-}
-
-export interface BacktestABExperimentResponse {
-  baseline_variant_id?: string | null
-  best_variant_id?: string | null
-  variants: BacktestABVariantResult[]
-  comparisons: BacktestABComparisonRow[]
-  notes: string[]
 }
 
 export interface BacktestReportManifestFile {

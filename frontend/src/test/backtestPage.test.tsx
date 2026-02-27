@@ -1,4 +1,4 @@
-﻿import { screen } from '@testing-library/react'
+﻿import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { delay, http, HttpResponse } from 'msw'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -146,7 +146,11 @@ describe('BacktestPage', () => {
     expect(await screen.findByText('sz300750')).toBeInTheDocument()
     const chartLink = await screen.findByRole('link', { name: 'sz300750' })
     expect(chartLink.getAttribute('href')).toContain('/stocks/sz300750/chart')
-    expect(await screen.findByText('mock note')).toBeInTheDocument()
+
+    await waitFor(() => {
+      const task = useBacktestTaskStore.getState().tasksById.bt_test_001
+      expect(task?.result?.notes ?? []).toContain('mock note')
+    })
   }, 12_000)
 
   it('binds local screener run_id into backtest form', async () => {
@@ -162,6 +166,11 @@ describe('BacktestPage', () => {
         },
       }),
     )
+    server.use(
+      http.get('/api/screener/latest-run', async () => {
+        return HttpResponse.json({ message: 'mock latest run unavailable' }, { status: 500 })
+      }),
+    )
 
     renderWithProviders(
       <>
@@ -174,7 +183,10 @@ describe('BacktestPage', () => {
     const bindButton = await screen.findByRole('button', { name: /带入最新筛选/ })
     await userEvent.click(bindButton)
 
-    expect(await screen.findByDisplayValue('latest-run-20260220')).toBeInTheDocument()
+    await waitFor(() => {
+      const input = screen.getByPlaceholderText('请输入筛选任务 run_id') as HTMLInputElement
+      expect(input.value).toBe('latest-run-20260220')
+    })
   }, 12_000)
 
   it('submits full_market via task api instead of sync api', async () => {
@@ -227,7 +239,10 @@ describe('BacktestPage', () => {
     await userEvent.click(await screen.findByText('全市场'))
     await userEvent.click(await screen.findByRole('button', { name: /开始回测/ }))
 
-    expect(await screen.findByText('full market task')).toBeInTheDocument()
+    await waitFor(() => {
+      const task = useBacktestTaskStore.getState().tasksById.bt_test_full_001
+      expect(task?.result?.notes ?? []).toContain('full market task')
+    })
     expect(syncRunCalled).toBe(false)
   }, 12_000)
 })

@@ -796,75 +796,6 @@ class BacktestResponse(BaseModel):
     effective_run_request: BacktestRunRequest | None = None
 
 
-class BacktestABVariantConfig(BaseModel):
-    label: str | None = None
-    entry_delay_days: int | None = Field(default=None, ge=1, le=5)
-    health_score_min: float | None = Field(default=None, ge=0.0, le=100.0)
-    event_score_min: float | None = Field(default=None, ge=0.0, le=100.0)
-    event_grade_min: Literal["A", "B", "C"] | None = None
-    require_key_event_confirmation: bool | None = None
-    execution_path_preference: Literal["auto", "matrix", "legacy"] | None = None
-    matrix_event_semantic_version: Literal["matrix_v1", "aligned_wyckoff_v2"] | None = None
-    rank_weight_health: float | None = Field(default=None, ge=0.0, le=1.0)
-    rank_weight_event: float | None = Field(default=None, ge=0.0, le=1.0)
-    strategy_id: StrategyId | None = None
-    strategy_params: dict[str, Any] | None = None
-    enable_advanced_analysis: bool | None = None
-
-
-class BacktestABExperimentRequest(BaseModel):
-    base_payload: BacktestRunRequest
-    variants: list[BacktestABVariantConfig] = Field(default_factory=list, max_length=64)
-    auto_generate_default_matrix: bool = True
-    max_variants: int = Field(default=16, ge=1, le=64)
-
-
-class BacktestABSignalBucket(BaseModel):
-    signal: str
-    trade_count: int = 0
-    win_rate: float = 0.0
-    avg_pnl_ratio: float = 0.0
-    total_pnl_ratio: float = 0.0
-    utad_exit_ratio: float = 0.0
-
-
-class BacktestABVariantResult(BaseModel):
-    variant_id: str
-    label: str
-    run_request: BacktestRunRequest
-    status: Literal["succeeded", "failed"] = "succeeded"
-    error: str | None = None
-    stats: ReviewStats | None = None
-    risk_metrics: BacktestRiskMetrics | None = None
-    execution_path: Literal["matrix", "legacy"] | None = None
-    candidate_count: int = 0
-    trade_count: int = 0
-    utad_exit_ratio: float = 0.0
-    max_consecutive_losses: int = 0
-    signal_breakdown: list[BacktestABSignalBucket] = Field(default_factory=list)
-
-
-class BacktestABComparisonRow(BaseModel):
-    baseline_variant_id: str
-    variant_id: str
-    label: str
-    total_return_delta: float = 0.0
-    win_rate_delta: float = 0.0
-    max_drawdown_delta: float = 0.0
-    trade_count_delta: int = 0
-    utad_exit_ratio_delta: float = 0.0
-    expectancy_delta: float = 0.0
-    max_consecutive_losses_delta: int = 0
-
-
-class BacktestABExperimentResponse(BaseModel):
-    baseline_variant_id: str | None = None
-    best_variant_id: str | None = None
-    variants: list[BacktestABVariantResult] = Field(default_factory=list)
-    comparisons: list[BacktestABComparisonRow] = Field(default_factory=list)
-    notes: list[str] = Field(default_factory=list)
-
-
 class BacktestTaskStartResponse(BaseModel):
     task_id: str
 
@@ -904,6 +835,7 @@ class BacktestPlateauRunRequest(BaseModel):
     min_score_list: list[float] = Field(default_factory=list, max_length=16)
     stop_loss_list: list[float] = Field(default_factory=list, max_length=16)
     take_profit_list: list[float] = Field(default_factory=list, max_length=16)
+    trailing_stop_pct_list: list[float] = Field(default_factory=list, max_length=16)
     max_positions_list: list[int] = Field(default_factory=list, max_length=16)
     position_pct_list: list[float] = Field(default_factory=list, max_length=16)
     max_symbols_list: list[int] = Field(default_factory=list, max_length=16)
@@ -918,6 +850,7 @@ class BacktestPlateauParams(BaseModel):
     min_score: float
     stop_loss: float
     take_profit: float
+    trailing_stop_pct: float
     max_positions: int
     position_pct: float
     max_symbols: int
@@ -972,6 +905,15 @@ class BacktestPlateauTaskStatusResponse(BaseModel):
     result: BacktestPlateauResponse | None = None
     error: str | None = None
     error_code: str | None = None
+
+
+class BacktestPlateauTaskListResponse(BaseModel):
+    items: list[BacktestPlateauTaskStatusResponse] = Field(default_factory=list)
+
+
+class BacktestPlateauTaskDeleteResponse(BaseModel):
+    deleted: bool
+    task_id: str
 
 
 class BacktestReportManifestFile(BaseModel):

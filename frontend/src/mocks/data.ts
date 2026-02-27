@@ -1801,6 +1801,7 @@ export function runBacktestStore(payload: BacktestRunRequest): BacktestResponse 
                 min_score: payload.min_score,
                 stop_loss: payload.stop_loss,
                 take_profit: payload.take_profit,
+                trailing_stop_pct: Number(payload.trailing_stop_pct ?? 0),
                 max_positions: payload.max_positions,
                 position_pct: payload.position_pct,
                 max_symbols: payload.max_symbols,
@@ -1908,6 +1909,11 @@ export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): Bac
   const axisMinScore = payload.min_score_list.length > 0 ? payload.min_score_list : [base.min_score]
   const axisStopLoss = payload.stop_loss_list.length > 0 ? payload.stop_loss_list : [base.stop_loss]
   const axisTakeProfit = payload.take_profit_list.length > 0 ? payload.take_profit_list : [base.take_profit]
+  const axisTrailingStop = (
+    payload.trailing_stop_pct_list.length > 0
+      ? payload.trailing_stop_pct_list
+      : [base.trailing_stop_pct ?? 0]
+  ).map((value) => Number(value ?? 0))
   const axisMaxPositions = payload.max_positions_list.length > 0 ? payload.max_positions_list : [base.max_positions]
   const axisPositionPct = payload.position_pct_list.length > 0 ? payload.position_pct_list : [base.position_pct]
   const axisMaxSymbols = payload.max_symbols_list.length > 0 ? payload.max_symbols_list : [base.max_symbols]
@@ -1921,6 +1927,7 @@ export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): Bac
     * axisMinScore.length
     * axisStopLoss.length
     * axisTakeProfit.length
+    * axisTrailingStop.length
     * axisMaxPositions.length
     * axisPositionPct.length
     * axisMaxSymbols.length
@@ -1948,6 +1955,7 @@ export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): Bac
   const minScoreBounds: [number, number] = [Math.min(...axisMinScore), Math.max(...axisMinScore)]
   const stopLossBounds: [number, number] = [Math.min(...axisStopLoss), Math.max(...axisStopLoss)]
   const takeProfitBounds: [number, number] = [Math.min(...axisTakeProfit), Math.max(...axisTakeProfit)]
+  const trailingStopBounds: [number, number] = [Math.min(...axisTrailingStop), Math.max(...axisTrailingStop)]
   const maxPositionsBounds: [number, number] = [Math.min(...axisMaxPositions), Math.max(...axisMaxPositions)]
   const positionPctBounds: [number, number] = [Math.min(...axisPositionPct), Math.max(...axisPositionPct)]
   const maxSymbolsBounds: [number, number] = [Math.min(...axisMaxSymbols), Math.max(...axisMaxSymbols)]
@@ -1959,6 +1967,7 @@ export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): Bac
     min_score: number
     stop_loss: number
     take_profit: number
+    trailing_stop_pct: number
     max_positions: number
     position_pct: number
     max_symbols: number
@@ -1969,6 +1978,7 @@ export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): Bac
       candidate.min_score.toFixed(4),
       candidate.stop_loss.toFixed(6),
       candidate.take_profit.toFixed(6),
+      candidate.trailing_stop_pct.toFixed(6),
       candidate.max_positions,
       candidate.position_pct.toFixed(6),
       candidate.max_symbols,
@@ -1982,6 +1992,7 @@ export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): Bac
       min_score: candidate.min_score,
       stop_loss: candidate.stop_loss,
       take_profit: candidate.take_profit,
+      trailing_stop_pct: candidate.trailing_stop_pct,
       max_positions: candidate.max_positions,
       position_pct: candidate.position_pct,
       max_symbols: candidate.max_symbols,
@@ -2014,21 +2025,24 @@ export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): Bac
       for (const minScore of axisMinScore) {
         for (const stopLoss of axisStopLoss) {
           for (const takeProfit of axisTakeProfit) {
-            for (const maxPositions of axisMaxPositions) {
-              for (const positionPct of axisPositionPct) {
-                for (const maxSymbols of axisMaxSymbols) {
-                  for (const topK of axisTopK) {
-                    if (points.length >= targetEvaluate) break
-                    appendPoint({
-                      window_days: Math.max(20, Math.min(240, Math.round(windowDays))),
-                      min_score: Number(Math.max(0, Math.min(100, minScore)).toFixed(4)),
-                      stop_loss: Number(Math.max(0, Math.min(0.5, stopLoss)).toFixed(6)),
-                      take_profit: Number(Math.max(0, Math.min(1.5, takeProfit)).toFixed(6)),
-                      max_positions: Math.max(1, Math.min(100, Math.round(maxPositions))),
-                      position_pct: Number(Math.max(0.0001, Math.min(1, positionPct)).toFixed(6)),
-                      max_symbols: Math.max(20, Math.min(2000, Math.round(maxSymbols))),
-                      priority_topk_per_day: Math.max(0, Math.min(500, Math.round(topK))),
-                    })
+            for (const trailingStop of axisTrailingStop) {
+              for (const maxPositions of axisMaxPositions) {
+                for (const positionPct of axisPositionPct) {
+                  for (const maxSymbols of axisMaxSymbols) {
+                    for (const topK of axisTopK) {
+                      if (points.length >= targetEvaluate) break
+                      appendPoint({
+                        window_days: Math.max(20, Math.min(240, Math.round(windowDays))),
+                        min_score: Number(Math.max(0, Math.min(100, minScore)).toFixed(4)),
+                        stop_loss: Number(Math.max(0, Math.min(0.5, stopLoss)).toFixed(6)),
+                        take_profit: Number(Math.max(0, Math.min(1.5, takeProfit)).toFixed(6)),
+                        trailing_stop_pct: Number(Math.max(0, Math.min(0.5, trailingStop)).toFixed(6)),
+                        max_positions: Math.max(1, Math.min(100, Math.round(maxPositions))),
+                        position_pct: Number(Math.max(0.0001, Math.min(1, positionPct)).toFixed(6)),
+                        max_symbols: Math.max(20, Math.min(2000, Math.round(maxSymbols))),
+                        priority_topk_per_day: Math.max(0, Math.min(500, Math.round(topK))),
+                      })
+                    }
                   }
                 }
               }
@@ -2050,6 +2064,7 @@ export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): Bac
         min_score: Number(randomBetween(minScoreBounds[0], minScoreBounds[1]).toFixed(4)),
         stop_loss: Number(randomBetween(stopLossBounds[0], stopLossBounds[1]).toFixed(6)),
         take_profit: Number(randomBetween(takeProfitBounds[0], takeProfitBounds[1]).toFixed(6)),
+        trailing_stop_pct: Number(randomBetween(trailingStopBounds[0], trailingStopBounds[1]).toFixed(6)),
         max_positions: Math.max(1, Math.min(100, randomIntBetween(maxPositionsBounds[0], maxPositionsBounds[1]))),
         position_pct: Number(Math.max(0.0001, Math.min(1, randomBetween(positionPctBounds[0], positionPctBounds[1]))).toFixed(6)),
         max_symbols: Math.max(20, Math.min(2000, randomIntBetween(maxSymbolsBounds[0], maxSymbolsBounds[1]))),
@@ -2120,6 +2135,7 @@ export function runBacktestPlateauStore(payload: BacktestPlateauRunRequest): Bac
       { key: 'min_score', label: '最低评分', pick: (row) => Number(row.params.min_score) },
       { key: 'stop_loss', label: '止损比例', pick: (row) => Number(row.params.stop_loss) },
       { key: 'take_profit', label: '止盈比例', pick: (row) => Number(row.params.take_profit) },
+      { key: 'trailing_stop_pct', label: '高位回撤比例', pick: (row) => Number(row.params.trailing_stop_pct) },
       { key: 'max_positions', label: '最大并发持仓', pick: (row) => Number(row.params.max_positions) },
       { key: 'position_pct', label: '单笔仓位占比', pick: (row) => Number(row.params.position_pct) },
       { key: 'max_symbols', label: '最大股票数', pick: (row) => Number(row.params.max_symbols) },

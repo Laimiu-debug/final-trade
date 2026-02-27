@@ -14,12 +14,12 @@ from .models import (
     AIProviderTestRequest,
     AIProviderTestResponse,
     AIRecordsResponse,
-    BacktestABExperimentRequest,
-    BacktestABExperimentResponse,
     BacktestResponse,
     BacktestRunRequest,
     BacktestPlateauRunRequest,
     BacktestPlateauResponse,
+    BacktestPlateauTaskListResponse,
+    BacktestPlateauTaskDeleteResponse,
     BacktestPlateauTaskStatusResponse,
     BacktestPoolRollMode,
     BacktestTaskStartResponse,
@@ -384,16 +384,6 @@ def post_backtest_run(payload: BacktestRunRequest) -> BacktestResponse | JSONRes
         return error_response(400, "BACKTEST_INVALID", str(exc))
 
 
-@app.post("/api/backtest/experiments/ab", response_model=BacktestABExperimentResponse)
-def post_backtest_experiment_ab(payload: BacktestABExperimentRequest) -> BacktestABExperimentResponse | JSONResponse:
-    try:
-        return store.run_backtest_ab_experiment(payload)
-    except BacktestValidationError as exc:
-        return error_response(400, exc.code, str(exc))
-    except ValueError as exc:
-        return error_response(400, "BACKTEST_INVALID", str(exc))
-
-
 @app.post("/api/backtest/plateau", response_model=BacktestPlateauResponse)
 def post_backtest_plateau(payload: BacktestPlateauRunRequest) -> BacktestPlateauResponse | JSONResponse:
     try:
@@ -409,6 +399,18 @@ def post_backtest_plateau_task(payload: BacktestPlateauRunRequest) -> BacktestTa
     try:
         task_id = store.start_backtest_plateau_task(payload)
         return BacktestTaskStartResponse(task_id=task_id)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.get("/api/backtest/plateau/tasks", response_model=BacktestPlateauTaskListResponse)
+def get_backtest_plateau_tasks(
+    include_result: bool = Query(default=False),
+) -> BacktestPlateauTaskListResponse | JSONResponse:
+    try:
+        return store.list_backtest_plateau_tasks(include_result=include_result)
     except BacktestValidationError as exc:
         return error_response(400, exc.code, str(exc))
     except ValueError as exc:
@@ -457,6 +459,19 @@ def post_backtest_plateau_task_cancel(
 ) -> BacktestPlateauTaskStatusResponse | JSONResponse:
     try:
         return store.cancel_backtest_plateau_task(task_id)
+    except BacktestValidationError as exc:
+        status_code = 404 if exc.code == "BACKTEST_PLATEAU_TASK_NOT_FOUND" else 400
+        return error_response(status_code, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.delete("/api/backtest/plateau/tasks/{task_id}", response_model=BacktestPlateauTaskDeleteResponse)
+def delete_backtest_plateau_task(
+    task_id: str = Path(min_length=8, max_length=64),
+) -> BacktestPlateauTaskDeleteResponse | JSONResponse:
+    try:
+        return store.delete_backtest_plateau_task(task_id)
     except BacktestValidationError as exc:
         status_code = 404 if exc.code == "BACKTEST_PLATEAU_TASK_NOT_FOUND" else 400
         return error_response(status_code, exc.code, str(exc))
