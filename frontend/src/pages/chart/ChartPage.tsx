@@ -283,6 +283,25 @@ export function ChartPage() {
     (item) => item.symbol.toLowerCase() === symbol.toLowerCase(),
   )
   const candles = candlesQuery.data?.candles ?? []
+  const intradayReferencePrice = useMemo(() => {
+    const targetDate = String(intradayQuery.data?.date || intradayDate || '').trim()
+    if (!targetDate || candles.length <= 0) return undefined
+
+    const directIndex = candles.findIndex((item) => item.time === targetDate)
+    if (directIndex > 0) return Number(candles[directIndex - 1].close)
+    if (directIndex === 0) {
+      const first = candles[0]
+      return Number(first?.open || first?.close || 0) || undefined
+    }
+
+    const previous = [...candles]
+      .filter((item) => item.time < targetDate)
+      .sort((left, right) => left.time.localeCompare(right.time))
+      .at(-1)
+    if (previous) return Number(previous.close)
+
+    return Number(candles[0]?.close || 0) || undefined
+  }, [candles, intradayDate, intradayQuery.data?.date])
 
   useEffect(() => {
     setStatsRange([null, null])
@@ -693,7 +712,14 @@ export function ChartPage() {
             description={intradayQuery.data.degraded_reason}
           />
         ) : null}
-        {intradayChartReady ? <IntradayChart points={intradayQuery.data?.points ?? []} /> : <div style={{ height: 420 }} />}
+        {intradayChartReady ? (
+          <IntradayChart
+            points={intradayQuery.data?.points ?? []}
+            referencePrice={intradayReferencePrice}
+          />
+        ) : (
+          <div style={{ height: 420 }} />
+        )}
       </Modal>
     </Space>
   )

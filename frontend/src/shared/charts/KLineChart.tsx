@@ -315,6 +315,11 @@ function toMaybeNumber(value: number | '-' | undefined) {
   return value.toFixed(2)
 }
 
+function toSignedPercentFromPrice(basePrice: number, price: number, digits = 2) {
+  if (!Number.isFinite(basePrice) || basePrice <= 0 || !Number.isFinite(price)) return '--'
+  return toSignedPercent(price / basePrice - 1, digits)
+}
+
 function buildStackOffsetsAbove(count: number) {
   if (count <= 1) return [-24]
   const step = 10
@@ -733,6 +738,8 @@ export function KLineChart({
     annotationLegendItems.push(iceLine.legendItem)
   }
 
+  const ratioBasePrice = Number(candles[0]?.close ?? 0)
+
   const option = {
     animation: true,
     legend: { show: false },
@@ -748,6 +755,10 @@ export function KLineChart({
         const prevClose = dataIndex > 0 ? candles[dataIndex - 1].close : candle.open
         const change = candle.close - prevClose
         const changePct = prevClose > 0 ? change / prevClose : 0
+        const openPct = prevClose > 0 ? candle.open / prevClose - 1 : 0
+        const closePct = prevClose > 0 ? candle.close / prevClose - 1 : 0
+        const highPct = prevClose > 0 ? candle.high / prevClose - 1 : 0
+        const lowPct = prevClose > 0 ? candle.low / prevClose - 1 : 0
         const amplitudePct = prevClose > 0 ? (candle.high - candle.low) / prevClose : 0
         const bodyPct = candle.open > 0 ? Math.abs(candle.close - candle.open) / candle.open : 0
         const upperShadow = candle.high - Math.max(candle.open, candle.close)
@@ -770,8 +781,8 @@ export function KLineChart({
         const lines = [
           `<div style="min-width: 280px">`,
           `<div style="font-weight: 600; margin-bottom: 6px">${candle.time}</div>`,
-          `<div>\u5f00\u76d8\uff1a${toPrice(candle.open)}\u3000\u6536\u76d8\uff1a${toPrice(candle.close)}</div>`,
-          `<div>\u6700\u9ad8\uff1a${toPrice(candle.high)}\u3000\u6700\u4f4e\uff1a${toPrice(candle.low)}</div>`,
+          `<div>\u5f00\u76d8\uff1a${toPrice(candle.open)} (${toSignedPercent(openPct)})\u3000\u6536\u76d8\uff1a${toPrice(candle.close)} (${toSignedPercent(closePct)})</div>`,
+          `<div>\u6700\u9ad8\uff1a${toPrice(candle.high)} (${toSignedPercent(highPct)})\u3000\u6700\u4f4e\uff1a${toPrice(candle.low)} (${toSignedPercent(lowPct)})</div>`,
           `<div>\u6da8\u8dcc\uff1a<span style="color:${changeColor};font-weight:600">${toSignedNumber(change)} (${toSignedPercent(changePct)})</span></div>`,
           `<div>\u632f\u5e45\uff1a${toSignedPercent(amplitudePct)}\u3000\u5b9e\u4f53\uff1a${toSignedPercent(bodyPct)}</div>`,
           `<div>\u4e0a\u5f71\uff1a${toPrice(upperShadow)}\u3000\u4e0b\u5f71\uff1a${toPrice(lowerShadow)}</div>`,
@@ -822,6 +833,14 @@ export function KLineChart({
         splitLine: {
           lineStyle: { color: 'rgba(31,49,48,0.14)' },
         },
+      },
+      {
+        scale: true,
+        position: 'right',
+        axisLabel: {
+          formatter: (value: number) => toSignedPercentFromPrice(ratioBasePrice, Number(value), 2),
+        },
+        splitLine: { show: false },
       },
       {
         scale: true,
@@ -903,7 +922,7 @@ export function KLineChart({
         name: '\u6210\u4ea4\u91cf',
         type: 'bar',
         xAxisIndex: 1,
-        yAxisIndex: 1,
+        yAxisIndex: 2,
         data: volumes,
         itemStyle: {
           color: '#8ca9a7',

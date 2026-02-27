@@ -10,10 +10,12 @@ import {
   DatePicker,
   Input,
   InputNumber,
+  Modal,
   Progress,
   Radio,
   Row,
   Select,
+  Spin,
   Space,
   Statistic,
   Switch,
@@ -42,6 +44,7 @@ import {
   resumeBacktestPlateauTask,
   resumeBacktestTask,
   runBacktest,
+  getBacktestTask,
   getBacktestPlateauTask,
   startBacktestPlateauTask,
   startBacktestTask,
@@ -1239,6 +1242,9 @@ type AnalysisAdvice = {
 type BacktestModuleKey =
   | 'report_share'
   | 'plateau_params'
+  | 'plateau_presets'
+  | 'recent_task_progress'
+  | 'backtest_history'
   | 'run_notes'
 
 function normalizeEventToken(raw: string): string {
@@ -1727,6 +1733,10 @@ export function BacktestPage() {
   const [plateauSavedPresets, setPlateauSavedPresets] = useState<BacktestPlateauPreset[]>(() => loadBacktestPlateauPresets())
   const [plateauSavedPresetId, setPlateauSavedPresetId] = useState<string | null>(null)
   const [plateauExportingRowKey, setPlateauExportingRowKey] = useState<string | null>(null)
+  const [plateauTradeViewingRow, setPlateauTradeViewingRow] = useState<BacktestPlateauTableRow | null>(null)
+  const [plateauTradeViewResult, setPlateauTradeViewResult] = useState<BacktestResponse | null>(null)
+  const [plateauTradeViewLoading, setPlateauTradeViewLoading] = useState(false)
+  const [plateauTradeViewError, setPlateauTradeViewError] = useState<string | null>(null)
   const [tradePage, setTradePage] = useState(1)
   const [tradePageSize, setTradePageSize] = useState(initialDraft.trades_page_size)
   const [runError, setRunError] = useState<string | null>(null)
@@ -1737,9 +1747,13 @@ export function BacktestPage() {
   const [collapsedModules, setCollapsedModules] = useState<Record<BacktestModuleKey, boolean>>({
     report_share: true,
     plateau_params: true,
+    plateau_presets: false,
+    recent_task_progress: true,
+    backtest_history: false,
     run_notes: true,
   })
   const importReportFileRef = useRef<HTMLInputElement | null>(null)
+  const backtestResultSectionRef = useRef<HTMLDivElement | null>(null)
   const tasksById = useBacktestTaskStore((state) => state.tasksById)
   const payloadById = useBacktestTaskStore((state) => state.payloadById)
   const activeTaskIds = useBacktestTaskStore((state) => state.activeTaskIds)
@@ -1748,6 +1762,7 @@ export function BacktestPage() {
   const upsertTaskPayload = useBacktestTaskStore((state) => state.upsertTaskPayload)
   const upsertTaskStatus = useBacktestTaskStore((state) => state.upsertTaskStatus)
   const setSelectedTask = useBacktestTaskStore((state) => state.setSelectedTask)
+  const removeTask = useBacktestTaskStore((state) => state.removeTask)
   const plateauTasksById = useBacktestPlateauTaskStore((state) => state.tasksById)
   const plateauActiveTaskIds = useBacktestPlateauTaskStore((state) => state.activeTaskIds)
   const plateauSelectedTaskId = useBacktestPlateauTaskStore((state) => state.selectedTaskId)
@@ -1782,11 +1797,38 @@ export function BacktestPage() {
   const regimeAdvice = useMemo(() => buildRegimeAdvice(regimeBreakdown), [regimeBreakdown])
   const monteCarloAdvice = useMemo(() => buildMonteCarloAdvice(monteCarlo), [monteCarlo])
   const walkForwardAdvice = useMemo(() => buildWalkForwardAdvice(walkForward), [walkForward])
+  const scrollToBacktestResultSection = () => {
+    window.requestAnimationFrame(() => {
+      backtestResultSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }
+  const toggleModule = (key: BacktestModuleKey) => {
+    setCollapsedModules((prev) => ({ ...prev, [key]: !prev[key] }))
+  }
+  const renderModuleTitle = (key: BacktestModuleKey, label: string) => (
+    <span
+      role="button"
+      tabIndex={0}
+      style={{ display: 'block', width: '100%', cursor: 'pointer', userSelect: 'none' }}
+      onClick={() => toggleModule(key)}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          toggleModule(key)
+        }
+      }}
+    >
+      {label}
+    </span>
+  )
   const renderModuleToggle = (key: BacktestModuleKey) => (
     <Button
       type="text"
       size="small"
-      onClick={() => setCollapsedModules((prev) => ({ ...prev, [key]: !prev[key] }))}
+      onClick={(event) => {
+        event.stopPropagation()
+        toggleModule(key)
+      }}
     >
       {collapsedModules[key] ? '▶' : '▼'}
     </Button>
@@ -2669,27 +2711,26 @@ export function BacktestPage() {
     startPlateauTaskMutation.mutate(payload)
   }
 
-  async function handleExportPlateauTradeRecords(row: BacktestPlateauTableRow) {
+  function buildPlateauRowBacktestPayload(row: BacktestPlateauTableRow, actionLabel: string): BacktestRunRequest | null {
     if (row.error) {
-      message.warning('该参数组评估失败，无法导出交易记录')
-      return
+      message.warning(`该参数组评估失败，无法${actionLabel}`)
+      return null
     }
-    if (plateauExportingRowKey) return
     const cached = readScreenerRunMetaFromStorage()
     const effectiveBoardFilters = cached?.boardFilters?.length ? cached.boardFilters : boardFilters
     const shouldApplyBoardFilters = mode === 'trend_pool'
     if (shouldApplyBoardFilters && effectiveBoardFilters.length === 0) {
-      message.warning('请至少选择一个板块后再导出交易记录')
-      return
+      message.warning(`请至少选择一个板块后再${actionLabel}`)
+      return null
     }
     if (mode === 'trend_pool' && !runId.trim()) {
-      message.warning('趋势池模式导出交易记录需要绑定 run_id')
-      return
+      message.warning(`趋势池模式${actionLabel}需要绑定 run_id`)
+      return null
     }
     if (cached?.boardFilters?.length) {
       setBoardFilters(cached.boardFilters)
     }
-    const payload: BacktestRunRequest = {
+    return {
       ...buildBacktestPayload(shouldApplyBoardFilters ? effectiveBoardFilters : undefined),
       window_days: Number(row.params.window_days),
       min_score: Number(row.params.min_score),
@@ -2701,6 +2742,30 @@ export function BacktestPage() {
       max_symbols: Number(row.params.max_symbols),
       priority_topk_per_day: Number(row.params.priority_topk_per_day),
     }
+  }
+
+  async function handleViewPlateauTradeRecords(row: BacktestPlateauTableRow) {
+    if (plateauTradeViewLoading) return
+    const payload = buildPlateauRowBacktestPayload(row, '查看交易记录')
+    if (!payload) return
+    setPlateauTradeViewingRow(row)
+    setPlateauTradeViewResult(null)
+    setPlateauTradeViewError(null)
+    setPlateauTradeViewLoading(true)
+    try {
+      const runResult = await runBacktest(payload)
+      setPlateauTradeViewResult(runResult)
+    } catch (error) {
+      setPlateauTradeViewError(formatApiError(error))
+    } finally {
+      setPlateauTradeViewLoading(false)
+    }
+  }
+
+  async function handleExportPlateauTradeRecords(row: BacktestPlateauTableRow) {
+    if (plateauExportingRowKey) return
+    const payload = buildPlateauRowBacktestPayload(row, '导出交易记录')
+    if (!payload) return
     setPlateauExportingRowKey(row.__rowKey)
     try {
       const runResult = await runBacktest(payload)
@@ -2952,7 +3017,7 @@ export function BacktestPage() {
     {
       title: '操作',
       key: 'action',
-      width: 240,
+      width: 300,
       render: (_value, row) => {
         const exportingCurrentRow =
           plateauExportingRowKey === row.__rowKey
@@ -2963,6 +3028,16 @@ export function BacktestPage() {
           || (exportPlateauTradesMutation.isPending && !exportingCurrentRow)
         return (
           <Space size={6}>
+            <Button
+              size="small"
+              loading={plateauTradeViewLoading && plateauTradeViewingRow?.__rowKey === row.__rowKey}
+              disabled={plateauTradeViewLoading && plateauTradeViewingRow?.__rowKey !== row.__rowKey}
+              onClick={() => {
+                void handleViewPlateauTradeRecords(row)
+              }}
+            >
+              查看交易记录
+            </Button>
             <Button
               size="small"
               disabled={Boolean(row.error)}
@@ -2998,6 +3073,123 @@ export function BacktestPage() {
       },
     },
   ]
+  const backtestHistoryRows = useMemo(
+    () =>
+      Object.values(tasksById).sort((left, right) => {
+        const leftTs = Date.parse(left.progress.updated_at || left.progress.started_at || '')
+        const rightTs = Date.parse(right.progress.updated_at || right.progress.started_at || '')
+        return rightTs - leftTs
+      }),
+    [tasksById],
+  )
+  const backtestHistoryColumns = useMemo<ColumnsType<BacktestTaskStatusResponse>>(
+    () => [
+      {
+        title: '完成时间',
+        width: 180,
+        render: (_value, row) => row.progress.updated_at || row.progress.started_at || '--',
+      },
+      {
+        title: '核心参数摘要',
+        width: 460,
+        render: (_value, row) => {
+          const payload = payloadById[row.task_id] ?? row.result?.effective_run_request
+          if (!payload) return '--'
+          return `window=${payload.window_days}, min=${Number(payload.min_score).toFixed(2)}, sl=${(Number(payload.stop_loss) * 100).toFixed(2)}%, tp=${(Number(payload.take_profit) * 100).toFixed(2)}%, ts=${(Number(payload.trailing_stop_pct) * 100).toFixed(2)}%`
+        },
+      },
+      {
+        title: '收益率',
+        width: 110,
+        render: (_value, row) => (row.result ? formatPct(Number(row.result.stats.total_return)) : '--'),
+      },
+      {
+        title: '回撤',
+        width: 110,
+        render: (_value, row) => (row.result ? formatPct(Number(row.result.stats.max_drawdown)) : '--'),
+      },
+      {
+        title: '状态',
+        width: 100,
+        render: (_value, row) => <Tag color={taskStatusColor(row.status)}>{taskStatusLabel(row.status)}</Tag>,
+      },
+      {
+        title: '操作',
+        width: 340,
+        render: (_value, row) => {
+          const controlTaskId = controlTaskMutation.variables?.taskId
+          const controlAction = controlTaskMutation.variables?.action
+          const controlLoadingThisRow = controlTaskMutation.isPending && controlTaskId === row.task_id
+          const controlLoadingOtherRow = controlTaskMutation.isPending && controlTaskId !== row.task_id
+          const canPause = row.status === 'pending' || row.status === 'running'
+          const canResume = row.status === 'paused'
+          const canCancel = row.status === 'pending' || row.status === 'running' || row.status === 'paused'
+          const canDelete = row.status !== 'pending' && row.status !== 'running'
+          return (
+            <Space size={6} wrap>
+              <Button
+                size="small"
+                disabled={controlLoadingOtherRow}
+                onClick={() => {
+                  void handleViewBacktestHistoryTask(row.task_id)
+                }}
+              >
+                查看
+              </Button>
+              {canPause ? (
+                <Button
+                  size="small"
+                  loading={controlLoadingThisRow && controlAction === 'pause'}
+                  disabled={controlLoadingOtherRow}
+                  onClick={() => controlTaskMutation.mutate({ action: 'pause', taskId: row.task_id })}
+                >
+                  暂停
+                </Button>
+              ) : null}
+              {canResume ? (
+                <Button
+                  size="small"
+                  type="primary"
+                  ghost
+                  loading={controlLoadingThisRow && controlAction === 'resume'}
+                  disabled={controlLoadingOtherRow}
+                  onClick={() => controlTaskMutation.mutate({ action: 'resume', taskId: row.task_id })}
+                >
+                  继续
+                </Button>
+              ) : null}
+              {canCancel ? (
+                <Button
+                  size="small"
+                  danger
+                  loading={controlLoadingThisRow && controlAction === 'cancel'}
+                  disabled={controlLoadingOtherRow}
+                  onClick={() => controlTaskMutation.mutate({ action: 'cancel', taskId: row.task_id })}
+                >
+                  停止
+                </Button>
+              ) : null}
+              <Button
+                size="small"
+                danger
+                disabled={!canDelete || controlLoadingThisRow || controlLoadingOtherRow}
+                onClick={() => handleDeleteBacktestHistoryTask(row.task_id)}
+              >
+                删除
+              </Button>
+            </Space>
+          )
+        },
+      },
+    ],
+    [
+      controlTaskMutation.isPending,
+      controlTaskMutation.variables,
+      handleDeleteBacktestHistoryTask,
+      handleViewBacktestHistoryTask,
+      payloadById,
+    ],
+  )
   const plateauHistoryRows = useMemo(
     () =>
       Object.values(plateauTasksById).sort((left, right) => {
@@ -3065,7 +3257,9 @@ export function BacktestPage() {
               <Button
                 size="small"
                 disabled={disableActions}
-                onClick={() => setSelectedPlateauTask(row.task_id)}
+                onClick={() => {
+                  void handleViewPlateauHistoryTask(row.task_id)
+                }}
               >
                 查看
               </Button>
@@ -3121,6 +3315,7 @@ export function BacktestPage() {
       controlPlateauTaskMutation.variables,
       deletePlateauTaskMutation.isPending,
       deletePlateauTaskMutation.variables,
+      handleViewPlateauHistoryTask,
       handleDeletePlateauHistoryTask,
       setSelectedPlateauTask,
     ],
@@ -3639,6 +3834,50 @@ export function BacktestPage() {
       return
     }
     deletePlateauTaskMutation.mutate(normalizedTaskId)
+  }
+
+  async function handleViewPlateauHistoryTask(taskId: string) {
+    const normalizedTaskId = String(taskId || '').trim()
+    if (!normalizedTaskId) return
+    setSelectedPlateauTask(normalizedTaskId)
+    try {
+      const status = await getBacktestPlateauTask(normalizedTaskId)
+      upsertPlateauTaskStatus(status)
+      if (!status.result) {
+        message.info(`任务 ${normalizedTaskId} 暂无可展示结果`)
+      }
+    } catch (error) {
+      message.warning(`收益平原任务详情加载失败：${formatApiError(error)}`)
+    }
+  }
+
+  async function handleViewBacktestHistoryTask(taskId: string) {
+    const normalizedTaskId = String(taskId || '').trim()
+    if (!normalizedTaskId) return
+    setSelectedTask(normalizedTaskId)
+    const current = tasksById[normalizedTaskId]
+    if (current?.result) {
+      scrollToBacktestResultSection()
+      return
+    }
+    try {
+      const status = await getBacktestTask(normalizedTaskId)
+      upsertTaskStatus(status)
+      if (status.result) {
+        scrollToBacktestResultSection()
+      } else {
+        message.info(`任务 ${normalizedTaskId} 暂无可展示结果`)
+      }
+    } catch (error) {
+      message.warning(`策略回测任务详情加载失败：${formatApiError(error)}`)
+    }
+  }
+
+  function handleDeleteBacktestHistoryTask(taskId: string) {
+    const normalizedTaskId = String(taskId || '').trim()
+    if (!normalizedTaskId) return
+    removeTask(normalizedTaskId)
+    message.success(`策略回测任务已删除：${normalizedTaskId}`)
   }
 
   function appendPointsToCandidateSet(points: BacktestPlateauPoint[], sourceLabel: string) {
@@ -4171,7 +4410,8 @@ export function BacktestPage() {
             </Space>
           </Col>
           <Col xs={24} md={18}>
-            <Alert
+            <DismissibleAlert
+              dismissKey={`backtest.advanced-analysis-tip.${enableAdvancedAnalysis ? 'on' : 'off'}`}
               type={enableAdvancedAnalysis ? 'info' : 'warning'}
               showIcon
               title={enableAdvancedAnalysis ? '已启用高级分析' : '已关闭高级分析'}
@@ -4211,7 +4451,8 @@ export function BacktestPage() {
             </Space>
           </Col>
           <Col xs={24}>
-            <Alert
+            <DismissibleAlert
+              dismissKey="backtest.priority-mode-help"
               type="info"
               showIcon
               title="优先级模式说明"
@@ -4273,120 +4514,75 @@ export function BacktestPage() {
           {result ? <Tag color="green">{`${result.range.date_from} ~ ${result.range.date_to}`}</Tag> : null}
         </Space>
         {taskStatus ? (
-          <Card size="small" title="最近任务进度" style={{ marginTop: 12 }}>
-            <Space orientation="vertical" size={8} style={{ width: '100%' }}>
-              <Progress
-                percent={Math.max(0, Math.min(100, Number(taskProgress?.percent ?? 0)))}
-                status={taskRunning ? 'active' : (taskStatus.status === 'succeeded' ? 'success' : 'normal')}
-              />
-              <div>{taskProgress?.message || '任务执行中...'}</div>
-              {taskProgress?.current_date ? (
-                <div>当前日期：{taskProgress.current_date}</div>
-              ) : (
-                <div>当前日期：准备中...</div>
-              )}
-              <div>
-                进度：{taskProgress?.processed_dates ?? 0} / {taskProgress?.total_dates ?? 0}
-              </div>
-              {taskProgress?.warning ? <Alert type="warning" showIcon title={taskProgress.warning} /> : null}
-              {taskStageRows.rows.length > 0 ? (
-                <Card size="small" title={`阶段耗时（累计 ${(taskStageRows.totalMs / 1000).toFixed(2)}s）`}>
-                  <Space orientation="vertical" size={6} style={{ width: '100%' }}>
-                    {taskStageRows.rows.map((row) => (
-                      <Space key={row.stageKey} wrap style={{ justifyContent: 'space-between', width: '100%' }}>
-                        <span>{row.label}</span>
-                        <Space wrap size={6}>
-                          <Tag color="geekblue">{row.elapsedSecText}</Tag>
-                          <Tag>{row.shareText}</Tag>
+          <Card
+            size="small"
+            title={renderModuleTitle('recent_task_progress', '最近任务进度')}
+            style={{ marginTop: 12 }}
+            extra={renderModuleToggle('recent_task_progress')}
+          >
+            {!collapsedModules.recent_task_progress ? (
+              <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+                <Progress
+                  percent={Math.max(0, Math.min(100, Number(taskProgress?.percent ?? 0)))}
+                  status={taskRunning ? 'active' : (taskStatus.status === 'succeeded' ? 'success' : 'normal')}
+                />
+                <div>{taskProgress?.message || '任务执行中...'}</div>
+                {taskProgress?.current_date ? (
+                  <div>当前日期：{taskProgress.current_date}</div>
+                ) : (
+                  <div>当前日期：准备中...</div>
+                )}
+                <div>
+                  进度：{taskProgress?.processed_dates ?? 0} / {taskProgress?.total_dates ?? 0}
+                </div>
+                {taskProgress?.warning ? <Alert type="warning" showIcon title={taskProgress.warning} /> : null}
+                {taskStageRows.rows.length > 0 ? (
+                  <Card size="small" title={`阶段耗时（累计 ${(taskStageRows.totalMs / 1000).toFixed(2)}s）`}>
+                    <Space orientation="vertical" size={6} style={{ width: '100%' }}>
+                      {taskStageRows.rows.map((row) => (
+                        <Space key={row.stageKey} wrap style={{ justifyContent: 'space-between', width: '100%' }}>
+                          <span>{row.label}</span>
+                          <Space wrap size={6}>
+                            <Tag color="geekblue">{row.elapsedSecText}</Tag>
+                            <Tag>{row.shareText}</Tag>
+                          </Space>
                         </Space>
-                      </Space>
-                    ))}
-                  </Space>
-                </Card>
-              ) : null}
-            </Space>
+                      ))}
+                    </Space>
+                  </Card>
+                ) : null}
+              </Space>
+            ) : null}
           </Card>
         ) : null}
-      </Card>
-
-      <Card title="回测报告导出与共享" extra={renderModuleToggle('report_share')}>
-        {!collapsedModules.report_share ? (
-          <Space orientation="vertical" size={12} style={{ width: '100%' }}>
-          <Space wrap>
-            <Button
-              type="primary"
-              ghost
-              onClick={handleExportFtbt}
-              disabled={!result}
-              loading={exportReportMutation.isPending}
-            >
-              导出 ftbt
-            </Button>
-            <Button onClick={handleExportXlsxReport} disabled={!result}>
-              导出 Excel
-            </Button>
-            <Button onClick={handleExportHtmlReport} disabled={!result}>
-              导出 HTML
-            </Button>
-            <Button
-              onClick={() => importReportFileRef.current?.click()}
-              loading={importReportMutation.isPending}
-            >
-              导入 ftbt
-            </Button>
-            <input
-              ref={importReportFileRef}
-              type="file"
-              accept=".ftbt"
-              style={{ display: 'none' }}
-              onChange={(event) => {
-                const file = event.target.files?.[0]
-                handleImportFtbt(file)
-                event.target.value = ''
+        <Card
+          size="small"
+          title={renderModuleTitle('backtest_history', '策略回测历史任务列表')}
+          style={{ marginTop: 12 }}
+          extra={renderModuleToggle('backtest_history')}
+        >
+          {!collapsedModules.backtest_history ? (
+            <Table
+              size="small"
+              columns={backtestHistoryColumns}
+              dataSource={backtestHistoryRows}
+              rowKey={(row) => row.task_id}
+              scroll={{ x: 1320 }}
+              pagination={{
+                defaultPageSize: 8,
+                pageSizeOptions: [8, 20, 50, 100],
+                showSizeChanger: true,
+                showTotal: (total) => `共 ${total} 条`,
               }}
             />
-            <Tag color="blue">{`已导入 ${reportLibrary.length}`}</Tag>
-          </Space>
-          <Space wrap style={{ width: '100%' }}>
-            <Select
-              style={{ minWidth: 440 }}
-              placeholder={reportLibraryLoading ? '加载报告列表中...' : '选择导入报告'}
-              value={selectedReportId ?? undefined}
-              onChange={(value) => setSelectedReportId(String(value))}
-              loading={reportLibraryLoading}
-              options={reportLibrary.map((item) => ({
-                value: item.report_id,
-                label: `${item.report_id} | ${item.date_from}~${item.date_to} | 收益 ${formatPct(item.total_return)}`,
-              }))}
-            />
-            <Button
-              type="primary"
-              onClick={handleLoadSelectedReport}
-              disabled={!selectedReportId}
-              loading={loadReportMutation.isPending}
-            >
-              加载报告
-            </Button>
-            <Button
-              danger
-              onClick={handleDeleteSelectedReport}
-              disabled={!selectedReportId}
-              loading={deleteReportMutation.isPending}
-            >
-              删除报告
-            </Button>
-          </Space>
-          <Alert
-            type="info"
-            showIcon
-            title="导入说明"
-            description="可直接导出 Excel/HTML；.ftbt 用于跨设备共享（内含报告HTML、Excel与回测数据）。重复导入同一 report_id 将覆盖旧报告并保留导入时间。"
-          />
-          </Space>
-        ) : null}
+          ) : null}
+        </Card>
       </Card>
 
-      <Card title="收益平原参数与进度" extra={renderModuleToggle('plateau_params')}>
+      <Card
+        title={renderModuleTitle('plateau_params', '收益平原参数与进度')}
+        extra={renderModuleToggle('plateau_params')}
+      >
         {!collapsedModules.plateau_params ? (
           <Space orientation="vertical" size={12} style={{ width: '100%' }}>
           <Row gutter={[12, 12]}>
@@ -4655,7 +4851,207 @@ export function BacktestPage() {
         ) : null}
       </Card>
 
+      <Card
+        title={renderModuleTitle('plateau_presets', '参数收藏库（本地持久化）')}
+        extra={renderModuleToggle('plateau_presets')}
+      >
+        {!collapsedModules.plateau_presets ? (
+          <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+            <Space wrap>
+              <Tag color="geekblue">{`已收藏: ${plateauSavedPresets.length}`}</Tag>
+              {plateauSavedPresetOptions.length > 0 ? (
+                <Select
+                  style={{ minWidth: 420 }}
+                  value={plateauSavedPresetId ?? undefined}
+                  options={plateauSavedPresetOptions}
+                  onChange={(value) => setPlateauSavedPresetId(String(value))}
+                />
+              ) : null}
+              <Button disabled={!selectedSavedPreset} onClick={handleApplySavedPreset}>
+                回填收藏参数
+              </Button>
+              <Button danger disabled={!selectedSavedPreset} onClick={handleDeleteSavedPreset}>
+                删除当前收藏
+              </Button>
+            </Space>
+            <Table
+              size="small"
+              columns={plateauSavedPresetColumns}
+              dataSource={plateauSavedPresets}
+              rowKey="id"
+              scroll={{ x: 1220 }}
+              pagination={{
+                defaultPageSize: 8,
+                pageSizeOptions: [8, 20, 50, 100],
+                showSizeChanger: true,
+                showTotal: (total) => `共 ${total} 条`,
+              }}
+            />
+          </Space>
+        ) : null}
+      </Card>
+
+      <Card
+        title={renderModuleTitle('report_share', '回测报告导出与共享')}
+        extra={renderModuleToggle('report_share')}
+      >
+        {!collapsedModules.report_share ? (
+          <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+          <Space wrap>
+            <Button
+              type="primary"
+              ghost
+              onClick={handleExportFtbt}
+              disabled={!result}
+              loading={exportReportMutation.isPending}
+            >
+              导出 ftbt
+            </Button>
+            <Button onClick={handleExportXlsxReport} disabled={!result}>
+              导出 Excel
+            </Button>
+            <Button onClick={handleExportHtmlReport} disabled={!result}>
+              导出 HTML
+            </Button>
+            <Button
+              onClick={() => importReportFileRef.current?.click()}
+              loading={importReportMutation.isPending}
+            >
+              导入 ftbt
+            </Button>
+            <input
+              ref={importReportFileRef}
+              type="file"
+              accept=".ftbt"
+              style={{ display: 'none' }}
+              onChange={(event) => {
+                const file = event.target.files?.[0]
+                handleImportFtbt(file)
+                event.target.value = ''
+              }}
+            />
+            <Tag color="blue">{`已导入 ${reportLibrary.length}`}</Tag>
+          </Space>
+          <Space wrap style={{ width: '100%' }}>
+            <Select
+              style={{ minWidth: 440 }}
+              placeholder={reportLibraryLoading ? '加载报告列表中...' : '选择导入报告'}
+              value={selectedReportId ?? undefined}
+              onChange={(value) => setSelectedReportId(String(value))}
+              loading={reportLibraryLoading}
+              options={reportLibrary.map((item) => ({
+                value: item.report_id,
+                label: `${item.report_id} | ${item.date_from}~${item.date_to} | 收益 ${formatPct(item.total_return)}`,
+              }))}
+            />
+            <Button
+              type="primary"
+              onClick={handleLoadSelectedReport}
+              disabled={!selectedReportId}
+              loading={loadReportMutation.isPending}
+            >
+              加载报告
+            </Button>
+            <Button
+              danger
+              onClick={handleDeleteSelectedReport}
+              disabled={!selectedReportId}
+              loading={deleteReportMutation.isPending}
+            >
+              删除报告
+            </Button>
+          </Space>
+          <Alert
+            type="info"
+            showIcon
+            title="导入说明"
+            description="可直接导出 Excel/HTML；.ftbt 用于跨设备共享（内含报告HTML、Excel与回测数据）。重复导入同一 report_id 将覆盖旧报告并保留导入时间。"
+          />
+          </Space>
+        ) : null}
+      </Card>
+
       {effectivePlateauError ? <Alert type="error" title={effectivePlateauError} showIcon /> : null}
+
+      <Modal
+        title={plateauTradeViewingRow ? `收益平原交易记录 - 第${plateauTradeViewingRow.__rank}名` : '收益平原交易记录'}
+        open={Boolean(plateauTradeViewingRow)}
+        onCancel={() => {
+          if (plateauTradeViewLoading) return
+          setPlateauTradeViewingRow(null)
+          setPlateauTradeViewResult(null)
+          setPlateauTradeViewError(null)
+        }}
+        destroyOnHidden
+        width={1200}
+        footer={plateauTradeViewingRow ? [
+          <Button
+            key="close"
+            disabled={plateauTradeViewLoading}
+            onClick={() => {
+              setPlateauTradeViewingRow(null)
+              setPlateauTradeViewResult(null)
+              setPlateauTradeViewError(null)
+            }}
+          >
+            关闭
+          </Button>,
+          <Button
+            key="fill"
+            type="primary"
+            disabled={Boolean(plateauTradeViewingRow.error)}
+            onClick={() => applyPlateauPointToForm(plateauTradeViewingRow, `第${plateauTradeViewingRow.__rank}名`)}
+          >
+            回填参数
+          </Button>,
+        ] : null}
+      >
+        {plateauTradeViewingRow ? (
+          <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+            <Space wrap>
+              <Tag color="processing">{`评分 ${plateauTradeViewingRow.score.toFixed(3)}`}</Tag>
+              <Tag>{`收益 ${formatPct(plateauTradeViewingRow.stats.total_return)}`}</Tag>
+              <Tag>{`回撤 ${formatPct(plateauTradeViewingRow.stats.max_drawdown)}`}</Tag>
+              <Tag>{`胜率 ${formatPct(plateauTradeViewingRow.stats.win_rate)}`}</Tag>
+              <Tag>{`预估交易数 ${plateauTradeViewingRow.stats.trade_count}`}</Tag>
+            </Space>
+            {plateauTradeViewingRow.error ? (
+              <Alert type="error" showIcon title={`该参数组评估失败：${plateauTradeViewingRow.error}`} />
+            ) : plateauTradeViewLoading ? (
+              <div style={{ padding: '24px 0', textAlign: 'center' }}>
+                <Spin />
+                <div style={{ marginTop: 8 }}>正在加载交易记录...</div>
+              </div>
+            ) : plateauTradeViewError ? (
+              <Alert type="error" showIcon title={`交易记录加载失败：${plateauTradeViewError}`} />
+            ) : plateauTradeViewResult ? (
+              <>
+                <Space wrap>
+                  <Tag color="success">{`实际交易数 ${plateauTradeViewResult.stats.trade_count}`}</Tag>
+                  <Tag>{`实际收益 ${formatPct(plateauTradeViewResult.stats.total_return)}`}</Tag>
+                  <Tag>{`实际回撤 ${formatPct(plateauTradeViewResult.stats.max_drawdown)}`}</Tag>
+                  <Tag>{`实际胜率 ${formatPct(plateauTradeViewResult.stats.win_rate)}`}</Tag>
+                </Space>
+                <Table
+                  size="small"
+                  columns={tradeColumns}
+                  dataSource={plateauTradeViewResult.trades}
+                  rowKey={(row) => `${row.symbol}-${row.entry_date}-${row.exit_date}-${row.quantity}`}
+                  scroll={{ x: 1480, y: 480 }}
+                  pagination={{
+                    defaultPageSize: 20,
+                    pageSizeOptions: [20, 50, 100],
+                    showSizeChanger: true,
+                    showTotal: (total) => `共 ${total} 条`,
+                  }}
+                />
+              </>
+            ) : (
+              <Alert type="info" showIcon title="暂无交易记录数据" />
+            )}
+          </Space>
+        ) : null}
+      </Modal>
 
       {plateauResult ? (
         <>
@@ -4811,41 +5207,6 @@ export function BacktestPage() {
             />
           )}
 
-          <Card title="参数收藏库（本地持久化）">
-            <Space orientation="vertical" size={10} style={{ width: '100%' }}>
-              <Space wrap>
-                <Tag color="geekblue">{`已收藏: ${plateauSavedPresets.length}`}</Tag>
-                {plateauSavedPresetOptions.length > 0 ? (
-                  <Select
-                    style={{ minWidth: 420 }}
-                    value={plateauSavedPresetId ?? undefined}
-                    options={plateauSavedPresetOptions}
-                    onChange={(value) => setPlateauSavedPresetId(String(value))}
-                  />
-                ) : null}
-                <Button disabled={!selectedSavedPreset} onClick={handleApplySavedPreset}>
-                  回填收藏参数
-                </Button>
-                <Button danger disabled={!selectedSavedPreset} onClick={handleDeleteSavedPreset}>
-                  删除当前收藏
-                </Button>
-              </Space>
-              <Table
-                size="small"
-                columns={plateauSavedPresetColumns}
-                dataSource={plateauSavedPresets}
-                rowKey="id"
-                scroll={{ x: 1220 }}
-                pagination={{
-                  defaultPageSize: 8,
-                  pageSizeOptions: [8, 20, 50, 100],
-                  showSizeChanger: true,
-                  showTotal: (total) => `共 ${total} 条`,
-                }}
-              />
-            </Space>
-          </Card>
-
           <Card title="收益平原结果（按评分排序）">
             <Table
               size="small"
@@ -4878,6 +5239,7 @@ export function BacktestPage() {
 
       {effectiveRunError ? <Alert type="error" title={effectiveRunError} showIcon /> : null}
 
+      <div ref={backtestResultSectionRef} />
       {result ? (
         <>
           <Alert
@@ -5121,7 +5483,10 @@ export function BacktestPage() {
             </Col>
           </Row>
 
-          <Card title="运行说明" extra={renderModuleToggle('run_notes')}>
+          <Card
+            title={renderModuleTitle('run_notes', '运行说明')}
+            extra={renderModuleToggle('run_notes')}
+          >
             {!collapsedModules.run_notes ? (
               result.notes.length === 0 ? (
                 <span>无说明。</span>
@@ -5166,3 +5531,4 @@ export function BacktestPage() {
     </Space>
   )
 }
+
