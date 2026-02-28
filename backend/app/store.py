@@ -100,6 +100,10 @@ from .models import (
     SignalScanMode,
     SignalEtfBacktestConstituentDetail,
     SignalEtfBacktestConstituentInput,
+    SignalEtfBacktestAutoCreateIssue,
+    SignalEtfBacktestAutoCreateItem,
+    SignalEtfBacktestAutoCreateRequest,
+    SignalEtfBacktestAutoCreateResponse,
     SignalEtfBacktestCreateRequest,
     SignalEtfBacktestCurvePoint,
     SignalEtfBacktestDetail,
@@ -11942,6 +11946,7 @@ class InMemoryStore:
         *,
         candle_cache: dict[str, list[CandlePoint]],
         as_of_date: str | None = None,
+        holding_days: int | None = None,
     ) -> dict[str, object]:
         now_date = self._now_date()
         now_datetime = self._now_datetime()
@@ -11959,6 +11964,7 @@ class InMemoryStore:
             benchmark_symbol = benchmark_symbol_raw
         created_at = str(raw.get("created_at") or "").strip() or now_datetime
         updated_at = str(raw.get("updated_at") or "").strip() or created_at
+        normalized_holding_days = max(1, int(holding_days)) if holding_days is not None else None
 
         constituents = self._normalize_signal_etf_constituents(
             raw.get("constituents"),
@@ -12027,11 +12033,13 @@ class InMemoryStore:
         for item in constituents:
             frame = stock_frames.get(item.symbol) or {}
             dates = frame.get("dates") if isinstance(frame, dict) else None
+            closes = frame.get("closes") if isinstance(frame, dict) else None
             candles = frame.get("candles") if isinstance(frame, dict) else None
             date_to_index = frame.get("date_to_index") if isinstance(frame, dict) else None
             latest_date = frame.get("latest_date") if isinstance(frame, dict) else None
             latest_close = frame.get("latest_close") if isinstance(frame, dict) else None
             dates = dates if isinstance(dates, list) else []
+            closes = closes if isinstance(closes, list) else []
             candles = candles if isinstance(candles, list) else []
             date_to_index = date_to_index if isinstance(date_to_index, dict) else {}
             current_date = str(latest_date).strip() if isinstance(latest_date, str) and latest_date else None
@@ -12070,6 +12078,45 @@ class InMemoryStore:
                     buy_price_t2 = resolved_price
                     t2_positions[item.symbol] = (buy_date_t2 or "", buy_price_t2)
                     status_t2 = "bought"
+
+            holding_target_date = (
+                _resolve_buy_date(item.signal_date, normalized_holding_days)
+                if normalized_holding_days is not None
+                else None
+            )
+            holding_buy_date = (
+                _resolve_buy_date(item.signal_date, 1)
+                if normalized_holding_days is not None
+                else None
+            )
+            holding_buy_idx = date_to_index.get(holding_buy_date) if holding_buy_date else None
+            holding_buy_price: float | None = None
+            if isinstance(holding_buy_idx, int) and holding_buy_idx >= 0:
+                resolved_holding_buy_price = self._resolve_signal_etf_buy_price(
+                    symbol=item.symbol,
+                    candles=candles,
+                    buy_index=holding_buy_idx,
+                )
+                if resolved_holding_buy_price > 0:
+                    holding_buy_price = resolved_holding_buy_price
+
+            return_pct_holding = None
+            if (
+                normalized_holding_days is not None
+                and holding_target_date
+                and holding_buy_date
+                and holding_buy_price is not None
+                and holding_buy_price > 0
+                and holding_target_date >= holding_buy_date
+            ):
+                holding_close = self._resolve_close_on_or_before(
+                    dates=dates,
+                    closes=closes,
+                    target_date=holding_target_date,
+                    min_date=holding_buy_date,
+                )
+                if holding_close is not None and holding_close > 0:
+                    return_pct_holding = self._round_signal_etf_ratio((holding_close / holding_buy_price) - 1.0)
 
             return_pct_t1 = (
                 self._round_signal_etf_ratio((float(current_price) / buy_price_t1) - 1.0)
@@ -12113,6 +12160,9 @@ class InMemoryStore:
                     buy_price_t2=buy_price_t2,
                     return_pct_t2=return_pct_t2,
                     status_t2=status_t2,
+                    holding_period_days=normalized_holding_days,
+                    holding_target_date=holding_target_date if normalized_holding_days is not None else None,
+                    return_pct_holding=return_pct_holding,
                 )
             )
 
@@ -12203,6 +12253,18 @@ class InMemoryStore:
         t2_start = next(iter(t2_series.keys()), None) if t2_series else None
         t1_benchmark_series = _build_benchmark_series(t1_start)
         t2_benchmark_series = _build_benchmark_series(t2_start)
+        holding_target_date_summary: str | None = None
+        holding_return_pct_summary: float | None = None
+        if normalized_holding_days is not None and t1_series:
+            requested_target_date = _resolve_buy_date(signal_date, normalized_holding_days)
+            if requested_target_date:
+                eligible_dates = [day for day in t1_series.keys() if day <= requested_target_date]
+                if eligible_dates:
+                    resolved_target_date = eligible_dates[-1]
+                    holding_target_date_summary = resolved_target_date
+                    resolved_return = t1_series.get(resolved_target_date)
+                    if isinstance(resolved_return, (int, float)) and math.isfinite(float(resolved_return)):
+                        holding_return_pct_summary = self._round_signal_etf_ratio(float(resolved_return))
 
         def _build_performance(
             series: dict[str, float],
@@ -12254,6 +12316,9 @@ class InMemoryStore:
                 total_count=len(constituents),
             ),
             strategy_stats=SignalEtfBacktestStrategyStats(strategy_id=strategy_id),
+            holding_period_days=normalized_holding_days,
+            holding_target_date=holding_target_date_summary,
+            holding_return_pct=holding_return_pct_summary,
         )
 
         merged_curve_dates = sorted(
@@ -12353,11 +12418,20 @@ class InMemoryStore:
         self,
         *,
         as_of_date: str | None = None,
+        holding_days: int | None = None,
     ) -> tuple[list[SignalEtfBacktestRecord], dict[str, SignalEtfBacktestDetail]]:
         with self._lock:
             raw_rows = [dict(value) for value in self._signal_etf_backtest_store.values() if isinstance(value, dict)]
         candle_cache: dict[str, list[CandlePoint]] = {}
-        runtimes = [self._build_signal_etf_runtime(row, candle_cache=candle_cache, as_of_date=as_of_date) for row in raw_rows]
+        runtimes = [
+            self._build_signal_etf_runtime(
+                row,
+                candle_cache=candle_cache,
+                as_of_date=as_of_date,
+                holding_days=holding_days,
+            )
+            for row in raw_rows
+        ]
         stats_map = self._build_signal_etf_strategy_stats_map(runtimes)
 
         records: list[SignalEtfBacktestRecord] = []
@@ -12378,6 +12452,68 @@ class InMemoryStore:
         records.sort(key=lambda item: item.created_at, reverse=True)
         return records, detail_map
 
+    def _create_signal_etf_backtest_row(
+        self,
+        *,
+        strategy_id: str,
+        strategy_name: str,
+        signal_date: str,
+        name: str | None,
+        notes: str | None,
+        constituents: list[SignalEtfBacktestConstituentInput],
+        persist: bool,
+    ) -> tuple[str, str]:
+        if len(constituents) <= 0:
+            raise BacktestValidationError("SIGNAL_ETF_EMPTY", "没有可用成分股，无法生成待买ETF回测。")
+
+        custom_name = str(name or "").strip()
+        base_name = custom_name or f"{strategy_name}_{signal_date}"
+        now_text = self._now_datetime()
+        record_id = f"setf_{uuid4().hex[:16]}"
+
+        with self._lock:
+            unique_name = self._build_signal_etf_unique_name(base_name)
+            self._signal_etf_backtest_store[record_id] = {
+                "record_id": record_id,
+                "name": unique_name,
+                "notes": str(notes or "").strip(),
+                "signal_date": signal_date,
+                "strategy_id": strategy_id,
+                "strategy_name": strategy_name,
+                "benchmark_symbol": "sh000001",
+                "created_at": now_text,
+                "updated_at": now_text,
+                "constituents": [item.model_dump(exclude_none=True) for item in constituents],
+            }
+        if persist:
+            self._persist_app_state()
+        return record_id, unique_name
+
+    def _build_signal_etf_constituents_from_signals(
+        self,
+        items: list[SignalResult],
+        *,
+        fallback_signal_date: str,
+    ) -> list[SignalEtfBacktestConstituentInput]:
+        raw_rows: list[dict[str, object]] = []
+        for row in items:
+            raw_signal_date = str(row.trigger_date or "").strip()
+            signal_date = self._safe_signal_etf_date(raw_signal_date, fallback_signal_date)
+            signal_event = str(row.wyckoff_signal or "").strip()
+            if not signal_event and isinstance(row.wy_events, list) and row.wy_events:
+                signal_event = str(row.wy_events[-1] or "").strip()
+            raw_rows.append(
+                {
+                    "symbol": str(row.symbol or "").strip().lower(),
+                    "name": str(row.name or "").strip(),
+                    "signal_date": signal_date,
+                    "signal_primary": str(row.primary_signal or "").strip(),
+                    "signal_event": signal_event,
+                    "signal_reason": str(row.trigger_reason or "").strip(),
+                }
+            )
+        return self._normalize_signal_etf_constituents(raw_rows, fallback_signal_date=fallback_signal_date)
+
     def create_signal_etf_backtest(self, payload: SignalEtfBacktestCreateRequest) -> SignalEtfBacktestDetail:
         strategy_id = str(payload.strategy_id or "").strip()
         if not strategy_id:
@@ -12388,37 +12524,156 @@ class InMemoryStore:
             [item.model_dump(exclude_none=True) for item in payload.constituents],
             fallback_signal_date=signal_date,
         )
-        if len(normalized_constituents) <= 0:
-            raise BacktestValidationError("SIGNAL_ETF_EMPTY", "没有可用成分股，无法生成待买ETF回测。")
-
-        custom_name = str(payload.name or "").strip()
-        base_name = custom_name or f"{strategy_name}_{signal_date}"
-        now_text = self._now_datetime()
-        record_id = f"setf_{uuid4().hex[:16]}"
-
-        with self._lock:
-            unique_name = self._build_signal_etf_unique_name(base_name)
-            self._signal_etf_backtest_store[record_id] = {
-                "record_id": record_id,
-                "name": unique_name,
-                "notes": str(payload.notes or "").strip(),
-                "signal_date": signal_date,
-                "strategy_id": strategy_id,
-                "strategy_name": strategy_name,
-                "benchmark_symbol": "sh000001",
-                "created_at": now_text,
-                "updated_at": now_text,
-                "constituents": [item.model_dump(exclude_none=True) for item in normalized_constituents],
-            }
-        self._persist_app_state()
+        record_id, _ = self._create_signal_etf_backtest_row(
+            strategy_id=strategy_id,
+            strategy_name=strategy_name,
+            signal_date=signal_date,
+            name=payload.name,
+            notes=payload.notes,
+            constituents=normalized_constituents,
+            persist=True,
+        )
         detail = self.get_signal_etf_backtest(record_id, refresh=True)
         if detail is None:
             raise BacktestValidationError("SIGNAL_ETF_NOT_FOUND", "待买ETF回测记录创建失败。")
         return detail
 
-    def list_signal_etf_backtests(self, *, refresh: bool = True) -> SignalEtfBacktestListResponse:
+    def create_signal_etf_backtests_auto(
+        self,
+        payload: SignalEtfBacktestAutoCreateRequest,
+    ) -> SignalEtfBacktestAutoCreateResponse:
+        run_id = str(payload.run_id or "").strip()
+        if not run_id:
+            raise BacktestValidationError("SIGNAL_ETF_RUN_REQUIRED", "run_id 不能为空。")
+        _ = self._require_backtest_trend_pool_run(run_id)
+
+        scan_dates = self._build_backtest_scan_dates(payload.date_from, payload.date_to)
+        if not scan_dates:
+            raise BacktestValidationError("SIGNAL_ETF_DATE_RANGE_INVALID", "日期区间无效。")
+        if len(scan_dates) > 366:
+            raise BacktestValidationError("SIGNAL_ETF_DATE_RANGE_TOO_LARGE", "日期区间最多支持 366 个交易日。")
+
+        strategy_meta, normalized_strategy_params, _strategy_params_hash = self._resolve_strategy_runtime(
+            strategy_id=payload.strategy_id,
+            strategy_params=payload.strategy_params,
+        )
+        strategy_id = str(strategy_meta.get("strategy_id") or payload.strategy_id).strip() or "unknown_strategy"
+        strategy_name = str(payload.strategy_name or "").strip() or str(strategy_meta.get("name") or strategy_id)
+
+        allowed_board_filters = {"main", "gem", "star", "beijing", "st"}
+        normalized_board_filters = list(
+            dict.fromkeys(item for item in (payload.board_filters or []) if item in allowed_board_filters)
+        )
+
+        signal_age_min = max(0, int(payload.signal_age_min))
+        signal_age_max = int(payload.signal_age_max) if payload.signal_age_max is not None else None
+        if signal_age_max is not None:
+            signal_age_max = max(0, signal_age_max)
+            if signal_age_max < signal_age_min:
+                signal_age_min, signal_age_max = signal_age_max, signal_age_min
+
+        name_prefix = str(payload.name_prefix or "").strip()
+        notes_prefix = str(payload.notes or "").strip()
+        refresh_signals = bool(payload.refresh_signals)
+
+        created_items: list[SignalEtfBacktestAutoCreateItem] = []
+        skipped_items: list[SignalEtfBacktestAutoCreateIssue] = []
+        failed_items: list[SignalEtfBacktestAutoCreateIssue] = []
+
+        for as_of_date in scan_dates:
+            try:
+                signals = self.get_signals(
+                    mode="trend_pool",
+                    run_id=run_id,
+                    trend_step=payload.trend_step,
+                    strategy_id=strategy_id,
+                    strategy_params=normalized_strategy_params,
+                    board_filters=normalized_board_filters,
+                    as_of_date=as_of_date,
+                    refresh=refresh_signals,
+                    window_days=int(payload.window_days),
+                    min_score=float(payload.min_score),
+                    require_sequence=bool(payload.require_sequence),
+                    min_event_count=int(payload.min_event_count),
+                    signal_age_min=signal_age_min,
+                    signal_age_max=signal_age_max,
+                )
+            except BacktestValidationError as exc:
+                failed_items.append(SignalEtfBacktestAutoCreateIssue(as_of_date=as_of_date, reason=f"{exc.code}:{exc}"))
+                continue
+            except ValueError as exc:
+                failed_items.append(SignalEtfBacktestAutoCreateIssue(as_of_date=as_of_date, reason=str(exc)))
+                continue
+
+            if len(signals.items) <= 0:
+                skipped_items.append(SignalEtfBacktestAutoCreateIssue(as_of_date=as_of_date, reason="NO_SIGNALS"))
+                continue
+
+            signal_date = self._safe_signal_etf_date(signals.as_of_date, as_of_date)
+            constituents = self._build_signal_etf_constituents_from_signals(
+                signals.items,
+                fallback_signal_date=signal_date,
+            )
+            if len(constituents) <= 0:
+                skipped_items.append(
+                    SignalEtfBacktestAutoCreateIssue(as_of_date=as_of_date, reason="NO_VALID_CONSTITUENTS")
+                )
+                continue
+
+            record_notes = notes_prefix
+            auto_note = f"[auto] run_id={run_id}; as_of_date={as_of_date}"
+            if record_notes:
+                record_notes = f"{record_notes}\n{auto_note}"
+            else:
+                record_notes = auto_note
+
+            record_name = f"{name_prefix}_{signal_date}" if name_prefix else None
+            record_id, record_unique_name = self._create_signal_etf_backtest_row(
+                strategy_id=strategy_id,
+                strategy_name=strategy_name,
+                signal_date=signal_date,
+                name=record_name,
+                notes=record_notes,
+                constituents=constituents,
+                persist=False,
+            )
+            created_items.append(
+                SignalEtfBacktestAutoCreateItem(
+                    record_id=record_id,
+                    name=record_unique_name,
+                    signal_date=signal_date,
+                    as_of_date=as_of_date,
+                    total_constituents=len(constituents),
+                )
+            )
+
+        if created_items:
+            self._persist_app_state()
+
+        return SignalEtfBacktestAutoCreateResponse(
+            run_id=run_id,
+            strategy_id=strategy_id,
+            strategy_name=strategy_name,
+            date_from=scan_dates[0],
+            date_to=scan_dates[-1],
+            processed_dates=len(scan_dates),
+            created_count=len(created_items),
+            skipped_count=len(skipped_items),
+            failed_count=len(failed_items),
+            created=created_items,
+            skipped=skipped_items,
+            failed=failed_items,
+        )
+
+    def list_signal_etf_backtests(
+        self,
+        *,
+        refresh: bool = True,
+        holding_days: int | None = None,
+    ) -> SignalEtfBacktestListResponse:
         _ = refresh
-        records, _detail_map = self._build_signal_etf_runtime_bundle()
+        normalized_holding_days = max(1, int(holding_days)) if holding_days is not None else None
+        records, _detail_map = self._build_signal_etf_runtime_bundle(holding_days=normalized_holding_days)
         return SignalEtfBacktestListResponse(items=records)
 
     def get_signal_etf_backtest(
@@ -12427,13 +12682,18 @@ class InMemoryStore:
         *,
         refresh: bool = True,
         as_of_date: str | None = None,
+        holding_days: int | None = None,
     ) -> SignalEtfBacktestDetail | None:
         _ = refresh
         normalized = str(record_id or "").strip()
         if not normalized:
             return None
         valuation_date = self._safe_signal_etf_date(as_of_date, self._now_date()) if as_of_date else None
-        _records, detail_map = self._build_signal_etf_runtime_bundle(as_of_date=valuation_date)
+        normalized_holding_days = max(1, int(holding_days)) if holding_days is not None else None
+        _records, detail_map = self._build_signal_etf_runtime_bundle(
+            as_of_date=valuation_date,
+            holding_days=normalized_holding_days,
+        )
         return detail_map.get(normalized)
 
     def update_signal_etf_backtest(

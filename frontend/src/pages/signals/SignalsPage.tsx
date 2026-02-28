@@ -1,5 +1,5 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react'
-import dayjs from 'dayjs'
+import dayjs, { type Dayjs } from 'dayjs'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Alert,
@@ -12,6 +12,8 @@ import {
   Empty,
   Input,
   InputNumber,
+  Modal,
+  Progress,
   Radio,
   Row,
   Select,
@@ -28,6 +30,7 @@ import wyckoffCycleDiagram from '@/assets/wyckoff-cycle.svg'
 import { ApiError } from '@/shared/api/client'
 import {
   createSignalEtfBacktest,
+  createSignalEtfBacktestsAuto,
   getLatestScreenerRun,
   getScreenerRun,
   getSignals,
@@ -52,6 +55,7 @@ import type {
   Market,
   SignalResult,
   SignalScanMode,
+  SignalEtfBacktestAutoCreateRequest,
   SignalEtfBacktestCreateRequest,
   SignalType,
   StrategyId,
@@ -482,6 +486,9 @@ export function SignalsPage() {
   const [guideExpanded, setGuideExpanded] = useState(false)
   const [tablePage, setTablePage] = useState(1)
   const [tablePageSize, setTablePageSize] = useState(cachedSignalTablePageSize)
+  const [autoCreateModalOpen, setAutoCreateModalOpen] = useState(false)
+  const [autoCreateDateRange, setAutoCreateDateRange] = useState<[Dayjs, Dayjs] | null>(null)
+  const [autoCreateProgressPct, setAutoCreateProgressPct] = useState(0)
 
   const refreshTrackerRef = useRef(0)
   const missingRunHandledRef = useRef('')
@@ -936,6 +943,94 @@ export function SignalsPage() {
       message.error(formatSignalError(error))
     },
   })
+
+  const createSignalEtfAutoMutation = useMutation({
+    mutationFn: (payload: SignalEtfBacktestAutoCreateRequest) => createSignalEtfBacktestsAuto(payload),
+    onSuccess: (resp) => {
+      setAutoCreateProgressPct(100)
+      if (resp.created_count > 0) {
+        message.success(`批量生成完成：新增 ${resp.created_count} 条，跳过 ${resp.skipped_count} 条，失败 ${resp.failed_count} 条。`)
+      } else {
+        message.warning(`未生成新记录：跳过 ${resp.skipped_count} 条，失败 ${resp.failed_count} 条。`)
+      }
+      setAutoCreateModalOpen(false)
+      setAutoCreateProgressPct(0)
+      if (resp.created.length > 0) {
+        navigate(`/signals/backtest?highlight=${encodeURIComponent(resp.created[0].record_id)}`)
+      }
+    },
+    onError: (error) => {
+      setAutoCreateProgressPct(0)
+      message.error(formatSignalError(error))
+    },
+  })
+
+  useEffect(() => {
+    if (!createSignalEtfAutoMutation.isPending) return
+    setAutoCreateProgressPct((previous) => (previous > 5 ? previous : 5))
+    const timer = window.setInterval(() => {
+      setAutoCreateProgressPct((previous) => {
+        if (previous >= 92) return previous
+        const step = previous < 60 ? 4 : previous < 80 ? 2 : 1
+        return Math.min(92, previous + step)
+      })
+    }, 450)
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [createSignalEtfAutoMutation.isPending])
+
+  const handleOpenAutoCreateModal = () => {
+    if (mode !== 'trend_pool') {
+      message.warning('区间生成仅支持趋势池模式（需要 run_id 快照）。')
+      return
+    }
+    if (!runId) {
+      message.warning('请先绑定 run_id 后再批量生成。')
+      return
+    }
+    const anchorRaw = (signalQuery.data?.as_of_date ?? asOfDate).trim()
+    const anchor = dayjs(anchorRaw).isValid() ? dayjs(anchorRaw) : dayjs()
+    setAutoCreateDateRange([anchor.subtract(20, 'day').startOf('day'), anchor.startOf('day')])
+    setAutoCreateProgressPct(0)
+    setAutoCreateModalOpen(true)
+  }
+
+  const handleSubmitAutoCreate = () => {
+    if (mode !== 'trend_pool' || !runId) {
+      message.warning('请先绑定 run_id 后再批量生成。')
+      return
+    }
+    if (!autoCreateDateRange || !autoCreateDateRange[0] || !autoCreateDateRange[1]) {
+      message.warning('请选择有效的日期区间。')
+      return
+    }
+    const start = autoCreateDateRange[0]
+    const end = autoCreateDateRange[1]
+    if (!start.isValid() || !end.isValid()) {
+      message.warning('日期区间格式无效。')
+      return
+    }
+    const dateFrom = start.isBefore(end, 'day') ? start : end
+    const dateTo = start.isBefore(end, 'day') ? end : start
+    createSignalEtfAutoMutation.mutate({
+      run_id: runId,
+      strategy_id: strategyId,
+      strategy_name: selectedStrategy?.name || strategyId,
+      date_from: dateFrom.format('YYYY-MM-DD'),
+      date_to: dateTo.format('YYYY-MM-DD'),
+      trend_step: trendStep,
+      board_filters: boardFilters,
+      strategy_params: strategyParamsPayload,
+      window_days: windowDays,
+      min_score: minScore,
+      require_sequence: requireSequence,
+      min_event_count: minEventCount,
+      signal_age_min: signalAgeMin,
+      signal_age_max: signalAgeMax ?? undefined,
+      refresh_signals: false,
+    })
+  }
 
   const handleCreateSignalEtfBacktest = () => {
     if (filteredRows.length <= 0) {
@@ -1930,6 +2025,14 @@ export function SignalsPage() {
                   一键生成ETF回测
                 </Button>
                 <Button
+                  icon={<LineChartOutlined />}
+                  loading={createSignalEtfAutoMutation.isPending}
+                  disabled={signalQuery.isLoading || mode !== 'trend_pool' || !runId}
+                  onClick={handleOpenAutoCreateModal}
+                >
+                  区间生成ETF回测
+                </Button>
+                <Button
                   icon={<ReloadOutlined />}
                   loading={manualRefreshing && signalQuery.isFetching}
                   onClick={handleForceRefresh}
@@ -1966,6 +2069,50 @@ export function SignalsPage() {
           }}
         />
       </Card>
+
+      <Modal
+        title="区间生成ETF回测"
+        open={autoCreateModalOpen}
+        okText="开始生成"
+        cancelText="取消"
+        confirmLoading={createSignalEtfAutoMutation.isPending}
+        onCancel={() => {
+          if (createSignalEtfAutoMutation.isPending) return
+          setAutoCreateModalOpen(false)
+          setAutoCreateProgressPct(0)
+        }}
+        onOk={handleSubmitAutoCreate}
+      >
+        <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+          <Typography.Text type="secondary">
+            使用同一 run_id 快照逐日重建候选池，并按当前策略设置批量生成ETF回测。
+          </Typography.Text>
+          <Typography.Text>run_id：{runId || '--'}</Typography.Text>
+          <Typography.Text>策略：{selectedStrategy?.name || strategyId}</Typography.Text>
+          <DatePicker.RangePicker
+            style={{ width: '100%' }}
+            allowClear
+            value={autoCreateDateRange ? [autoCreateDateRange[0], autoCreateDateRange[1]] : null}
+            onChange={(values) => {
+              if (!values || !values[0] || !values[1]) {
+                setAutoCreateDateRange(null)
+                return
+              }
+              setAutoCreateDateRange([values[0], values[1]])
+            }}
+          />
+          <Typography.Text type="secondary">
+            当前附带参数：step={trendStep}，窗口={windowDays}，最低分={minScore}，最少事件={minEventCount}。
+          </Typography.Text>
+          {createSignalEtfAutoMutation.isPending || autoCreateProgressPct > 0 ? (
+            <Progress
+              percent={Math.round(autoCreateProgressPct)}
+              status={createSignalEtfAutoMutation.isPending ? 'active' : 'normal'}
+              size="small"
+            />
+          ) : null}
+        </Space>
+      </Modal>
     </Space>
   )
 }

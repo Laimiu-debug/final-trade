@@ -9,6 +9,7 @@ import {
   Empty,
   Form,
   Input,
+  InputNumber,
   Modal,
   Popconfirm,
   Slider,
@@ -26,6 +27,7 @@ import {
   listSignalEtfBacktests,
   updateSignalEtfBacktest,
 } from '@/shared/api/endpoints'
+import { ApiError } from '@/shared/api/client'
 import { PageHeader } from '@/shared/components/PageHeader'
 import type {
   SignalEtfBacktestConstituentDetail,
@@ -94,6 +96,38 @@ function buildTwoLineTitle(title: string, subtitle: string) {
   )
 }
 
+const SIGNALS_BACKTEST_LIST_PAGE_SIZE_KEY = 'tdx-signals-backtest-list-page-size-v1'
+const SIGNALS_BACKTEST_CONSTITUENT_PAGE_SIZE_KEY = 'tdx-signals-backtest-constituent-page-size-v1'
+const SIGNALS_BACKTEST_LIST_HOLDING_DAYS_KEY = 'tdx-signals-backtest-list-holding-days-v1'
+
+function loadPersistedPageSize(storageKey: string) {
+  try {
+    const raw = Number(window.localStorage.getItem(storageKey) ?? '')
+    if (raw === 20 || raw === 50 || raw === 100) return raw
+  } catch {
+    // ignore localStorage failures
+  }
+  return 20
+}
+
+function loadPersistedHoldingDays(storageKey: string) {
+  try {
+    const raw = Number(window.localStorage.getItem(storageKey) ?? '')
+    if (Number.isFinite(raw)) {
+      const normalized = Math.round(raw)
+      if (normalized >= 1 && normalized <= 120) return normalized
+    }
+  } catch {
+    // ignore localStorage failures
+  }
+  return 5
+}
+
+function isSignalEtfNotFoundError(error: unknown) {
+  if (!(error instanceof ApiError)) return false
+  return error.code === 'SIGNAL_ETF_NOT_FOUND' || error.code === 'HTTP_404'
+}
+
 export function SignalsBacktestPage() {
   const { message } = AntdApp.useApp()
   const [searchParams] = useSearchParams()
@@ -103,25 +137,46 @@ export function SignalsBacktestPage() {
   const [editingRecord, setEditingRecord] = useState<SignalEtfBacktestRecord | null>(null)
   const [valuationDate, setValuationDate] = useState<string | null>(null)
   const [valuationDateOptions, setValuationDateOptions] = useState<string[]>([])
+  const [listPage, setListPage] = useState(1)
+  const [listPageSize, setListPageSize] = useState(() => loadPersistedPageSize(SIGNALS_BACKTEST_LIST_PAGE_SIZE_KEY))
+  const [selectedRecordIds, setSelectedRecordIds] = useState<string[]>([])
+  const [constituentPage, setConstituentPage] = useState(1)
+  const [constituentPageSize, setConstituentPageSize] = useState(
+    () => loadPersistedPageSize(SIGNALS_BACKTEST_CONSTITUENT_PAGE_SIZE_KEY),
+  )
+  const [listHoldingPeriodDays, setListHoldingPeriodDays] = useState(() =>
+    loadPersistedHoldingDays(SIGNALS_BACKTEST_LIST_HOLDING_DAYS_KEY),
+  )
+  const [detailHoldingPeriodDays, setDetailHoldingPeriodDays] = useState(5)
   const [editForm] = Form.useForm<{ name: string; notes: string }>()
   const highlightedRecordId = (searchParams.get('highlight') ?? '').trim()
 
   const listQuery = useQuery({
-    queryKey: ['signal-etf-backtests'],
-    queryFn: () => listSignalEtfBacktests({ refresh: true }),
+    queryKey: ['signal-etf-backtests', listHoldingPeriodDays],
+    queryFn: () => listSignalEtfBacktests({ refresh: true, holdingDays: listHoldingPeriodDays }),
     refetchInterval: 60_000,
     staleTime: 15_000,
   })
+  const rows = listQuery.data?.items ?? []
+  const selectedRecordExists = useMemo(
+    () => (selectedRecordId ? rows.some((item) => item.record_id === selectedRecordId) : false),
+    [rows, selectedRecordId],
+  )
 
   const detailQuery = useQuery({
-    queryKey: ['signal-etf-backtest-detail', selectedRecordId, valuationDate ?? 'latest'],
+    queryKey: ['signal-etf-backtest-detail', selectedRecordId, valuationDate ?? 'latest', detailHoldingPeriodDays],
     queryFn: () =>
       getSignalEtfBacktest(selectedRecordId as string, {
         refresh: true,
         asOfDate: valuationDate ?? undefined,
+        holdingDays: detailHoldingPeriodDays,
       }),
-    enabled: Boolean(selectedRecordId),
+    enabled: Boolean(selectedRecordId) && selectedRecordExists,
     staleTime: 0,
+    retry: (failureCount, error) => {
+      if (isSignalEtfNotFoundError(error)) return false
+      return failureCount < 1
+    },
   })
 
   const updateMutation = useMutation({
@@ -155,16 +210,91 @@ export function SignalsBacktestPage() {
     },
   })
 
-  const rows = listQuery.data?.items ?? []
+  const batchDeleteMutation = useMutation({
+    mutationFn: async (recordIds: string[]) => {
+      const tasks = recordIds.map(async (recordId) => {
+        try {
+          const resp = await deleteSignalEtfBacktest(recordId)
+          return { ok: true as const, recordId: resp.record_id || recordId }
+        } catch (error) {
+          const text = error instanceof Error ? error.message : '删除失败'
+          return { ok: false as const, recordId, message: text }
+        }
+      })
+      const results = await Promise.all(tasks)
+      const successIds = results.filter((item) => item.ok).map((item) => item.recordId)
+      const failed = results.filter((item) => !item.ok)
+      return { successIds, failed }
+    },
+    onSuccess: (result) => {
+      const { successIds, failed } = result
+      if (successIds.length > 0) {
+        message.success(`批量删除成功 ${successIds.length} 条`)
+      }
+      if (failed.length > 0) {
+        const hint = failed
+          .slice(0, 2)
+          .map((item) => `${item.recordId}(${item.message})`)
+          .join('；')
+        message.error(`批量删除失败 ${failed.length} 条${hint ? `：${hint}` : ''}`)
+      }
+      if (selectedRecordId && successIds.includes(selectedRecordId)) {
+        setSelectedRecordId(null)
+      }
+      setSelectedRecordIds((prev) => prev.filter((recordId) => !successIds.includes(recordId)))
+      void queryClient.invalidateQueries({ queryKey: ['signal-etf-backtests'] })
+    },
+  })
+
   const strategyFilters = useMemo(() => buildFilters(rows.map((row) => row.strategy_name || row.strategy_id)), [rows])
   const signalDateFilters = useMemo(() => buildFilters(rows.map((row) => row.signal_date)), [rows])
   const detail = detailQuery.data
   const constituents = detail?.constituents ?? []
 
   useEffect(() => {
+    if (!selectedRecordId) return
+    if (listQuery.isLoading || listQuery.isFetching) return
+    if (selectedRecordExists) return
+    message.warning('该回测记录已不存在，已关闭详情弹窗。')
+    setSelectedRecordId(null)
+  }, [listQuery.isFetching, listQuery.isLoading, message, selectedRecordExists, selectedRecordId])
+
+  useEffect(() => {
     setValuationDate(null)
     setValuationDateOptions([])
+    setConstituentPage(1)
   }, [selectedRecordId])
+
+  useEffect(() => {
+    const validIds = new Set(rows.map((row) => row.record_id))
+    setSelectedRecordIds((prev) => {
+      const next = prev.filter((recordId) => validIds.has(recordId))
+      return next.length === prev.length ? prev : next
+    })
+  }, [rows])
+
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(rows.length / listPageSize))
+    if (listPage > maxPage) {
+      setListPage(maxPage)
+    }
+  }, [listPage, listPageSize, rows.length])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIGNALS_BACKTEST_LIST_PAGE_SIZE_KEY, String(listPageSize))
+    } catch {
+      // ignore localStorage failures
+    }
+  }, [listPageSize])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIGNALS_BACKTEST_LIST_HOLDING_DAYS_KEY, String(listHoldingPeriodDays))
+    } catch {
+      // ignore localStorage failures
+    }
+  }, [listHoldingPeriodDays])
 
   useEffect(() => {
     if (!detail || valuationDate !== null) return
@@ -232,6 +362,10 @@ export function SignalsBacktestPage() {
     () => toSingleDateLabel(constituents.map((row) => row.current_date)),
     [constituents],
   )
+  const holdingTargetDateLabel = useMemo(
+    () => toSingleDateLabel(constituents.map((row) => row.holding_target_date)),
+    [constituents],
+  )
 
   const constituentRows = useMemo<ConstituentTableRow[]>(() => {
     const tradableCountT1 = detail?.summary.t1.tradable_count ?? 0
@@ -259,6 +393,21 @@ export function SignalsBacktestPage() {
       }
     })
   }, [constituents, detail?.summary.t1.tradable_count, detail?.summary.t2.tradable_count])
+
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(constituentRows.length / constituentPageSize))
+    if (constituentPage > maxPage) {
+      setConstituentPage(maxPage)
+    }
+  }, [constituentPage, constituentPageSize, constituentRows.length])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIGNALS_BACKTEST_CONSTITUENT_PAGE_SIZE_KEY, String(constituentPageSize))
+    } catch {
+      // ignore localStorage failures
+    }
+  }, [constituentPageSize])
 
   const chartOption = useMemo(() => {
     const curve = detail?.curve ?? []
@@ -434,6 +583,37 @@ export function SignalsBacktestPage() {
         render: (_, row) => `${toSignedPercent(row.summary.t1.excess_return_pct)} / ${toSignedPercent(row.summary.t2.excess_return_pct)}`,
       },
       {
+        title: (
+          <div onClick={(event) => event.stopPropagation()}>
+            <Space size={4} align="center" wrap={false}>
+              <Typography.Text style={{ fontSize: 12 }}>持仓</Typography.Text>
+              <InputNumber
+                value={listHoldingPeriodDays}
+                min={1}
+                max={120}
+                size="small"
+                style={{ width: 64 }}
+                onChange={(value: number | null) => {
+                  if (typeof value === 'number' && Number.isFinite(value)) {
+                    const normalized = Math.max(1, Math.min(120, Math.round(value)))
+                    setListHoldingPeriodDays(normalized)
+                  }
+                }}
+              />
+              <Typography.Text style={{ fontSize: 12 }}>天收益</Typography.Text>
+            </Space>
+          </div>
+        ),
+        key: 'holding_return',
+        width: 156,
+        sorter: (a, b) => Number(a.summary.holding_return_pct ?? -99) - Number(b.summary.holding_return_pct ?? -99),
+        render: (_, row) => (
+          <Typography.Text style={{ color: toSignedColor(row.summary.holding_return_pct) }}>
+            {toSignedPercent(row.summary.holding_return_pct)}
+          </Typography.Text>
+        ),
+      },
+      {
         title: '操作',
         key: 'actions',
         width: 120,
@@ -476,7 +656,14 @@ export function SignalsBacktestPage() {
         ),
       },
     ],
-    [deleteMutation.isPending, editForm, highlightedRecordId, signalDateFilters, strategyFilters],
+    [
+      deleteMutation.isPending,
+      editForm,
+      highlightedRecordId,
+      listHoldingPeriodDays,
+      signalDateFilters,
+      strategyFilters,
+    ],
   )
 
   const constituentColumns = useMemo<ColumnsType<ConstituentTableRow>>(
@@ -567,6 +754,40 @@ export function SignalsBacktestPage() {
         ),
       },
       {
+        title: (
+          <div onClick={(event) => event.stopPropagation()}>
+            <Space size={4} align="center" wrap={false}>
+              <Typography.Text style={{ fontSize: 12 }}>持仓</Typography.Text>
+              <InputNumber
+                value={detailHoldingPeriodDays}
+                min={1}
+                max={120}
+                size="small"
+                style={{ width: 68 }}
+                onChange={(value: number | null) => {
+                  if (typeof value === 'number' && Number.isFinite(value)) {
+                    const normalized = Math.max(1, Math.min(120, Math.round(value)))
+                    setDetailHoldingPeriodDays(normalized)
+                  }
+                }}
+              />
+              <Typography.Text style={{ fontSize: 12 }}>天收益</Typography.Text>
+            </Space>
+            <div style={{ marginTop: 2, fontSize: 11, color: 'rgba(0, 0, 0, 0.45)' }}>
+              {holdingTargetDateLabel}
+            </div>
+          </div>
+        ),
+        key: 'return_holding',
+        width: 156,
+        sorter: (a, b) => Number(a.return_pct_holding ?? -99) - Number(b.return_pct_holding ?? -99),
+        render: (_, row) => (
+          <Typography.Text style={{ color: toSignedColor(row.return_pct_holding) }}>
+            {toSignedPercent(row.return_pct_holding)}
+          </Typography.Text>
+        ),
+      },
+      {
         title: buildTwoLineTitle('收益率贡献', 'T+1 / T+2'),
         key: 'contribution',
         width: 132,
@@ -584,7 +805,14 @@ export function SignalsBacktestPage() {
         ),
       },
     ],
-    [buyDateT1Label, buyDateT2Label, currentDateLabel, navigate],
+    [
+      buyDateT1Label,
+      buyDateT2Label,
+      currentDateLabel,
+      detailHoldingPeriodDays,
+      holdingTargetDateLabel,
+      navigate,
+    ],
   )
 
   return (
@@ -600,18 +828,39 @@ export function SignalsBacktestPage() {
           <Typography.Text type="secondary">
             共 {rows.length} 条记录，自动按最新行情刷新收益与胜率。
           </Typography.Text>
-          <Button
-            icon={<ReloadOutlined />}
-            loading={listQuery.isFetching}
-            onClick={() => {
-              void queryClient.invalidateQueries({ queryKey: ['signal-etf-backtests'] })
-              if (selectedRecordId) {
-                void queryClient.invalidateQueries({ queryKey: ['signal-etf-backtest-detail', selectedRecordId] })
-              }
-            }}
-          >
-            立即刷新
-          </Button>
+          <Space size={8}>
+            <Tag color={selectedRecordIds.length > 0 ? 'blue' : 'default'}>已选 {selectedRecordIds.length} 条</Tag>
+            <Button disabled={selectedRecordIds.length <= 0} onClick={() => setSelectedRecordIds([])}>
+              清空选择
+            </Button>
+            <Popconfirm
+              title={`删除已选 ${selectedRecordIds.length} 条记录？`}
+              description="删除后不可恢复。"
+              disabled={selectedRecordIds.length <= 0}
+              onConfirm={() => batchDeleteMutation.mutate([...selectedRecordIds])}
+            >
+              <Button
+                danger
+                icon={<DeleteOutlined />}
+                disabled={selectedRecordIds.length <= 0}
+                loading={batchDeleteMutation.isPending}
+              >
+                批量删除
+              </Button>
+            </Popconfirm>
+            <Button
+              icon={<ReloadOutlined />}
+              loading={listQuery.isFetching}
+              onClick={() => {
+                void queryClient.invalidateQueries({ queryKey: ['signal-etf-backtests'] })
+                if (selectedRecordId) {
+                  void queryClient.invalidateQueries({ queryKey: ['signal-etf-backtest-detail', selectedRecordId] })
+                }
+              }}
+            >
+              立即刷新
+            </Button>
+          </Space>
         </Space>
 
         <Table
@@ -622,15 +871,28 @@ export function SignalsBacktestPage() {
           dataSource={rows}
           columns={columns}
           scroll={{ x: 1480 }}
+          rowSelection={{
+            selectedRowKeys: selectedRecordIds,
+            onChange: (keys) => setSelectedRecordIds(keys.map((item) => String(item))),
+          }}
           pagination={{
-            pageSize: 20,
+            current: listPage,
+            pageSize: listPageSize,
             showSizeChanger: true,
             pageSizeOptions: ['20', '50', '100'],
             size: 'small',
             showTotal: (total) => `共 ${total} 条`,
+            onChange: (page, pageSize) => {
+              setListPage(page)
+              setListPageSize(pageSize)
+            },
           }}
           onRow={(record) => ({
-            onClick: () => setSelectedRecordId(record.record_id),
+            onClick: (event) => {
+              const target = event.target as HTMLElement | null
+              if (target?.closest('.ant-table-selection-column') || target?.closest('.ant-checkbox-wrapper')) return
+              setSelectedRecordId(record.record_id)
+            },
           })}
           locale={{
             emptyText: listQuery.isLoading ? '加载中...' : <Empty description="暂无待买回测记录，请去待买信号页一键生成。" />,
@@ -731,9 +993,14 @@ export function SignalsBacktestPage() {
               columns={constituentColumns}
               scroll={{ x: 1220, y: 360 }}
               pagination={{
-                pageSize: 20,
+                current: constituentPage,
+                pageSize: constituentPageSize,
                 showSizeChanger: true,
                 pageSizeOptions: ['20', '50', '100'],
+                onChange: (page, pageSize) => {
+                  setConstituentPage(page)
+                  setConstituentPageSize(pageSize)
+                },
               }}
             />
           </Card>

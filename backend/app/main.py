@@ -60,6 +60,8 @@ from .models import (
     SystemStorageStatus,
     SignalScanMode,
     SignalEtfBacktestCreateRequest,
+    SignalEtfBacktestAutoCreateRequest,
+    SignalEtfBacktestAutoCreateResponse,
     SignalEtfBacktestDeleteResponse,
     SignalEtfBacktestDetail,
     SignalEtfBacktestListResponse,
@@ -258,10 +260,25 @@ def post_signal_etf_backtest(
         return error_response(400, "SIGNAL_ETF_INVALID", str(exc))
 
 
-@app.get("/api/signals/etf-backtests", response_model=SignalEtfBacktestListResponse)
-def get_signal_etf_backtests(refresh: bool = Query(default=True)) -> SignalEtfBacktestListResponse | JSONResponse:
+@app.post("/api/signals/etf-backtests/auto", response_model=SignalEtfBacktestAutoCreateResponse)
+def post_signal_etf_backtest_auto(
+    payload: SignalEtfBacktestAutoCreateRequest,
+) -> SignalEtfBacktestAutoCreateResponse | JSONResponse:
     try:
-        return store.list_signal_etf_backtests(refresh=refresh)
+        return store.create_signal_etf_backtests_auto(payload)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "SIGNAL_ETF_INVALID", str(exc))
+
+
+@app.get("/api/signals/etf-backtests", response_model=SignalEtfBacktestListResponse)
+def get_signal_etf_backtests(
+    refresh: bool = Query(default=True),
+    holding_days: int | None = Query(default=None, ge=1, le=120),
+) -> SignalEtfBacktestListResponse | JSONResponse:
+    try:
+        return store.list_signal_etf_backtests(refresh=refresh, holding_days=holding_days)
     except BacktestValidationError as exc:
         return error_response(400, exc.code, str(exc))
     except ValueError as exc:
@@ -273,9 +290,15 @@ def get_signal_etf_backtest(
     record_id: str = Path(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9._-]+$"),
     refresh: bool = Query(default=True),
     as_of_date: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    holding_days: int | None = Query(default=None, ge=1, le=120),
 ) -> SignalEtfBacktestDetail | JSONResponse:
     try:
-        detail = store.get_signal_etf_backtest(record_id, refresh=refresh, as_of_date=as_of_date)
+        detail = store.get_signal_etf_backtest(
+            record_id,
+            refresh=refresh,
+            as_of_date=as_of_date,
+            holding_days=holding_days,
+        )
     except BacktestValidationError as exc:
         return error_response(400, exc.code, str(exc))
     except ValueError as exc:

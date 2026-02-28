@@ -43,6 +43,8 @@ import type {
   ScreenerRunResponse,
   SignalScanMode,
   SignalEtfBacktestCreateRequest,
+  SignalEtfBacktestAutoCreateRequest,
+  SignalEtfBacktestAutoCreateResponse,
   SignalEtfBacktestDeleteResponse,
   SignalEtfBacktestDetail,
   SignalEtfBacktestListResponse,
@@ -194,19 +196,34 @@ export function createSignalEtfBacktest(payload: SignalEtfBacktestCreateRequest)
   })
 }
 
-export function listSignalEtfBacktests(params?: { refresh?: boolean }) {
+export function createSignalEtfBacktestsAuto(payload: SignalEtfBacktestAutoCreateRequest) {
+  return apiRequest<SignalEtfBacktestAutoCreateResponse>('/api/signals/etf-backtests/auto', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    timeoutMs: 420_000,
+  })
+}
+
+export function listSignalEtfBacktests(params?: { refresh?: boolean; holdingDays?: number }) {
   const query = new URLSearchParams()
   if (typeof params?.refresh === 'boolean') query.set('refresh', String(params.refresh))
+  if (typeof params?.holdingDays === 'number' && Number.isFinite(params.holdingDays) && params.holdingDays > 0) {
+    query.set('holding_days', String(Math.round(params.holdingDays)))
+  }
   const suffix = query.toString()
   return apiRequest<SignalEtfBacktestListResponse>(`/api/signals/etf-backtests${suffix ? `?${suffix}` : ''}`, {
     timeoutMs: 90_000,
   })
 }
 
-export function getSignalEtfBacktest(recordId: string, params?: { refresh?: boolean; asOfDate?: string }) {
+export function getSignalEtfBacktest(recordId: string, params?: { refresh?: boolean; asOfDate?: string; holdingDays?: number }) {
   const query = new URLSearchParams()
   if (typeof params?.refresh === 'boolean') query.set('refresh', String(params.refresh))
   if (typeof params?.asOfDate === 'string' && params.asOfDate.trim()) query.set('as_of_date', params.asOfDate.trim())
+  if (typeof params?.holdingDays === 'number' && Number.isFinite(params.holdingDays) && params.holdingDays > 0) {
+    query.set('holding_days', String(Math.round(params.holdingDays)))
+  }
   const suffix = query.toString()
   return apiRequest<SignalEtfBacktestDetail>(
     `/api/signals/etf-backtests/${encodeURIComponent(recordId)}${suffix ? `?${suffix}` : ''}`,

@@ -294,6 +294,54 @@ export interface SignalEtfBacktestCreateRequest {
   constituents: SignalEtfBacktestConstituentInput[]
 }
 
+export interface SignalEtfBacktestAutoCreateRequest {
+  run_id: string
+  strategy_id: string
+  strategy_name?: string
+  date_from: string
+  date_to: string
+  trend_step?: TrendPoolStep
+  board_filters?: BoardFilter[]
+  strategy_params?: Record<string, unknown>
+  window_days?: number
+  min_score?: number
+  require_sequence?: boolean
+  min_event_count?: number
+  signal_age_min?: number
+  signal_age_max?: number
+  name_prefix?: string
+  notes?: string
+  refresh_signals?: boolean
+}
+
+export interface SignalEtfBacktestAutoCreateItem {
+  record_id: string
+  name: string
+  signal_date: string
+  as_of_date: string
+  total_constituents: number
+}
+
+export interface SignalEtfBacktestAutoCreateIssue {
+  as_of_date: string
+  reason: string
+}
+
+export interface SignalEtfBacktestAutoCreateResponse {
+  run_id: string
+  strategy_id: string
+  strategy_name: string
+  date_from: string
+  date_to: string
+  processed_dates: number
+  created_count: number
+  skipped_count: number
+  failed_count: number
+  created: SignalEtfBacktestAutoCreateItem[]
+  skipped: SignalEtfBacktestAutoCreateIssue[]
+  failed: SignalEtfBacktestAutoCreateIssue[]
+}
+
 export interface SignalEtfBacktestUpdateRequest {
   name?: string
   notes?: string
@@ -320,6 +368,9 @@ export interface SignalEtfBacktestSummary {
   t1: SignalEtfBacktestPerformance
   t2: SignalEtfBacktestPerformance
   strategy_stats: SignalEtfBacktestStrategyStats
+  holding_period_days?: number
+  holding_target_date?: string
+  holding_return_pct?: number
 }
 
 export interface SignalEtfBacktestRecord {
@@ -353,6 +404,9 @@ export interface SignalEtfBacktestConstituentDetail {
   buy_price_t2?: number
   return_pct_t2?: number
   status_t2: 'bought' | 'skipped'
+  holding_period_days?: number
+  holding_target_date?: string
+  return_pct_holding?: number
 }
 
 export interface SignalEtfBacktestCurvePoint {
