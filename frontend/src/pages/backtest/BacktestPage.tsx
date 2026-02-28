@@ -8,6 +8,7 @@ import {
   Card,
   Col,
   DatePicker,
+  Dropdown,
   Input,
   InputNumber,
   Modal,
@@ -23,6 +24,7 @@ import {
   Tag,
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
+import type { MenuProps } from 'antd'
 import ReactECharts from 'echarts-for-react'
 import { Link } from 'react-router-dom'
 import * as XLSX from 'xlsx'
@@ -64,6 +66,7 @@ import {
 } from '@/shared/utils/strategyParams'
 import type {
   BacktestPlateauCorrelationRow,
+  BacktestPlateauParams,
   BacktestPlateauPoint,
   BacktestPlateauResponse,
   BacktestPlateauTaskStatusResponse,
@@ -134,6 +137,14 @@ type PlateauAxisKey =
   | 'max_symbols'
   | 'priority_topk_per_day'
 type PlateauMetricKey = 'score' | 'total_return'
+type PlateauHistoryExportFormat = 'excel' | 'html' | 'ftbt'
+type PlateauPointRunRecord = {
+  rank: number
+  point: BacktestPlateauPoint
+  runRequest: BacktestRunRequest
+  runResult: BacktestResponse | null
+  error: string | null
+}
 
 const PLATEAU_AXIS_OPTIONS: Array<{ value: PlateauAxisKey; label: string }> = [
   { value: 'window_days', label: '信号窗口天数' },
@@ -159,6 +170,12 @@ const PLATEAU_AXIS_LABEL_MAP: Record<PlateauAxisKey, string> = Object.fromEntrie
 const PLATEAU_METRIC_LABEL_MAP: Record<PlateauMetricKey, string> = Object.fromEntries(
   PLATEAU_METRIC_OPTIONS.map((item) => [item.value, item.label]),
 ) as Record<PlateauMetricKey, string>
+
+const PLATEAU_HISTORY_EXPORT_LABEL_MAP: Record<PlateauHistoryExportFormat, string> = {
+  excel: 'Excel',
+  html: 'HTML',
+  ftbt: 'ftbt',
+}
 
 type BacktestFormDraft = {
   mode: SignalScanMode
@@ -972,6 +989,330 @@ function buildBacktestReportHtml(
 </html>`
 }
 
+function buildRunRequestFromPlateauParams(
+  basePayload: BacktestRunRequest,
+  params: BacktestPlateauParams,
+): BacktestRunRequest {
+  return {
+    ...basePayload,
+    window_days: Number(params.window_days),
+    min_score: Number(params.min_score),
+    stop_loss: Number(params.stop_loss),
+    take_profit: Number(params.take_profit),
+    trailing_stop_pct: Number(params.trailing_stop_pct),
+    max_positions: Number(params.max_positions),
+    position_pct: Number(params.position_pct),
+    max_symbols: Number(params.max_symbols),
+    priority_topk_per_day: Number(params.priority_topk_per_day),
+  }
+}
+
+function buildPlateauHistoryWorkbookBuffer(
+  taskId: string,
+  plateauResult: BacktestPlateauResponse,
+): ArrayBuffer {
+  const workbook = XLSX.utils.book_new()
+  const bestPoint = plateauResult.best_point ?? null
+  const correlations = resolvePlateauCorrelations(plateauResult)
+  const overviewRows = [
+    {
+      task_id: taskId,
+      generated_at: plateauResult.generated_at,
+      total_combinations: plateauResult.total_combinations,
+      evaluated_combinations: plateauResult.evaluated_combinations,
+      best_score: bestPoint?.score ?? null,
+      best_total_return: bestPoint?.stats.total_return ?? null,
+      best_max_drawdown: bestPoint?.stats.max_drawdown ?? null,
+      best_win_rate: bestPoint?.stats.win_rate ?? null,
+      best_trade_count: bestPoint?.stats.trade_count ?? null,
+      points_count: plateauResult.points.length,
+      note_count: plateauResult.notes.length,
+    },
+  ]
+  const pointsRows = plateauResult.points.map((row, index) => ({
+    rank: index + 1,
+    status: row.error ? 'failed' : 'succeeded',
+    error: row.error ?? '',
+    score: row.score,
+    total_return: row.stats.total_return,
+    max_drawdown: row.stats.max_drawdown,
+    win_rate: row.stats.win_rate,
+    trade_count: row.stats.trade_count,
+    candidate_count: row.candidate_count,
+    skipped_count: row.skipped_count,
+    fill_rate: row.fill_rate,
+    max_concurrent_positions: row.max_concurrent_positions,
+    cache_hit: row.cache_hit,
+    window_days: row.params.window_days,
+    min_score: row.params.min_score,
+    stop_loss: row.params.stop_loss,
+    take_profit: row.params.take_profit,
+    trailing_stop_pct: row.params.trailing_stop_pct,
+    max_positions: row.params.max_positions,
+    position_pct: row.params.position_pct,
+    max_symbols: row.params.max_symbols,
+    priority_topk_per_day: row.params.priority_topk_per_day,
+  }))
+  const correlationRows = correlations.map((item) => ({
+    parameter: item.parameter,
+    parameter_label: item.parameter_label,
+    score_corr: item.score_corr,
+    score_direction: classifyCorrelationDirection(item.score_corr),
+    total_return_corr: item.total_return_corr,
+    total_return_direction: classifyCorrelationDirection(item.total_return_corr),
+    win_rate_corr: item.win_rate_corr,
+    win_rate_direction: classifyCorrelationDirection(item.win_rate_corr),
+  }))
+  const noteRows = plateauResult.notes.map((note, index) => ({ index: index + 1, note }))
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(overviewRows), 'PlateauSummary')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([plateauResult.base_payload]), 'BasePayload')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(pointsRows), 'PlateauPoints')
+  if (correlationRows.length > 0) {
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(correlationRows), 'PlateauCorr')
+  }
+  if (noteRows.length > 0) {
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(noteRows), 'PlateauNotes')
+  }
+  return XLSX.write(workbook, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer
+}
+
+function buildPlateauHistoryHtml(taskId: string, plateauResult: BacktestPlateauResponse): string {
+  const bestPoint = plateauResult.best_point ?? null
+  const correlations = resolvePlateauCorrelations(plateauResult)
+  const pointRows = plateauResult.points
+    .map((row, index) => (
+      `<tr>
+        <td>${index + 1}</td>
+        <td>${row.error ? 'failed' : 'succeeded'}</td>
+        <td>${row.error ? escapeHtml(row.error) : '-'}</td>
+        <td>${Number(row.score).toFixed(3)}</td>
+        <td>${(Number(row.stats.total_return) * 100).toFixed(2)}%</td>
+        <td>${(Number(row.stats.max_drawdown) * 100).toFixed(2)}%</td>
+        <td>${(Number(row.stats.win_rate) * 100).toFixed(2)}%</td>
+        <td>${row.stats.trade_count}</td>
+        <td>${row.params.window_days}</td>
+        <td>${Number(row.params.min_score).toFixed(2)}</td>
+        <td>${(Number(row.params.stop_loss) * 100).toFixed(2)}%</td>
+        <td>${(Number(row.params.take_profit) * 100).toFixed(2)}%</td>
+        <td>${(Number(row.params.trailing_stop_pct) * 100).toFixed(2)}%</td>
+      </tr>`
+    ))
+    .join('\n')
+  const correlationRows = correlations
+    .map((item) => (
+      `<tr>
+        <td>${escapeHtml(item.parameter_label)}</td>
+        <td>${formatSigned(item.score_corr)} (${classifyCorrelationDirection(item.score_corr)})</td>
+        <td>${formatSigned(item.total_return_corr)} (${classifyCorrelationDirection(item.total_return_corr)})</td>
+        <td>${formatSigned(item.win_rate_corr)} (${classifyCorrelationDirection(item.win_rate_corr)})</td>
+      </tr>`
+    ))
+    .join('\n')
+  const notes = plateauResult.notes.map((note) => `<li>${escapeHtml(note)}</li>`).join('\n')
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Plateau Report ${escapeHtml(taskId)}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; margin: 24px; color: #0f172a; }
+    h1, h2 { margin: 8px 0; }
+    .meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 16px; margin-bottom: 16px; }
+    .block { margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { border: 1px solid #cbd5e1; padding: 6px 8px; text-align: left; }
+    th { background: #f8fafc; }
+  </style>
+</head>
+<body>
+  <h1>收益平原历史报告</h1>
+  <div class="block">任务ID：${escapeHtml(taskId)}</div>
+  <div class="meta">
+    <div>生成时间：${escapeHtml(plateauResult.generated_at)}</div>
+    <div>总组合：${plateauResult.total_combinations}</div>
+    <div>评估组数：${plateauResult.evaluated_combinations}</div>
+    <div>最佳评分：${bestPoint ? bestPoint.score.toFixed(3) : '--'}</div>
+    <div>最佳收益：${bestPoint ? `${(Number(bestPoint.stats.total_return) * 100).toFixed(2)}%` : '--'}</div>
+    <div>最佳胜率：${bestPoint ? `${(Number(bestPoint.stats.win_rate) * 100).toFixed(2)}%` : '--'}</div>
+  </div>
+  <h2>基础参数快照</h2>
+  <pre>${escapeHtml(JSON.stringify(plateauResult.base_payload, null, 2))}</pre>
+  <h2>参数相关性分析</h2>
+  ${correlationRows
+    ? `<table>
+      <thead>
+        <tr><th>参数</th><th>与评分相关</th><th>与收益相关</th><th>与胜率相关</th></tr>
+      </thead>
+      <tbody>${correlationRows}</tbody>
+    </table>`
+    : '<div>有效参数组不足，暂无相关性分析。</div>'}
+  <h2>收益平原说明</h2>
+  <ul>${notes || '<li>无</li>'}</ul>
+  <h2>参数组明细</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>rank</th><th>status</th><th>error</th><th>score</th><th>total_return</th><th>max_drawdown</th><th>win_rate</th><th>trade_count</th>
+        <th>window_days</th><th>min_score</th><th>stop_loss</th><th>take_profit</th><th>trailing_stop_pct</th>
+      </tr>
+    </thead>
+    <tbody>${pointRows || '<tr><td colspan="13">无</td></tr>'}</tbody>
+  </table>
+</body>
+</html>`
+}
+
+function buildPlateauAllTradesWorkbookBuffer(
+  taskId: string,
+  plateauResult: BacktestPlateauResponse,
+  pointRuns: PlateauPointRunRecord[],
+): ArrayBuffer {
+  const workbook = XLSX.utils.book_new()
+  const bestPoint = plateauResult.best_point ?? null
+  const overviewRows = [
+    {
+      task_id: taskId,
+      generated_at: plateauResult.generated_at,
+      total_combinations: plateauResult.total_combinations,
+      evaluated_combinations: plateauResult.evaluated_combinations,
+      replay_total_points: pointRuns.length,
+      replay_success_points: pointRuns.filter((item) => item.runResult).length,
+      replay_failed_points: pointRuns.filter((item) => !item.runResult).length,
+      best_score: bestPoint?.score ?? null,
+      best_total_return: bestPoint?.stats.total_return ?? null,
+      best_win_rate: bestPoint?.stats.win_rate ?? null,
+    },
+  ]
+  const runSummaryRows = pointRuns.map((item) => ({
+    rank: item.rank,
+    status: item.runResult ? 'succeeded' : 'failed',
+    error: item.error ?? '',
+    score: item.point.score,
+    total_return: item.runResult?.stats.total_return ?? item.point.stats.total_return,
+    max_drawdown: item.runResult?.stats.max_drawdown ?? item.point.stats.max_drawdown,
+    win_rate: item.runResult?.stats.win_rate ?? item.point.stats.win_rate,
+    trade_count: item.runResult?.stats.trade_count ?? item.point.stats.trade_count,
+    window_days: item.point.params.window_days,
+    min_score: item.point.params.min_score,
+    stop_loss: item.point.params.stop_loss,
+    take_profit: item.point.params.take_profit,
+    trailing_stop_pct: item.point.params.trailing_stop_pct,
+    max_positions: item.point.params.max_positions,
+    position_pct: item.point.params.position_pct,
+    max_symbols: item.point.params.max_symbols,
+    priority_topk_per_day: item.point.params.priority_topk_per_day,
+  }))
+  const allTradeRows = pointRuns.flatMap((item) => {
+    if (!item.runResult) return []
+    return item.runResult.trades.map((trade, index) => {
+      const parsedExit = parseExitReason(trade.exit_reason)
+      return {
+        rank: item.rank,
+        score: Number(item.point.score.toFixed(3)),
+        trade_index: index + 1,
+        symbol: trade.symbol,
+        name: trade.name,
+        signal_date: trade.signal_date,
+        entry_date: trade.entry_date,
+        exit_date: trade.exit_date,
+        entry_signal: formatEventSequence(trade.entry_signal),
+        entry_phase: trade.entry_phase,
+        exit_reason: parsedExit.detail ? `${parsedExit.label}:${parsedExit.detail}` : parsedExit.label,
+        quantity: trade.quantity,
+        entry_price: trade.entry_price,
+        exit_price: trade.exit_price,
+        holding_days: trade.holding_days,
+        pnl_amount: trade.pnl_amount,
+        pnl_ratio: trade.pnl_ratio,
+        health_score: trade.health_score ?? 0,
+        event_score: trade.event_score ?? 0,
+        risk_score: trade.risk_score ?? 0,
+        confirmation_status: trade.confirmation_status ?? 'unconfirmed',
+      }
+    })
+  })
+  const allEquityRows = pointRuns.flatMap((item) => {
+    if (!item.runResult) return []
+    return item.runResult.equity_curve.map((row) => ({
+      rank: item.rank,
+      date: row.date,
+      equity: row.equity,
+      realized_pnl: row.realized_pnl,
+    }))
+  })
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(overviewRows), 'PlateauSummary')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([plateauResult.base_payload]), 'BasePayload')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(runSummaryRows), 'PointRuns')
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(allTradeRows), 'AllTrades')
+  if (allEquityRows.length > 0) {
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(allEquityRows), 'AllEquity')
+  }
+  return XLSX.write(workbook, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer
+}
+
+function buildPlateauAllTradesHtml(
+  taskId: string,
+  plateauResult: BacktestPlateauResponse,
+  pointRuns: PlateauPointRunRecord[],
+): string {
+  const replaySuccessCount = pointRuns.filter((item) => item.runResult).length
+  const replayFailedCount = pointRuns.length - replaySuccessCount
+  const runSummaryRows = pointRuns
+    .map((item) => (
+      `<tr>
+        <td>${item.rank}</td>
+        <td>${item.runResult ? 'succeeded' : 'failed'}</td>
+        <td>${item.error ? escapeHtml(item.error) : '-'}</td>
+        <td>${item.point.score.toFixed(3)}</td>
+        <td>${((item.runResult?.stats.total_return ?? item.point.stats.total_return) * 100).toFixed(2)}%</td>
+        <td>${((item.runResult?.stats.max_drawdown ?? item.point.stats.max_drawdown) * 100).toFixed(2)}%</td>
+        <td>${((item.runResult?.stats.win_rate ?? item.point.stats.win_rate) * 100).toFixed(2)}%</td>
+        <td>${item.runResult?.stats.trade_count ?? item.point.stats.trade_count}</td>
+      </tr>`
+    ))
+    .join('\n')
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Plateau ftbt ${escapeHtml(taskId)}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; margin: 24px; color: #0f172a; }
+    h1, h2 { margin: 8px 0; }
+    .meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 16px; margin-bottom: 16px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { border: 1px solid #cbd5e1; padding: 6px 8px; text-align: left; }
+    th { background: #f8fafc; }
+  </style>
+</head>
+<body>
+  <h1>收益平原 ftbt 导出</h1>
+  <div class="meta">
+    <div>任务ID：${escapeHtml(taskId)}</div>
+    <div>生成时间：${escapeHtml(plateauResult.generated_at)}</div>
+    <div>总组合：${plateauResult.total_combinations}</div>
+    <div>评估组数：${plateauResult.evaluated_combinations}</div>
+    <div>回放成功：${replaySuccessCount}</div>
+    <div>回放失败：${replayFailedCount}</div>
+  </div>
+  <h2>参数组回放摘要</h2>
+  <table>
+    <thead>
+      <tr><th>rank</th><th>status</th><th>error</th><th>score</th><th>total_return</th><th>max_drawdown</th><th>win_rate</th><th>trade_count</th></tr>
+    </thead>
+    <tbody>${runSummaryRows || '<tr><td colspan="8">无</td></tr>'}</tbody>
+  </table>
+  <h2>说明</h2>
+  <ul>
+    <li>全部参数组交易记录已写入 report.xlsx 的 AllTrades 工作表。</li>
+    <li>全部参数组资金曲线已写入 report.xlsx 的 AllEquity 工作表（若有）。</li>
+  </ul>
+</body>
+</html>`
+}
+
 function buildPlateauRowKey(row: BacktestPlateauPoint, index: number) {
   const params = row.params
   return [
@@ -1737,6 +2078,10 @@ export function BacktestPage() {
   const [plateauTradeViewResult, setPlateauTradeViewResult] = useState<BacktestResponse | null>(null)
   const [plateauTradeViewLoading, setPlateauTradeViewLoading] = useState(false)
   const [plateauTradeViewError, setPlateauTradeViewError] = useState<string | null>(null)
+  const [plateauTradePage, setPlateauTradePage] = useState(1)
+  const [plateauTradePageSize, setPlateauTradePageSize] = useState(20)
+  const [plateauHistoryExportingTaskId, setPlateauHistoryExportingTaskId] = useState<string | null>(null)
+  const [plateauHistoryExportingFormat, setPlateauHistoryExportingFormat] = useState<PlateauHistoryExportFormat | null>(null)
   const [tradePage, setTradePage] = useState(1)
   const [tradePageSize, setTradePageSize] = useState(initialDraft.trades_page_size)
   const [runError, setRunError] = useState<string | null>(null)
@@ -2436,6 +2781,10 @@ export function BacktestPage() {
   }, [result?.trades])
 
   useEffect(() => {
+    setPlateauTradePage(1)
+  }, [plateauTradeViewingRow?.__rowKey, plateauTradeViewResult?.trades])
+
+  useEffect(() => {
     const draft: BacktestPlateauFormDraft = {
       sampling_mode: plateauSamplingMode,
       sample_points: plateauSamplePoints,
@@ -2565,6 +2914,25 @@ export function BacktestPage() {
       grid: { left: 48, right: 20, top: 24, bottom: 36 },
     }
   }, [result?.drawdown_curve])
+
+  const plateauTradeEquityOption = useMemo(() => {
+    const curve = plateauTradeViewResult?.equity_curve ?? []
+    return {
+      tooltip: { trigger: 'axis' },
+      xAxis: { type: 'category', data: curve.map((row) => row.date) },
+      yAxis: { type: 'value', scale: true },
+      series: [
+        {
+          type: 'line',
+          smooth: true,
+          data: curve.map((row) => row.equity),
+          lineStyle: { width: 2, color: '#0f8b6f' },
+          areaStyle: { color: 'rgba(15,139,111,0.16)' },
+        },
+      ],
+      grid: { left: 48, right: 20, top: 24, bottom: 36 },
+    }
+  }, [plateauTradeViewResult?.equity_curve])
 
   function buildBacktestPayload(effectiveBoardFilters?: BoardFilter[]) {
     return {
@@ -3238,7 +3606,7 @@ export function BacktestPage() {
       },
       {
         title: '操作',
-        width: 340,
+        width: 420,
         render: (_value, row) => {
           const controlTaskId = controlPlateauTaskMutation.variables?.taskId
           const controlAction = controlPlateauTaskMutation.variables?.action
@@ -3247,11 +3615,17 @@ export function BacktestPage() {
           const deleteTaskId = deletePlateauTaskMutation.variables
           const deleteLoadingThisRow = deletePlateauTaskMutation.isPending && deleteTaskId === row.task_id
           const deleteLoadingOtherRow = deletePlateauTaskMutation.isPending && deleteTaskId !== row.task_id
+          const exportingThisRow = plateauHistoryExportingTaskId === row.task_id
+          const exportingOtherRow = plateauHistoryExportingTaskId !== null && plateauHistoryExportingTaskId !== row.task_id
           const disableActions = controlLoadingOtherRow || deleteLoadingOtherRow
+          const canExport = row.status === 'succeeded'
           const canPause = row.status === 'pending' || row.status === 'running'
           const canResume = row.status === 'paused'
           const canCancel = row.status === 'pending' || row.status === 'running' || row.status === 'paused'
           const canDelete = row.status !== 'pending' && row.status !== 'running'
+          const exportButtonText = exportingThisRow && plateauHistoryExportingFormat
+            ? `导出${PLATEAU_HISTORY_EXPORT_LABEL_MAP[plateauHistoryExportingFormat]}`
+            : '导出'
           return (
             <Space size={6} wrap>
               <Button
@@ -3305,16 +3679,40 @@ export function BacktestPage() {
               >
                 删除
               </Button>
+              <Dropdown
+                trigger={['click']}
+                menu={buildPlateauHistoryExportMenu(row)}
+                disabled={
+                  !canExport
+                  || disableActions
+                  || controlLoadingThisRow
+                  || deleteLoadingThisRow
+                  || exportingOtherRow
+                }
+              >
+                <Button
+                  size="small"
+                  type="primary"
+                  ghost
+                  loading={exportingThisRow}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  {exportButtonText}
+                </Button>
+              </Dropdown>
             </Space>
           )
         },
       },
     ],
     [
+      buildPlateauHistoryExportMenu,
       controlPlateauTaskMutation.isPending,
       controlPlateauTaskMutation.variables,
       deletePlateauTaskMutation.isPending,
       deletePlateauTaskMutation.variables,
+      plateauHistoryExportingFormat,
+      plateauHistoryExportingTaskId,
       handleViewPlateauHistoryTask,
       handleDeletePlateauHistoryTask,
       setSelectedPlateauTask,
@@ -3823,6 +4221,190 @@ export function BacktestPage() {
       setPlateauSavedPresetId(null)
     }
     message.success('已删除收藏参数。')
+  }
+
+  async function resolvePlateauHistoryTaskForExport(
+    row: BacktestPlateauTaskStatusResponse,
+  ): Promise<BacktestPlateauTaskStatusResponse | null> {
+    const taskId = String(row.task_id || '').trim()
+    if (!taskId) return null
+    const current = plateauTasksById[taskId] ?? row
+    if (current.result) {
+      return current
+    }
+    try {
+      const status = await getBacktestPlateauTask(taskId)
+      upsertPlateauTaskStatus(status)
+      if (!status.result) {
+        message.warning(`任务 ${taskId} 暂无可导出的收益平原结果`)
+        return null
+      }
+      return status
+    } catch (error) {
+      message.warning(`收益平原任务详情加载失败：${formatApiError(error)}`)
+      return null
+    }
+  }
+
+  async function handleExportPlateauHistoryTask(
+    row: BacktestPlateauTaskStatusResponse,
+    format: PlateauHistoryExportFormat,
+  ) {
+    if (plateauHistoryExportingTaskId) return
+    const taskId = String(row.task_id || '').trim()
+    if (!taskId) return
+    if (row.status !== 'succeeded') {
+      message.warning('仅支持导出已完成的收益平原任务')
+      return
+    }
+    setPlateauHistoryExportingTaskId(taskId)
+    setPlateauHistoryExportingFormat(format)
+    const ftbtProgressKey = `plateau-history-ftbt-${taskId}`
+    try {
+      const resolved = await resolvePlateauHistoryTaskForExport(row)
+      if (!resolved?.result) return
+      const plateauResultWithCorr: BacktestPlateauResponse = {
+        ...resolved.result,
+        correlations: resolvePlateauCorrelations(resolved.result),
+      }
+      const safeTaskId = taskId.replace(/[^0-9A-Za-z_.-]/g, '_') || 'plateau_task'
+      const timestamp = dayjs().format('YYYYMMDD_HHmmss')
+      if (format === 'excel') {
+        const workbookBuffer = buildPlateauHistoryWorkbookBuffer(taskId, plateauResultWithCorr)
+        const fileName = `plateau_history_${safeTaskId}_${timestamp}.xlsx`
+        const blob = new Blob([workbookBuffer], {
+          type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        })
+        downloadBlob(fileName, blob)
+        message.success(`已导出收益平原 Excel：${fileName}`)
+        return
+      }
+      if (format === 'html') {
+        const reportHtml = buildPlateauHistoryHtml(taskId, plateauResultWithCorr)
+        const fileName = `plateau_history_${safeTaskId}_${timestamp}.html`
+        const blob = new Blob([reportHtml], { type: 'text/html;charset=utf-8' })
+        downloadBlob(fileName, blob)
+        message.success(`已导出收益平原 HTML：${fileName}`)
+        return
+      }
+
+      const points = plateauResultWithCorr.points ?? []
+      if (points.length <= 0) {
+        message.warning('当前收益平原任务没有参数组合，无法导出 ftbt')
+        return
+      }
+      const pointRuns: PlateauPointRunRecord[] = []
+      message.open({
+        key: ftbtProgressKey,
+        type: 'loading',
+        content: `正在回放参数组 0/${points.length} ...`,
+        duration: 0,
+      })
+      for (let index = 0; index < points.length; index += 1) {
+        const point = points[index]!
+        const rank = index + 1
+        const runRequest = buildRunRequestFromPlateauParams(plateauResultWithCorr.base_payload, point.params)
+        if (point.error) {
+          pointRuns.push({
+            rank,
+            point,
+            runRequest,
+            runResult: null,
+            error: String(point.error),
+          })
+          message.open({
+            key: ftbtProgressKey,
+            type: 'loading',
+            content: `正在回放参数组 ${rank}/${points.length} ...`,
+            duration: 0,
+          })
+          continue
+        }
+        try {
+          const runResult = await runBacktest(runRequest)
+          pointRuns.push({
+            rank,
+            point,
+            runRequest,
+            runResult,
+            error: null,
+          })
+        } catch (error) {
+          pointRuns.push({
+            rank,
+            point,
+            runRequest,
+            runResult: null,
+            error: formatApiError(error),
+          })
+        }
+        message.open({
+          key: ftbtProgressKey,
+          type: 'loading',
+          content: `正在回放参数组 ${rank}/${points.length} ...`,
+          duration: 0,
+        })
+      }
+      const successRuns = pointRuns.filter(
+        (item): item is PlateauPointRunRecord & { runResult: BacktestResponse } => item.runResult !== null,
+      )
+      if (successRuns.length <= 0) {
+        throw new Error('全部参数组回放失败，无法生成 ftbt 包')
+      }
+      const ref = successRuns[0]
+      const workbookBuffer = buildPlateauAllTradesWorkbookBuffer(taskId, plateauResultWithCorr, pointRuns)
+      const reportHtml = buildPlateauAllTradesHtml(taskId, plateauResultWithCorr, pointRuns)
+      const reportId = `plateau_all_trades_${safeTaskId}_${timestamp}`
+        .replace(/[^0-9A-Za-z_.-]/g, '_')
+        .slice(0, 96)
+      const payload = await buildBacktestReportPackage({
+        run_request: ref.runRequest,
+        run_result: ref.runResult,
+        report_html: reportHtml,
+        report_xlsx_base64: bufferToBase64(workbookBuffer),
+        plateau_result: plateauResultWithCorr,
+        report_id: reportId,
+        app_name: 'Final Trade',
+        app_version: String(import.meta.env.VITE_APP_VERSION || 'frontend'),
+      })
+      const bytes = base64ToUint8Array(payload.file_base64)
+      const safeBytes = new Uint8Array(bytes.byteLength)
+      safeBytes.set(bytes)
+      const blob = new Blob([safeBytes], { type: 'application/octet-stream' })
+      downloadBlob(payload.file_name, blob)
+      message.success({
+        key: ftbtProgressKey,
+        content: `已导出 ftbt：${payload.file_name}（成功回放 ${successRuns.length}/${pointRuns.length} 组）`,
+        duration: 2,
+      })
+    } catch (error) {
+      const text = formatApiError(error)
+      if (format === 'ftbt') {
+        message.error({ key: ftbtProgressKey, content: `导出 ftbt 失败：${text}` })
+      } else {
+        message.error(`导出失败：${text}`)
+      }
+    } finally {
+      setPlateauHistoryExportingTaskId(null)
+      setPlateauHistoryExportingFormat(null)
+    }
+  }
+
+  function buildPlateauHistoryExportMenu(row: BacktestPlateauTaskStatusResponse): MenuProps {
+    return {
+      items: [
+        { key: 'excel', label: '导出 Excel' },
+        { key: 'html', label: '导出 HTML' },
+        { key: 'ftbt', label: '导出 ftbt（含全部参数组合交易记录）' },
+      ],
+      onClick: (info) => {
+        info.domEvent.stopPropagation()
+        const key = String(info.key)
+        if (key === 'excel' || key === 'html' || key === 'ftbt') {
+          void handleExportPlateauHistoryTask(row, key as PlateauHistoryExportFormat)
+        }
+      },
+    }
   }
 
   function handleDeletePlateauHistoryTask(taskId: string) {
@@ -4930,6 +5512,11 @@ export function BacktestPage() {
                 event.target.value = ''
               }}
             />
+            <Tag color={plateauResult ? 'success' : 'default'}>
+              {plateauResult
+                ? `本次导出包含收益平原（${plateauResult.evaluated_combinations}/${plateauResult.total_combinations}）`
+                : '本次导出不包含收益平原'}
+            </Tag>
             <Tag color="blue">{`已导入 ${reportLibrary.length}`}</Tag>
           </Space>
           <Space wrap style={{ width: '100%' }}>
@@ -5026,6 +5613,13 @@ export function BacktestPage() {
               <Alert type="error" showIcon title={`交易记录加载失败：${plateauTradeViewError}`} />
             ) : plateauTradeViewResult ? (
               <>
+                {plateauTradeViewResult.equity_curve.length > 0 ? (
+                  <Card size="small" title="收益曲线">
+                    <ReactECharts option={plateauTradeEquityOption} style={{ height: 240 }} />
+                  </Card>
+                ) : (
+                  <Alert type="info" showIcon title="暂无收益曲线数据" />
+                )}
                 <Space wrap>
                   <Tag color="success">{`实际交易数 ${plateauTradeViewResult.stats.trade_count}`}</Tag>
                   <Tag>{`实际收益 ${formatPct(plateauTradeViewResult.stats.total_return)}`}</Tag>
@@ -5039,10 +5633,19 @@ export function BacktestPage() {
                   rowKey={(row) => `${row.symbol}-${row.entry_date}-${row.exit_date}-${row.quantity}`}
                   scroll={{ x: 1480, y: 480 }}
                   pagination={{
-                    defaultPageSize: 20,
+                    current: plateauTradePage,
+                    pageSize: plateauTradePageSize,
                     pageSizeOptions: [20, 50, 100],
                     showSizeChanger: true,
                     showTotal: (total) => `共 ${total} 条`,
+                    onChange: (page, pageSize) => {
+                      if (pageSize !== plateauTradePageSize) {
+                        setPlateauTradePageSize(pageSize)
+                        setPlateauTradePage(1)
+                        return
+                      }
+                      setPlateauTradePage(page)
+                    },
                   }}
                 />
               </>
