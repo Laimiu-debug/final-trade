@@ -1811,7 +1811,7 @@ function buildChartPath(symbol: string, name?: string) {
 }
 
 function taskStatusLabel(status: BacktestTaskStatusResponse['status']) {
-  if (status === 'pending') return '排队中'
+  if (status === 'pending') return '准备中'
   if (status === 'running') return '运行中'
   if (status === 'paused') return '已暂停'
   if (status === 'succeeded') return '已完成'
@@ -1829,7 +1829,7 @@ function taskStatusColor(status: BacktestTaskStatusResponse['status']) {
 }
 
 function plateauTaskStatusLabel(status: BacktestPlateauTaskStatusResponse['status']) {
-  if (status === 'pending') return '排队中'
+  if (status === 'pending') return '准备中'
   if (status === 'running') return '运行中'
   if (status === 'paused') return '已暂停'
   if (status === 'succeeded') return '已完成'

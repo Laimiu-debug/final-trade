@@ -11140,7 +11140,30 @@ class InMemoryStore:
                 self.maybe_trim_backtest_runtime_memory()
                 self._persist_backtest_task_state(force=True)
 
-        Thread(target=_worker, daemon=True).start()
+        try:
+            Thread(target=_worker, daemon=True).start()
+        except Exception as exc:
+            with self._backtest_task_lock:
+                self._backtest_running_worker_ids.discard(task_id)
+            failed_task = self.get_backtest_task(task_id)
+            if failed_task is not None and failed_task.status not in {"succeeded", "failed", "cancelled"}:
+                failed_progress = failed_task.progress.model_copy(
+                    update={
+                        "message": "回测任务启动失败。",
+                        "updated_at": self._now_datetime(),
+                    }
+                )
+                self._upsert_backtest_task(
+                    failed_task.model_copy(
+                        update={
+                            "status": "failed",
+                            "progress": failed_progress,
+                            "error": f"任务线程启动失败：{exc}",
+                            "error_code": "BACKTEST_TASK_WORKER_START_FAILED",
+                        }
+                    )
+                )
+            self._persist_backtest_task_state(force=True)
 
     def start_backtest_task(self, payload: BacktestRunRequest) -> str:
         async_precheck = self._is_backtest_task_precheck_async_enabled()
@@ -11670,7 +11693,30 @@ class InMemoryStore:
                 self.maybe_trim_backtest_runtime_memory()
                 self._persist_backtest_plateau_task_state(force=True)
 
-        Thread(target=_worker, daemon=True).start()
+        try:
+            Thread(target=_worker, daemon=True).start()
+        except Exception as exc:
+            with self._backtest_plateau_task_lock:
+                self._backtest_plateau_running_worker_ids.discard(task_id)
+            failed_task = self.get_backtest_plateau_task(task_id)
+            if failed_task is not None and failed_task.status not in {"succeeded", "failed", "cancelled"}:
+                failed_progress = failed_task.progress.model_copy(
+                    update={
+                        "message": "收益平原任务启动失败。",
+                        "updated_at": self._now_datetime(),
+                    }
+                )
+                self._upsert_backtest_plateau_task(
+                    failed_task.model_copy(
+                        update={
+                            "status": "failed",
+                            "progress": failed_progress,
+                            "error": f"任务线程启动失败：{exc}",
+                            "error_code": "BACKTEST_PLATEAU_TASK_WORKER_START_FAILED",
+                        }
+                    )
+                )
+            self._persist_backtest_plateau_task_state(force=True)
 
     def start_backtest_plateau_task(self, payload: BacktestPlateauRunRequest) -> str:
         task_id = f"bp_{uuid4().hex[:16]}"
