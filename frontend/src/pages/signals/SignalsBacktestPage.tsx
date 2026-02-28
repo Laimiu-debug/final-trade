@@ -997,9 +997,13 @@ export function SignalsBacktestPage() {
                 pageSize: constituentPageSize,
                 showSizeChanger: true,
                 pageSizeOptions: ['20', '50', '100'],
-                onChange: (page, pageSize) => {
+                onShowSizeChange: (_current, pageSize) => {
+                  const nextSize = [20, 50, 100].includes(pageSize) ? pageSize : 20
+                  setConstituentPage(1)
+                  setConstituentPageSize(nextSize)
+                },
+                onChange: (page) => {
                   setConstituentPage(page)
-                  setConstituentPageSize(pageSize)
                 },
               }}
             />

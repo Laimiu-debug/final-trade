@@ -159,6 +159,13 @@ export function AppShell() {
             <Link to="/strategy">策略中心</Link>
             <Link to="/strategy/events">事件判别</Link>
             <Link to="/settings">设置</Link>
+            <a
+              href="https://laimiuworld.notion.site/Final-Trade-3155946e3698807e9c66d7052b5febf6?source=copy_link"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              使用说明
+            </a>
             <AreaChartOutlined style={{ color: '#0f8b6f' }} />
           </Space>
         </Header>

@@ -15,6 +15,10 @@ function confidenceTagColor(confidence: number) {
   return 'default'
 }
 
+function buildAIRecordRowKey(record: Pick<AIAnalysisRecord, 'symbol' | 'fetched_at' | 'provider'>) {
+  return `${record.symbol}-${record.fetched_at}-${record.provider}`
+}
+
 export function AiPage() {
   const { message } = AntdApp.useApp()
   const navigate = useNavigate()
@@ -82,6 +86,7 @@ export function AiPage() {
       message.error('删除失败，请稍后重试')
     },
   })
+  const deletingRowKey = deleteMutation.variables ? buildAIRecordRowKey(deleteMutation.variables) : ''
 
   const renderTruncated = (value: string | undefined) => {
     const text = (value ?? '').trim() || '--'
@@ -184,25 +189,29 @@ export function AiPage() {
       key: 'actions',
       width: 200,
       fixed: 'right',
-      render: (_, record) => (
-        <Space wrap size={6}>
-          <Button size="small" onClick={() => navigate(`/stocks/${record.symbol}/chart`)}>
-            去K线标注
-          </Button>
-          <Popconfirm
-            title="删除这条 AI 分析记录?"
-            okText="删除"
-            cancelText="取消"
-            onConfirm={() => {
-              return deleteMutation.mutateAsync(record).catch(() => undefined)
-            }}
-          >
-            <Button size="small" danger loading={deleteMutation.isPending}>
-              删除
+      render: (_, record) => {
+        const rowKey = buildAIRecordRowKey(record)
+        const deletingThisRow = deleteMutation.isPending && deletingRowKey === rowKey
+        return (
+          <Space wrap size={6}>
+            <Button size="small" onClick={() => navigate(`/stocks/${record.symbol}/chart`)}>
+              去K线标注
             </Button>
-          </Popconfirm>
-        </Space>
-      ),
+            <Popconfirm
+              title="删除这条 AI 分析记录?"
+              okText="删除"
+              cancelText="取消"
+              onConfirm={() => {
+                return deleteMutation.mutateAsync(record).catch(() => undefined)
+              }}
+            >
+              <Button size="small" danger loading={deletingThisRow}>
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        )
+      },
     },
   ]
 
@@ -250,7 +259,7 @@ export function AiPage() {
           <Typography.Text type="secondary">结果 {filteredItems.length} 条</Typography.Text>
         </Space>
         <Table
-          rowKey={(row) => `${row.symbol}-${row.fetched_at}-${row.provider}`}
+          rowKey={buildAIRecordRowKey}
           loading={query.isLoading}
           dataSource={filteredItems}
           columns={columns}

@@ -178,6 +178,10 @@ export function EventJudgmentPage() {
   const profiles = query.data?.profiles ?? []
   const activeProfileId = String(query.data?.active_profile_id || '').trim()
   const metricKeys = useMemo(() => metricOptions.map((m) => m.metric_key), [metricOptions])
+  const metricDescMap = useMemo(
+    () => new Map(metricOptions.map((m) => [m.metric_key, String(m.description || '').trim()])),
+    [metricOptions],
+  )
 
   const [selectedProfileId, setSelectedProfileId] = useState('')
   const [saving, setSaving] = useState(false)
@@ -365,16 +369,38 @@ export function EventJudgmentPage() {
             </Row>
 
             <Divider>评分维度</Divider>
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="维度分计算说明"
+              description="总分 = Σ(有效分 × 权重) / Σ权重；反向=开启后有效分按 100-原始分计算；启用=关闭后该维度不参与计算。"
+            />
             {draft.dimensions.length <= 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前草稿还没有维度" /> : (
               <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+                <Card size="small">
+                  <Row gutter={[8, 8]} align="middle">
+                    <Col xs={24} md={5}><Typography.Text type="secondary">维度名称</Typography.Text></Col>
+                    <Col xs={24} md={8}><Typography.Text type="secondary">评分指标</Typography.Text></Col>
+                    <Col xs={12} md={3}><Typography.Text type="secondary">权重</Typography.Text></Col>
+                    <Col xs={12} md={3}><Typography.Text type="secondary">反向</Typography.Text></Col>
+                    <Col xs={12} md={3}><Typography.Text type="secondary">启用</Typography.Text></Col>
+                    <Col xs={12} md={2}><Typography.Text type="secondary">操作</Typography.Text></Col>
+                  </Row>
+                </Card>
                 {draft.dimensions.map((d, i) => (
                   <Card key={`${d.dimension_id}-${i}`} size="small">
                     <Row gutter={[8, 8]} align="middle">
                       <Col xs={24} md={5}><Input value={d.label} onChange={(e) => setDraft((p) => { const x = [...p.dimensions]; x[i] = { ...x[i], label: e.target.value }; return { ...p, dimensions: x } })} /></Col>
-                      <Col xs={24} md={8}><Select style={{ width: '100%' }} value={d.metric_key} options={metricOptions.map((m) => ({ value: m.metric_key, label: `${m.label} (${m.metric_key})` }))} onChange={(v) => setDraft((p) => { const x = [...p.dimensions]; x[i] = { ...x[i], metric_key: String(v) }; return { ...p, dimensions: x } })} /></Col>
+                      <Col xs={24} md={8}>
+                        <Select style={{ width: '100%' }} value={d.metric_key} options={metricOptions.map((m) => ({ value: m.metric_key, label: `${m.label} (${m.metric_key})` }))} onChange={(v) => setDraft((p) => { const x = [...p.dimensions]; x[i] = { ...x[i], metric_key: String(v) }; return { ...p, dimensions: x } })} />
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                          {metricDescMap.get(d.metric_key) || '该指标暂无说明。'}
+                        </Typography.Text>
+                      </Col>
                       <Col xs={12} md={3}><InputNumber style={{ width: '100%' }} min={0} max={10} step={0.05} value={d.weight} onChange={(v) => setDraft((p) => { const x = [...p.dimensions]; x[i] = { ...x[i], weight: Number(v ?? 0) }; return { ...p, dimensions: x } })} /></Col>
-                      <Col xs={12} md={3}><Switch checked={d.invert} onChange={(v) => setDraft((p) => { const x = [...p.dimensions]; x[i] = { ...x[i], invert: v }; return { ...p, dimensions: x } })} /></Col>
-                      <Col xs={12} md={3}><Switch checked={d.enabled} onChange={(v) => setDraft((p) => { const x = [...p.dimensions]; x[i] = { ...x[i], enabled: v }; return { ...p, dimensions: x } })} /></Col>
+                      <Col xs={12} md={3}><Switch checked={d.invert} checkedChildren="反" unCheckedChildren="正" onChange={(v) => setDraft((p) => { const x = [...p.dimensions]; x[i] = { ...x[i], invert: v }; return { ...p, dimensions: x } })} /></Col>
+                      <Col xs={12} md={3}><Switch checked={d.enabled} checkedChildren="开" unCheckedChildren="关" onChange={(v) => setDraft((p) => { const x = [...p.dimensions]; x[i] = { ...x[i], enabled: v }; return { ...p, dimensions: x } })} /></Col>
                       <Col xs={12} md={2}><Button danger onClick={() => setDraft((p) => ({ ...p, dimensions: p.dimensions.filter((_, j) => j !== i) }))}>删除</Button></Col>
                     </Row>
                   </Card>
