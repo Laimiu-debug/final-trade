@@ -785,6 +785,10 @@ export interface BacktestTaskStatusResponse {
   error_code?: string | null
 }
 
+export interface BacktestTaskListResponse {
+  items: BacktestTaskStatusResponse[]
+}
+
 export interface BacktestPlateauRunRequest {
   base_payload: BacktestRunRequest
   sampling_mode?: 'grid' | 'lhs'
@@ -823,6 +827,7 @@ export interface BacktestPlateauPoint {
   max_concurrent_positions: number
   score: number
   cache_hit: boolean
+  detail_key?: string | null
   error?: string | null
 }
 
@@ -871,6 +876,15 @@ export interface BacktestPlateauTaskListResponse {
 export interface BacktestPlateauTaskDeleteResponse {
   deleted: boolean
   task_id: string
+}
+
+export interface BacktestPlateauPointDetailResponse {
+  task_id: string
+  detail_key: string
+  saved_at: string
+  params: BacktestPlateauParams
+  run_request: BacktestRunRequest
+  run_result: BacktestResponse
 }
 
 export interface StrategyCapabilities {

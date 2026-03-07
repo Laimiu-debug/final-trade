@@ -45,6 +45,7 @@ from .models import (
     BacktestPlateauTaskStatusResponse,
     BacktestPlateauTaskListResponse,
     BacktestPlateauTaskDeleteResponse,
+    BacktestPlateauPointDetailResponse,
     BacktestPoolRollMode,
     BacktestResponse,
     BacktestTrade,
@@ -56,6 +57,7 @@ from .models import (
     BacktestWalkForwardReport,
     BacktestTaskProgress,
     BacktestTaskStageTiming,
+    BacktestTaskListResponse,
     BacktestTaskStatusResponse,
     BacktestReportBuildRequest,
     BacktestReportBuildResponse,
@@ -220,6 +222,8 @@ class InMemoryStore:
     )
     _BACKTEST_REPORT_META_SCHEMA_VERSION = 1
     _BACKTEST_REPORT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{4,96}$")
+    _BACKTEST_TASK_ID_RE = re.compile(r"^[A-Za-z0-9._-]{4,96}$")
+    _BACKTEST_PLATEAU_POINT_DETAIL_KEY_RE = re.compile(r"^[A-Za-z0-9._-]{4,96}$")
     _EVENT_GRADE_RANK = {"C": 1, "B": 2, "A": 3}
     _EVENT_JUDGMENT_DEFAULT_PROFILE_ID = "system_legacy_formula_v1"
     _BACKTEST_MATRIX_TIMING_RE = re.compile(
@@ -1298,6 +1302,13 @@ class InMemoryStore:
         if env_value:
             return cls._resolve_user_path(env_value)
         return Path.home() / ".tdx-trend" / "backtest_plateau_tasks.json"
+
+    @classmethod
+    def _resolve_backtest_plateau_detail_store_dir(cls) -> Path:
+        env_value = os.getenv("TDX_TREND_BACKTEST_PLATEAU_DETAIL_STORE_DIR", "").strip()
+        if env_value:
+            return cls._resolve_user_path(env_value)
+        return Path.home() / ".tdx-trend" / "backtest-plateau-details"
 
     @classmethod
     def _resolve_backtest_input_pool_cache_dir(cls) -> Path:
@@ -8781,6 +8792,7 @@ class InMemoryStore:
         self,
         payload: BacktestPlateauRunRequest,
         *,
+        task_id: str | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         control_callback: Callable[[], None] | None = None,
     ) -> BacktestPlateauResponse:
@@ -8956,6 +8968,11 @@ class InMemoryStore:
         ) -> tuple[int, BacktestPlateauPoint, bool]:
             if control_callback is not None:
                 control_callback()
+            detail_key = (
+                self._build_backtest_plateau_detail_key(params)
+                if task_id
+                else None
+            )
             run_payload = base.model_copy(
                 update={
                     "window_days": params.window_days,
@@ -8977,6 +8994,14 @@ class InMemoryStore:
                         candidates=cached_candidates,
                         payload=run_payload,
                     )
+                    if task_id and detail_key:
+                        self._persist_backtest_plateau_point_detail(
+                            task_id=task_id,
+                            detail_key=detail_key,
+                            params=params,
+                            run_request=run_payload,
+                            run_result=result,
+                        )
                     return (
                         index,
                         BacktestPlateauPoint(
@@ -8988,6 +9013,7 @@ class InMemoryStore:
                             max_concurrent_positions=int(result.max_concurrent_positions),
                             score=self._backtest_plateau_score(result),
                             cache_hit=True,
+                            detail_key=detail_key,
                             error=None,
                         ),
                         False,
@@ -8997,6 +9023,14 @@ class InMemoryStore:
                     control_callback=control_callback,
                     prebuilt_universe=universe,
                 )
+                if task_id and detail_key:
+                    self._persist_backtest_plateau_point_detail(
+                        task_id=task_id,
+                        detail_key=detail_key,
+                        params=params,
+                        run_request=run_payload,
+                        run_result=result,
+                    )
                 cache_hit = any("回测结果缓存命中" in str(note) for note in result.notes)
                 return (
                     index,
@@ -9009,6 +9043,7 @@ class InMemoryStore:
                         max_concurrent_positions=int(result.max_concurrent_positions),
                         score=self._backtest_plateau_score(result),
                         cache_hit=cache_hit,
+                        detail_key=detail_key,
                         error=None,
                     ),
                     False,
@@ -10635,7 +10670,7 @@ class InMemoryStore:
             tasks = []
             for task_id, task in self._backtest_tasks.items():
                 payload = self._backtest_task_payloads.get(task_id)
-                task_payload = task.model_dump(exclude_none=True, exclude={"result"})
+                task_payload = task.model_dump(exclude_none=True)
                 tasks.append(
                     {
                         "task": task_payload,
@@ -10802,6 +10837,21 @@ class InMemoryStore:
             if task is None:
                 return None
             return task.model_copy(deep=True)
+
+    def list_backtest_tasks(self, *, include_result: bool = False) -> BacktestTaskListResponse:
+        with self._backtest_task_lock:
+            tasks = sorted(
+                self._backtest_tasks.values(),
+                key=lambda row: row.progress.updated_at,
+                reverse=True,
+            )
+            items: list[BacktestTaskStatusResponse] = []
+            for row in tasks:
+                copied = row.model_copy(deep=True)
+                if not include_result:
+                    copied = copied.model_copy(update={"result": None})
+                items.append(copied)
+        return BacktestTaskListResponse(items=items)
 
     def _await_backtest_task_runnable(self, task_id: str) -> None:
         while True:
@@ -11221,6 +11271,100 @@ class InMemoryStore:
         )
         return task_id
 
+    @classmethod
+    def _validate_backtest_task_id(cls, task_id: str, *, field_name: str = "task_id") -> str:
+        text = str(task_id or "").strip()
+        if not cls._BACKTEST_TASK_ID_RE.fullmatch(text):
+            raise BacktestValidationError("BACKTEST_TASK_INVALID_ID", f"{field_name} 不合法。")
+        return text
+
+    @classmethod
+    def _validate_backtest_plateau_detail_key(cls, detail_key: str) -> str:
+        text = str(detail_key or "").strip()
+        if not cls._BACKTEST_PLATEAU_POINT_DETAIL_KEY_RE.fullmatch(text):
+            raise BacktestValidationError("BACKTEST_PLATEAU_POINT_DETAIL_INVALID", "收益平原参数组明细ID不合法。")
+        return text
+
+    @staticmethod
+    def _build_backtest_plateau_detail_key(params: BacktestPlateauParams) -> str:
+        payload = json.dumps(
+            params.model_dump(exclude_none=True),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return f"pt_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]}"
+
+    def _backtest_plateau_task_detail_dir(self, task_id: str) -> Path:
+        normalized_task_id = self._validate_backtest_task_id(task_id)
+        return self._resolve_backtest_plateau_detail_store_dir() / normalized_task_id
+
+    def _backtest_plateau_point_detail_path(self, task_id: str, detail_key: str) -> Path:
+        normalized_detail_key = self._validate_backtest_plateau_detail_key(detail_key)
+        return self._backtest_plateau_task_detail_dir(task_id) / f"{normalized_detail_key}.json"
+
+    def _persist_backtest_plateau_point_detail(
+        self,
+        *,
+        task_id: str,
+        detail_key: str,
+        params: BacktestPlateauParams,
+        run_request: BacktestRunRequest,
+        run_result: BacktestResponse,
+    ) -> None:
+        path = self._backtest_plateau_point_detail_path(task_id, detail_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = {
+            "schema_version": 1,
+            "task_id": self._validate_backtest_task_id(task_id),
+            "detail_key": self._validate_backtest_plateau_detail_key(detail_key),
+            "saved_at": self._now_datetime(),
+            "params": params.model_dump(exclude_none=True),
+            "run_request": run_request.model_dump(exclude_none=True),
+            "run_result": run_result.model_dump(exclude_none=True),
+        }
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+
+    def _clear_backtest_plateau_task_detail_store(self, task_id: str) -> None:
+        try:
+            target_dir = self._backtest_plateau_task_detail_dir(task_id)
+        except BacktestValidationError:
+            return
+        if not target_dir.exists():
+            return
+        shutil.rmtree(target_dir, ignore_errors=True)
+
+    def get_backtest_plateau_point_detail(
+        self,
+        task_id: str,
+        detail_key: str,
+    ) -> BacktestPlateauPointDetailResponse | None:
+        try:
+            path = self._backtest_plateau_point_detail_path(task_id, detail_key)
+        except BacktestValidationError:
+            return None
+        if not path.exists():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return None
+            return BacktestPlateauPointDetailResponse(
+                task_id=self._validate_backtest_task_id(str(raw.get("task_id") or task_id)),
+                detail_key=self._validate_backtest_plateau_detail_key(str(raw.get("detail_key") or detail_key)),
+                saved_at=str(raw.get("saved_at") or ""),
+                params=BacktestPlateauParams(**dict(raw.get("params") or {})),
+                run_request=BacktestRunRequest(**dict(raw.get("run_request") or {})),
+                run_result=BacktestResponse(**dict(raw.get("run_result") or {})),
+            )
+        except Exception:
+            return None
+
     def _estimate_backtest_plateau_total_points(self, payload: BacktestPlateauRunRequest) -> int:
         sample_points = max(1, int(self._resolve_plateau_sample_points(payload)))
         if payload.sampling_mode == "lhs":
@@ -11396,6 +11540,7 @@ class InMemoryStore:
 
     def _upsert_backtest_plateau_task(self, task: BacktestPlateauTaskStatusResponse) -> None:
         force_persist = task.status in {"paused", "succeeded", "failed", "cancelled"}
+        removed_task_ids: list[str] = []
         with self._backtest_plateau_task_lock:
             self._backtest_plateau_tasks[task.task_id] = task
             if len(self._backtest_plateau_tasks) > 80:
@@ -11406,6 +11551,9 @@ class InMemoryStore:
                 for old_task_id, _ in sorted_items[: max(0, len(sorted_items) - 80)]:
                     self._backtest_plateau_tasks.pop(old_task_id, None)
                     self._backtest_plateau_task_payloads.pop(old_task_id, None)
+                    removed_task_ids.append(old_task_id)
+        for old_task_id in removed_task_ids:
+            self._clear_backtest_plateau_task_detail_store(old_task_id)
         self._persist_backtest_plateau_task_state(force=force_persist)
 
     def get_backtest_plateau_task(self, task_id: str) -> BacktestPlateauTaskStatusResponse | None:
@@ -11443,6 +11591,7 @@ class InMemoryStore:
             self._backtest_plateau_tasks.pop(task_id, None)
             self._backtest_plateau_task_payloads.pop(task_id, None)
             self._backtest_plateau_running_worker_ids.discard(task_id)
+        self._clear_backtest_plateau_task_detail_store(task_id)
         self._persist_backtest_plateau_task_state(force=True)
         return BacktestPlateauTaskDeleteResponse(deleted=True, task_id=task_id)
 
@@ -11618,6 +11767,7 @@ class InMemoryStore:
 
                 result = self.run_backtest_plateau(
                     payload,
+                    task_id=task_id,
                     progress_callback=_progress,
                     control_callback=lambda: self._await_backtest_plateau_task_runnable(task_id),
                 )

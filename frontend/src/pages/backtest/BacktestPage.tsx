@@ -35,7 +35,9 @@ import {
   cancelBacktestTask,
   deleteBacktestReport,
   deleteBacktestPlateauTask,
+  getBacktestPlateauPointDetail,
   getBacktestReport,
+  listBacktestTasks,
   getLatestScreenerRun,
   getStrategies,
   importBacktestReportPackage,
@@ -68,6 +70,7 @@ import type {
   BacktestPlateauCorrelationRow,
   BacktestPlateauParams,
   BacktestPlateauPoint,
+  BacktestPlateauPointDetailResponse,
   BacktestPlateauResponse,
   BacktestPlateauTaskStatusResponse,
   BacktestPoolRollMode,
@@ -121,11 +124,18 @@ const SCREENER_CACHE_KEY = 'tdx-trend-screener-cache-v4'
 const BACKTEST_FORM_CACHE_KEY = 'tdx-trend-backtest-form-v2'
 const BACKTEST_PLATEAU_FORM_CACHE_KEY = 'tdx-trend-backtest-plateau-form-v1'
 const BACKTEST_PLATEAU_PRESETS_KEY = 'tdx-trend-backtest-plateau-presets-v1'
+const BACKTEST_COLLAPSED_MODULES_KEY = 'tdx-trend-backtest-collapsed-modules-v1'
 const WY_EVENTS = ['PS', 'SC', 'AR', 'ST', 'TSO', 'Spring', 'SOS', 'JOC', 'LPS', 'UTAD', 'SOW', 'LPSY']
 const BACKTEST_DEFAULT_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star']
 const ALLOWED_BOARD_FILTERS: BoardFilter[] = ['main', 'gem', 'star', 'beijing', 'st']
 type BacktestPlateauTableRow = BacktestPlateauPoint & { __rowKey: string; __rank: number }
-type BacktestPlateauPreset = { id: string; name: string; saved_at: string; point: BacktestPlateauPoint }
+type BacktestPlateauPreset = {
+  id: string
+  name: string
+  saved_at: string
+  point: BacktestPlateauPoint
+  run_request?: BacktestRunRequest | null
+}
 type PlateauAxisKey =
   | 'window_days'
   | 'min_score'
@@ -1004,6 +1014,7 @@ function buildRunRequestFromPlateauParams(
     position_pct: Number(params.position_pct),
     max_symbols: Number(params.max_symbols),
     priority_topk_per_day: Number(params.priority_topk_per_day),
+    enable_advanced_analysis: false,
   }
 }
 
@@ -1542,12 +1553,17 @@ function loadBacktestPlateauPresets(): BacktestPlateauPreset[] {
       const name = String(row?.name || '').trim()
       const savedAt = String(row?.saved_at || '').trim()
       const point = row?.point as BacktestPlateauPoint | undefined
+      const runRequest =
+        row?.run_request && typeof row.run_request === 'object'
+          ? (row.run_request as BacktestRunRequest)
+          : null
       if (!id || !name || !savedAt || !point || !point.params || !point.stats) continue
       out.push({
         id,
         name,
         saved_at: savedAt,
         point,
+        run_request: runRequest,
       })
     }
     return out.slice(0, 300)
@@ -1587,6 +1603,44 @@ type BacktestModuleKey =
   | 'recent_task_progress'
   | 'backtest_history'
   | 'run_notes'
+
+const DEFAULT_COLLAPSED_MODULES: Record<BacktestModuleKey, boolean> = {
+  report_share: true,
+  plateau_params: true,
+  plateau_presets: false,
+  recent_task_progress: true,
+  backtest_history: false,
+  run_notes: true,
+}
+
+function loadCollapsedModules(): Record<BacktestModuleKey, boolean> {
+  if (typeof window === 'undefined') return { ...DEFAULT_COLLAPSED_MODULES }
+  try {
+    const raw = window.localStorage.getItem(BACKTEST_COLLAPSED_MODULES_KEY)
+    if (!raw) return { ...DEFAULT_COLLAPSED_MODULES }
+    const parsed = JSON.parse(raw) as Partial<Record<BacktestModuleKey, boolean>>
+    return {
+      ...DEFAULT_COLLAPSED_MODULES,
+      report_share: Boolean(parsed.report_share ?? DEFAULT_COLLAPSED_MODULES.report_share),
+      plateau_params: Boolean(parsed.plateau_params ?? DEFAULT_COLLAPSED_MODULES.plateau_params),
+      plateau_presets: Boolean(parsed.plateau_presets ?? DEFAULT_COLLAPSED_MODULES.plateau_presets),
+      recent_task_progress: Boolean(parsed.recent_task_progress ?? DEFAULT_COLLAPSED_MODULES.recent_task_progress),
+      backtest_history: Boolean(parsed.backtest_history ?? DEFAULT_COLLAPSED_MODULES.backtest_history),
+      run_notes: Boolean(parsed.run_notes ?? DEFAULT_COLLAPSED_MODULES.run_notes),
+    }
+  } catch {
+    return { ...DEFAULT_COLLAPSED_MODULES }
+  }
+}
+
+function persistCollapsedModules(state: Record<BacktestModuleKey, boolean>) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(BACKTEST_COLLAPSED_MODULES_KEY, JSON.stringify(state))
+  } catch {
+    // ignore local storage errors
+  }
+}
 
 function normalizeEventToken(raw: string): string {
   const token = String(raw || '').trim()
@@ -2089,16 +2143,10 @@ export function BacktestPage() {
   const [reportLibraryLoading, setReportLibraryLoading] = useState(false)
   const [selectedReportId, setSelectedReportId] = useState<string | null>(null)
   const [plateauHistoryLoading, setPlateauHistoryLoading] = useState(false)
-  const [collapsedModules, setCollapsedModules] = useState<Record<BacktestModuleKey, boolean>>({
-    report_share: true,
-    plateau_params: true,
-    plateau_presets: false,
-    recent_task_progress: true,
-    backtest_history: false,
-    run_notes: true,
-  })
+  const [collapsedModules, setCollapsedModules] = useState<Record<BacktestModuleKey, boolean>>(() => loadCollapsedModules())
   const importReportFileRef = useRef<HTMLInputElement | null>(null)
   const backtestResultSectionRef = useRef<HTMLDivElement | null>(null)
+  const plateauPointDetailCacheRef = useRef<Map<string, BacktestPlateauPointDetailResponse>>(new Map())
   const tasksById = useBacktestTaskStore((state) => state.tasksById)
   const payloadById = useBacktestTaskStore((state) => state.payloadById)
   const activeTaskIds = useBacktestTaskStore((state) => state.activeTaskIds)
@@ -2178,7 +2226,9 @@ export function BacktestPage() {
       {collapsedModules[key] ? '▶' : '▼'}
     </Button>
   )
-  const selectedTaskPayload = selectedTaskId ? payloadById[selectedTaskId] ?? null : null
+  const selectedTaskPayload = selectedTaskId
+    ? payloadById[selectedTaskId] ?? tasksById[selectedTaskId]?.result?.effective_run_request ?? null
+    : null
   const runningTaskCount = activeTaskIds.length
   const plateauTaskOptions = useMemo(
     () =>
@@ -2505,6 +2555,20 @@ export function BacktestPage() {
     }
   }
 
+  async function refreshBacktestTaskHistory() {
+    try {
+      const response = await listBacktestTasks({ includeResult: true })
+      for (const row of response.items) {
+        upsertTaskStatus(row)
+        if (row.result?.effective_run_request) {
+          upsertTaskPayload(row.task_id, row.result.effective_run_request)
+        }
+      }
+    } catch (error) {
+      message.warning(`策略回测历史加载失败：${formatApiError(error)}`)
+    }
+  }
+
   async function refreshPlateauTaskHistory() {
     setPlateauHistoryLoading(true)
     try {
@@ -2531,41 +2595,6 @@ export function BacktestPage() {
     },
     onError: (error) => {
       message.error(formatApiError(error))
-    },
-  })
-
-  const exportPlateauTradesMutation = useMutation({
-    mutationFn: async (payload: { row: BacktestPlateauTableRow; runRequest: BacktestRunRequest }) => {
-      const runResult = await runBacktest(payload.runRequest)
-      const workbookBuffer = buildBacktestReportWorkbookBuffer(payload.runRequest, runResult)
-      const blob = new Blob([workbookBuffer], {
-        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      })
-      const dateFrom = String(runResult.range.date_from || '').replaceAll('-', '')
-      const dateTo = String(runResult.range.date_to || '').replaceAll('-', '')
-      const fileBaseName = [
-        'plateau_trades',
-        `rank${payload.row.__rank}`,
-        `score${payload.row.score.toFixed(3)}`,
-        dateFrom || 'from',
-        dateTo || 'to',
-        dayjs().format('YYYYMMDD_HHmmss'),
-      ]
-        .join('_')
-        .replace(/[^0-9A-Za-z_.-]/g, '_')
-      const fileName = `${fileBaseName}.xlsx`
-      downloadBlob(fileName, blob)
-      return {
-        fileName,
-        tradeCount: runResult.trades.length,
-        rank: payload.row.__rank,
-      }
-    },
-    onSuccess: (payload) => {
-      message.success(`第${payload.rank}名交易记录已导出：${payload.fileName}（${payload.tradeCount} 笔）`)
-    },
-    onError: (error) => {
-      message.error(`导出交易记录失败：${formatApiError(error)}`)
     },
   })
 
@@ -2753,7 +2782,15 @@ export function BacktestPage() {
   }
 
   useEffect(() => {
+    persistCollapsedModules(collapsedModules)
+  }, [collapsedModules])
+
+  useEffect(() => {
     void refreshReportLibrary()
+  }, [])
+
+  useEffect(() => {
+    void refreshBacktestTaskHistory()
   }, [])
 
   useEffect(() => {
@@ -3079,50 +3116,137 @@ export function BacktestPage() {
     startPlateauTaskMutation.mutate(payload)
   }
 
-  function buildPlateauRowBacktestPayload(row: BacktestPlateauTableRow, actionLabel: string): BacktestRunRequest | null {
-    if (row.error) {
-      message.warning(`该参数组评估失败，无法${actionLabel}`)
+  function applyBacktestRunRequestToForm(runRequest: BacktestRunRequest) {
+    const nextStrategyId = (
+      String(runRequest.strategy_id || '').trim()
+      || resolveDefaultStrategyId(strategyItems, strategyId)
+    ) as StrategyId
+    const nextStrategyParams = normalizeStrategyParams(runRequest.strategy_params)
+    const nextBoardFilters = sanitizeBoardFilters(runRequest.board_filters)
+    const nextDateFrom = dayjs(runRequest.date_from)
+    const nextDateTo = dayjs(runRequest.date_to)
+
+    setMode(runRequest.mode)
+    setTrendStep(runRequest.trend_step)
+    setPoolRollMode(runRequest.pool_roll_mode)
+    setRunId(String(runRequest.run_id ?? ''))
+    if (runRequest.mode === 'trend_pool') {
+      setBoardFilters(nextBoardFilters.length > 0 ? nextBoardFilters : BACKTEST_DEFAULT_BOARD_FILTERS)
+    } else {
+      setBoardFilters(nextBoardFilters)
+    }
+    setStrategyId(nextStrategyId)
+    setStrategyParams(nextStrategyParams)
+    if (nextDateFrom.isValid() && nextDateTo.isValid()) {
+      setRange([nextDateFrom, nextDateTo])
+    }
+    if (Array.isArray(runRequest.entry_events) && runRequest.entry_events.length > 0) {
+      setEntryEvents(runRequest.entry_events)
+    }
+    if (Array.isArray(runRequest.exit_events) && runRequest.exit_events.length > 0) {
+      setExitEvents(runRequest.exit_events)
+    }
+    setInitialCapital(Number(runRequest.initial_capital))
+    setPositionPctPercent(toPercent(Number(runRequest.position_pct)))
+    setMaxPositions(Number(runRequest.max_positions))
+    setStopLossPercent(toPercent(Number(runRequest.stop_loss)))
+    setTakeProfitPercent(toPercent(Number(runRequest.take_profit)))
+    setTrailingStopPercent(toPercent(Number(runRequest.trailing_stop_pct ?? 0)))
+    setMaxHoldDays(Number(runRequest.max_hold_days))
+    setFeeBps(Number(runRequest.fee_bps))
+    setWindowDays(Number(runRequest.window_days))
+    setMinScore(Number(runRequest.min_score))
+    setMinEventCount(Number(runRequest.min_event_count))
+    setRequireSequence(Boolean(runRequest.require_sequence))
+    setPrioritizeSignals(Boolean(runRequest.prioritize_signals))
+    setPriorityMode(runRequest.priority_mode)
+    setPriorityTopK(Number(runRequest.priority_topk_per_day))
+    setEnforceT1(Boolean(runRequest.enforce_t1))
+    setEntryDelayDays(Math.max(1, Number(runRequest.entry_delay_days ?? 1)))
+    setDelayInvalidationEnabled(runRequest.delay_invalidation_enabled !== false)
+    setMaxSymbols(Number(runRequest.max_symbols))
+    setEnableAdvancedAnalysis(runRequest.enable_advanced_analysis !== false)
+  }
+
+  function buildPlateauPointRunRequest(
+    point: BacktestPlateauPoint,
+    basePayload?: BacktestRunRequest | null,
+  ): BacktestRunRequest | null {
+    if (point.error || !basePayload) return null
+    return buildRunRequestFromPlateauParams(basePayload, point.params)
+  }
+
+  async function loadPlateauPointDetail(
+    taskId: string | null | undefined,
+    point: BacktestPlateauPoint,
+  ): Promise<BacktestPlateauPointDetailResponse | null> {
+    const normalizedTaskId = String(taskId || '').trim()
+    const detailKey = String(point.detail_key || '').trim()
+    if (!normalizedTaskId || !detailKey) return null
+    const cacheKey = `${normalizedTaskId}:${detailKey}`
+    const cached = plateauPointDetailCacheRef.current.get(cacheKey)
+    if (cached) return cached
+    try {
+      const detail = await getBacktestPlateauPointDetail(normalizedTaskId, detailKey)
+      plateauPointDetailCacheRef.current.set(cacheKey, detail)
+      return detail
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'BACKTEST_PLATEAU_POINT_DETAIL_NOT_FOUND') {
+        return null
+      }
+      throw error
+    }
+  }
+
+  async function resolvePlateauPointRunArtifact(
+    point: BacktestPlateauPoint,
+    options: {
+      actionLabel: string
+      taskId?: string | null
+      basePayload?: BacktestRunRequest | null
+      notifyOnRerunFallback?: boolean
+    },
+  ): Promise<{ runRequest: BacktestRunRequest; runResult: BacktestResponse; source: 'persisted' | 'rerun' } | null> {
+    if (point.error) {
+      message.warning(`该参数组评估失败，无法${options.actionLabel}`)
       return null
     }
-    const cached = readScreenerRunMetaFromStorage()
-    const effectiveBoardFilters = cached?.boardFilters?.length ? cached.boardFilters : boardFilters
-    const shouldApplyBoardFilters = mode === 'trend_pool'
-    if (shouldApplyBoardFilters && effectiveBoardFilters.length === 0) {
-      message.warning(`请至少选择一个板块后再${actionLabel}`)
+    const detail = await loadPlateauPointDetail(options.taskId, point)
+    if (detail) {
+      return {
+        runRequest: detail.run_request,
+        runResult: detail.run_result,
+        source: 'persisted',
+      }
+    }
+    const runRequest = buildPlateauPointRunRequest(point, options.basePayload)
+    if (!runRequest) {
+      message.warning(`当前收益平原结果缺少完整上下文，无法${options.actionLabel}`)
       return null
     }
-    if (mode === 'trend_pool' && !runId.trim()) {
-      message.warning(`趋势池模式${actionLabel}需要绑定 run_id`)
-      return null
+    if (options.notifyOnRerunFallback) {
+      message.warning('未找到已持久化的参数组明细，正在临时重算一次。')
     }
-    if (cached?.boardFilters?.length) {
-      setBoardFilters(cached.boardFilters)
-    }
-    return {
-      ...buildBacktestPayload(shouldApplyBoardFilters ? effectiveBoardFilters : undefined),
-      window_days: Number(row.params.window_days),
-      min_score: Number(row.params.min_score),
-      stop_loss: Number(row.params.stop_loss),
-      take_profit: Number(row.params.take_profit),
-      trailing_stop_pct: Number(row.params.trailing_stop_pct),
-      max_positions: Number(row.params.max_positions),
-      position_pct: Number(row.params.position_pct),
-      max_symbols: Number(row.params.max_symbols),
-      priority_topk_per_day: Number(row.params.priority_topk_per_day),
-    }
+    const runResult = await runBacktest(runRequest)
+    return { runRequest, runResult, source: 'rerun' }
   }
 
   async function handleViewPlateauTradeRecords(row: BacktestPlateauTableRow) {
     if (plateauTradeViewLoading) return
-    const payload = buildPlateauRowBacktestPayload(row, '查看交易记录')
-    if (!payload) return
     setPlateauTradeViewingRow(row)
     setPlateauTradeViewResult(null)
     setPlateauTradeViewError(null)
     setPlateauTradeViewLoading(true)
     try {
-      const runResult = await runBacktest(payload)
-      setPlateauTradeViewResult(runResult)
+      const resolved = await resolvePlateauPointRunArtifact(row, {
+        actionLabel: '查看交易记录',
+        taskId: plateauTaskStatus?.task_id ?? null,
+        basePayload: plateauResult?.base_payload ?? null,
+        notifyOnRerunFallback: true,
+      })
+      if (resolved) {
+        setPlateauTradeViewResult(resolved.runResult)
+      }
     } catch (error) {
       setPlateauTradeViewError(formatApiError(error))
     } finally {
@@ -3132,16 +3256,25 @@ export function BacktestPage() {
 
   async function handleExportPlateauTradeRecords(row: BacktestPlateauTableRow) {
     if (plateauExportingRowKey) return
-    const payload = buildPlateauRowBacktestPayload(row, '导出交易记录')
-    if (!payload) return
     setPlateauExportingRowKey(row.__rowKey)
     try {
-      const runResult = await runBacktest(payload)
-      const workbookBuffer = buildPlateauTradeExportWorkbookBuffer(payload, runResult, row, row.__rank)
+      const resolved = await resolvePlateauPointRunArtifact(row, {
+        actionLabel: '导出交易记录',
+        taskId: plateauTaskStatus?.task_id ?? null,
+        basePayload: plateauResult?.base_payload ?? null,
+        notifyOnRerunFallback: true,
+      })
+      if (!resolved) return
+      const workbookBuffer = buildPlateauTradeExportWorkbookBuffer(
+        resolved.runRequest,
+        resolved.runResult,
+        row,
+        row.__rank,
+      )
       const blob = new Blob([workbookBuffer], {
         type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       })
-      const safeRunId = (payload.run_id ?? '').trim().replace(/[^0-9a-zA-Z_-]/g, '')
+      const safeRunId = (resolved.runRequest.run_id ?? '').trim().replace(/[^0-9a-zA-Z_-]/g, '')
       const runSuffix = safeRunId ? `_run_${safeRunId.slice(0, 16)}` : ''
       const fileName = `收益平原第${row.__rank}名_交易记录${runSuffix}_${dayjs().format('YYYYMMDD_HHmmss')}.xlsx`
       downloadBlob(fileName, blob)
@@ -3153,9 +3286,22 @@ export function BacktestPage() {
     }
   }
 
-  function applyPlateauPointToForm(point: BacktestPlateauPoint, rankLabel?: string) {
+  function applyPlateauPointToForm(
+    point: BacktestPlateauPoint,
+    rankLabel?: string,
+    runRequest?: BacktestRunRequest | null,
+  ) {
     if (point.error) {
       message.warning('该参数组评估失败，无法回填')
+      return
+    }
+    const effectiveRunRequest = runRequest ?? buildPlateauPointRunRequest(point, plateauResult?.base_payload ?? null)
+    const prefix = rankLabel ? `${rankLabel}参数已回填` : '参数已回填'
+    if (effectiveRunRequest) {
+      applyBacktestRunRequestToForm(effectiveRunRequest)
+      setRunError(null)
+      const strategyText = String(effectiveRunRequest.strategy_id || '').trim() || '默认策略'
+      message.success(`${prefix}：已包含策略=${strategyText}、滚动=${effectiveRunRequest.pool_roll_mode}`)
       return
     }
     setWindowDays(Number(point.params.window_days))
@@ -3168,39 +3314,11 @@ export function BacktestPage() {
     setMaxSymbols(Number(point.params.max_symbols))
     setPriorityTopK(Number(point.params.priority_topk_per_day))
     setRunError(null)
-    const prefix = rankLabel ? `${rankLabel}参数已回填` : '参数已回填'
-    message.success(`${prefix}：信号窗口=${point.params.window_days}，最低评分=${point.params.min_score.toFixed(2)}`)
-  }
-
-  function buildBacktestPayloadFromPlateauPoint(point: BacktestPlateauPoint): BacktestRunRequest | null {
-    if (point.error) {
-      message.warning('该参数组评估失败，无法导出交易记录')
-      return null
-    }
-    const basePayload = plateauResult?.base_payload
-    if (!basePayload) {
-      message.warning('当前收益平原结果缺少基础参数，无法导出交易记录')
-      return null
-    }
-    return {
-      ...basePayload,
-      window_days: Number(point.params.window_days),
-      min_score: Number(point.params.min_score),
-      stop_loss: Number(point.params.stop_loss),
-      take_profit: Number(point.params.take_profit),
-      trailing_stop_pct: Number(point.params.trailing_stop_pct),
-      max_positions: Number(point.params.max_positions),
-      position_pct: Number(point.params.position_pct),
-      max_symbols: Number(point.params.max_symbols),
-      priority_topk_per_day: Number(point.params.priority_topk_per_day),
-    }
+    message.warning(`${prefix}：仅回填了参数组数值，策略/滚动模式等上下文缺失`)
   }
 
   function handleExportPlateauPointTrades(row: BacktestPlateauTableRow) {
-    if (exportPlateauTradesMutation.isPending) return
-    const runRequest = buildBacktestPayloadFromPlateauPoint(row)
-    if (!runRequest) return
-    exportPlateauTradesMutation.mutate({ row, runRequest })
+    void handleExportPlateauTradeRecords(row)
   }
 
   const taskRunning = taskStatus?.status === 'running' || taskStatus?.status === 'pending' || taskStatus?.status === 'paused'
@@ -3387,13 +3505,8 @@ export function BacktestPage() {
       key: 'action',
       width: 300,
       render: (_value, row) => {
-        const exportingCurrentRow =
-          plateauExportingRowKey === row.__rowKey
-          || (exportPlateauTradesMutation.isPending
-            && exportPlateauTradesMutation.variables?.row.__rowKey === row.__rowKey)
-        const exportingOtherRow =
-          (plateauExportingRowKey !== null && plateauExportingRowKey !== row.__rowKey)
-          || (exportPlateauTradesMutation.isPending && !exportingCurrentRow)
+        const exportingCurrentRow = plateauExportingRowKey === row.__rowKey
+        const exportingOtherRow = plateauExportingRowKey !== null && plateauExportingRowKey !== row.__rowKey
         return (
           <Space size={6}>
             <Button
@@ -3427,10 +3540,6 @@ export function BacktestPage() {
               loading={exportingCurrentRow}
               disabled={Boolean(row.error) || exportingOtherRow}
               onClick={() => {
-                if (mode === 'trend_pool') {
-                  void handleExportPlateauTradeRecords(row)
-                  return
-                }
                 handleExportPlateauPointTrades(row)
               }}
             >
@@ -4144,7 +4253,7 @@ export function BacktestPage() {
         width: 150,
         render: (_value, row) => (
           <Space size={6}>
-            <Button size="small" onClick={() => applyPlateauPointToForm(row.point, '收藏参数')}>
+            <Button size="small" onClick={() => applyPlateauPointToForm(row.point, '收藏参数', row.run_request ?? null)}>
               回填
             </Button>
             <Button
@@ -4164,7 +4273,11 @@ export function BacktestPage() {
     [applyPlateauPointToForm, plateauSavedPresetId],
   )
 
-  function savePlateauPreset(point: BacktestPlateauPoint, sourceLabel: string) {
+  function savePlateauPreset(
+    point: BacktestPlateauPoint,
+    sourceLabel: string,
+    runRequest?: BacktestRunRequest | null,
+  ) {
     if (point.error) {
       message.warning('该参数组评估失败，无法保存。')
       return
@@ -4172,6 +4285,7 @@ export function BacktestPage() {
     const nowText = dayjs().format('YYYY-MM-DD HH:mm:ss')
     const paramsKey = buildPlateauParamsKey(point)
     const presetName = `${sourceLabel} | 评分 ${point.score.toFixed(3)} | 收益 ${formatPct(point.stats.total_return)}`
+    const effectiveRunRequest = runRequest ?? buildPlateauPointRunRequest(point, plateauResult?.base_payload ?? null)
     let persistedId = ''
     setPlateauSavedPresets((prev) => {
       const idx = prev.findIndex((item) => buildPlateauParamsKey(item.point) === paramsKey)
@@ -4184,6 +4298,7 @@ export function BacktestPage() {
           name: presetName,
           saved_at: nowText,
           point,
+          run_request: effectiveRunRequest,
         }
         return next
       }
@@ -4192,6 +4307,7 @@ export function BacktestPage() {
         name: presetName,
         saved_at: nowText,
         point,
+        run_request: effectiveRunRequest,
       }
       persistedId = created.id
       return [created, ...prev].slice(0, 300)
@@ -4207,7 +4323,7 @@ export function BacktestPage() {
       message.info('请先选择一个收藏参数。')
       return
     }
-    applyPlateauPointToForm(selectedSavedPreset.point, '收藏参数')
+    applyPlateauPointToForm(selectedSavedPreset.point, '收藏参数', selectedSavedPreset.run_request ?? null)
   }
 
   function handleDeleteSavedPreset() {
@@ -4297,43 +4413,57 @@ export function BacktestPage() {
       message.open({
         key: ftbtProgressKey,
         type: 'loading',
-        content: `正在回放参数组 0/${points.length} ...`,
+        content: `正在整理参数组 0/${points.length} ...`,
         duration: 0,
       })
       for (let index = 0; index < points.length; index += 1) {
         const point = points[index]!
         const rank = index + 1
-        const runRequest = buildRunRequestFromPlateauParams(plateauResultWithCorr.base_payload, point.params)
         if (point.error) {
           pointRuns.push({
             rank,
             point,
-            runRequest,
+            runRequest: buildRunRequestFromPlateauParams(plateauResultWithCorr.base_payload, point.params),
             runResult: null,
             error: String(point.error),
           })
           message.open({
             key: ftbtProgressKey,
             type: 'loading',
-            content: `正在回放参数组 ${rank}/${points.length} ...`,
+            content: `正在整理参数组 ${rank}/${points.length} ...`,
             duration: 0,
           })
           continue
         }
         try {
-          const runResult = await runBacktest(runRequest)
-          pointRuns.push({
-            rank,
-            point,
-            runRequest,
-            runResult,
-            error: null,
+          const resolved = await resolvePlateauPointRunArtifact(point, {
+            actionLabel: '导出 ftbt',
+            taskId,
+            basePayload: plateauResultWithCorr.base_payload,
+            notifyOnRerunFallback: false,
           })
+          if (!resolved) {
+            pointRuns.push({
+              rank,
+              point,
+              runRequest: buildRunRequestFromPlateauParams(plateauResultWithCorr.base_payload, point.params),
+              runResult: null,
+              error: '缺少可用的参数组明细结果',
+            })
+          } else {
+            pointRuns.push({
+              rank,
+              point,
+              runRequest: resolved.runRequest,
+              runResult: resolved.runResult,
+              error: null,
+            })
+          }
         } catch (error) {
           pointRuns.push({
             rank,
             point,
-            runRequest,
+            runRequest: buildRunRequestFromPlateauParams(plateauResultWithCorr.base_payload, point.params),
             runResult: null,
             error: formatApiError(error),
           })
@@ -4341,7 +4471,7 @@ export function BacktestPage() {
         message.open({
           key: ftbtProgressKey,
           type: 'loading',
-          content: `正在回放参数组 ${rank}/${points.length} ...`,
+          content: `正在整理参数组 ${rank}/${points.length} ...`,
           duration: 0,
         })
       }
@@ -4374,7 +4504,7 @@ export function BacktestPage() {
       downloadBlob(payload.file_name, blob)
       message.success({
         key: ftbtProgressKey,
-        content: `已导出 ftbt：${payload.file_name}（成功回放 ${successRuns.length}/${pointRuns.length} 组）`,
+        content: `已导出 ftbt：${payload.file_name}（成功整理 ${successRuns.length}/${pointRuns.length} 组）`,
         duration: 2,
       })
     } catch (error) {

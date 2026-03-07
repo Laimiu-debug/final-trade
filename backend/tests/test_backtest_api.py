@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import base64
+import json
 import os
 import sys
 import tempfile
@@ -18,6 +19,9 @@ if str(ROOT) not in sys.path:
 TEST_STATE_ROOT = Path(tempfile.mkdtemp(prefix="backtest-api-state-"))
 os.environ.setdefault("TDX_TREND_APP_STATE_PATH", str(TEST_STATE_ROOT / "app_state.json"))
 os.environ.setdefault("TDX_TREND_SIM_STATE_PATH", str(TEST_STATE_ROOT / "sim_state.json"))
+os.environ.setdefault("TDX_TREND_BACKTEST_TASK_STATE_PATH", str(TEST_STATE_ROOT / "backtest_tasks.json"))
+os.environ.setdefault("TDX_TREND_BACKTEST_PLATEAU_TASK_STATE_PATH", str(TEST_STATE_ROOT / "backtest_plateau_tasks.json"))
+os.environ.setdefault("TDX_TREND_BACKTEST_PLATEAU_DETAIL_STORE_DIR", str(TEST_STATE_ROOT / "backtest_plateau_details"))
 os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_PATH", str(TEST_STATE_ROOT / "wyckoff_events.sqlite"))
 os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_ENABLED", "1")
 os.environ.setdefault("TDX_TREND_WYCKOFF_STORE_READ_ONLY", "0")
@@ -646,6 +650,130 @@ def test_backtest_plateau_task_delete_succeeded_task(monkeypatch: pytest.MonkeyP
     assert get_resp.json()["code"] == "BACKTEST_PLATEAU_TASK_NOT_FOUND"
 
 
+def test_backtest_plateau_point_detail_endpoint_persists_and_cleans_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
+        _ = (progress_callback, prebuilt_universe)
+        if control_callback is not None:
+            control_callback()
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.6,
+                total_return=float(payload.min_score) / 100.0,
+                max_drawdown=-0.05,
+                avg_pnl_ratio=0.04,
+                trade_count=1,
+                win_count=1,
+                loss_count=0,
+                profit_factor=2.0,
+            ),
+            trades=[
+                BacktestTrade(
+                    symbol="sz300750",
+                    name="宁德时代",
+                    signal_date=payload.date_from,
+                    entry_date=payload.date_from,
+                    exit_date=payload.date_to,
+                    entry_signal="SOS",
+                    entry_phase="吸筹D",
+                    entry_quality_score=80.0,
+                    exit_reason="take_profit",
+                    quantity=100,
+                    entry_price=10.0,
+                    exit_price=11.0,
+                    holding_days=5,
+                    pnl_amount=100.0,
+                    pnl_ratio=0.1,
+                )
+            ],
+            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+            notes=["plateau detail persisted"],
+            candidate_count=5,
+            skipped_count=0,
+            fill_rate=1.0,
+            max_concurrent_positions=int(payload.max_positions),
+            effective_run_request=payload.model_copy(deep=True),
+        )
+
+    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
+
+    base_payload = {
+        "mode": "full_market",
+        "run_id": "",
+        "trend_step": "auto",
+        "pool_roll_mode": "position",
+        "board_filters": [],
+        "date_from": "2025-01-02",
+        "date_to": "2025-01-31",
+        "window_days": 60,
+        "min_score": 55,
+        "require_sequence": False,
+        "min_event_count": 1,
+        "entry_events": ["Spring", "SOS"],
+        "exit_events": ["UTAD", "SOW"],
+        "initial_capital": 1_000_000,
+        "position_pct": 0.2,
+        "max_positions": 5,
+        "stop_loss": 0.05,
+        "take_profit": 0.15,
+        "max_hold_days": 30,
+        "fee_bps": 8.0,
+        "prioritize_signals": True,
+        "priority_mode": "balanced",
+        "priority_topk_per_day": 0,
+        "enforce_t1": True,
+        "max_symbols": 80,
+    }
+    payload = {
+        "base_payload": base_payload,
+        "sampling_mode": "grid",
+        "window_days_list": [40],
+        "min_score_list": [52],
+        "stop_loss_list": [0.03],
+        "take_profit_list": [0.12],
+        "trailing_stop_pct_list": [0.01],
+        "max_positions_list": [3],
+        "position_pct_list": [0.2],
+        "max_symbols_list": [60],
+        "priority_topk_per_day_list": [0],
+        "sample_points": 1,
+        "max_points": 1,
+    }
+
+    start_resp = client.post("/api/backtest/plateau/tasks", json=payload)
+    assert start_resp.status_code == 200
+    task_id = str(start_resp.json()["task_id"])
+
+    finished = _wait_backtest_plateau_task(task_id)
+    assert finished["status"] == "succeeded"
+    point = finished["result"]["points"][0]
+    detail_key = str(point["detail_key"])
+    assert detail_key.startswith("pt_")
+
+    detail_resp = client.get(f"/api/backtest/plateau/tasks/{task_id}/points/{detail_key}")
+    assert detail_resp.status_code == 200
+    detail = detail_resp.json()
+    assert detail["task_id"] == task_id
+    assert detail["detail_key"] == detail_key
+    assert detail["run_request"]["pool_roll_mode"] == "position"
+    assert detail["run_request"]["window_days"] == 40
+    assert detail["run_result"]["notes"] == ["plateau detail persisted"]
+    assert detail["run_result"]["trades"][0]["symbol"] == "sz300750"
+
+    detail_path = store._backtest_plateau_point_detail_path(task_id, detail_key)
+    detail_dir = store._backtest_plateau_task_detail_dir(task_id)
+    assert detail_path.exists()
+    assert detail_dir.exists()
+
+    delete_resp = client.delete(f"/api/backtest/plateau/tasks/{task_id}")
+    assert delete_resp.status_code == 200
+    assert delete_resp.json()["deleted"] is True
+    assert not detail_dir.exists()
+
+    detail_resp_after = client.get(f"/api/backtest/plateau/tasks/{task_id}/points/{detail_key}")
+    assert detail_resp_after.status_code == 404
+    assert detail_resp_after.json()["code"] == "BACKTEST_PLATEAU_POINT_DETAIL_NOT_FOUND"
+
+
 def test_backtest_plateau_task_delete_running_task_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
         _ = (progress_callback, prebuilt_universe)
@@ -1076,6 +1204,79 @@ def test_backtest_task_full_market_daily_smoke() -> None:
     assert result["range"]["date_from"] == date_from
     assert result["range"]["date_to"] == date_to
     assert any("全市场候选池构建" in note for note in result["notes"])
+
+
+def test_backtest_task_list_includes_persisted_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_precheck(payload):  # noqa: ANN001
+        _ = payload
+        return None
+
+    def _fake_scan_total_dates(payload):  # noqa: ANN001
+        _ = payload
+        return 2
+
+    def _fake_total_dates(payload):  # noqa: ANN001
+        _ = payload
+        return 2
+
+    def _fake_run_backtest(payload, *, progress_callback=None, control_callback=None, prebuilt_universe=None):  # noqa: ANN001
+        _ = (progress_callback, control_callback, prebuilt_universe)
+        return BacktestResponse(
+            stats=ReviewStats(
+                win_rate=0.5,
+                total_return=0.12,
+                max_drawdown=-0.08,
+                avg_pnl_ratio=0.03,
+                trade_count=2,
+                win_count=1,
+                loss_count=1,
+                profit_factor=1.3,
+            ),
+            trades=[],
+            range=ReviewRange(date_from=payload.date_from, date_to=payload.date_to, date_axis="sell"),
+            notes=["persisted task result"],
+            candidate_count=6,
+            skipped_count=1,
+            fill_rate=0.5,
+            max_concurrent_positions=2,
+            effective_run_request=payload.model_copy(deep=True),
+        )
+
+    monkeypatch.setattr(store, "_run_backtest_precheck_with_cache", _fake_precheck)
+    monkeypatch.setattr(store, "_estimate_backtest_scan_progress_total_dates", _fake_scan_total_dates)
+    monkeypatch.setattr(store, "_estimate_backtest_progress_total_dates", _fake_total_dates)
+    monkeypatch.setattr(store, "run_backtest", _fake_run_backtest)
+
+    payload = {
+        "mode": "full_market",
+        "pool_roll_mode": "daily",
+        "date_from": "2025-01-02",
+        "date_to": "2025-01-10",
+        "window_days": 60,
+        "min_score": 55,
+        "max_symbols": 20,
+        "priority_topk_per_day": 0,
+    }
+
+    start_resp = client.post("/api/backtest/tasks", json=payload)
+    assert start_resp.status_code == 200
+    task_id = str(start_resp.json()["task_id"])
+
+    finished = _wait_backtest_task(task_id)
+    assert finished["status"] == "succeeded"
+    assert finished["result"]["notes"] == ["persisted task result"]
+
+    list_resp = client.get("/api/backtest/tasks", params={"include_result": "true"})
+    assert list_resp.status_code == 200
+    items = list_resp.json()["items"]
+    matched = next(item for item in items if item["task_id"] == task_id)
+    assert matched["result"]["notes"] == ["persisted task result"]
+    assert matched["result"]["effective_run_request"]["pool_roll_mode"] == "daily"
+
+    persisted = json.loads(store._backtest_task_state_path.read_text(encoding="utf-8"))
+    persisted_row = next(row for row in persisted["tasks"] if row["task"]["task_id"] == task_id)
+    assert persisted_row["task"]["result"]["notes"] == ["persisted task result"]
+    assert persisted_row["task"]["result"]["effective_run_request"]["pool_roll_mode"] == "daily"
 
 
 def test_backtest_task_supports_pause_resume_cancel(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -18,10 +18,12 @@ from .models import (
     BacktestRunRequest,
     BacktestPlateauRunRequest,
     BacktestPlateauResponse,
+    BacktestPlateauPointDetailResponse,
     BacktestPlateauTaskListResponse,
     BacktestPlateauTaskDeleteResponse,
     BacktestPlateauTaskStatusResponse,
     BacktestPoolRollMode,
+    BacktestTaskListResponse,
     BacktestTaskStartResponse,
     BacktestTaskStatusResponse,
     BacktestReportBuildRequest,
@@ -450,6 +452,17 @@ def get_backtest_plateau_task(
     return task
 
 
+@app.get("/api/backtest/plateau/tasks/{task_id}/points/{detail_key}", response_model=BacktestPlateauPointDetailResponse)
+def get_backtest_plateau_point_detail(
+    task_id: str = Path(min_length=8, max_length=64),
+    detail_key: str = Path(min_length=4, max_length=96),
+) -> BacktestPlateauPointDetailResponse | JSONResponse:
+    detail = store.get_backtest_plateau_point_detail(task_id, detail_key)
+    if detail is None:
+        return error_response(404, "BACKTEST_PLATEAU_POINT_DETAIL_NOT_FOUND", "收益平原参数组结果不存在")
+    return detail
+
+
 @app.post("/api/backtest/plateau/tasks/{task_id}/pause", response_model=BacktestPlateauTaskStatusResponse)
 def post_backtest_plateau_task_pause(
     task_id: str = Path(min_length=8, max_length=64),
@@ -507,6 +520,18 @@ def post_backtest_task(payload: BacktestRunRequest) -> BacktestTaskStartResponse
     try:
         task_id = store.start_backtest_task(payload)
         return BacktestTaskStartResponse(task_id=task_id)
+    except BacktestValidationError as exc:
+        return error_response(400, exc.code, str(exc))
+    except ValueError as exc:
+        return error_response(400, "BACKTEST_INVALID", str(exc))
+
+
+@app.get("/api/backtest/tasks", response_model=BacktestTaskListResponse)
+def get_backtest_tasks(
+    include_result: bool = Query(default=False),
+) -> BacktestTaskListResponse | JSONResponse:
+    try:
+        return store.list_backtest_tasks(include_result=include_result)
     except BacktestValidationError as exc:
         return error_response(400, exc.code, str(exc))
     except ValueError as exc:

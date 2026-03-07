@@ -53,6 +53,7 @@ import {
 import type {
   AIProviderTestRequest,
   AppConfig,
+  BacktestPlateauPointDetailResponse,
   BacktestReportDetail,
   BacktestReportSummary,
   BacktestPlateauResponse,
@@ -76,11 +77,15 @@ import type {
 type MockBacktestTask = {
   status: 'running' | 'succeeded'
   poll_count: number
+  payload: BacktestRunRequest
   result: BacktestResponse
+  updated_at: string
 }
 type MockBacktestPlateauTask = {
   status: 'pending' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled'
   poll_count: number
+  payload: BacktestPlateauRunRequest
+  point_details: Record<string, BacktestPlateauPointDetailResponse>
   result: BacktestPlateauResponse
   sampling_mode: 'grid' | 'lhs'
   updated_at: string
@@ -94,6 +99,22 @@ type MockBacktestReport = {
 const mockBacktestTaskStore = new Map<string, MockBacktestTask>()
 const mockBacktestPlateauTaskStore = new Map<string, MockBacktestPlateauTask>()
 const mockBacktestReportStore = new Map<string, MockBacktestReport>()
+
+function buildMockPlateauRunRequest(basePayload: BacktestRunRequest, params: BacktestPlateauResponse['points'][number]['params']): BacktestRunRequest {
+  return {
+    ...basePayload,
+    window_days: Number(params.window_days),
+    min_score: Number(params.min_score),
+    stop_loss: Number(params.stop_loss),
+    take_profit: Number(params.take_profit),
+    trailing_stop_pct: Number(params.trailing_stop_pct),
+    max_positions: Number(params.max_positions),
+    position_pct: Number(params.position_pct),
+    max_symbols: Number(params.max_symbols),
+    priority_topk_per_day: Number(params.priority_topk_per_day),
+    enable_advanced_analysis: false,
+  }
+}
 
 export const handlers = [
   http.post('/api/screener/run', async ({ request }) => {
@@ -283,7 +304,7 @@ export const handlers = [
           error: null,
           error_code: null,
         }
-      })
+    })
     return HttpResponse.json({ items })
   }),
 
@@ -291,10 +312,35 @@ export const handlers = [
     await delay(120)
     const payload = (await request.json()) as BacktestPlateauRunRequest
     const taskId = `bp_mock_${Date.now()}_${Math.floor(Math.random() * 10000)}`
+    const result = runBacktestPlateauStore(payload)
+    const pointDetails: Record<string, BacktestPlateauPointDetailResponse> = {}
+    const points = result.points.map((point, index) => {
+      if (point.error) return point
+      const detailKey = `pt_mock_${index + 1}`
+      const runRequest = buildMockPlateauRunRequest(payload.base_payload, point.params)
+      pointDetails[detailKey] = {
+        task_id: taskId,
+        detail_key: detailKey,
+        saved_at: new Date().toISOString(),
+        params: point.params,
+        run_request: runRequest,
+        run_result: runBacktestStore(runRequest),
+      }
+      return {
+        ...point,
+        detail_key: detailKey,
+      }
+    })
     mockBacktestPlateauTaskStore.set(taskId, {
       status: 'running',
       poll_count: 0,
-      result: runBacktestPlateauStore(payload),
+      payload,
+      point_details: pointDetails,
+      result: {
+        ...result,
+        points,
+        best_point: points.find((point) => !point.error) ?? result.best_point ?? null,
+      },
       sampling_mode: payload.sampling_mode ?? 'lhs',
       updated_at: new Date().toISOString(),
     })
@@ -339,6 +385,25 @@ export const handlers = [
       error: null,
       error_code: null,
     })
+  }),
+
+  http.get('/api/backtest/plateau/tasks/:taskId/points/:detailKey', async ({ params }) => {
+    await delay(80)
+    const taskId = String(params.taskId)
+    const detailKey = String(params.detailKey)
+    const task = mockBacktestPlateauTaskStore.get(taskId)
+    const detail = task?.point_details?.[detailKey]
+    if (!detail) {
+      return HttpResponse.json(
+        {
+          code: 'BACKTEST_PLATEAU_POINT_DETAIL_NOT_FOUND',
+          message: '收益平原参数组结果不存在',
+          trace_id: `${Date.now()}`,
+        },
+        { status: 404 },
+      )
+    }
+    return HttpResponse.json(detail)
   }),
 
   http.post('/api/backtest/plateau/tasks/:taskId/pause', async ({ params }) => {
@@ -446,9 +511,37 @@ export const handlers = [
     mockBacktestTaskStore.set(taskId, {
       status: 'running',
       poll_count: 0,
+      payload,
       result: runBacktestStore(payload),
+      updated_at: new Date().toISOString(),
     })
     return HttpResponse.json({ task_id: taskId })
+  }),
+
+  http.get('/api/backtest/tasks', async () => {
+    await delay(80)
+    const items = Array.from(mockBacktestTaskStore.entries())
+      .sort((left, right) => right[1].updated_at.localeCompare(left[1].updated_at))
+      .map(([taskId, task]) => ({
+        task_id: taskId,
+        status: task.status,
+        progress: {
+          mode: task.payload.pool_roll_mode,
+          current_date: task.status === 'succeeded' ? task.result.range.date_to : task.result.range.date_from,
+          processed_dates: task.status === 'succeeded' ? 2 : 1,
+          total_dates: 2,
+          percent: task.status === 'succeeded' ? 100 : 50,
+          message: task.status === 'succeeded' ? '回测完成。' : '滚动筛选进度 1/2',
+          warning: null,
+          stage_timings: [],
+          started_at: task.updated_at,
+          updated_at: task.updated_at,
+        },
+        result: task.status === 'succeeded' ? task.result : null,
+        error: null,
+        error_code: null,
+      }))
+    return HttpResponse.json({ items })
   }),
 
   http.get('/api/backtest/tasks/:taskId', async ({ params }) => {
@@ -474,7 +567,7 @@ export const handlers = [
         task_id: taskId,
         status: 'running',
         progress: {
-          mode: 'daily',
+          mode: task.payload.pool_roll_mode,
           current_date: task.result.range.date_from,
           processed_dates: 1,
           total_dates: 2,
@@ -491,7 +584,7 @@ export const handlers = [
       task_id: taskId,
       status: 'succeeded',
       progress: {
-        mode: 'daily',
+        mode: task.payload.pool_roll_mode,
         current_date: task.result.range.date_to,
         processed_dates: 2,
         total_dates: 2,

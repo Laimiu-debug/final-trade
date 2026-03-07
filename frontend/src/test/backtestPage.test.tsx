@@ -80,9 +80,14 @@ describe('BacktestPage', () => {
     window.localStorage.clear()
     useBacktestTaskStore.setState({
       tasksById: {},
+      payloadById: {},
       activeTaskIds: [],
       selectedTaskId: undefined,
     })
+    server.use(
+      http.get('/api/backtest/tasks', async () => HttpResponse.json({ items: [] })),
+      http.get('/api/backtest/plateau/tasks', async () => HttpResponse.json({ items: [] })),
+    )
   })
 
   it('runs backtest and renders result summary', async () => {

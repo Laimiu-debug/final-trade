@@ -4,7 +4,9 @@ import type {
   AIProviderTestRequest,
   AIProviderTestResponse,
   AppConfig,
+  BacktestPlateauPointDetailResponse,
   BacktestTaskStartResponse,
+  BacktestTaskListResponse,
   BacktestTaskStatusResponse,
   BacktestReportBuildRequest,
   BacktestReportBuildResponse,
@@ -517,8 +519,23 @@ export function startBacktestTask(payload: BacktestRunRequest) {
   })
 }
 
+export function listBacktestTasks(params?: { includeResult?: boolean }) {
+  const query = new URLSearchParams()
+  if (typeof params?.includeResult === 'boolean') query.set('include_result', String(params.includeResult))
+  const suffix = query.toString()
+  return apiRequest<BacktestTaskListResponse>(`/api/backtest/tasks${suffix ? `?${suffix}` : ''}`, {
+    timeoutMs: 60_000,
+  })
+}
+
 export function getBacktestTask(taskId: string) {
   return apiRequest<BacktestTaskStatusResponse>(`/api/backtest/tasks/${taskId}`, {
+    timeoutMs: 60_000,
+  })
+}
+
+export function getBacktestPlateauPointDetail(taskId: string, detailKey: string) {
+  return apiRequest<BacktestPlateauPointDetailResponse>(`/api/backtest/plateau/tasks/${taskId}/points/${detailKey}`, {
     timeoutMs: 60_000,
   })
 }

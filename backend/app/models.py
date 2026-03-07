@@ -882,6 +882,10 @@ class BacktestTaskStatusResponse(BaseModel):
     error_code: str | None = None
 
 
+class BacktestTaskListResponse(BaseModel):
+    items: list[BacktestTaskStatusResponse] = Field(default_factory=list)
+
+
 class BacktestPlateauRunRequest(BaseModel):
     base_payload: BacktestRunRequest
     sampling_mode: Literal["grid", "lhs"] = "lhs"
@@ -920,6 +924,7 @@ class BacktestPlateauPoint(BaseModel):
     max_concurrent_positions: int = 0
     score: float = 0.0
     cache_hit: bool = False
+    detail_key: str | None = None
     error: str | None = None
 
 
@@ -968,6 +973,15 @@ class BacktestPlateauTaskListResponse(BaseModel):
 class BacktestPlateauTaskDeleteResponse(BaseModel):
     deleted: bool
     task_id: str
+
+
+class BacktestPlateauPointDetailResponse(BaseModel):
+    task_id: str
+    detail_key: str
+    saved_at: str
+    params: BacktestPlateauParams
+    run_request: BacktestRunRequest
+    run_result: BacktestResponse
 
 
 class BacktestReportManifestFile(BaseModel):
