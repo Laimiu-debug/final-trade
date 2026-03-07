@@ -274,10 +274,16 @@ def test_backtest_plateau_endpoint_handles_truncation_and_failures(monkeypatch: 
     assert len(body["points"]) == 3
     assert body["best_point"] is not None
     assert body["best_point"]["params"]["window_days"] == 60
+    assert body["recommended_point"] is not None
+    assert "plateau_score" in body["recommended_point"]
+    assert "local_score" in body["recommended_point"]
+    assert len(body["regions"]) >= 1
+    assert body["regions"][0]["point_count"] >= 1
+    assert body["regions"][0]["center_point"]["params"]["window_days"] in {40, 60}
     assert len(body["correlations"]) == 9
     assert any("参数组合总数" in note for note in body["notes"])
     assert any("参数评估失败" in note for note in body["notes"])
-    assert any("低胜率惩罚" in note for note in body["notes"])
+    assert any("稳定区域" in note for note in body["notes"])
     assert sum(1 for point in body["points"] if point.get("error")) >= 1
 
 
@@ -369,9 +375,11 @@ def test_backtest_plateau_endpoint_lhs_sampling_is_repeatable(monkeypatch: pytes
     assert any(row["parameter"] == "min_score" for row in body1["correlations"])
     assert body1["points"] == body2["points"]
     assert body1["correlations"] == body2["correlations"]
+    assert body1["recommended_point"] == body2["recommended_point"]
+    assert body1["regions"] == body2["regions"]
     assert any("参数采样模式: lhs" in note for note in body1["notes"])
     assert any("LHS 随机种子: 20260221" in note for note in body1["notes"])
-    assert any("低胜率惩罚" in note for note in body1["notes"])
+    assert any("稳定区域" in note for note in body1["notes"])
 
 
 def test_backtest_plateau_endpoint_parallel_workers(monkeypatch: pytest.MonkeyPatch) -> None:

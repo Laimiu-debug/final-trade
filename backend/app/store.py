@@ -40,6 +40,7 @@ from .models import (
     BacktestPlateauResponse,
     BacktestPlateauPoint,
     BacktestPlateauParams,
+    BacktestPlateauRegionSummary,
     BacktestPlateauCorrelationRow,
     BacktestPlateauTaskProgress,
     BacktestPlateauTaskStatusResponse,
@@ -8384,43 +8385,505 @@ class InMemoryStore:
             float(point.params.priority_topk_per_day),
         )
 
-    def _apply_plateau_neighborhood_consistency(self, points: list[BacktestPlateauPoint]) -> None:
-        valid_points = [row for row in points if row.error is None]
-        if len(valid_points) < 3:
-            return
+    @staticmethod
+    def _plateau_param_dim_weights() -> tuple[float, ...]:
+        return (
+            1.0,  # window_days
+            1.0,  # min_score
+            0.8,  # stop_loss
+            0.8,  # take_profit
+            0.8,  # trailing_stop_pct
+            0.5,  # max_positions
+            0.5,  # position_pct
+            0.5,  # max_symbols
+            0.5,  # priority_topk_per_day
+        )
 
-        vectors = [self._plateau_param_vector(row) for row in valid_points]
-        dim_count = len(vectors[0])
-        ranges: list[float] = []
+    @staticmethod
+    def _safe_percentile_scores(values: list[float]) -> list[float]:
+        if not values:
+            return []
+        if len(values) == 1:
+            return [50.0]
+        sorted_indices = sorted(range(len(values)), key=lambda idx: float(values[idx]))
+        out = [50.0] * len(values)
+        cursor = 0
+        while cursor < len(sorted_indices):
+            end = cursor
+            base_value = float(values[sorted_indices[cursor]])
+            while end + 1 < len(sorted_indices) and float(values[sorted_indices[end + 1]]) == base_value:
+                end += 1
+            rank = ((cursor + end) / 2.0) / float(len(values) - 1) * 100.0
+            for pos in range(cursor, end + 1):
+                out[sorted_indices[pos]] = round(float(rank), 6)
+            cursor = end + 1
+        return out
+
+    @staticmethod
+    def _estimate_backtest_years(date_from: str, date_to: str) -> float:
+        try:
+            start = datetime.strptime(str(date_from), "%Y-%m-%d").date()
+            end = datetime.strptime(str(date_to), "%Y-%m-%d").date()
+        except Exception:
+            return 1.0
+        delta_days = max(1, (end - start).days + 1)
+        return max(1.0 / 12.0, float(delta_days) / 365.25)
+
+    @classmethod
+    def _format_plateau_param_range(cls, param_name: str, values: list[float]) -> str:
+        if not values:
+            return "--"
+        lower = min(float(item) for item in values)
+        upper = max(float(item) for item in values)
+        if param_name in {"window_days", "max_positions", "max_symbols", "priority_topk_per_day"}:
+            lower_text = str(int(round(lower)))
+            upper_text = str(int(round(upper)))
+        elif param_name == "min_score":
+            lower_text = f"{lower:.2f}"
+            upper_text = f"{upper:.2f}"
+        else:
+            lower_text = f"{lower * 100.0:.2f}%"
+            upper_text = f"{upper * 100.0:.2f}%"
+        if lower_text == upper_text:
+            return lower_text
+        return f"{lower_text} ~ {upper_text}"
+
+    def _apply_plateau_robustness_scores(
+        self,
+        points: list[BacktestPlateauPoint],
+        *,
+        base_payload: BacktestRunRequest,
+    ) -> tuple[list[BacktestPlateauPoint], list[dict[str, Any]]]:
+        valid_points = [row for row in points if row.error is None]
+        if not valid_points:
+            return [], []
+
+        backtest_years = self._estimate_backtest_years(base_payload.date_from, base_payload.date_to)
+        min_avg_pnl_ratio = max(0.002, float(base_payload.fee_bps) * 4.0 / 10000.0)
+
+        calmar_values: list[float] = []
+        return_values: list[float] = []
+        profit_factor_values: list[float] = []
+        annual_trade_values: list[float] = []
+        fill_rate_values: list[float] = []
+
+        for row in valid_points:
+            annual_trades = float(row.stats.trade_count) / backtest_years
+            row.annual_trades = round(float(annual_trades), 6)
+            failures: list[str] = []
+            if float(row.stats.total_return) <= 0.0:
+                failures.append("收益<=0")
+            if float(row.stats.profit_factor) < 1.05:
+                failures.append("ProfitFactor<1.05")
+            if abs(float(row.stats.max_drawdown)) > 0.35:
+                failures.append("回撤>35%")
+            if float(row.fill_rate) < 0.10:
+                failures.append("fill_rate<10%")
+            if annual_trades < 12.0:
+                failures.append("年化交易数<12")
+            if float(row.stats.avg_pnl_ratio) < min_avg_pnl_ratio:
+                failures.append("单笔收益不足覆盖成本")
+            row.hard_filter_failures = failures
+            row.passes_hard_filters = len(failures) == 0
+
+            max_drawdown = max(abs(float(row.stats.max_drawdown)), 0.02)
+            calmar_values.append(float(row.stats.total_return) / max_drawdown)
+            return_values.append(float(row.stats.total_return))
+            profit_factor = float(row.stats.profit_factor)
+            if not math.isfinite(profit_factor):
+                profit_factor = 5.0
+            profit_factor_values.append(max(0.0, min(profit_factor, 5.0)))
+            annual_trade_values.append(float(annual_trades))
+            fill_rate_values.append(float(row.fill_rate))
+
+        calmar_percentiles = self._safe_percentile_scores(calmar_values)
+        return_percentiles = self._safe_percentile_scores(return_values)
+        profit_factor_percentiles = self._safe_percentile_scores(profit_factor_values)
+        annual_trade_percentiles = self._safe_percentile_scores(annual_trade_values)
+        fill_rate_percentiles = self._safe_percentile_scores(fill_rate_values)
+
+        raw_vectors = [self._plateau_param_vector(row) for row in valid_points]
+        dim_count = len(raw_vectors[0])
+        minimums: list[float] = []
+        spans: list[float] = []
         for dim in range(dim_count):
-            values = [vector[dim] for vector in vectors]
-            span = max(values) - min(values)
-            ranges.append(span if span > 1e-9 else 1.0)
+            values = [vector[dim] for vector in raw_vectors]
+            lower = min(values)
+            span = max(values) - lower
+            minimums.append(lower)
+            spans.append(span if span > 1e-9 else 1.0)
+        normalized_vectors: list[tuple[float, ...]] = []
+        for vector in raw_vectors:
+            normalized_vectors.append(
+                tuple(
+                    (float(vector[dim]) - minimums[dim]) / spans[dim]
+                    for dim in range(dim_count)
+                )
+            )
+
+        dim_weights = self._plateau_param_dim_weights()
+        neighbor_count = min(12, max(0, len(valid_points) - 1))
+        neighbor_meta: list[dict[str, Any]] = []
+        raw_sensitivity_values: list[float] = []
 
         for idx, row in enumerate(valid_points):
-            base_vector = vectors[idx]
+            row.point_score = round(
+                (
+                    0.30 * calmar_percentiles[idx]
+                    + 0.25 * return_percentiles[idx]
+                    + 0.15 * profit_factor_percentiles[idx]
+                    + 0.15 * annual_trade_percentiles[idx]
+                    + 0.15 * fill_rate_percentiles[idx]
+                ),
+                6,
+            )
             distance_items: list[tuple[float, int]] = []
-            for other_idx, other_vector in enumerate(vectors):
+            for other_idx, other_vector in enumerate(normalized_vectors):
                 if other_idx == idx:
                     continue
                 diff_sq = 0.0
                 for dim in range(dim_count):
-                    normalized = (base_vector[dim] - other_vector[dim]) / ranges[dim]
-                    diff_sq += normalized * normalized
+                    diff = float(normalized_vectors[idx][dim]) - float(other_vector[dim])
+                    diff_sq += float(dim_weights[dim]) * diff * diff
                 distance_items.append((math.sqrt(diff_sq), other_idx))
-            if not distance_items:
+            distance_items.sort(key=lambda item: (item[0], item[1]))
+            neighbors = distance_items[:neighbor_count]
+            if neighbors:
+                neighbor_points = [valid_points[item[1]] for item in neighbors]
+                pass_rate = sum(1 for item in neighbor_points if item.passes_hard_filters) / float(len(neighbor_points))
+                neighbor_point_scores = [float(item.point_score) for item in neighbor_points]
+                neighbor_median = self._quantile(neighbor_point_scores, 0.50)
+                neighbor_p25 = self._quantile(neighbor_point_scores, 0.25)
+                raw_sensitivity = self._safe_mean(
+                    [
+                        abs(float(valid_points[item[1]].point_score) - float(row.point_score)) / max(0.05, float(item[0]))
+                        for item in neighbors
+                    ]
+                )
+            else:
+                pass_rate = 1.0 if row.passes_hard_filters else 0.0
+                neighbor_median = float(row.point_score)
+                neighbor_p25 = float(row.point_score)
+                raw_sensitivity = 0.0
+            row.neighbor_pass_rate = round(float(pass_rate), 6)
+            row.neighbor_median_score = round(float(neighbor_median), 6)
+            row.neighbor_p25_score = round(float(neighbor_p25), 6)
+            neighbor_meta.append(
+                {
+                    "vector": normalized_vectors[idx],
+                    "neighbors": neighbors,
+                }
+            )
+            raw_sensitivity_values.append(float(raw_sensitivity))
+
+        sensitivity_percentiles = self._safe_percentile_scores(raw_sensitivity_values)
+        for idx, row in enumerate(valid_points):
+            stability_score = max(0.0, 100.0 - float(sensitivity_percentiles[idx]))
+            row.sensitivity_penalty = round(float(sensitivity_percentiles[idx]), 6)
+            row.local_score = round(
+                (
+                    0.35 * float(row.neighbor_pass_rate) * 100.0
+                    + 0.30 * float(row.neighbor_median_score)
+                    + 0.20 * float(row.neighbor_p25_score)
+                    + 0.15 * stability_score
+                ),
+                6,
+            )
+            combined_score = 0.35 * float(row.point_score) + 0.65 * float(row.local_score)
+            if not row.passes_hard_filters:
+                combined_score *= 0.45
+            row.plateau_score = round(float(combined_score), 6)
+            neighbor_meta[idx]["stability_score"] = round(float(stability_score), 6)
+
+        return valid_points, neighbor_meta
+
+    def _build_backtest_plateau_run_payload(
+        self,
+        base_payload: BacktestRunRequest,
+        params: BacktestPlateauParams,
+    ) -> BacktestRunRequest:
+        return base_payload.model_copy(
+            update={
+                "window_days": params.window_days,
+                "min_score": params.min_score,
+                "stop_loss": params.stop_loss,
+                "take_profit": params.take_profit,
+                "trailing_stop_pct": params.trailing_stop_pct,
+                "max_positions": params.max_positions,
+                "position_pct": params.position_pct,
+                "max_symbols": params.max_symbols,
+                "priority_topk_per_day": params.priority_topk_per_day,
+                "enable_advanced_analysis": False,
+            },
+            deep=True,
+        )
+
+    def _build_backtest_plateau_regions(
+        self,
+        valid_points: list[BacktestPlateauPoint],
+        neighbor_meta: list[dict[str, Any]],
+        *,
+        base_payload: BacktestRunRequest,
+        control_callback: Callable[[], None] | None = None,
+        include_oos: bool = True,
+    ) -> list[BacktestPlateauRegionSummary]:
+        if not valid_points:
+            return []
+
+        candidate_indices = [
+            idx
+            for idx, row in enumerate(valid_points)
+            if row.passes_hard_filters and float(row.local_score) >= 55.0
+        ]
+        if not candidate_indices:
+            return []
+
+        candidate_set = set(candidate_indices)
+        connect_neighbor_count = min(4, max(1, min(12, len(valid_points) - 1)))
+        adjacency: dict[int, set[int]] = {idx: set() for idx in candidate_indices}
+        for idx in candidate_indices:
+            for _distance, neighbor_idx in neighbor_meta[idx]["neighbors"][:connect_neighbor_count]:
+                if neighbor_idx in candidate_set:
+                    adjacency[idx].add(int(neighbor_idx))
+                    adjacency[int(neighbor_idx)].add(idx)
+
+        components: list[list[int]] = []
+        visited: set[int] = set()
+        for idx in candidate_indices:
+            if idx in visited:
                 continue
-            distance_items.sort(key=lambda item: item[0])
-            neighbor_count = min(6, len(distance_items))
-            neighbor_scores = [float(valid_points[item[1]].score) for item in distance_items[:neighbor_count]]
-            if not neighbor_scores:
-                continue
-            close_band = max(0.08, abs(float(row.score)) * 0.3)
-            close_ratio = sum(1 for value in neighbor_scores if abs(value - float(row.score)) <= close_band) / neighbor_count
-            positive_ratio = sum(1 for value in neighbor_scores if value > 0.0) / neighbor_count
-            consistency = (close_ratio + positive_ratio) / 2.0
-            adjustment = (consistency - 0.5) * 0.2
-            row.score = round(float(row.score) + adjustment, 6)
+            stack = [idx]
+            component: list[int] = []
+            visited.add(idx)
+            while stack:
+                current = stack.pop()
+                component.append(current)
+                for neighbor_idx in adjacency.get(current, set()):
+                    if neighbor_idx in visited:
+                        continue
+                    visited.add(neighbor_idx)
+                    stack.append(neighbor_idx)
+            components.append(sorted(component))
+
+        provisional_regions: list[dict[str, Any]] = []
+        max_candidate_count = max(1, len(candidate_indices))
+        for comp_index, component in enumerate(components, start=1):
+            members = [valid_points[idx] for idx in component]
+            vectors = [neighbor_meta[idx]["vector"] for idx in component]
+            avg_distances: list[float] = []
+            for vector in vectors:
+                if len(vectors) <= 1:
+                    avg_distances.append(0.0)
+                    continue
+                distances: list[float] = []
+                for other in vectors:
+                    if other is vector:
+                        continue
+                    diff_sq = sum((float(vector[dim]) - float(other[dim])) ** 2 for dim in range(len(vector)))
+                    distances.append(math.sqrt(diff_sq))
+                avg_distances.append(self._safe_mean(distances))
+            centrality_percentiles = self._safe_percentile_scores(avg_distances)
+            center_scores: list[float] = []
+            for idx, member in enumerate(members):
+                center_scores.append(
+                    0.70 * float(member.plateau_score)
+                    + 0.30 * (100.0 - float(centrality_percentiles[idx]))
+                )
+            center_local_idx = max(
+                range(len(members)),
+                key=lambda item: (
+                    center_scores[item],
+                    members[item].local_score,
+                    members[item].plateau_score,
+                    members[item].stats.total_return,
+                ),
+            )
+            center_point = members[center_local_idx]
+            center_margin_score = round(float(100.0 - centrality_percentiles[center_local_idx]), 6)
+            size_score = round(min(100.0, float(len(component)) / 6.0 * 100.0), 6)
+            median_local = round(self._quantile([float(item.local_score) for item in members], 0.50), 6)
+            p25_local = round(self._quantile([float(item.local_score) for item in members], 0.25), 6)
+            median_point = round(self._quantile([float(item.point_score) for item in members], 0.50), 6)
+            median_total_return = round(self._quantile([float(item.stats.total_return) for item in members], 0.50), 6)
+            best_total_return = round(max(float(item.stats.total_return) for item in members), 6)
+            provisional_score = round(
+                0.45 * median_local
+                + 0.25 * p25_local
+                + 0.15 * size_score
+                + 0.15 * center_margin_score,
+                6,
+            )
+            parameter_ranges = {
+                "window_days": self._format_plateau_param_range("window_days", [float(item.params.window_days) for item in members]),
+                "min_score": self._format_plateau_param_range("min_score", [float(item.params.min_score) for item in members]),
+                "stop_loss": self._format_plateau_param_range("stop_loss", [float(item.params.stop_loss) for item in members]),
+                "take_profit": self._format_plateau_param_range("take_profit", [float(item.params.take_profit) for item in members]),
+                "trailing_stop_pct": self._format_plateau_param_range("trailing_stop_pct", [float(item.params.trailing_stop_pct) for item in members]),
+                "max_positions": self._format_plateau_param_range("max_positions", [float(item.params.max_positions) for item in members]),
+                "position_pct": self._format_plateau_param_range("position_pct", [float(item.params.position_pct) for item in members]),
+                "max_symbols": self._format_plateau_param_range("max_symbols", [float(item.params.max_symbols) for item in members]),
+                "priority_topk_per_day": self._format_plateau_param_range("priority_topk_per_day", [float(item.params.priority_topk_per_day) for item in members]),
+            }
+            provisional_regions.append(
+                {
+                    "component": component,
+                    "internal_id": f"region_{comp_index}",
+                    "center_point": center_point,
+                    "median_local_score": median_local,
+                    "p25_local_score": p25_local,
+                    "median_point_score": median_point,
+                    "median_total_return": median_total_return,
+                    "best_total_return": best_total_return,
+                    "center_margin_score": center_margin_score,
+                    "size_score": size_score,
+                    "parameter_ranges": parameter_ranges,
+                    "point_count": len(component),
+                    "region_score": provisional_score,
+                }
+            )
+
+        provisional_regions.sort(
+            key=lambda item: (
+                float(item["region_score"]),
+                int(item["point_count"]),
+                float(item["median_local_score"]),
+                float(item["best_total_return"]),
+            ),
+            reverse=True,
+        )
+
+        if include_oos:
+            for region in provisional_regions[:3]:
+                if control_callback is not None:
+                    control_callback()
+                center_payload = self._build_backtest_plateau_run_payload(base_payload, region["center_point"].params)
+                walk_forward = self._run_backtest_walk_forward(center_payload, control_callback=control_callback)
+                region["walk_forward"] = walk_forward
+                if int(walk_forward.fold_count) > 0:
+                    region["oos_pass_rate"] = round(float(walk_forward.oos_pass_rate) * 100.0, 6)
+                else:
+                    region["oos_pass_rate"] = None
+
+        for region in provisional_regions:
+            oos_pass_rate = region.get("oos_pass_rate")
+            weighted_terms = [
+                (0.30, float(region["median_local_score"])),
+                (0.20, float(region["p25_local_score"])),
+                (0.15, float(region["size_score"])),
+                (0.15, float(region["center_margin_score"])),
+            ]
+            if oos_pass_rate is not None:
+                weighted_terms.append((0.20, float(oos_pass_rate)))
+            weight_sum = sum(weight for weight, _value in weighted_terms)
+            final_score = sum(weight * value for weight, value in weighted_terms) / max(weight_sum, 1e-9)
+            region["region_score"] = round(float(final_score), 6)
+
+        provisional_regions.sort(
+            key=lambda item: (
+                float(item["region_score"]),
+                int(item["point_count"]),
+                float(item["median_local_score"]),
+                float(item["best_total_return"]),
+            ),
+            reverse=True,
+        )
+
+        output_regions: list[BacktestPlateauRegionSummary] = []
+        for rank, region in enumerate(provisional_regions, start=1):
+            region_id = f"region_{rank}"
+            for point_idx in region["component"]:
+                valid_points[point_idx].region_id = region_id
+                valid_points[point_idx].region_rank = int(rank)
+            output_regions.append(
+                BacktestPlateauRegionSummary(
+                    region_id=region_id,
+                    region_rank=int(rank),
+                    point_count=int(region["point_count"]),
+                    parameter_ranges=dict(region["parameter_ranges"]),
+                    center_point=region["center_point"],
+                    median_local_score=float(region["median_local_score"]),
+                    p25_local_score=float(region["p25_local_score"]),
+                    median_point_score=float(region["median_point_score"]),
+                    median_total_return=float(region["median_total_return"]),
+                    best_total_return=float(region["best_total_return"]),
+                    center_margin_score=float(region["center_margin_score"]),
+                    size_score=float(region["size_score"]),
+                    oos_pass_rate=(
+                        None
+                        if region.get("oos_pass_rate") is None
+                        else float(region["oos_pass_rate"])
+                    ),
+                    region_score=float(region["region_score"]),
+                    walk_forward=region.get("walk_forward"),
+                )
+            )
+
+        return output_regions
+
+    def _rehydrate_backtest_plateau_result(
+        self,
+        result: BacktestPlateauResponse,
+        *,
+        control_callback: Callable[[], None] | None = None,
+    ) -> BacktestPlateauResponse:
+        points = [item.model_copy(deep=True) for item in list(result.points or [])]
+        valid_points = [item for item in points if item.error is None]
+        needs_refresh = (
+            result.recommended_point is None
+            or result.peak_point is None
+            or len(result.regions) <= 0
+            or any(
+                (float(item.plateau_score) == 0.0 and float(item.local_score) == 0.0 and float(item.point_score) == 0.0)
+                for item in valid_points
+            )
+        )
+        if not needs_refresh:
+            return result
+
+        scored_points, neighbor_meta = self._apply_plateau_robustness_scores(
+            points,
+            base_payload=result.base_payload,
+        )
+        regions = self._build_backtest_plateau_regions(
+            scored_points,
+            neighbor_meta,
+            base_payload=result.base_payload,
+            control_callback=control_callback,
+            include_oos=False,
+        )
+        points.sort(
+            key=lambda row: (
+                row.error is None,
+                row.plateau_score,
+                row.local_score,
+                row.point_score,
+                row.score,
+                row.stats.total_return,
+                row.stats.win_rate,
+            ),
+            reverse=True,
+        )
+        recommended_point = regions[0].center_point if regions else next((row for row in points if row.error is None), None)
+        peak_point = None
+        if scored_points:
+            peak_point = max(
+                scored_points,
+                key=lambda row: (
+                    row.score,
+                    row.stats.total_return,
+                    row.stats.win_rate,
+                ),
+            )
+        return result.model_copy(
+            update={
+                "points": points,
+                "best_point": recommended_point,
+                "recommended_point": recommended_point,
+                "peak_point": peak_point,
+                "regions": regions,
+            },
+            deep=True,
+        )
 
     @staticmethod
     def _safe_pearson_correlation(x_values: list[float], y_values: list[float]) -> float:
@@ -8973,21 +9436,7 @@ class InMemoryStore:
                 if task_id
                 else None
             )
-            run_payload = base.model_copy(
-                update={
-                    "window_days": params.window_days,
-                    "min_score": params.min_score,
-                    "stop_loss": params.stop_loss,
-                    "take_profit": params.take_profit,
-                    "trailing_stop_pct": params.trailing_stop_pct,
-                    "max_positions": params.max_positions,
-                    "position_pct": params.position_pct,
-                    "max_symbols": params.max_symbols,
-                    "priority_topk_per_day": params.priority_topk_per_day,
-                    "enable_advanced_analysis": False,
-                },
-                deep=True,
-            )
+            run_payload = self._build_backtest_plateau_run_payload(base, params)
             try:
                 if cached_candidates is not None:
                     result = _plateau_engine.replay_portfolio(
@@ -9348,18 +9797,40 @@ class InMemoryStore:
             raise cancelled_exc
 
         points = [point for point in points_slots if point is not None]
-
-        self._apply_plateau_neighborhood_consistency(points)
+        valid_points, neighbor_meta = self._apply_plateau_robustness_scores(
+            points,
+            base_payload=base,
+        )
+        regions = self._build_backtest_plateau_regions(
+            valid_points,
+            neighbor_meta,
+            base_payload=base,
+            control_callback=control_callback,
+        )
         points.sort(
             key=lambda row: (
                 row.error is None,
+                row.plateau_score,
+                row.local_score,
+                row.point_score,
                 row.score,
                 row.stats.total_return,
                 row.stats.win_rate,
             ),
             reverse=True,
         )
-        best_point = next((row for row in points if row.error is None), None)
+        peak_point = None
+        if valid_points:
+            peak_point = max(
+                valid_points,
+                key=lambda row: (
+                    row.score,
+                    row.stats.total_return,
+                    row.stats.win_rate,
+                ),
+            )
+        recommended_point = regions[0].center_point if regions else next((row for row in points if row.error is None), None)
+        best_point = recommended_point
         correlations = self._build_backtest_plateau_correlations(points)
         notes: list[str] = []
         if sampling_mode == "grid" and grid_total_combinations > sample_points:
@@ -9385,11 +9856,27 @@ class InMemoryStore:
             )
         if failure_count > 0:
             notes.append(f"有 {failure_count} 组参数评估失败，详情见 points.error。")
-        notes.append("评分规则已加入低胜率惩罚：胜率低于45%将额外扣分。")
-        notes.append("评分规则已加入稳定性约束：低交易数惩罚、月度收益方差惩罚、邻域一致性加权。")
+        notes.append("收益平原 V1 改为优先寻找稳定区域：先过硬门槛，再计算单点质量分、局部分与收益平原分。")
+        notes.append("硬门槛包含：收益>0、ProfitFactor>=1.05、回撤<=35%、fill_rate>=10%、年化交易数>=12、单笔收益能覆盖成本。")
+        notes.append("自动区域识别仅纳入通过硬门槛且局部分>=55 的参数组；推荐参数默认取区域中心，而不是历史峰值。")
+        if regions:
+            notes.append(
+                f"自动识别收益平原区域 {len(regions)} 个，Top1 区域包含 {regions[0].point_count} 组参数，"
+                f"区域分 {regions[0].region_score:.1f}。"
+            )
+            if regions[0].oos_pass_rate is not None:
+                notes.append(
+                    f"Top1 区域中心样本外通过率 {regions[0].oos_pass_rate:.1f}%（walk-forward {regions[0].walk_forward.fold_count if regions[0].walk_forward else 0} 折）。"
+                )
+            elif regions[0].walk_forward is not None and regions[0].walk_forward.notes:
+                notes.append(f"Top1 区域中心样本外验证未形成有效折叠：{regions[0].walk_forward.notes[0]}")
+        if peak_point is not None and recommended_point is not None and peak_point is not recommended_point:
+            notes.append(
+                "best_point 已改为推荐区域中心；peak_point 保留原始评分峰值，便于对比鲁棒性与历史最优的差异。"
+            )
         score_corr_note = self._build_plateau_correlation_summary_note(
             correlations,
-            metric_label="评分",
+            metric_label="原始评分",
             corr_field="score_corr",
         )
         if score_corr_note:
@@ -9417,6 +9904,9 @@ class InMemoryStore:
             evaluated_combinations=int(evaluated),
             points=points,
             best_point=best_point,
+            recommended_point=recommended_point,
+            peak_point=peak_point,
+            regions=regions,
             correlations=correlations,
             generated_at=self._now_datetime(),
             notes=notes,
@@ -11446,6 +11936,16 @@ class InMemoryStore:
                     task = BacktestPlateauTaskStatusResponse(**task_raw)
                 except Exception:
                     continue
+                if task.result is not None:
+                    try:
+                        task = task.model_copy(
+                            update={
+                                "result": self._rehydrate_backtest_plateau_result(task.result),
+                            },
+                            deep=True,
+                        )
+                    except Exception:
+                        pass
                 restored_tasks[task.task_id] = task
                 payload_raw = row.get("payload")
                 if isinstance(payload_raw, dict):
@@ -11561,7 +12061,18 @@ class InMemoryStore:
             task = self._backtest_plateau_tasks.get(task_id)
             if task is None:
                 return None
-            return task.model_copy(deep=True)
+            copied = task.model_copy(deep=True)
+        if copied.result is not None:
+            try:
+                copied = copied.model_copy(
+                    update={
+                        "result": self._rehydrate_backtest_plateau_result(copied.result),
+                    },
+                    deep=True,
+                )
+            except Exception:
+                pass
+        return copied
 
     def list_backtest_plateau_tasks(self, *, include_result: bool = False) -> BacktestPlateauTaskListResponse:
         with self._backtest_plateau_task_lock:
@@ -11573,6 +12084,16 @@ class InMemoryStore:
             items: list[BacktestPlateauTaskStatusResponse] = []
             for row in tasks:
                 copied = row.model_copy(deep=True)
+                if include_result and copied.result is not None:
+                    try:
+                        copied = copied.model_copy(
+                            update={
+                                "result": self._rehydrate_backtest_plateau_result(copied.result),
+                            },
+                            deep=True,
+                        )
+                    except Exception:
+                        pass
                 if not include_result:
                     copied = copied.model_copy(update={"result": None})
                 items.append(copied)

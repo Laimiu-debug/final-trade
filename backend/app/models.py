@@ -922,10 +922,40 @@ class BacktestPlateauPoint(BaseModel):
     skipped_count: int = 0
     fill_rate: float = 0.0
     max_concurrent_positions: int = 0
+    annual_trades: float = 0.0
     score: float = 0.0
+    point_score: float = 0.0
+    local_score: float = 0.0
+    plateau_score: float = 0.0
+    neighbor_pass_rate: float = 0.0
+    neighbor_median_score: float = 0.0
+    neighbor_p25_score: float = 0.0
+    sensitivity_penalty: float = 0.0
+    passes_hard_filters: bool = False
+    hard_filter_failures: list[str] = Field(default_factory=list)
+    region_id: str | None = None
+    region_rank: int | None = None
     cache_hit: bool = False
     detail_key: str | None = None
     error: str | None = None
+
+
+class BacktestPlateauRegionSummary(BaseModel):
+    region_id: str
+    region_rank: int = 0
+    point_count: int = 0
+    parameter_ranges: dict[str, str] = Field(default_factory=dict)
+    center_point: BacktestPlateauPoint
+    median_local_score: float = 0.0
+    p25_local_score: float = 0.0
+    median_point_score: float = 0.0
+    median_total_return: float = 0.0
+    best_total_return: float = 0.0
+    center_margin_score: float = 0.0
+    size_score: float = 0.0
+    oos_pass_rate: float | None = None
+    region_score: float = 0.0
+    walk_forward: BacktestWalkForwardReport | None = None
 
 
 class BacktestPlateauCorrelationRow(BaseModel):
@@ -942,6 +972,9 @@ class BacktestPlateauResponse(BaseModel):
     evaluated_combinations: int
     points: list[BacktestPlateauPoint] = Field(default_factory=list)
     best_point: BacktestPlateauPoint | None = None
+    recommended_point: BacktestPlateauPoint | None = None
+    peak_point: BacktestPlateauPoint | None = None
+    regions: list[BacktestPlateauRegionSummary] = Field(default_factory=list)
     correlations: list[BacktestPlateauCorrelationRow] = Field(default_factory=list)
     generated_at: str
     notes: list[str] = Field(default_factory=list)

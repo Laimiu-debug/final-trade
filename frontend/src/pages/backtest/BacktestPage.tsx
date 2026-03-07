@@ -24,6 +24,7 @@ import {
   Tag,
 } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
+import type { SortOrder, SorterResult } from 'antd/es/table/interface'
 import type { MenuProps } from 'antd'
 import ReactECharts from 'echarts-for-react'
 import { Link } from 'react-router-dom'
@@ -122,7 +123,7 @@ const TRADE_BACKTEST_DEFAULTS = {
 
 const SCREENER_CACHE_KEY = 'tdx-trend-screener-cache-v4'
 const BACKTEST_FORM_CACHE_KEY = 'tdx-trend-backtest-form-v2'
-const BACKTEST_PLATEAU_FORM_CACHE_KEY = 'tdx-trend-backtest-plateau-form-v1'
+const BACKTEST_PLATEAU_FORM_CACHE_KEY = 'tdx-trend-backtest-plateau-form-v2'
 const BACKTEST_PLATEAU_PRESETS_KEY = 'tdx-trend-backtest-plateau-presets-v1'
 const BACKTEST_COLLAPSED_MODULES_KEY = 'tdx-trend-backtest-collapsed-modules-v1'
 const WY_EVENTS = ['PS', 'SC', 'AR', 'ST', 'TSO', 'Spring', 'SOS', 'JOC', 'LPS', 'UTAD', 'SOW', 'LPSY']
@@ -146,7 +147,7 @@ type PlateauAxisKey =
   | 'position_pct'
   | 'max_symbols'
   | 'priority_topk_per_day'
-type PlateauMetricKey = 'score' | 'total_return'
+type PlateauMetricKey = 'plateau_score' | 'local_score' | 'point_score' | 'score' | 'total_return'
 type PlateauHistoryExportFormat = 'excel' | 'html' | 'ftbt'
 type PlateauPointRunRecord = {
   rank: number
@@ -154,6 +155,37 @@ type PlateauPointRunRecord = {
   runRequest: BacktestRunRequest
   runResult: BacktestResponse | null
   error: string | null
+}
+const PLATEAU_TABLE_SORT_KEYS = [
+  'plateau_score',
+  'local_score',
+  'point_score',
+  'score',
+  'total_return',
+  'max_drawdown',
+  'win_rate',
+  'trade_count',
+  'annual_trades',
+  'window_days',
+  'min_score',
+  'stop_loss',
+  'take_profit',
+  'trailing_stop_pct',
+  'max_positions',
+  'position_pct',
+  'max_symbols',
+  'priority_topk_per_day',
+  'region_rank',
+] as const
+type PlateauTableSortKey = (typeof PLATEAU_TABLE_SORT_KEYS)[number]
+type PlateauTableSortOrder = Extract<SortOrder, 'ascend' | 'descend'>
+type PlateauTableSortState = {
+  key: PlateauTableSortKey
+  order: PlateauTableSortOrder
+}
+const DEFAULT_PLATEAU_TABLE_SORT_STATE: PlateauTableSortState = {
+  key: 'score',
+  order: 'descend',
 }
 
 const PLATEAU_AXIS_OPTIONS: Array<{ value: PlateauAxisKey; label: string }> = [
@@ -169,7 +201,10 @@ const PLATEAU_AXIS_OPTIONS: Array<{ value: PlateauAxisKey; label: string }> = [
 ]
 
 const PLATEAU_METRIC_OPTIONS: Array<{ value: PlateauMetricKey; label: string }> = [
-  { value: 'score', label: '评分' },
+  { value: 'plateau_score', label: '收益平原分' },
+  { value: 'local_score', label: '局部分' },
+  { value: 'point_score', label: '单点质分' },
+  { value: 'score', label: '原始评分' },
   { value: 'total_return', label: '总收益率' },
 ]
 
@@ -240,6 +275,8 @@ type BacktestPlateauFormDraft = {
   heatmap_metric: PlateauMetricKey
   heatmap_show_best_path: boolean
   heatmap_show_cell_label: boolean
+  table_sort_key: PlateauTableSortKey
+  table_sort_order: PlateauTableSortOrder
 }
 
 function formatApiError(error: unknown) {
@@ -1023,7 +1060,9 @@ function buildPlateauHistoryWorkbookBuffer(
   plateauResult: BacktestPlateauResponse,
 ): ArrayBuffer {
   const workbook = XLSX.utils.book_new()
-  const bestPoint = plateauResult.best_point ?? null
+  const bestPoint = plateauResult.recommended_point ?? plateauResult.best_point ?? null
+  const peakPoint = plateauResult.peak_point ?? null
+  const regions = plateauResult.regions ?? []
   const correlations = resolvePlateauCorrelations(plateauResult)
   const overviewRows = [
     {
@@ -1031,11 +1070,15 @@ function buildPlateauHistoryWorkbookBuffer(
       generated_at: plateauResult.generated_at,
       total_combinations: plateauResult.total_combinations,
       evaluated_combinations: plateauResult.evaluated_combinations,
-      best_score: bestPoint?.score ?? null,
-      best_total_return: bestPoint?.stats.total_return ?? null,
-      best_max_drawdown: bestPoint?.stats.max_drawdown ?? null,
-      best_win_rate: bestPoint?.stats.win_rate ?? null,
-      best_trade_count: bestPoint?.stats.trade_count ?? null,
+      recommended_plateau_score: bestPoint?.plateau_score ?? null,
+      recommended_local_score: bestPoint?.local_score ?? null,
+      recommended_total_return: bestPoint?.stats.total_return ?? null,
+      recommended_max_drawdown: bestPoint?.stats.max_drawdown ?? null,
+      recommended_win_rate: bestPoint?.stats.win_rate ?? null,
+      recommended_trade_count: bestPoint?.stats.trade_count ?? null,
+      peak_score: peakPoint?.score ?? null,
+      peak_total_return: peakPoint?.stats.total_return ?? null,
+      region_count: regions.length,
       points_count: plateauResult.points.length,
       note_count: plateauResult.notes.length,
     },
@@ -1044,15 +1087,27 @@ function buildPlateauHistoryWorkbookBuffer(
     rank: index + 1,
     status: row.error ? 'failed' : 'succeeded',
     error: row.error ?? '',
+    plateau_score: row.plateau_score,
+    local_score: row.local_score,
+    point_score: row.point_score,
     score: row.score,
     total_return: row.stats.total_return,
     max_drawdown: row.stats.max_drawdown,
     win_rate: row.stats.win_rate,
     trade_count: row.stats.trade_count,
+    annual_trades: row.annual_trades,
     candidate_count: row.candidate_count,
     skipped_count: row.skipped_count,
     fill_rate: row.fill_rate,
     max_concurrent_positions: row.max_concurrent_positions,
+    neighbor_pass_rate: row.neighbor_pass_rate,
+    neighbor_median_score: row.neighbor_median_score,
+    neighbor_p25_score: row.neighbor_p25_score,
+    sensitivity_penalty: row.sensitivity_penalty,
+    passes_hard_filters: row.passes_hard_filters,
+    hard_filter_failures: (row.hard_filter_failures ?? []).join(' | '),
+    region_id: row.region_id ?? '',
+    region_rank: row.region_rank ?? null,
     cache_hit: row.cache_hit,
     window_days: row.params.window_days,
     min_score: row.params.min_score,
@@ -1074,10 +1129,32 @@ function buildPlateauHistoryWorkbookBuffer(
     win_rate_corr: item.win_rate_corr,
     win_rate_direction: classifyCorrelationDirection(item.win_rate_corr),
   }))
+  const regionRows = regions.map((region) => ({
+    region_id: region.region_id,
+    region_rank: region.region_rank,
+    point_count: region.point_count,
+    region_score: region.region_score,
+    median_local_score: region.median_local_score,
+    p25_local_score: region.p25_local_score,
+    median_point_score: region.median_point_score,
+    median_total_return: region.median_total_return,
+    best_total_return: region.best_total_return,
+    center_margin_score: region.center_margin_score,
+    size_score: region.size_score,
+    oos_pass_rate: region.oos_pass_rate ?? null,
+    center_plateau_score: region.center_point.plateau_score,
+    center_total_return: region.center_point.stats.total_return,
+    center_max_drawdown: region.center_point.stats.max_drawdown,
+    center_params: JSON.stringify(region.center_point.params),
+    parameter_ranges: JSON.stringify(region.parameter_ranges),
+  }))
   const noteRows = plateauResult.notes.map((note, index) => ({ index: index + 1, note }))
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(overviewRows), 'PlateauSummary')
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([plateauResult.base_payload]), 'BasePayload')
   XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(pointsRows), 'PlateauPoints')
+  if (regionRows.length > 0) {
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(regionRows), 'PlateauRegions')
+  }
   if (correlationRows.length > 0) {
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(correlationRows), 'PlateauCorr')
   }
@@ -1375,12 +1452,36 @@ function formatPlateauAxisCategory(axis: PlateauAxisKey, value: number): string 
   return `${Number(value).toFixed(2)}%`
 }
 
+function quantile(values: number[], ratio: number): number {
+  if (values.length <= 0) return 0
+  const clipped = Math.max(0, Math.min(1, Number(ratio)))
+  const sorted = [...values].sort((left, right) => left - right)
+  if (sorted.length === 1) return Number(sorted[0])
+  const position = clipped * (sorted.length - 1)
+  const lowerIndex = Math.floor(position)
+  const upperIndex = Math.ceil(position)
+  if (lowerIndex === upperIndex) return Number(sorted[lowerIndex])
+  const weight = position - lowerIndex
+  return Number(sorted[lowerIndex]) * (1 - weight) + Number(sorted[upperIndex]) * weight
+}
+
+function getPlateauPrimaryScore(point: BacktestPlateauPoint): number {
+  if (Number.isFinite(Number(point.plateau_score)) && Number(point.plateau_score) > 0) return Number(point.plateau_score)
+  if (Number.isFinite(Number(point.local_score)) && Number(point.local_score) > 0) return Number(point.local_score)
+  if (Number.isFinite(Number(point.point_score)) && Number(point.point_score) > 0) return Number(point.point_score)
+  return Number(point.score)
+}
+
 function getPlateauMetricValue(point: BacktestPlateauPoint, metric: PlateauMetricKey): number {
+  if (metric === 'plateau_score') return Number(point.plateau_score ?? 0)
+  if (metric === 'local_score') return Number(point.local_score ?? 0)
+  if (metric === 'point_score') return Number(point.point_score ?? 0)
   if (metric === 'score') return Number(point.score)
   return Number(point.stats.total_return)
 }
 
 function formatPlateauMetricValue(metric: PlateauMetricKey, value: number): string {
+  if (metric === 'plateau_score' || metric === 'local_score' || metric === 'point_score') return Number(value).toFixed(1)
   if (metric === 'score') return Number(value).toFixed(3)
   return formatPct(Number(value))
 }
@@ -1501,9 +1602,11 @@ function buildDefaultPlateauDraft(): BacktestPlateauFormDraft {
     topk_list_raw: '',
     heatmap_x_axis: 'window_days',
     heatmap_y_axis: 'min_score',
-    heatmap_metric: 'score',
-    heatmap_show_best_path: true,
+    heatmap_metric: 'plateau_score',
+    heatmap_show_best_path: false,
     heatmap_show_cell_label: false,
+    table_sort_key: DEFAULT_PLATEAU_TABLE_SORT_STATE.key,
+    table_sort_order: DEFAULT_PLATEAU_TABLE_SORT_STATE.order,
   }
 }
 
@@ -1524,6 +1627,9 @@ function loadBacktestPlateauDraft(): BacktestPlateauFormDraft {
     if (!PLATEAU_METRIC_OPTIONS.some((item) => item.value === merged.heatmap_metric)) merged.heatmap_metric = defaults.heatmap_metric
     merged.heatmap_show_best_path = Boolean(merged.heatmap_show_best_path)
     merged.heatmap_show_cell_label = Boolean(merged.heatmap_show_cell_label)
+    const normalizedTableSort = normalizePlateauTableSortState(merged.table_sort_key, merged.table_sort_order)
+    merged.table_sort_key = normalizedTableSort.key
+    merged.table_sort_order = normalizedTableSort.order
     return merged
   } catch {
     return defaults
@@ -1992,61 +2098,208 @@ const tradeColumns: ColumnsType<BacktestTrade> = [
   },
 ]
 
+function toSortableNumber(value: unknown) {
+  const numeric = Number(value)
+  return Number.isFinite(numeric) ? numeric : Number.NEGATIVE_INFINITY
+}
+
+function compareSortableNumbers(left: unknown, right: unknown) {
+  return toSortableNumber(left) - toSortableNumber(right)
+}
+
+function isPlateauTableSortKey(value: unknown): value is PlateauTableSortKey {
+  return typeof value === 'string' && (PLATEAU_TABLE_SORT_KEYS as readonly string[]).includes(value)
+}
+
+function normalizePlateauTableSortState(
+  key: unknown,
+  order: unknown,
+): PlateauTableSortState {
+  const normalizedKey = isPlateauTableSortKey(key) ? key : DEFAULT_PLATEAU_TABLE_SORT_STATE.key
+  const normalizedOrder = order === 'ascend' || order === 'descend'
+    ? order
+    : DEFAULT_PLATEAU_TABLE_SORT_STATE.order
+  return {
+    key: normalizedKey,
+    order: normalizedOrder,
+  }
+}
+
+function resolvePlateauTableSortState(
+  sorter: SorterResult<BacktestPlateauTableRow> | SorterResult<BacktestPlateauTableRow>[],
+): PlateauTableSortState | null {
+  const resolved = Array.isArray(sorter)
+    ? sorter.find((item) => isPlateauTableSortKey(item?.columnKey) && (item.order === 'ascend' || item.order === 'descend'))
+    : sorter
+  if (!resolved || !isPlateauTableSortKey(resolved.columnKey) || (resolved.order !== 'ascend' && resolved.order !== 'descend')) {
+    return null
+  }
+  return {
+    key: resolved.columnKey,
+    order: resolved.order,
+  }
+}
+
 const plateauColumns: ColumnsType<BacktestPlateauTableRow> = [
   {
-    title: '评分',
+    title: '收益平原分',
+    key: 'plateau_score',
+    dataIndex: 'plateau_score',
+    width: 98,
+    sorter: (left, right) => compareSortableNumbers(left.plateau_score, right.plateau_score),
+    render: (value: number) => Number(value ?? 0).toFixed(1),
+  },
+  {
+    title: '局部分',
+    key: 'local_score',
+    dataIndex: 'local_score',
+    width: 88,
+    sorter: (left, right) => compareSortableNumbers(left.local_score, right.local_score),
+    render: (value: number) => Number(value ?? 0).toFixed(1),
+  },
+  {
+    title: '单点质分',
+    key: 'point_score',
+    dataIndex: 'point_score',
+    width: 90,
+    sorter: (left, right) => compareSortableNumbers(left.point_score, right.point_score),
+    render: (value: number) => Number(value ?? 0).toFixed(1),
+  },
+  {
+    title: '原始评分',
+    key: 'score',
     dataIndex: 'score',
     width: 90,
-    render: (value: number) => value.toFixed(3),
+    sorter: (left, right) => compareSortableNumbers(left.score, right.score),
+    render: (value: number) => Number(value ?? 0).toFixed(3),
   },
   {
     title: '总收益',
+    key: 'total_return',
     dataIndex: ['stats', 'total_return'],
     width: 90,
+    sorter: (left, right) => compareSortableNumbers(left.stats.total_return, right.stats.total_return),
     render: (value: number) => formatPct(value),
   },
   {
     title: '最大回撤',
+    key: 'max_drawdown',
     dataIndex: ['stats', 'max_drawdown'],
     width: 100,
+    sorter: (left, right) => compareSortableNumbers(left.stats.max_drawdown, right.stats.max_drawdown),
     render: (value: number) => formatPct(value),
   },
   {
     title: '胜率',
+    key: 'win_rate',
     dataIndex: ['stats', 'win_rate'],
     width: 90,
+    sorter: (left, right) => compareSortableNumbers(left.stats.win_rate, right.stats.win_rate),
     render: (value: number) => formatPct(value),
   },
-  { title: '交易数', dataIndex: ['stats', 'trade_count'], width: 80 },
-  { title: '窗口', dataIndex: ['params', 'window_days'], width: 70 },
-  { title: '最低分', dataIndex: ['params', 'min_score'], width: 80 },
+  {
+    title: '交易数',
+    key: 'trade_count',
+    dataIndex: ['stats', 'trade_count'],
+    width: 80,
+    sorter: (left, right) => compareSortableNumbers(left.stats.trade_count, right.stats.trade_count),
+  },
+  {
+    title: '年化交易',
+    key: 'annual_trades',
+    dataIndex: 'annual_trades',
+    width: 92,
+    sorter: (left, right) => compareSortableNumbers(left.annual_trades, right.annual_trades),
+    render: (value: number) => Number(value ?? 0).toFixed(1),
+  },
+  {
+    title: '窗口',
+    key: 'window_days',
+    dataIndex: ['params', 'window_days'],
+    width: 70,
+    sorter: (left, right) => compareSortableNumbers(left.params.window_days, right.params.window_days),
+  },
+  {
+    title: '最低分',
+    key: 'min_score',
+    dataIndex: ['params', 'min_score'],
+    width: 80,
+    sorter: (left, right) => compareSortableNumbers(left.params.min_score, right.params.min_score),
+  },
   {
     title: '止损%',
+    key: 'stop_loss',
     dataIndex: ['params', 'stop_loss'],
     width: 80,
+    sorter: (left, right) => compareSortableNumbers(left.params.stop_loss, right.params.stop_loss),
     render: (value: number) => `${(Number(value) * 100).toFixed(2)}%`,
   },
   {
     title: '止盈%',
+    key: 'take_profit',
     dataIndex: ['params', 'take_profit'],
     width: 80,
+    sorter: (left, right) => compareSortableNumbers(left.params.take_profit, right.params.take_profit),
     render: (value: number) => `${(Number(value) * 100).toFixed(2)}%`,
   },
   {
     title: '高位回撤%',
+    key: 'trailing_stop_pct',
     dataIndex: ['params', 'trailing_stop_pct'],
     width: 92,
+    sorter: (left, right) => compareSortableNumbers(left.params.trailing_stop_pct, right.params.trailing_stop_pct),
     render: (value: number) => `${(Number(value) * 100).toFixed(2)}%`,
   },
-  { title: '仓位上限', dataIndex: ['params', 'max_positions'], width: 86 },
+  {
+    title: '仓位上限',
+    key: 'max_positions',
+    dataIndex: ['params', 'max_positions'],
+    width: 86,
+    sorter: (left, right) => compareSortableNumbers(left.params.max_positions, right.params.max_positions),
+  },
   {
     title: '单笔%',
+    key: 'position_pct',
     dataIndex: ['params', 'position_pct'],
     width: 78,
+    sorter: (left, right) => compareSortableNumbers(left.params.position_pct, right.params.position_pct),
     render: (value: number) => `${(Number(value) * 100).toFixed(1)}%`,
   },
-  { title: '股票数', dataIndex: ['params', 'max_symbols'], width: 78 },
-  { title: 'TopK', dataIndex: ['params', 'priority_topk_per_day'], width: 70 },
+  {
+    title: '股票数',
+    key: 'max_symbols',
+    dataIndex: ['params', 'max_symbols'],
+    width: 78,
+    sorter: (left, right) => compareSortableNumbers(left.params.max_symbols, right.params.max_symbols),
+  },
+  {
+    title: 'TopK',
+    key: 'priority_topk_per_day',
+    dataIndex: ['params', 'priority_topk_per_day'],
+    width: 70,
+    sorter: (left, right) => compareSortableNumbers(left.params.priority_topk_per_day, right.params.priority_topk_per_day),
+  },
+  {
+    title: '区域',
+    key: 'region_rank',
+    dataIndex: 'region_rank',
+    width: 84,
+    sorter: (left, right) => compareSortableNumbers(left.region_rank, right.region_rank),
+    render: (value: number | null | undefined) => {
+      if (!value) return <Tag>--</Tag>
+      return <Tag color="geekblue">{`R${value}`}</Tag>
+    },
+  },
+  {
+    title: '硬门槛',
+    dataIndex: 'passes_hard_filters',
+    width: 100,
+    render: (_value: boolean, row) => {
+      if (row.error) return <Tag color="error">失败</Tag>
+      if (row.passes_hard_filters) return <Tag color="success">通过</Tag>
+      return <Tag color="warning">未通过</Tag>
+    },
+  },
   {
     title: '状态',
     dataIndex: 'error',
@@ -2114,6 +2367,10 @@ export function BacktestPage() {
   const [plateauPositionPctListRaw, setPlateauPositionPctListRaw] = useState(initialPlateauDraft.position_pct_list_raw)
   const [plateauMaxSymbolsListRaw, setPlateauMaxSymbolsListRaw] = useState(initialPlateauDraft.max_symbols_list_raw)
   const [plateauTopKListRaw, setPlateauTopKListRaw] = useState(initialPlateauDraft.topk_list_raw)
+  const [plateauTableSort, setPlateauTableSort] = useState<PlateauTableSortState>(() => ({
+    key: initialPlateauDraft.table_sort_key,
+    order: initialPlateauDraft.table_sort_order,
+  }))
   const [plateauError, setPlateauError] = useState<string | null>(null)
   const [plateauApplyRank, setPlateauApplyRank] = useState(1)
   const [plateauHeatmapXAxis, setPlateauHeatmapXAxis] = useState<PlateauAxisKey>(initialPlateauDraft.heatmap_x_axis)
@@ -2840,6 +3097,8 @@ export function BacktestPage() {
       heatmap_metric: plateauHeatmapMetric,
       heatmap_show_best_path: plateauHeatmapShowBestPath,
       heatmap_show_cell_label: plateauHeatmapShowCellLabel,
+      table_sort_key: plateauTableSort.key,
+      table_sort_order: plateauTableSort.order,
     }
     persistBacktestPlateauDraft(draft)
   }, [
@@ -2860,6 +3119,7 @@ export function BacktestPage() {
     plateauHeatmapMetric,
     plateauHeatmapShowBestPath,
     plateauHeatmapShowCellLabel,
+    plateauTableSort,
   ])
 
   useEffect(() => {
@@ -3333,7 +3593,10 @@ export function BacktestPage() {
     || (plateauTaskStatus?.status === 'failed'
       ? (plateauTaskStatus.error?.trim() || '收益平原任务失败')
       : null)
-  const plateauBestPoint = plateauResult?.best_point ?? null
+  const plateauRecommendedPoint = plateauResult?.recommended_point ?? plateauResult?.best_point ?? null
+  const plateauPeakPoint = plateauResult?.peak_point ?? null
+  const plateauRegions = plateauResult?.regions ?? []
+  const plateauSummaryPoint = plateauRecommendedPoint ?? plateauRegions[0]?.center_point ?? null
   const plateauValidPoints = useMemo(
     () => (plateauResult?.points ?? []).filter((row) => !row.error),
     [plateauResult?.points],
@@ -3484,7 +3747,7 @@ export function BacktestPage() {
     () =>
       plateauValidPoints.slice(0, 20).map((row, idx) => ({
         value: idx + 1,
-        label: `第${idx + 1}名 | 评分 ${row.score.toFixed(3)} | 收益 ${formatPct(row.stats.total_return)}`,
+        label: `第${idx + 1}名 | 平原分 ${getPlateauPrimaryScore(row).toFixed(1)} | 收益 ${formatPct(row.stats.total_return)}`,
       })),
     [plateauValidPoints],
   )
@@ -3497,9 +3760,20 @@ export function BacktestPage() {
       })),
     [plateauResult?.points],
   )
+  const plateauUsingDefaultSort = (
+    plateauTableSort.key === DEFAULT_PLATEAU_TABLE_SORT_STATE.key
+    && plateauTableSort.order === DEFAULT_PLATEAU_TABLE_SORT_STATE.order
+  )
   const selectedRankPoint = plateauValidPoints[plateauApplyRank - 1] ?? null
   const plateauColumnsWithAction: ColumnsType<BacktestPlateauTableRow> = [
-    ...plateauColumns,
+    ...plateauColumns.map((column) => {
+      const columnKey = column.key
+      if (!isPlateauTableSortKey(columnKey)) return column
+      return {
+        ...column,
+        sortOrder: plateauTableSort.key === columnKey ? plateauTableSort.order : null,
+      }
+    }),
     {
       title: '操作',
       key: 'action',
@@ -3550,6 +3824,19 @@ export function BacktestPage() {
       },
     },
   ]
+  const handlePlateauTableChange = (
+    _pagination: unknown,
+    _filters: Record<string, unknown>,
+    sorter: SorterResult<BacktestPlateauTableRow> | SorterResult<BacktestPlateauTableRow>[],
+  ) => {
+    const nextSort = resolvePlateauTableSortState(sorter)
+    if (nextSort) {
+      setPlateauTableSort(nextSort)
+    }
+  }
+  const handleResetPlateauTableSort = () => {
+    setPlateauTableSort(DEFAULT_PLATEAU_TABLE_SORT_STATE)
+  }
   const backtestHistoryRows = useMemo(
     () =>
       Object.values(tasksById).sort((left, right) => {
@@ -3847,12 +4134,12 @@ export function BacktestPage() {
       },
       yAxis: {
         type: 'value',
-        name: '评分',
+        name: '收益平原分',
       },
       series: [
         {
           type: 'bar',
-          data: rows.map((row) => Number(row.score.toFixed(4))),
+          data: rows.map((row) => Number(getPlateauPrimaryScore(row).toFixed(4))),
           itemStyle: {
             color: '#0f8b6f',
             borderRadius: [3, 3, 0, 0],
@@ -3911,17 +4198,16 @@ export function BacktestPage() {
       }
     }
 
-    const metricByCell = new Map<string, number>()
-    const bestPointByCell = new Map<string, BacktestPlateauPoint>()
+    const cellPointsByKey = new Map<string, BacktestPlateauPoint[]>()
     rows.forEach((row) => {
       const xValue = getPlateauAxisRawValue(row, plateauHeatmapXAxis)
       const yValue = getPlateauAxisRawValue(row, plateauHeatmapYAxis)
-      const metric = getPlateauMetricValue(row, plateauHeatmapMetric)
       const key = buildPlateauCellKey(xValue, yValue)
-      const prev = metricByCell.get(key)
-      if (typeof prev !== 'number' || metric > prev) {
-        metricByCell.set(key, metric)
-        bestPointByCell.set(key, row)
+      const existing = cellPointsByKey.get(key)
+      if (existing) {
+        existing.push(row)
+      } else {
+        cellPointsByKey.set(key, [row])
       }
     })
 
@@ -3931,21 +4217,35 @@ export function BacktestPage() {
     const cellKeyByDataIndex: string[] = []
     const metricByCategory = new Map<string, number>()
     const pointByCategory = new Map<string, BacktestPlateauPoint>()
+    const pointCountByCategory = new Map<string, number>()
     let minMetricValue = Number.POSITIVE_INFINITY
     let maxMetricValue = Number.NEGATIVE_INFINITY
 
     xAxisValues.forEach((xValue) => {
       yAxisValues.forEach((yValue) => {
-        const metric = metricByCell.get(buildPlateauCellKey(xValue, yValue))
-        if (typeof metric !== 'number') return
+        const cellPoints = cellPointsByKey.get(buildPlateauCellKey(xValue, yValue)) ?? []
+        if (cellPoints.length <= 0) return
+        const metricValues = cellPoints
+          .map((row) => getPlateauMetricValue(row, plateauHeatmapMetric))
+          .filter((value) => Number.isFinite(value))
+        if (metricValues.length <= 0) return
         const xCategory = formatPlateauAxisCategory(plateauHeatmapXAxis, xValue)
         const yCategory = formatPlateauAxisCategory(plateauHeatmapYAxis, yValue)
         const categoryKey = `${xCategory}|${yCategory}`
-        const roundedMetric = Number(metric.toFixed(6))
+        const roundedMetric = Number(quantile(metricValues, 0.5).toFixed(6))
         heatmapData.push([xCategory, yCategory, roundedMetric])
         cellKeyByDataIndex.push(categoryKey)
         metricByCategory.set(categoryKey, roundedMetric)
-        const point = bestPointByCell.get(buildPlateauCellKey(xValue, yValue))
+        pointCountByCategory.set(categoryKey, cellPoints.length)
+        const point = [...cellPoints].sort((left, right) => {
+          return (
+            getPlateauPrimaryScore(right) - getPlateauPrimaryScore(left)
+            || Number(right.local_score ?? 0) - Number(left.local_score ?? 0)
+            || Number(right.point_score ?? 0) - Number(left.point_score ?? 0)
+            || Number(right.score ?? 0) - Number(left.score ?? 0)
+            || Number(right.stats.total_return ?? 0) - Number(left.stats.total_return ?? 0)
+          )
+        })[0]
         if (point) {
           pointByCategory.set(categoryKey, point)
         }
@@ -3973,7 +4273,14 @@ export function BacktestPage() {
         let bestMetric = Number.NEGATIVE_INFINITY
         let bestYCategory: string | null = null
         yAxisValues.forEach((yValue) => {
-          const metric = metricByCell.get(buildPlateauCellKey(xValue, yValue))
+          const cellPoints = cellPointsByKey.get(buildPlateauCellKey(xValue, yValue)) ?? []
+          if (cellPoints.length <= 0) return
+          const metric = quantile(
+            cellPoints
+              .map((row) => getPlateauMetricValue(row, plateauHeatmapMetric))
+              .filter((value) => Number.isFinite(value)),
+            0.5,
+          )
           if (typeof metric !== 'number') return
           if (metric > bestMetric) {
             bestMetric = metric
@@ -4008,10 +4315,13 @@ export function BacktestPage() {
           if (!Array.isArray(value) || value.length < 3) return ''
           const [xCategory, yCategory, metric] = value
           const actualMetric = metricByCategory.get(`${xCategory}|${yCategory}`) ?? Number(metric)
+          const pointCount = pointCountByCategory.get(`${xCategory}|${yCategory}`) ?? 0
           return [
             `${xAxisLabel}: ${xCategory}`,
             `${yAxisLabel}: ${yCategory}`,
+            `该格参数数: ${pointCount}`,
             `${metricLabel}: ${formatPlateauMetricValue(plateauHeatmapMetric, actualMetric)}`,
+            '说明: 当前方块展示该格参数组的中位数；点击时会回填该格收益平原分最高的代表点。',
           ].join('<br/>')
         },
       },
@@ -5490,10 +5800,13 @@ export function BacktestPage() {
                 {`已评估 ${plateauResult.evaluated_combinations} / ${plateauResult.total_combinations}`}
               </Tag>
             ) : null}
-            {plateauBestPoint ? (
+            {plateauRecommendedPoint ? (
               <Tag color="processing">
-                {`最佳评分 ${plateauBestPoint.score.toFixed(3)} | 收益 ${formatPct(plateauBestPoint.stats.total_return)}`}
+                {`推荐平原分 ${getPlateauPrimaryScore(plateauRecommendedPoint).toFixed(1)} | 收益 ${formatPct(plateauRecommendedPoint.stats.total_return)}`}
               </Tag>
+            ) : null}
+            {plateauPeakPoint ? (
+              <Tag>{`峰值收益 ${formatPct(plateauPeakPoint.stats.total_return)} | 原始评分 ${Number(plateauPeakPoint.score ?? 0).toFixed(3)}`}</Tag>
             ) : null}
             {plateauTopRankOptions.length > 0 ? (
               <Select
@@ -5503,14 +5816,14 @@ export function BacktestPage() {
                 onChange={(value) => setPlateauApplyRank(Number(value))}
               />
             ) : null}
-            {plateauBestPoint ? (
-              <Button onClick={() => applyPlateauPointToForm(plateauBestPoint, '最佳')}>
-                回填最佳参数
+            {plateauRecommendedPoint ? (
+              <Button onClick={() => applyPlateauPointToForm(plateauRecommendedPoint, '推荐区域中心')}>
+                回填推荐参数
               </Button>
             ) : null}
-            {plateauBestPoint ? (
-              <Button onClick={() => savePlateauPreset(plateauBestPoint, '最佳参数')}>
-                保存最佳参数
+            {plateauRecommendedPoint ? (
+              <Button onClick={() => savePlateauPreset(plateauRecommendedPoint, '推荐区域中心')}>
+                保存推荐参数
               </Button>
             ) : null}
             {selectedRankPoint ? (
@@ -5801,14 +6114,14 @@ export function BacktestPage() {
             </Col>
             <Col xs={12} md={6}>
               <Card>
-                <Statistic title="最佳评分" value={plateauBestPoint?.score ?? 0} precision={3} />
+                <Statistic title="推荐平原分" value={plateauSummaryPoint ? getPlateauPrimaryScore(plateauSummaryPoint) : 0} precision={1} />
               </Card>
             </Col>
             <Col xs={12} md={6}>
               <Card>
                 <Statistic
-                  title="最佳收益"
-                  value={(plateauBestPoint?.stats.total_return ?? 0) * 100}
+                  title="推荐收益"
+                  value={(plateauSummaryPoint?.stats.total_return ?? 0) * 100}
                   precision={2}
                   suffix="%"
                 />
@@ -5816,14 +6129,50 @@ export function BacktestPage() {
             </Col>
           </Row>
 
+          {plateauRegions.length > 0 ? (
+            <Card title="自动识别收益平原区域">
+              <Row gutter={[12, 12]}>
+                {plateauRegions.slice(0, 3).map((region) => (
+                  <Col xs={24} lg={8} key={region.region_id}>
+                    <Card size="small" title={`Region ${region.region_rank}`}>
+                      <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+                        <Space wrap>
+                          <Tag color="geekblue">{`区域分 ${region.region_score.toFixed(1)}`}</Tag>
+                          <Tag color="processing">{`点数 ${region.point_count}`}</Tag>
+                          {typeof region.oos_pass_rate === 'number' ? (
+                            <Tag color={region.oos_pass_rate >= 60 ? 'success' : 'warning'}>{`样本外 ${region.oos_pass_rate.toFixed(1)}%`}</Tag>
+                          ) : null}
+                        </Space>
+                        <div>{`中心参数收益 ${formatPct(region.center_point.stats.total_return)} | 回撤 ${formatPct(region.center_point.stats.max_drawdown)}`}</div>
+                        <div>{`中心参数: window=${region.center_point.params.window_days}, min=${Number(region.center_point.params.min_score).toFixed(2)}, maxPos=${region.center_point.params.max_positions}`}</div>
+                        <div>{`区间: ${Object.entries(region.parameter_ranges).slice(0, 4).map(([key, value]) => `${PLATEAU_AXIS_LABEL_MAP[key as PlateauAxisKey]}=${value}`).join(' | ')}`}</div>
+                        {region.walk_forward?.notes?.length ? (
+                          <Alert type="info" showIcon title={region.walk_forward?.notes?.[0] ?? 'walk-forward 未生成有效折叠'} />
+                        ) : null}
+                        <Space wrap>
+                          <Button size="small" onClick={() => applyPlateauPointToForm(region.center_point, `Region ${region.region_rank} 中心`)}>
+                            回填区域中心
+                          </Button>
+                          <Button size="small" onClick={() => savePlateauPreset(region.center_point, `Region ${region.region_rank}`)}>
+                            保存区域中心
+                          </Button>
+                        </Space>
+                      </Space>
+                    </Card>
+                  </Col>
+                ))}
+              </Row>
+            </Card>
+          ) : null}
+
           {plateauScoreBarOption ? (
-            <Card title="评分可视化（Top 30）">
+            <Card title="收益平原分可视化（Top 30）">
               <ReactECharts option={plateauScoreBarOption} style={{ height: 220 }} />
             </Card>
           ) : null}
 
           {plateauCorrelationRows.length > 0 ? (
-            <Card title="参数相关性分析（皮尔逊）">
+            <Card title="参数相关性分析（原始评分/收益/胜率）">
               <Table
                 size="small"
                 columns={plateauCorrelationColumns}
@@ -5853,7 +6202,7 @@ export function BacktestPage() {
                       type="info"
                       showIcon
                       title="交互说明"
-                      description="点击方块回填参数；框选后可加入候选参数集。橙线表示每个横轴取值下的最优纵轴点。"
+                      description="方块展示该格参数组的中位数；点击时会回填该格收益平原分最高的代表点。橙线仅表示当前横轴下的列内峰值，不代表可执行的参数路径。"
                     />
                     <Card size="small" title="热力图设置">
                       <Space orientation="vertical" size={8} style={{ width: '100%' }}>
@@ -5883,7 +6232,7 @@ export function BacktestPage() {
                           <Switch checked={plateauHeatmapShowCellLabel} onChange={setPlateauHeatmapShowCellLabel} />
                         </Space>
                         <Space wrap>
-                          <Tag color="orange">最佳点连线</Tag>
+                          <Tag color="orange">列内峰值线</Tag>
                           <Switch checked={plateauHeatmapShowBestPath} onChange={setPlateauHeatmapShowBestPath} />
                         </Space>
                       </Space>
@@ -5940,13 +6289,29 @@ export function BacktestPage() {
             />
           )}
 
-          <Card title="收益平原结果（按评分排序）">
+          <Card
+            title="收益平原结果"
+            extra={(
+              <Space size={8} wrap>
+                <span style={{ color: 'rgba(0, 0, 0, 0.45)', fontSize: 12 }}>默认按原始评分倒序，可点击表头切换并自动记住</span>
+                <Button
+                  size="small"
+                  onClick={handleResetPlateauTableSort}
+                  disabled={plateauUsingDefaultSort}
+                >
+                  恢复默认排序
+                </Button>
+              </Space>
+            )}
+          >
             <Table
               size="small"
               columns={plateauColumnsWithAction}
               dataSource={plateauTableRows}
               rowKey="__rowKey"
               scroll={{ x: 1460 }}
+              sortDirections={['ascend', 'descend', 'ascend']}
+              onChange={handlePlateauTableChange}
               pagination={{
                 defaultPageSize: 10,
                 pageSizeOptions: [10, 20, 50, 100],

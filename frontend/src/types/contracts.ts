@@ -825,10 +825,40 @@ export interface BacktestPlateauPoint {
   skipped_count: number
   fill_rate: number
   max_concurrent_positions: number
+  annual_trades?: number
   score: number
+  point_score?: number
+  local_score?: number
+  plateau_score?: number
+  neighbor_pass_rate?: number
+  neighbor_median_score?: number
+  neighbor_p25_score?: number
+  sensitivity_penalty?: number
+  passes_hard_filters?: boolean
+  hard_filter_failures?: string[]
+  region_id?: string | null
+  region_rank?: number | null
   cache_hit: boolean
   detail_key?: string | null
   error?: string | null
+}
+
+export interface BacktestPlateauRegionSummary {
+  region_id: string
+  region_rank: number
+  point_count: number
+  parameter_ranges: Record<string, string>
+  center_point: BacktestPlateauPoint
+  median_local_score: number
+  p25_local_score: number
+  median_point_score: number
+  median_total_return: number
+  best_total_return: number
+  center_margin_score: number
+  size_score: number
+  oos_pass_rate?: number | null
+  region_score: number
+  walk_forward?: BacktestWalkForwardReport | null
 }
 
 export interface BacktestPlateauCorrelationRow {
@@ -845,6 +875,9 @@ export interface BacktestPlateauResponse {
   evaluated_combinations: number
   points: BacktestPlateauPoint[]
   best_point?: BacktestPlateauPoint | null
+  recommended_point?: BacktestPlateauPoint | null
+  peak_point?: BacktestPlateauPoint | null
+  regions?: BacktestPlateauRegionSummary[]
   correlations?: BacktestPlateauCorrelationRow[]
   generated_at: string
   notes: string[]
