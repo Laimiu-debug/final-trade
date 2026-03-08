@@ -61,7 +61,7 @@ import type {
   SimTradeFill,
   SimTradeOrder,
   SimTradingConfig,
-  StockAnalysis,
+  StockAnalysisResponse,
   StockAnnotation,
   StrategyCatalogResponse,
   EventJudgmentCatalogResponse,
@@ -114,7 +114,7 @@ export function getStockIntraday(symbol: string, date: string) {
 }
 
 export function getStockAnalysis(symbol: string) {
-  return apiRequest<{ analysis: StockAnalysis; annotation?: StockAnnotation }>(
+  return apiRequest<StockAnalysisResponse>(
     `/api/stocks/${symbol}/analysis`,
   )
 }

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any, Literal
 
@@ -209,6 +209,7 @@ class StockAnnotation(BaseModel):
 class StockAnalysisResponse(BaseModel):
     analysis: StockAnalysis
     annotation: StockAnnotation | None = None
+    signal: 'SignalResult | None' = None
 
 
 class AnnotationUpdateResponse(BaseModel):
@@ -1413,3 +1414,4 @@ class AIProviderTestResponse(BaseModel):
 
 
 BacktestWalkForwardFold.model_rebuild()
+StockAnalysisResponse.model_rebuild()

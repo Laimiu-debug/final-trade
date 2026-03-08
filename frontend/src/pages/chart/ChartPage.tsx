@@ -282,6 +282,11 @@ export function ChartPage() {
   const symbolSignals = (signalsQuery.data?.items ?? []).filter(
     (item) => item.symbol.toLowerCase() === symbol.toLowerCase(),
   )
+  const chartSignals = symbolSignals.length > 0
+    ? symbolSignals
+    : analysisQuery.data?.signal
+      ? [analysisQuery.data.signal]
+      : []
   const candles = candlesQuery.data?.candles ?? []
   const intradayReferencePrice = useMemo(() => {
     const targetDate = String(intradayQuery.data?.date || intradayDate || '').trim()
@@ -423,7 +428,7 @@ export function ChartPage() {
       >
         <KLineChart
           candles={candles}
-          signals={symbolSignals}
+          signals={chartSignals}
           manualStartDate={manualStartDate}
           aiBreakoutDate={lastAIRecord?.breakout_date}
           statsRangeStartDate={statsRange[0] ?? undefined}

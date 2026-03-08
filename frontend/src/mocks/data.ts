@@ -44,6 +44,7 @@ import type {
   SignalResult,
   SignalsResponse,
   StockAnalysis,
+  StockAnalysisResponse,
   StockAnnotation,
   StrategyCatalogResponse,
   EventJudgmentCatalogResponse,
@@ -869,7 +870,7 @@ export function getIntradayPayload(symbol: string, date: string) {
   }
 }
 
-export function getAnalysis(symbol: string): { analysis: StockAnalysis; annotation?: StockAnnotation } {
+export function getAnalysis(symbol: string): StockAnalysisResponse {
   const base = stockPool.find((stock) => stock.symbol === symbol)
   const analysis: StockAnalysis = {
     symbol,
@@ -882,9 +883,11 @@ export function getAnalysis(symbol: string): { analysis: StockAnalysis; annotati
     degraded: symbol === 'sz002230',
     degraded_reason: symbol === 'sz002230' ? 'AI_TIMEOUT_CACHE_FALLBACK' : undefined,
   }
+  const signal = getSignals({ min_score: 0, min_event_count: 0 }).items.find((item) => item.symbol === symbol)
   return {
     analysis,
     annotation: annotationStore.get(symbol),
+    signal,
   }
 }
 

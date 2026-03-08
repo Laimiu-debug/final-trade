@@ -323,6 +323,30 @@ def test_annotation_roundtrip() -> None:
     get_resp = client.get("/api/stocks/sh600519/analysis")
     assert get_resp.status_code == 200
     assert get_resp.json()["annotation"]["symbol"] == "sh600519"
+    signal = get_resp.json()["signal"]
+    assert signal["symbol"] == "sh600519"
+    assert len(signal["wy_event_chain"]) >= 1
+
+
+def test_analysis_signal_snapshot_uses_current_chart_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    symbol = "sh600519"
+    candles_resp = client.get(f"/api/stocks/{symbol}/candles")
+    assert candles_resp.status_code == 200
+    expected_window_days = len(candles_resp.json()["candles"])
+    assert expected_window_days >= 120
+
+    original = store._calc_wyckoff_snapshot
+    captured: dict[str, int] = {}
+
+    def wrapped(row: ScreenerResult, window_days: int, *, as_of_date: str | None = None) -> dict[str, object]:
+        captured["window_days"] = window_days
+        return original(row, window_days=window_days, as_of_date=as_of_date)
+
+    monkeypatch.setattr(store, "_calc_wyckoff_snapshot", wrapped)
+
+    resp = client.get(f"/api/stocks/{symbol}/analysis")
+    assert resp.status_code == 200
+    assert captured["window_days"] == expected_window_days
 
 
 def test_config_update() -> None:

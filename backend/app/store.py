@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import base64
 import gc
@@ -4702,8 +4702,167 @@ class InMemoryStore:
             degraded_reason="LC1_DATA_NOT_FOUND_FALLBACK_APPROX",
         )
 
+    def _build_stock_signal_snapshot(self, symbol: str) -> SignalResult | None:
+        normalized_symbol = str(symbol).strip().lower()
+        if not normalized_symbol:
+            return None
+
+        try:
+            candles = self._ensure_candles(normalized_symbol)
+            chart_window_days = max(20, len(candles))
+            row = self._build_row_from_candles(normalized_symbol) or self._latest_rows.get(normalized_symbol)
+            if row is None:
+                return None
+            snapshot = self._calc_wyckoff_snapshot(row, window_days=chart_window_days)
+        except Exception:
+            return None
+
+        events = snapshot["events"] if isinstance(snapshot.get("events"), list) else []
+        risk_events = snapshot["risk_events"] if isinstance(snapshot.get("risk_events"), list) else []
+
+        raw_event_dates = snapshot.get("event_dates")
+        event_dates: dict[str, str] = {}
+        if isinstance(raw_event_dates, dict):
+            for event_code, event_date in raw_event_dates.items():
+                code_text = str(event_code).strip()
+                date_text = str(event_date).strip()
+                if code_text and date_text:
+                    event_dates[code_text] = date_text
+
+        raw_event_chain = snapshot.get("event_chain")
+        event_chain: list[dict[str, str]] = []
+        if isinstance(raw_event_chain, list):
+            for node in raw_event_chain:
+                if not isinstance(node, dict):
+                    continue
+                code_text = str(node.get("event", "")).strip()
+                date_text = str(node.get("date", "")).strip()
+                category_text = str(node.get("category", "")).strip()
+                if code_text and date_text:
+                    event_chain.append({
+                        "event": code_text,
+                        "date": date_text,
+                        "category": category_text or "other",
+                    })
+        if not event_chain and event_dates:
+            risk_event_set = {str(event).strip() for event in risk_events}
+            for code_text, date_text in sorted(event_dates.items(), key=lambda item: (item[1], item[0])):
+                event_chain.append({
+                    "event": code_text,
+                    "date": date_text,
+                    "category": "distributionRisk" if code_text in risk_event_set else "accumulation",
+                })
+
+        sequence_ok = bool(snapshot.get("sequence_ok"))
+        entry_quality_score = float(snapshot.get("entry_quality_score", 0.0) or 0.0)
+        event_score = float(snapshot.get("event_score", snapshot.get("event_strength_score", 0.0)) or 0.0)
+        event_grade = self._normalize_event_grade(snapshot.get("event_grade", "C"))
+
+        raw_event_confirmation_map = snapshot.get("event_confirmation_map")
+        event_confirmation_map: dict[str, str] = {}
+        if isinstance(raw_event_confirmation_map, dict):
+            for event_name, status in raw_event_confirmation_map.items():
+                name_text = str(event_name).strip()
+                status_text = str(status).strip().lower()
+                if not name_text or status_text not in {"confirmed", "pending", "failed"}:
+                    continue
+                event_confirmation_map[name_text] = status_text
+
+        total_event_count = len(event_chain) if event_chain else len(events) + len(risk_events)
+        signal_tags: list[str] = []
+        if entry_quality_score >= 82:
+            signal_tags.append("B")
+        elif entry_quality_score >= 68:
+            signal_tags.append("A")
+        else:
+            signal_tags.append("C")
+        if risk_events:
+            signal_tags.append("C")
+        phase_text = str(snapshot.get("phase", "阶段未明"))
+        if phase_text.startswith("吸筹D") or phase_text.startswith("吸筹E"):
+            signal_tags.append("B")
+        primary, secondary = self._resolve_signal_priority(signal_tags)
+
+        trigger_date = str(snapshot.get("trigger_date") or "").strip()
+        try:
+            trigger_dt = datetime.strptime(trigger_date, "%Y-%m-%d")
+        except ValueError:
+            trigger_dt = datetime.now()
+            trigger_date = trigger_dt.strftime("%Y-%m-%d")
+        signal_age_days, _ = self._compute_signal_age_days(
+            symbol=row.symbol,
+            trigger_date=trigger_date,
+            as_of_date=None,
+        )
+        expire_date = (trigger_dt + timedelta(days=2)).strftime("%Y-%m-%d")
+        wyckoff_signal = str(snapshot.get("signal", "")).strip()
+        phase_hint = str(snapshot.get("phase_hint", "")).strip()
+        reason = f"{phase_hint} 关键事件={wyckoff_signal or '无'}"
+        if risk_events:
+            reason = f"{reason} 风险={','.join(str(event) for event in risk_events)}"
+
+        raw_event_grade_map = snapshot.get("event_grade_map")
+        event_grade_map: dict[str, str] = {}
+        if isinstance(raw_event_grade_map, dict):
+            for event_name, grade in raw_event_grade_map.items():
+                name_text = str(event_name).strip()
+                grade_text = str(grade).strip().upper()
+                if not name_text or grade_text not in {"A", "B", "C"}:
+                    continue
+                event_grade_map[name_text] = grade_text
+
+        return SignalResult(
+            symbol=row.symbol,
+            name=row.name,
+            primary_signal=primary,  # type: ignore[arg-type]
+            secondary_signals=secondary,  # type: ignore[arg-type]
+            trigger_date=trigger_date,
+            expire_date=expire_date,
+            signal_age_days=signal_age_days,
+            trigger_reason=reason,
+            priority=3 if primary == "B" else 2 if primary == "A" else 1,
+            wyckoff_phase=phase_text,
+            wyckoff_signal=wyckoff_signal,
+            structure_hhh=str(snapshot.get("structure_hhh", "-")),
+            wy_event_count=total_event_count,
+            wy_sequence_ok=sequence_ok,
+            entry_quality_score=entry_quality_score,
+            wy_events=[str(event) for event in events],
+            wy_risk_events=[str(event) for event in risk_events],
+            wy_event_dates=event_dates,
+            wy_event_chain=event_chain,
+            phase_hint=phase_hint,
+            scan_mode="trend_pool",
+            event_strength_score=float(snapshot.get("event_strength_score", 0.0) or 0.0),
+            phase_score=float(snapshot.get("phase_score", 0.0) or 0.0),
+            structure_score=float(snapshot.get("structure_score", 0.0) or 0.0),
+            trend_score=float(snapshot.get("trend_score", 0.0) or 0.0),
+            volatility_score=float(snapshot.get("volatility_score", 0.0) or 0.0),
+            health_score=float(snapshot.get("health_score", 0.0) or 0.0),
+            slope_stability=float(snapshot.get("slope_stability", 0.0) or 0.0),
+            volatility_stability=float(snapshot.get("volatility_stability", 0.0) or 0.0),
+            pullback_quality=float(snapshot.get("pullback_quality", 0.0) or 0.0),
+            event_score=event_score,
+            event_grade=event_grade,  # type: ignore[arg-type]
+            event_background_score=float(snapshot.get("event_background_score", 0.0) or 0.0),
+            event_position_score=float(snapshot.get("event_position_score", 0.0) or 0.0),
+            event_vol_price_score=float(snapshot.get("event_vol_price_score", 0.0) or 0.0),
+            event_confirmation_score=float(snapshot.get("event_confirmation_score", 0.0) or 0.0),
+            candle_quality_score=float(snapshot.get("candle_quality_score", 0.0) or 0.0),
+            cost_center_shift_score=float(snapshot.get("cost_center_shift_score", 0.0) or 0.0),
+            weekly_context_score=float(snapshot.get("weekly_context_score", 0.0) or 0.0),
+            weekly_context_multiplier=float(snapshot.get("weekly_context_multiplier", 1.0) or 1.0),
+            event_recency_score=float(snapshot.get("event_recency_score", 0.0) or 0.0),
+            phase_context_score=float(snapshot.get("phase_context_score", 0.0) or 0.0),
+            risk_score=float(snapshot.get("risk_score", 0.0) or 0.0),
+            confirmation_status=self._normalize_confirmation_status(snapshot.get("confirmation_status", "unconfirmed")),  # type: ignore[arg-type]
+            event_confirmation_map=event_confirmation_map,
+            event_grade_map=event_grade_map,
+        )
+
     def get_analysis(self, symbol: str) -> StockAnalysisResponse:
         cached = self._latest_rows.get(symbol)
+        signal = self._build_stock_signal_snapshot(symbol)
         if cached:
             analysis = StockAnalysis(
                 symbol=symbol,
@@ -4716,7 +4875,11 @@ class InMemoryStore:
                 degraded=cached.degraded,
                 degraded_reason=cached.degraded_reason,
             )
-            return StockAnalysisResponse(analysis=analysis, annotation=self._annotation_store.get(symbol))
+            return StockAnalysisResponse(
+                analysis=analysis,
+                annotation=self._annotation_store.get(symbol),
+                signal=signal,
+            )
 
         base = next((stock for stock in STOCK_POOL if stock["symbol"] == symbol), None)
         analysis = StockAnalysis(
@@ -4730,7 +4893,11 @@ class InMemoryStore:
             degraded=symbol == "sz002230",
             degraded_reason="AI_TIMEOUT_CACHE_FALLBACK" if symbol == "sz002230" else None,
         )
-        return StockAnalysisResponse(analysis=analysis, annotation=self._annotation_store.get(symbol))
+        return StockAnalysisResponse(
+            analysis=analysis,
+            annotation=self._annotation_store.get(symbol),
+            signal=signal,
+        )
 
     def save_annotation(self, annotation: StockAnnotation) -> StockAnnotation:
         self._annotation_store[annotation.symbol] = annotation

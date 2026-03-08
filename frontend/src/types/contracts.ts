@@ -207,6 +207,12 @@ export interface StockAnnotation {
   updated_by: 'manual' | 'auto'
 }
 
+export interface StockAnalysisResponse {
+  analysis: StockAnalysis
+  annotation?: StockAnnotation
+  signal?: SignalResult
+}
+
 export interface SignalResult {
   symbol: string
   name: string
