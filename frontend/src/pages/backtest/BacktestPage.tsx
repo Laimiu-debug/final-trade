@@ -459,7 +459,63 @@ function resolvePlateauCorrelations(plateauResult?: BacktestPlateauResponse | nu
   return buildPlateauCorrelationsFromPoints(validPoints)
 }
 
-function resolveEffectiveRunRequest(runRequest: BacktestRunRequest, runResult: BacktestResponse): BacktestRunRequest {
+const BACKTEST_TASK_ID_MAX_LENGTH = 64
+const IMPORTED_BACKTEST_TASK_PREFIX = 'imp_'
+const IMPORTED_PLATEAU_TASK_PREFIX = 'imp_plateau_'
+
+function hashTextToBase36(text: string): string {
+  let hash = 2166136261
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(36)
+}
+
+export function buildImportedLocalTaskId(reportId: string, kind: 'backtest' | 'plateau'): string {
+  const prefix = kind === 'plateau' ? IMPORTED_PLATEAU_TASK_PREFIX : IMPORTED_BACKTEST_TASK_PREFIX
+  const raw = String(reportId || '').trim() || 'report'
+  const safe = raw.replace(/[^0-9A-Za-z._-]/g, '_')
+  const maxBodyLength = Math.max(8, BACKTEST_TASK_ID_MAX_LENGTH - prefix.length)
+  if (safe.length <= maxBodyLength) {
+    return `${prefix}${safe}`
+  }
+  const hashSuffix = hashTextToBase36(raw).padStart(8, '0').slice(-8)
+  const headLength = Math.max(8, maxBodyLength - hashSuffix.length - 1)
+  return `${prefix}${safe.slice(0, headLength)}_${hashSuffix}`
+}
+
+function isImportedLocalTaskId(taskId: string, kind: 'backtest' | 'plateau'): boolean {
+  const prefix = kind === 'plateau' ? IMPORTED_PLATEAU_TASK_PREFIX : IMPORTED_BACKTEST_TASK_PREFIX
+  return String(taskId || '').trim().startsWith(prefix)
+}
+
+function buildPlateauPointDetailPayloads(
+  taskId: string | null | undefined,
+  pointRuns: PlateauPointRunRecord[],
+): BacktestPlateauPointDetailResponse[] {
+  const normalizedTaskId = String(taskId || '').trim()
+  if (!normalizedTaskId) return []
+  const savedAt = new Date().toISOString()
+  return pointRuns.flatMap((item) => {
+    const detailKey = String(item.point.detail_key || '').trim()
+    if (!detailKey || !item.runResult) {
+      return []
+    }
+    return [
+      {
+        task_id: normalizedTaskId,
+        detail_key: detailKey,
+        saved_at: savedAt,
+        params: item.point.params,
+        run_request: item.runRequest,
+        run_result: item.runResult,
+      },
+    ]
+  })
+}
+
+export function resolveEffectiveRunRequest(runRequest: BacktestRunRequest, runResult: BacktestResponse): BacktestRunRequest {
   return runResult.effective_run_request ?? runRequest
 }
 
@@ -2869,12 +2925,13 @@ export function BacktestPage() {
   const loadReportMutation = useMutation({
     mutationFn: getBacktestReport,
     onSuccess: (payload) => {
-      const taskId = `imp_${payload.summary.report_id}`
+      const effectiveRunRequest = resolveEffectiveRunRequest(payload.run_request, payload.run_result)
+      const taskId = buildImportedLocalTaskId(payload.summary.report_id, 'backtest')
       const status: BacktestTaskStatusResponse = {
         task_id: taskId,
         status: 'succeeded',
         progress: {
-          mode: payload.run_request.pool_roll_mode,
+          mode: effectiveRunRequest.pool_roll_mode,
           current_date: payload.run_result.range.date_to,
           processed_dates: 1,
           total_dates: 1,
@@ -2890,10 +2947,10 @@ export function BacktestPage() {
         error_code: null,
       }
       upsertTaskStatus(status)
-      upsertTaskPayload(taskId, payload.run_request)
+      upsertTaskPayload(taskId, effectiveRunRequest)
       setSelectedTask(taskId)
       if (payload.plateau_result) {
-        const plateauTaskId = `imp_plateau_${payload.summary.report_id}`
+        const plateauTaskId = buildImportedLocalTaskId(payload.summary.report_id, 'plateau')
         const normalizedPlateauResult: BacktestPlateauResponse = {
           ...payload.plateau_result,
           correlations: resolvePlateauCorrelations(payload.plateau_result),
@@ -2945,19 +3002,20 @@ export function BacktestPage() {
       return null
     }
     try {
+      const effectiveRunRequest = resolveEffectiveRunRequest(selectedTaskPayload, result)
       const exportPlateauResult: BacktestPlateauResponse | null = plateauResult
         ? {
             ...plateauResult,
             correlations: resolvePlateauCorrelations(plateauResult),
           }
         : null
-      const workbookBuffer = buildBacktestReportWorkbookBuffer(selectedTaskPayload, result, exportPlateauResult)
-      const reportHtml = buildBacktestReportHtml(selectedTaskPayload, result, exportPlateauResult)
+      const workbookBuffer = buildBacktestReportWorkbookBuffer(effectiveRunRequest, result, exportPlateauResult)
+      const reportHtml = buildBacktestReportHtml(effectiveRunRequest, result, exportPlateauResult)
       const dateFrom = String(result.range.date_from || '').replaceAll('-', '')
       const dateTo = String(result.range.date_to || '').replaceAll('-', '')
       const fileBaseName = [
         'backtest_report',
-        String(selectedTaskPayload.mode || 'backtest'),
+        String(effectiveRunRequest.mode || 'backtest'),
         dateFrom || 'from',
         dateTo || 'to',
         dayjs().format('YYYYMMDD_HHmmss'),
@@ -2965,9 +3023,10 @@ export function BacktestPage() {
         .join('_')
         .replace(/[^0-9A-Za-z_.-]/g, '_')
       return {
-        runRequest: selectedTaskPayload,
+        runRequest: effectiveRunRequest,
         runResult: result,
         exportPlateauResult,
+        plateauTaskId: exportPlateauResult ? plateauTaskStatus?.task_id ?? null : null,
         workbookBuffer,
         reportHtml,
         fileBaseName,
@@ -2988,6 +3047,7 @@ export function BacktestPage() {
       report_html: payload.reportHtml,
       report_xlsx_base64: reportXlsxBase64,
       plateau_result: payload.exportPlateauResult,
+      plateau_task_id: payload.plateauTaskId,
       app_name: 'Final Trade',
       app_version: String(import.meta.env.VITE_APP_VERSION || 'frontend'),
     })
@@ -3057,7 +3117,7 @@ export function BacktestPage() {
   useEffect(() => {
     if (!plateauSelectedTaskId) return
     const current = plateauTasksById[plateauSelectedTaskId]
-    if (!current || current.result) return
+    if (!current || current.result || isImportedLocalTaskId(plateauSelectedTaskId, 'plateau')) return
     let active = true
     void getBacktestPlateauTask(plateauSelectedTaskId)
       .then((status) => {
@@ -4658,6 +4718,10 @@ export function BacktestPage() {
     if (current.result) {
       return current
     }
+    if (isImportedLocalTaskId(taskId, 'plateau')) {
+      message.warning(`本地导入任务 ${taskId} 已丢失结果缓存，请重新加载报告后再导出。`)
+      return null
+    }
     try {
       const status = await getBacktestPlateauTask(taskId)
       upsertPlateauTaskStatus(status)
@@ -4803,6 +4867,8 @@ export function BacktestPage() {
         report_html: reportHtml,
         report_xlsx_base64: bufferToBase64(workbookBuffer),
         plateau_result: plateauResultWithCorr,
+        plateau_task_id: taskId,
+        plateau_point_details: buildPlateauPointDetailPayloads(taskId, pointRuns),
         report_id: reportId,
         app_name: 'Final Trade',
         app_version: String(import.meta.env.VITE_APP_VERSION || 'frontend'),
@@ -4850,7 +4916,7 @@ export function BacktestPage() {
   function handleDeletePlateauHistoryTask(taskId: string) {
     const normalizedTaskId = String(taskId || '').trim()
     if (!normalizedTaskId) return
-    if (normalizedTaskId.startsWith('imp_plateau_')) {
+    if (isImportedLocalTaskId(normalizedTaskId, 'plateau')) {
       removePlateauTask(normalizedTaskId)
       message.success(`已删除本地导入任务：${normalizedTaskId}`)
       return
@@ -4862,6 +4928,14 @@ export function BacktestPage() {
     const normalizedTaskId = String(taskId || '').trim()
     if (!normalizedTaskId) return
     setSelectedPlateauTask(normalizedTaskId)
+    const current = plateauTasksById[normalizedTaskId]
+    if (current?.result) {
+      return
+    }
+    if (isImportedLocalTaskId(normalizedTaskId, 'plateau')) {
+      message.info(`本地导入任务 ${normalizedTaskId} 需要重新加载报告后才能查看。`)
+      return
+    }
     try {
       const status = await getBacktestPlateauTask(normalizedTaskId)
       upsertPlateauTaskStatus(status)
@@ -4880,6 +4954,10 @@ export function BacktestPage() {
     const current = tasksById[normalizedTaskId]
     if (current?.result) {
       scrollToBacktestResultSection()
+      return
+    }
+    if (isImportedLocalTaskId(normalizedTaskId, 'backtest')) {
+      message.info(`本地导入任务 ${normalizedTaskId} 需要重新加载报告后才能查看。`)
       return
     }
     try {
@@ -6629,4 +6707,3 @@ export function BacktestPage() {
     </Space>
   )
 }
-

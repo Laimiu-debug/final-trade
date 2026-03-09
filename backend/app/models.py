@@ -1044,6 +1044,8 @@ class BacktestReportBuildRequest(BaseModel):
     report_html: str = Field(min_length=1)
     report_xlsx_base64: str = Field(min_length=1)
     plateau_result: BacktestPlateauResponse | None = None
+    plateau_task_id: str | None = None
+    plateau_point_details: list[BacktestPlateauPointDetailResponse] = Field(default_factory=list)
     report_id: str | None = None
     app_name: str = "Final Trade"
     app_version: str = "unknown"

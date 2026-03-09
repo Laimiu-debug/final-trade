@@ -221,6 +221,11 @@ class InMemoryStore:
         "report.xlsx",
         "report.html",
     )
+    _BACKTEST_IMPORTED_TASK_ID_MAX_LENGTH = 64
+    _IMPORTED_BACKTEST_TASK_PREFIX = "imp_"
+    _IMPORTED_PLATEAU_TASK_PREFIX = "imp_plateau_"
+    _BACKTEST_REPORT_PLATEAU_POINT_DETAIL_FILE_PREFIX = "plateau_point_detail__"
+    _BACKTEST_REPORT_PLATEAU_POINT_DETAIL_FILE_SUFFIX = ".json"
     _BACKTEST_REPORT_META_SCHEMA_VERSION = 1
     _BACKTEST_REPORT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{4,96}$")
     _BACKTEST_TASK_ID_RE = re.compile(r"^[A-Za-z0-9._-]{4,96}$")
@@ -14852,6 +14857,60 @@ class InMemoryStore:
         return f"bt_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
 
     @staticmethod
+    def _hash_text_to_base36(text: str) -> str:
+        digest = 2166136261
+        for char in str(text):
+            digest ^= ord(char)
+            digest = (digest * 16777619) & 0xFFFFFFFF
+        value = digest & 0xFFFFFFFF
+        if value == 0:
+            return "0"
+        alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+        chars: list[str] = []
+        while value > 0:
+            value, remainder = divmod(value, 36)
+            chars.append(alphabet[remainder])
+        return "".join(reversed(chars))
+
+    @classmethod
+    def _build_imported_local_task_id(cls, report_id: str, kind: Literal["backtest", "plateau"]) -> str:
+        prefix = (
+            cls._IMPORTED_PLATEAU_TASK_PREFIX
+            if kind == "plateau"
+            else cls._IMPORTED_BACKTEST_TASK_PREFIX
+        )
+        raw = str(report_id or "").strip() or "report"
+        safe = re.sub(r"[^0-9A-Za-z._-]", "_", raw)
+        max_body_length = max(8, cls._BACKTEST_IMPORTED_TASK_ID_MAX_LENGTH - len(prefix))
+        if len(safe) <= max_body_length:
+            return f"{prefix}{safe}"
+        hash_suffix = cls._hash_text_to_base36(raw).rjust(8, "0")[-8:]
+        head_length = max(8, max_body_length - len(hash_suffix) - 1)
+        return f"{prefix}{safe[:head_length]}_{hash_suffix}"
+
+    @classmethod
+    def _build_backtest_report_plateau_point_detail_file_name(cls, detail_key: str) -> str:
+        normalized_detail_key = cls._validate_backtest_plateau_detail_key(detail_key)
+        return (
+            f"{cls._BACKTEST_REPORT_PLATEAU_POINT_DETAIL_FILE_PREFIX}"
+            f"{normalized_detail_key}"
+            f"{cls._BACKTEST_REPORT_PLATEAU_POINT_DETAIL_FILE_SUFFIX}"
+        )
+
+    @classmethod
+    def _parse_backtest_report_plateau_point_detail_file_name(cls, path: str) -> str | None:
+        normalized = str(path or "").strip().replace("\\", "/")
+        prefix = cls._BACKTEST_REPORT_PLATEAU_POINT_DETAIL_FILE_PREFIX
+        suffix = cls._BACKTEST_REPORT_PLATEAU_POINT_DETAIL_FILE_SUFFIX
+        if not normalized.startswith(prefix) or not normalized.endswith(suffix):
+            return None
+        detail_key = normalized[len(prefix) : len(normalized) - len(suffix)]
+        try:
+            return cls._validate_backtest_plateau_detail_key(detail_key)
+        except BacktestValidationError:
+            return None
+
+    @staticmethod
     def _sha256_bytes(raw: bytes) -> str:
         return hashlib.sha256(raw).hexdigest()
 
@@ -14913,6 +14972,70 @@ class InMemoryStore:
         safe_name = Path(text).name.strip()
         return safe_name or fallback
 
+    @staticmethod
+    def _resolve_backtest_report_run_request(
+        run_request: BacktestRunRequest,
+        run_result: BacktestResponse,
+    ) -> BacktestRunRequest:
+        effective = run_result.effective_run_request
+        if effective is not None:
+            return effective.model_copy(deep=True)
+        return run_request.model_copy(deep=True)
+
+    def _collect_backtest_report_plateau_point_details(
+        self,
+        *,
+        plateau_result: BacktestPlateauResponse | None,
+        plateau_task_id: str | None,
+        explicit_details: list[BacktestPlateauPointDetailResponse],
+    ) -> list[BacktestPlateauPointDetailResponse]:
+        if plateau_result is None:
+            return []
+        allowed_detail_keys = {
+            self._validate_backtest_plateau_detail_key(str(point.detail_key or "").strip())
+            for point in plateau_result.points
+            if str(point.detail_key or "").strip()
+        }
+        detail_map: dict[str, BacktestPlateauPointDetailResponse] = {}
+        for detail in explicit_details:
+            detail_key = self._validate_backtest_plateau_detail_key(detail.detail_key)
+            if detail_key not in allowed_detail_keys:
+                continue
+            detail_map[detail_key] = detail.model_copy(deep=True)
+        normalized_task_id = ""
+        if str(plateau_task_id or "").strip():
+            normalized_task_id = self._validate_backtest_task_id(str(plateau_task_id or "").strip())
+        if normalized_task_id:
+            for point in plateau_result.points:
+                detail_key = str(point.detail_key or "").strip()
+                if not detail_key:
+                    continue
+                normalized_detail_key = self._validate_backtest_plateau_detail_key(detail_key)
+                if normalized_detail_key in detail_map:
+                    continue
+                detail = self.get_backtest_plateau_point_detail(normalized_task_id, normalized_detail_key)
+                if detail is None:
+                    continue
+                detail_map[normalized_detail_key] = detail
+        return [detail_map[key] for key in sorted(detail_map.keys())]
+
+    def _build_backtest_report_plateau_point_payload_files(
+        self,
+        *,
+        plateau_result: BacktestPlateauResponse | None,
+        plateau_task_id: str | None,
+        explicit_details: list[BacktestPlateauPointDetailResponse],
+    ) -> dict[str, bytes]:
+        payload_files: dict[str, bytes] = {}
+        for detail in self._collect_backtest_report_plateau_point_details(
+            plateau_result=plateau_result,
+            plateau_task_id=plateau_task_id,
+            explicit_details=explicit_details,
+        ):
+            file_name = self._build_backtest_report_plateau_point_detail_file_name(detail.detail_key)
+            payload_files[file_name] = self._json_dumps_bytes(detail.model_dump(exclude_none=True))
+        return payload_files
+
     def _parse_backtest_report_package(
         self,
         package_bytes: bytes,
@@ -14922,6 +15045,7 @@ class InMemoryStore:
         BacktestRunRequest,
         BacktestResponse,
         BacktestPlateauResponse | None,
+        list[BacktestPlateauPointDetailResponse],
     ]:
         try:
             with zipfile.ZipFile(io.BytesIO(package_bytes), mode="r") as archive:
@@ -15002,6 +15126,7 @@ class InMemoryStore:
             run_result = BacktestResponse(
                 **json.loads(payload_files["run_result.json"].decode("utf-8"))
             )
+            run_request = self._resolve_backtest_report_run_request(run_request, run_result)
         except BacktestValidationError:
             raise
         except Exception as exc:
@@ -15016,7 +15141,36 @@ class InMemoryStore:
             except Exception as exc:
                 raise BacktestValidationError("BACKTEST_REPORT_INVALID", f"plateau_result 校验失败: {exc}") from exc
 
-        return manifest, payload_files, run_request, run_result, plateau_result
+        plateau_point_details: list[BacktestPlateauPointDetailResponse] = []
+        for path, content in sorted(payload_files.items()):
+            detail_key = self._parse_backtest_report_plateau_point_detail_file_name(path)
+            if detail_key is None:
+                continue
+            try:
+                raw = json.loads(content.decode("utf-8"))
+                if not isinstance(raw, dict):
+                    raise ValueError("plateau point detail payload must be an object")
+                plateau_point_details.append(
+                    BacktestPlateauPointDetailResponse(
+                        task_id=self._validate_backtest_task_id(str(raw.get("task_id") or "pt_report_detail")),
+                        detail_key=self._validate_backtest_plateau_detail_key(
+                            str(raw.get("detail_key") or detail_key)
+                        ),
+                        saved_at=str(raw.get("saved_at") or ""),
+                        params=BacktestPlateauParams(**dict(raw.get("params") or {})),
+                        run_request=BacktestRunRequest(**dict(raw.get("run_request") or {})),
+                        run_result=BacktestResponse(**dict(raw.get("run_result") or {})),
+                    )
+                )
+            except BacktestValidationError:
+                raise
+            except Exception as exc:
+                raise BacktestValidationError(
+                    "BACKTEST_REPORT_INVALID",
+                    f"plateau point detail 校验失败: {path}: {exc}",
+                ) from exc
+
+        return manifest, payload_files, run_request, run_result, plateau_result, plateau_point_details
 
     @staticmethod
     def _backtest_report_meta_path(report_dir: Path) -> Path:
@@ -15074,6 +15228,7 @@ class InMemoryStore:
             run_result = BacktestResponse(
                 **json.loads((report_dir / "run_result.json").read_text(encoding="utf-8"))
             )
+            run_request = self._resolve_backtest_report_run_request(run_request, run_result)
             plateau_result: BacktestPlateauResponse | None = None
             plateau_path = report_dir / "plateau_result.json"
             if plateau_path.exists():
@@ -15118,8 +15273,13 @@ class InMemoryStore:
         if len(report_xlsx_bytes) <= 0:
             raise BacktestValidationError("BACKTEST_REPORT_INVALID", "report_xlsx_base64 解码后为空。")
 
+        effective_run_request = self._resolve_backtest_report_run_request(
+            payload.run_request,
+            payload.run_result,
+        )
+
         payload_files: dict[str, bytes] = {
-            "run_request.json": self._json_dumps_bytes(payload.run_request.model_dump(exclude_none=True)),
+            "run_request.json": self._json_dumps_bytes(effective_run_request.model_dump(exclude_none=True)),
             "run_result.json": self._json_dumps_bytes(payload.run_result.model_dump(exclude_none=True)),
             "report.xlsx": report_xlsx_bytes,
             "report.html": report_html_text.encode("utf-8"),
@@ -15128,6 +15288,13 @@ class InMemoryStore:
             payload_files["plateau_result.json"] = self._json_dumps_bytes(
                 payload.plateau_result.model_dump(exclude_none=True)
             )
+        payload_files.update(
+            self._build_backtest_report_plateau_point_payload_files(
+                plateau_result=payload.plateau_result,
+                plateau_task_id=payload.plateau_task_id,
+                explicit_details=list(payload.plateau_point_details or []),
+            )
+        )
 
         manifest = self._build_backtest_report_manifest(
             report_id=report_id,
@@ -15160,9 +15327,17 @@ class InMemoryStore:
         if len(package_bytes) <= 0:
             raise BacktestValidationError("BACKTEST_REPORT_INVALID", "导入文件为空。")
 
-        manifest, payload_files, run_request, run_result, plateau_result = self._parse_backtest_report_package(package_bytes)
+        (
+            manifest,
+            payload_files,
+            run_request,
+            run_result,
+            plateau_result,
+            plateau_point_details,
+        ) = self._parse_backtest_report_package(package_bytes)
         _ = run_request
         report_id = self._validate_backtest_report_id(manifest.report_id)
+        imported_plateau_task_id = self._build_imported_local_task_id(report_id, "plateau")
         now_text = self._now_datetime()
         store_dir = self._resolve_backtest_report_store_dir()
         store_dir.mkdir(parents=True, exist_ok=True)
@@ -15179,6 +15354,7 @@ class InMemoryStore:
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
         tmp_dir.mkdir(parents=True, exist_ok=True)
+        self._clear_backtest_plateau_task_detail_store(imported_plateau_task_id)
 
         manifest_bytes = self._json_dumps_bytes(manifest.model_dump(exclude_none=True))
         run_request_bytes = self._json_dumps_bytes(run_request.model_dump(exclude_none=True))
@@ -15198,6 +15374,14 @@ class InMemoryStore:
             (tmp_dir / "run_result.json").write_bytes(run_result_bytes)
             for path, content in payload_files.items():
                 (tmp_dir / path).write_bytes(content)
+            for detail in plateau_point_details:
+                self._persist_backtest_plateau_point_detail(
+                    task_id=imported_plateau_task_id,
+                    detail_key=detail.detail_key,
+                    params=detail.params,
+                    run_request=detail.run_request,
+                    run_result=detail.run_result,
+                )
             (tmp_dir / "meta.json").write_text(
                 json.dumps(meta_payload, ensure_ascii=False, sort_keys=True, indent=2),
                 encoding="utf-8",
@@ -15255,8 +15439,10 @@ class InMemoryStore:
         report_dir = self._resolve_backtest_report_store_dir() / normalized
         if not report_dir.exists() or (not report_dir.is_dir()):
             return False
+        imported_plateau_task_id = self._build_imported_local_task_id(normalized, "plateau")
         try:
             shutil.rmtree(report_dir)
+            self._clear_backtest_plateau_task_detail_store(imported_plateau_task_id)
             return True
         except Exception as exc:
             raise BacktestValidationError("BACKTEST_REPORT_DELETE_FAILED", f"删除报告失败: {exc}") from exc

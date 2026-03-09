@@ -1045,6 +1045,8 @@ export interface BacktestReportBuildRequest {
   report_html: string
   report_xlsx_base64: string
   plateau_result?: BacktestPlateauResponse | null
+  plateau_task_id?: string | null
+  plateau_point_details?: BacktestPlateauPointDetailResponse[]
   report_id?: string
   app_name?: string
   app_version?: string

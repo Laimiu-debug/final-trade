@@ -1,12 +1,15 @@
 ﻿from __future__ import annotations
 
 import base64
+import hashlib
+import io
 import json
 import os
 import sys
 import tempfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,6 +33,9 @@ from app.main import app
 import app.store as store_module
 from app.core.backtest_engine import CandidateTrade
 from app.models import (
+    BacktestPlateauParams,
+    BacktestPlateauPoint,
+    BacktestPlateauResponse,
     BacktestResponse,
     BacktestRiskMetrics,
     BacktestRunRequest,
@@ -2568,6 +2574,77 @@ def _build_backtest_report_build_payload(report_id: str) -> dict[str, object]:
     }
 
 
+def _build_backtest_report_plateau_fixture(report_id: str) -> tuple[dict[str, object], dict[str, object]]:
+    payload = _build_backtest_report_build_payload(report_id)
+    detail_key = "pt_shared_detail_01"
+    point_params = {
+        "window_days": 40,
+        "min_score": 58.0,
+        "stop_loss": 0.04,
+        "take_profit": 0.18,
+        "trailing_stop_pct": 0.03,
+        "max_positions": 4,
+        "position_pct": 0.25,
+        "max_symbols": 120,
+        "priority_topk_per_day": 0,
+    }
+    point = {
+        "params": point_params,
+        "stats": payload["run_result"]["stats"],
+        "candidate_count": 6,
+        "skipped_count": 1,
+        "fill_rate": 0.4,
+        "max_concurrent_positions": 2,
+        "annual_trades": 24.0,
+        "score": 81.0,
+        "point_score": 79.0,
+        "local_score": 78.0,
+        "plateau_score": 77.0,
+        "passes_hard_filters": True,
+        "cache_hit": True,
+        "detail_key": detail_key,
+        "error": None,
+    }
+    plateau_result = {
+        "base_payload": payload["run_request"],
+        "total_combinations": 1,
+        "evaluated_combinations": 1,
+        "points": [point],
+        "best_point": point,
+        "recommended_point": point,
+        "peak_point": point,
+        "regions": [],
+        "correlations": [],
+        "generated_at": "2025-01-31 10:00:00",
+        "notes": ["mock plateau"],
+    }
+    detail = {
+        "task_id": "plateau_task_src_001",
+        "detail_key": detail_key,
+        "saved_at": "2025-01-31 10:05:00",
+        "params": point_params,
+        "run_request": {
+            **payload["run_request"],
+            "window_days": 40,
+            "min_score": 58.0,
+            "stop_loss": 0.04,
+            "take_profit": 0.18,
+            "trailing_stop_pct": 0.03,
+            "max_positions": 4,
+            "position_pct": 0.25,
+            "max_symbols": 120,
+            "priority_topk_per_day": 0,
+        },
+        "run_result": {
+            **payload["run_result"],
+            "notes": ["plateau detail packaged"],
+        },
+    }
+    payload["plateau_result"] = plateau_result
+    payload["plateau_task_id"] = detail["task_id"]
+    return payload, detail
+
+
 def test_backtest_report_build_import_and_manage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TDX_TREND_BACKTEST_REPORT_STORE_DIR", str(tmp_path / "backtest-reports"))
 
@@ -2614,3 +2691,121 @@ def test_backtest_report_build_import_and_manage(monkeypatch: pytest.MonkeyPatch
     missing_resp = client.get(f"/api/backtest/reports/{report_id}")
     assert missing_resp.status_code == 404
     assert missing_resp.json()["code"] == "BACKTEST_REPORT_NOT_FOUND"
+
+
+def test_backtest_report_import_recovers_effective_run_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TDX_TREND_BACKTEST_REPORT_STORE_DIR", str(tmp_path / "backtest-reports"))
+
+    report_id = "bt_report_shared_runid_001"
+    payload = _build_backtest_report_build_payload(report_id)
+    payload["run_request"] = {
+        **payload["run_request"],
+        "mode": "trend_pool",
+        "run_id": "",
+        "board_filters": ["main", "gem", "star"],
+    }
+    payload["run_result"] = {
+        **payload["run_result"],
+        "effective_run_request": {
+            **payload["run_request"],
+            "run_id": "shared-run-20260301",
+            "board_filters": ["main", "gem", "star"],
+        },
+    }
+
+    build_resp = client.post("/api/backtest/reports/build", json=payload)
+    assert build_resp.status_code == 200
+    package_bytes = base64.b64decode(build_resp.json()["file_base64"])
+
+    with zipfile.ZipFile(io.BytesIO(package_bytes), mode="r") as archive:
+        exported_run_request = json.loads(archive.read("run_request.json").decode("utf-8"))
+    assert exported_run_request["run_id"] == "shared-run-20260301"
+
+    legacy_buffer = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(package_bytes), mode="r") as source_archive:
+        archive_entries = {
+            name: source_archive.read(name)
+            for name in source_archive.namelist()
+        }
+        legacy_run_request = {
+            **exported_run_request,
+            "run_id": "",
+        }
+        legacy_run_request_bytes = json.dumps(legacy_run_request, ensure_ascii=False).encode("utf-8")
+        archive_entries["run_request.json"] = legacy_run_request_bytes
+        manifest_payload = json.loads(archive_entries["manifest.json"].decode("utf-8"))
+        for row in manifest_payload["files"]:
+            if row["path"] != "run_request.json":
+                continue
+            row["bytes"] = len(legacy_run_request_bytes)
+            row["sha256"] = hashlib.sha256(legacy_run_request_bytes).hexdigest()
+        archive_entries["manifest.json"] = json.dumps(manifest_payload, ensure_ascii=False).encode("utf-8")
+        with zipfile.ZipFile(legacy_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as legacy_archive:
+            for name, content in archive_entries.items():
+                legacy_archive.writestr(name, content)
+    legacy_package_bytes = legacy_buffer.getvalue()
+
+    import_resp = client.post(
+        "/api/backtest/reports/import",
+        files={"file": (f"{report_id}.ftbt", legacy_package_bytes, "application/octet-stream")},
+    )
+    assert import_resp.status_code == 200
+
+    detail_resp = client.get(f"/api/backtest/reports/{report_id}")
+    assert detail_resp.status_code == 200
+    detail_body = detail_resp.json()
+    assert detail_body["run_request"]["mode"] == "trend_pool"
+    assert detail_body["run_request"]["run_id"] == "shared-run-20260301"
+    assert detail_body["run_result"]["effective_run_request"]["run_id"] == "shared-run-20260301"
+
+
+def test_backtest_report_import_restores_plateau_point_details(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TDX_TREND_BACKTEST_REPORT_STORE_DIR", str(tmp_path / "backtest-reports"))
+    monkeypatch.setenv("TDX_TREND_BACKTEST_PLATEAU_DETAIL_STORE_DIR", str(tmp_path / "backtest-plateau-details"))
+
+    report_id = "bt_report_plateau_detail_001"
+    payload, detail_payload = _build_backtest_report_plateau_fixture(report_id)
+    store._persist_backtest_plateau_point_detail(
+        task_id=str(detail_payload["task_id"]),
+        detail_key=str(detail_payload["detail_key"]),
+        params=BacktestPlateauParams(**dict(detail_payload["params"])),
+        run_request=BacktestRunRequest(**dict(detail_payload["run_request"])),
+        run_result=BacktestResponse(**dict(detail_payload["run_result"])),
+    )
+
+    build_resp = client.post("/api/backtest/reports/build", json=payload)
+    assert build_resp.status_code == 200
+    build_body = build_resp.json()
+    detail_file_name = f"plateau_point_detail__{detail_payload['detail_key']}.json"
+    assert any(item["path"] == detail_file_name for item in build_body["manifest"]["files"])
+
+    package_bytes = base64.b64decode(build_body["file_base64"])
+    with zipfile.ZipFile(io.BytesIO(package_bytes), mode="r") as archive:
+        packaged_detail = json.loads(archive.read(detail_file_name).decode("utf-8"))
+    assert packaged_detail["detail_key"] == detail_payload["detail_key"]
+    assert packaged_detail["run_result"]["notes"] == ["plateau detail packaged"]
+
+    import_resp = client.post(
+        "/api/backtest/reports/import",
+        files={"file": (f"{report_id}.ftbt", package_bytes, "application/octet-stream")},
+    )
+    assert import_resp.status_code == 200
+
+    imported_task_id = store._build_imported_local_task_id(report_id, "plateau")
+    detail_resp = client.get(
+        f"/api/backtest/plateau/tasks/{imported_task_id}/points/{detail_payload['detail_key']}"
+    )
+    assert detail_resp.status_code == 200
+    detail_body = detail_resp.json()
+    assert detail_body["task_id"] == imported_task_id
+    assert detail_body["detail_key"] == detail_payload["detail_key"]
+    assert detail_body["run_result"]["notes"] == ["plateau detail packaged"]
+
+    delete_resp = client.delete(f"/api/backtest/reports/{report_id}")
+    assert delete_resp.status_code == 200
+
+    detail_resp_after = client.get(
+        f"/api/backtest/plateau/tasks/{imported_task_id}/points/{detail_payload['detail_key']}"
+    )
+    assert detail_resp_after.status_code == 404
+    assert detail_resp_after.json()["code"] == "BACKTEST_PLATEAU_POINT_DETAIL_NOT_FOUND"

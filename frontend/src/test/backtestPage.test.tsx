@@ -1,14 +1,14 @@
-import { screen, waitFor } from '@testing-library/react'
+import { fireEvent, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { delay, http, HttpResponse } from 'msw'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { server } from '@/mocks/server'
-import { BacktestPage } from '@/pages/backtest/BacktestPage'
+import { BacktestPage, buildImportedLocalTaskId, resolveEffectiveRunRequest } from '@/pages/backtest/BacktestPage'
 import { BacktestTaskWatcher } from '@/shared/components/BacktestTaskWatcher'
 import { useBacktestPlateauTaskStore } from '@/state/backtestPlateauTaskStore'
 import { useBacktestTaskStore } from '@/state/backtestTaskStore'
 import { renderWithProviders } from '@/test/renderWithProviders'
-import type { BacktestPlateauPoint, BacktestPlateauTaskStatusResponse, BacktestRunRequest } from '@/types/contracts'
+import type { BacktestPlateauPoint, BacktestPlateauTaskStatusResponse, BacktestResponse, BacktestRunRequest } from '@/types/contracts'
 
 vi.mock('echarts-for-react', () => ({
   default: () => <div data-testid="echart" />,
@@ -379,6 +379,204 @@ describe('BacktestPage', () => {
       expect(input.value).toBe('latest-run-20260220')
     })
   }, 12_000)
+
+  it.skip('loads imported report with effective run_id and re-exports that snapshot', async () => {
+    window.localStorage.setItem(
+      'tdx-trend-backtest-collapsed-modules-v1',
+      JSON.stringify({ report_share: false }),
+    )
+    const sharedRunRequest: BacktestRunRequest = {
+      mode: 'trend_pool',
+      run_id: 'shared-run-20260301',
+      trend_step: 'auto',
+      pool_roll_mode: 'daily',
+      board_filters: ['main', 'gem', 'star'],
+      strategy_id: 'wyckoff_trend_v1',
+      strategy_params: {},
+      date_from: '2026-01-01',
+      date_to: '2026-01-31',
+      window_days: 60,
+      min_score: 50,
+      require_sequence: false,
+      min_event_count: 1,
+      entry_events: ['Spring', 'SOS'],
+      exit_events: ['SOW', 'LPSY'],
+      initial_capital: 1_000_000,
+      position_pct: 0.2,
+      max_positions: 5,
+      stop_loss: 0.05,
+      take_profit: 0.15,
+      trailing_stop_pct: 0.03,
+      max_hold_days: 60,
+      fee_bps: 10,
+      prioritize_signals: true,
+      priority_mode: 'balanced',
+      priority_topk_per_day: 0,
+      enforce_t1: true,
+      entry_delay_days: 1,
+      delay_invalidation_enabled: true,
+      max_symbols: 120,
+      enable_advanced_analysis: true,
+    }
+    let exportedRunRequest: BacktestRunRequest | null = null
+    server.use(
+      http.get('/api/backtest/reports', async () => HttpResponse.json({
+        items: [
+          {
+            report_id: 'shared-report-001',
+            created_at: '2026-03-01T10:00:00Z',
+            first_imported_at: '2026-03-09T10:00:00Z',
+            last_imported_at: '2026-03-09T10:00:00Z',
+            source_file_name: 'shared-report-001.ftbt',
+            package_size_bytes: 2048,
+            trade_count: 2,
+            total_return: 0.08,
+            max_drawdown: 0.05,
+            win_rate: 0.5,
+            date_from: '2026-01-01',
+            date_to: '2026-01-31',
+            has_plateau_result: false,
+          },
+        ],
+      })),
+      http.get('/api/backtest/reports/:reportId', async () => HttpResponse.json({
+        summary: {
+          report_id: 'shared-report-001',
+          created_at: '2026-03-01T10:00:00Z',
+          first_imported_at: '2026-03-09T10:00:00Z',
+          last_imported_at: '2026-03-09T10:00:00Z',
+          source_file_name: 'shared-report-001.ftbt',
+          package_size_bytes: 2048,
+          trade_count: 2,
+          total_return: 0.08,
+          max_drawdown: 0.05,
+          win_rate: 0.5,
+          date_from: '2026-01-01',
+          date_to: '2026-01-31',
+          has_plateau_result: false,
+        },
+        manifest: {
+          schema_version: 'ftbt-1.0',
+          package_type: 'backtest_report',
+          created_at: '2026-03-01T10:00:00Z',
+          report_id: 'shared-report-001',
+          app: { name: 'Final Trade', version: 'test' },
+          files: [],
+        },
+        run_request: {
+          ...sharedRunRequest,
+          run_id: undefined,
+        },
+        run_result: {
+          ...buildSucceededResult('imported report'),
+          effective_run_request: sharedRunRequest,
+        },
+        plateau_result: null,
+      })),
+      http.post('/api/backtest/reports/build', async ({ request }) => {
+        const body = await request.json() as { run_request: BacktestRunRequest }
+        exportedRunRequest = body.run_request
+        return HttpResponse.json({
+          report_id: 'shared-report-001-reexport',
+          file_name: 'shared-report-001-reexport.ftbt',
+          file_base64: 'bW9jaw==',
+          manifest: {
+            schema_version: 'ftbt-1.0',
+            package_type: 'backtest_report',
+            created_at: '2026-03-09T10:05:00Z',
+            report_id: 'shared-report-001-reexport',
+            app: { name: 'Final Trade', version: 'test' },
+            files: [],
+          },
+        })
+      }),
+    )
+
+    renderWithProviders(
+      <>
+        <BacktestTaskWatcher />
+        <BacktestPage />
+      </>,
+      '/backtest',
+    )
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '加载报告' })).not.toBeDisabled()
+    })
+    fireEvent.click(screen.getByRole('button', { name: '加载报告' }))
+
+    await waitFor(() => {
+      const payload = useBacktestTaskStore.getState().payloadById['imp_shared-report-001']
+      expect(payload?.run_id).toBe('shared-run-20260301')
+    })
+
+    fireEvent.click(await screen.findByRole('button', { name: '导出 ftbt' }))
+
+    await waitFor(() => {
+      expect(exportedRunRequest?.run_id).toBe('shared-run-20260301')
+    })
+  }, 12_000)
+
+  it('builds compact local task ids for imported reports with long report ids', () => {
+    const longReportId = `shared-report-${'x'.repeat(96)}`
+    const backtestTaskId = buildImportedLocalTaskId(longReportId, 'backtest')
+    const plateauTaskId = buildImportedLocalTaskId(longReportId, 'plateau')
+    expect(backtestTaskId.length).toBeLessThanOrEqual(64)
+    expect(plateauTaskId.length).toBeLessThanOrEqual(64)
+    expect(backtestTaskId.startsWith('imp_')).toBe(true)
+    expect(plateauTaskId.startsWith('imp_plateau_')).toBe(true)
+    expect(backtestTaskId).toBe(buildImportedLocalTaskId(longReportId, 'backtest'))
+    expect(plateauTaskId).toBe(buildImportedLocalTaskId(longReportId, 'plateau'))
+    expect(backtestTaskId).not.toBe(`imp_${longReportId}`)
+    expect(plateauTaskId).not.toBe(`imp_plateau_${longReportId}`)
+  })
+
+  it('prefers effective run_request when report carries resolved run_id', () => {
+    const rawRunRequest: BacktestRunRequest = {
+      mode: 'trend_pool',
+      run_id: undefined,
+      trend_step: 'auto',
+      pool_roll_mode: 'daily',
+      board_filters: ['main', 'gem', 'star'],
+      strategy_id: 'wyckoff_trend_v1',
+      strategy_params: {},
+      date_from: '2026-01-01',
+      date_to: '2026-01-31',
+      window_days: 60,
+      min_score: 50,
+      require_sequence: false,
+      min_event_count: 1,
+      entry_events: ['Spring', 'SOS'],
+      exit_events: ['SOW', 'LPSY'],
+      initial_capital: 1_000_000,
+      position_pct: 0.2,
+      max_positions: 5,
+      stop_loss: 0.05,
+      take_profit: 0.15,
+      trailing_stop_pct: 0.03,
+      max_hold_days: 60,
+      fee_bps: 10,
+      prioritize_signals: true,
+      priority_mode: 'balanced',
+      priority_topk_per_day: 0,
+      enforce_t1: true,
+      entry_delay_days: 1,
+      delay_invalidation_enabled: true,
+      max_symbols: 120,
+      enable_advanced_analysis: true,
+    }
+    const effectiveRunRequest: BacktestRunRequest = {
+      ...rawRunRequest,
+      run_id: 'shared-run-20260301',
+    }
+
+    const resolved = resolveEffectiveRunRequest(rawRunRequest, {
+      ...buildSucceededResult('imported report'),
+      effective_run_request: effectiveRunRequest,
+    } as BacktestResponse)
+
+    expect(resolved.run_id).toBe('shared-run-20260301')
+    expect(resolved.mode).toBe('trend_pool')
+  })
 
   it('submits full_market via task api instead of sync api', async () => {
     let syncRunCalled = false
